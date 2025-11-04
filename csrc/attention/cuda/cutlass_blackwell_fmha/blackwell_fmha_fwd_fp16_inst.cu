@@ -1,4 +1,11 @@
-// @nolint
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #include "blackwell_fmha_fwd_template.cuh"
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
