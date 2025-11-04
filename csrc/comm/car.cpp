@@ -1,0 +1,334 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/core/ScalarType.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/util/Exception.h>
+#include <sys/stat.h>
+#include <torch/csrc/cuda/nccl.h>
+#include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
+#include <torch/library.h>
+#include <unistd.h>
+#include <vector>
+
+#include <mslk/comm/car.h> // @manual
+
+namespace mslk::comm {
+
+static_assert(sizeof(cudaIpcMemHandle_t) == 64, "");
+
+constexpr size_t kMaxNumNcclComms = 5;
+
+static ncclComm_t* get_nccl_comm(int64_t comm_idx) {
+  static ncclComm_t comms[kMaxNumNcclComms];
+
+  TORCH_CHECK_GE(comm_idx, 0);
+  TORCH_CHECK_LT(comm_idx, kMaxNumNcclComms);
+  return &comms[comm_idx];
+}
+
+void nccl_init(
+    int64_t rank,
+    int64_t world_size,
+    std::string rendevouz,
+    int64_t comm_idx) {
+  using namespace c10d;
+  ncclUniqueId id;
+  if (rank == 0) {
+    C10D_NCCL_CHECK(ncclGetUniqueId(&id), "ncclGetUniqueId");
+    auto* f = fopen(rendevouz.c_str(), "w");
+    fwrite(&id, sizeof(id), 1, f);
+    fclose(f);
+  } else {
+    auto check_size = [&]() {
+      struct stat s;
+      memset(&s, 0, sizeof(s));
+      stat(rendevouz.c_str(), &s);
+      return s.st_size;
+    };
+    while (static_cast<unsigned long>(check_size()) < sizeof(ncclUniqueId)) {
+      usleep(1000);
+    }
+    auto* f = fopen(rendevouz.c_str(), "r");
+    fread(&id, sizeof(id), 1, f);
+    fclose(f);
+  }
+  C10D_NCCL_CHECK(
+      ncclCommInitRank(get_nccl_comm(comm_idx), world_size, id, rank),
+      "ncclCommInitRank");
+  return;
+}
+
+at::Tensor nccl_get_unique_id() {
+  using namespace c10d;
+  ncclUniqueId id;
+  static_assert(sizeof(ncclUniqueId) == 128, "");
+  C10D_NCCL_CHECK(ncclGetUniqueId(&id), "ncclGetUniqueId");
+  auto id_ = at::empty({128}, at::TensorOptions().dtype(at::kChar));
+  std::memcpy(id_.data_ptr(), &id, sizeof(id));
+  return id_;
+}
+
+void nccl_comm_init_rank(
+    int64_t world_size,
+    int64_t rank,
+    at::Tensor id_,
+    int64_t comm_idx) {
+  using namespace c10d;
+  ncclUniqueId id;
+  static_assert(sizeof(ncclUniqueId) == 128, "");
+  std::memcpy(&id, id_.data_ptr(), sizeof(id));
+  C10D_NCCL_CHECK(
+      ncclCommInitRank(get_nccl_comm(comm_idx), world_size, id, rank),
+      "ncclCommInitRank");
+}
+
+ncclDataType_t to_nccl_data_type(c10::ScalarType type) {
+  switch (type) {
+    case at::kFloat:
+      return ncclDataType_t::ncclFloat;
+    case at::kHalf:
+      return ncclDataType_t::ncclHalf;
+    case at::kDouble:
+      return ncclDataType_t::ncclDouble;
+    case at::kLong:
+      return ncclDataType_t::ncclInt64;
+    case at::kInt:
+      return ncclDataType_t::ncclInt;
+    case at::kChar:
+      return ncclDataType_t::ncclChar;
+    case at::kByte:
+      return ncclDataType_t::ncclUint8;
+    case at::kBool:
+      return ncclDataType_t::ncclUint8;
+#if defined(USE_ROCM)
+    case at::kFloat8_e4m3fnuz:
+      return ncclDataType_t::ncclUint8;
+    case at::kFloat8_e5m2fnuz:
+      return ncclDataType_t::ncclUint8;
+#else
+    case at::kFloat8_e4m3fn:
+      return ncclDataType_t::ncclUint8;
+    case at::kFloat8_e5m2:
+      return ncclDataType_t::ncclUint8;
+#endif
+    case at::kBFloat16:
+      return ncclDataType_t::ncclBfloat16;
+    default:
+      TORCH_CHECK(false, "Unconvertible NCCL type ", type);
+  }
+}
+
+void nccl_allgather(at::Tensor dst, at::Tensor src, int64_t comm_idx) {
+  using namespace c10d;
+  TORCH_CHECK(src.is_contiguous());
+  TORCH_CHECK(dst.is_contiguous());
+  TORCH_CHECK(
+      src.dtype() == dst.dtype(),
+      "dst and src tensors must have the same dtype.");
+  ncclDataType_t type = to_nccl_data_type(src.scalar_type());
+  C10D_NCCL_CHECK(
+      ncclAllGather(
+          src.data_ptr(),
+          dst.data_ptr(),
+          src.numel(),
+          type,
+          *get_nccl_comm(comm_idx),
+          at::cuda::getCurrentCUDAStream()),
+      "ncclAllGather");
+}
+
+void nccl_alltoall_single(
+    at::Tensor dst,
+    at::Tensor src,
+    int64_t world_size,
+    int64_t comm_idx) {
+  TORCH_CHECK(src.is_contiguous());
+  TORCH_CHECK(dst.is_contiguous());
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  torch::cuda::nccl::all2all_single_equal_split(
+      src, dst, world_size, *get_nccl_comm(comm_idx), stream);
+}
+
+void nccl_alltoall(
+    std::vector<at::Tensor> dsts,
+    std::vector<at::Tensor> srcs,
+    int64_t comm_idx) {
+  auto stream = at::cuda::getCurrentCUDAStream();
+  torch::cuda::nccl::all2all(dsts, srcs, *get_nccl_comm(comm_idx), stream);
+}
+
+void nccl_one2many(
+    const std::vector<int64_t>& dst_ranks,
+    std::vector<at::Tensor> srcs,
+    int64_t comm_idx) {
+  using namespace c10d;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto& comm = *get_nccl_comm(comm_idx);
+
+  C10D_NCCL_CHECK(ncclGroupStart(), "ncclGroupStart");
+  for (const auto i : c10::irange(static_cast<int>(srcs.size()))) {
+    auto& src = srcs[i];
+    C10D_NCCL_CHECK(
+        ncclSend(
+            src.data_ptr(),
+            src.numel(),
+            to_nccl_data_type(src.scalar_type()),
+            dst_ranks[i],
+            comm,
+            stream.stream()),
+        "ncclSend");
+  }
+  C10D_NCCL_CHECK(ncclGroupEnd(), "ncclGroupEnd");
+}
+
+void nccl_many2one(
+    std::vector<at::Tensor> dsts,
+    const std::vector<int64_t>& src_ranks,
+    int64_t comm_idx) {
+  using namespace c10d;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto& comm = *get_nccl_comm(comm_idx);
+
+  C10D_NCCL_CHECK(ncclGroupStart(), "ncclGroupStart");
+  for (const auto i : c10::irange(static_cast<int>(dsts.size()))) {
+    auto& dst = dsts[i];
+    C10D_NCCL_CHECK(
+        ncclRecv(
+            dst.data_ptr(),
+            dst.numel(),
+            to_nccl_data_type(dst.scalar_type()),
+            src_ranks[i],
+            comm,
+            stream.stream()),
+        "ncclRecv");
+  }
+  C10D_NCCL_CHECK(ncclGroupEnd(), "ncclGroupEnd");
+}
+
+void nccl_broadcast(
+    at::Tensor send,
+    at::Tensor recv,
+    int64_t root,
+    int64_t comm_idx) {
+  using namespace c10d;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto& comm = *get_nccl_comm(comm_idx);
+
+  C10D_NCCL_CHECK(
+      ncclBroadcast(
+          send.data_ptr(),
+          recv.data_ptr(),
+          send.numel(),
+          to_nccl_data_type(recv.scalar_type()),
+          root,
+          comm,
+          stream.stream()),
+      "ncclBroadcast");
+}
+
+void nccl_reducescatter(at::Tensor dst, at::Tensor src, int64_t comm_idx) {
+  using namespace c10d;
+  TORCH_CHECK(src.is_contiguous());
+  TORCH_CHECK(dst.is_contiguous());
+  TORCH_CHECK(src.dtype() == at::ScalarType::BFloat16);
+  TORCH_CHECK(dst.dtype() == at::ScalarType::BFloat16);
+
+  C10D_NCCL_CHECK(
+      ncclReduceScatter(
+          src.data_ptr(),
+          dst.data_ptr(),
+          dst.numel(),
+          ncclDataType_t::ncclBfloat16,
+          ncclSum,
+          *get_nccl_comm(comm_idx),
+          at::cuda::getCurrentCUDAStream()),
+      "ncclReduceScatter");
+}
+
+void nccl_allreduce(
+    at::Tensor dst,
+    at::Tensor src,
+    std::optional<at::Tensor> bias,
+    int64_t comm_idx) {
+  using namespace c10d;
+  TORCH_CHECK(src.is_contiguous());
+  TORCH_CHECK(dst.is_contiguous());
+  TORCH_CHECK(dst.dtype() == src.dtype());
+  ncclDataType_t type;
+  switch (src.scalar_type()) {
+    case at::kFloat:
+      type = ncclDataType_t::ncclFloat;
+      break;
+    case at::kHalf:
+      type = ncclDataType_t::ncclHalf;
+      break;
+#ifdef IS_NCCLX_MSCCL
+    case at::kFloat8_e4m3fn:
+      type = ncclDataType_t::ncclFp8E4M3;
+      break;
+#endif
+    case at::kBFloat16:
+      type = ncclDataType_t::ncclBfloat16;
+      break;
+    default:
+      TORCH_CHECK(false, "unsupported type: ", src.scalar_type());
+  }
+
+// ncclAllReduceWithBias landed in OSS RCCL only recently, so it won't be
+// available in public ROCm for a while.  As such, its use has to be guarded by
+// a far-off ROCm version check.
+//    https://github.com/ROCm/rccl/pull/1729
+#if (defined(MSLK_FBCODE) && defined(USE_ROCM)) || \
+    (!defined(MSLK_FBCODE) && defined(USE_ROCM) && (ROCM_VERSION >= 70200))
+  if (bias) {
+    C10D_NCCL_CHECK(
+        ncclAllReduceWithBias(
+            src.data_ptr(),
+            dst.data_ptr(),
+            src.numel(),
+            type,
+            ncclSum,
+            *get_nccl_comm(comm_idx),
+            at::cuda::getCurrentCUDAStream(),
+            (*bias).data_ptr()),
+        "ncclAllReduceWithBias");
+  } else {
+    C10D_NCCL_CHECK(
+        ncclAllReduce(
+            src.data_ptr(),
+            dst.data_ptr(),
+            src.numel(),
+            type,
+            ncclSum,
+            *get_nccl_comm(comm_idx),
+            at::cuda::getCurrentCUDAStream()),
+        "ncclAllReduce");
+  }
+#else
+  C10D_NCCL_CHECK(
+      ncclAllReduce(
+          src.data_ptr(),
+          dst.data_ptr(),
+          src.numel(),
+          type,
+          ncclSum,
+          *get_nccl_comm(comm_idx),
+          at::cuda::getCurrentCUDAStream()),
+      "ncclAllReduce");
+  if (bias) {
+    dst.add_(*bias);
+  }
+#endif
+}
+
+} // namespace mslk::comm

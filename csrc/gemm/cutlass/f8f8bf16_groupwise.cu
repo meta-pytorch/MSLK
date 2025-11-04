@@ -1,0 +1,102 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <mslk/utils/utils.h>
+#include <mslk/utils/utils_gpu.h>
+#include <mslk/utils/tuning_cache.cuh>
+#include "f8f8bf16_groupwise/f8f8bf16_groupwise_manifest.cuh"
+
+namespace mslk::gemm {
+
+#if CUDART_VERSION >= 12000
+
+// FP8 Groupwise Cutlass kernel dispatch.
+Kernel_f8f8bf16_groupwise
+get_kernel_via_heuristic(int arch, int M, int N, int K) {
+  // Use shape heuristics to dispatch to optimized kernel configuration.
+  // Initial enablement includes only one schedule.
+  if (M <= 16) {
+    return f8f8bf16_groupwise_128_16_128_1_1_1_9_t;
+  } else {
+    return f8f8bf16_groupwise_128_128_128_1_2_1_9_f;
+  }
+}
+
+Kernel_f8f8bf16_groupwise get_kernel_via_tuning(
+    int arch,
+    int M,
+    int N,
+    int K,
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale) {
+  // One cache per kernel type
+  static TuningCache cache("f8f8bf16_groupwise");
+
+  // Reducing amount of auto tuning by rounding up M to next power of 2.
+  M = nextPowerOf2(M);
+  // Use (M, N, K) shape as the key.
+  const std::string shape_key =
+      std::to_string(M) + "_" + std::to_string(N) + "_" + std::to_string(K);
+  const auto& kernels = get_f8f8bf16_groupwise_kernels(arch);
+  auto kernel = cache.findBestKernelMaybeAutotune(
+      shape_key, kernels, XQ, WQ, x_scale, w_scale);
+  return kernel;
+}
+
+// FP8 Rowwise Cutlass kernel dispatch.
+at::Tensor dispatch_fp8_groupwise_kernel(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale) {
+  int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+  int N = size_to_dim_(WQ.dim() - 1, WQ.sizes());
+  int K = XQ.size(-1);
+
+  const int arch = getDeviceArch();
+
+  // Select kernel to run via heuristics or tuning.
+  auto kernel = [&]() {
+    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+      return get_kernel_via_tuning(arch, M, N, K, XQ, WQ, x_scale, w_scale);
+    } else {
+      return get_kernel_via_heuristic(arch, M, N, K);
+    }
+  }();
+  // Invoke kernel
+  return kernel(XQ, WQ, x_scale, w_scale);
+}
+
+at::Tensor f8f8bf16_groupwise(
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // FP8
+    at::Tensor x_scale,
+    at::Tensor w_scale) {
+  // Invoke and return rowwise kernel without output argument.
+  return dispatch_fp8_groupwise_kernel(XQ, WQ, x_scale, w_scale);
+}
+
+#else
+
+at::Tensor f8f8bf16_groupwise(
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // FP8
+    at::Tensor x_scale,
+    at::Tensor w_scale) {
+  throw std::runtime_error(
+      "CUDA version is older than 12.0"); // requires CUDA>=12
+}
+#endif
+
+} // namespace mslk::gemm

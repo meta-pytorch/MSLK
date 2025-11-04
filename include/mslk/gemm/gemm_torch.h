@@ -1,0 +1,49 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include <ATen/ATen.h>
+
+#pragma once
+
+namespace mslk::gemm {
+
+#ifdef USE_ROCM
+
+// PyTorch FP8 grouped GEMM API is only available on AMD
+at::Tensor f8f8bf16_rowwise_grouped_mm(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    std::optional<at::Tensor> offsets,
+    at::Tensor& output);
+
+#else
+
+// Torch compliant MXFP8 grouped GEMM only on CUDA for now.
+at::Tensor mx8mx8bf16_grouped_mm(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor offsets,
+    std::optional<at::Tensor> output = std::nullopt);
+
+// Torch compliant FP4 grouped GEMM.
+at::Tensor f4f4bf16_grouped_mm(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor offsets,
+    std::optional<at::Tensor> output = std::nullopt,
+    std::optional<at::Tensor> global_scale = std::nullopt);
+
+#endif
+
+} // namespace mslk::gemm
