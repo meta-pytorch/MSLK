@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// @nolint
 /***************************************************************************************************
  * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights
  * reserved. SPDX-License-Identifier: BSD-3-Clause
