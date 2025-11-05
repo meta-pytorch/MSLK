@@ -1,15 +1,21 @@
-// @nolint
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #pragma once
 #include "blackwell_fmha_utils.hpp"
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 template <
-  typename Element,
-  typename ElementOut,
-  int HeadDim,
-  bool kIsVarlen,
-  typename ActiveMask
->
+    typename Element,
+    typename ElementOut,
+    int HeadDim,
+    bool kIsVarlen,
+    typename ActiveMask>
 std::tuple<at::Tensor, at::Tensor> fmha_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -21,8 +27,7 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
     const std::optional<double> softmax_scale,
     const std::optional<const at::Tensor>& seqlen_kv,
     const int window_size_left,
-    const int window_size_right
-  ) {
+    const int window_size_right) {
   const auto device = q.device();
   at::cuda::CUDAGuard device_guard(device);
 
@@ -88,29 +93,34 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
     TORCH_CHECK(
         q.dim() == 3,
         "Expect Q shape to be (total_Q_seqlen, num_Q_heads, head_dim) ",
-        "Found shape ", q.sizes());
+        "Found shape ",
+        q.sizes());
     TORCH_CHECK(
         k.dim() == 3,
         "Expect K shape to be (total_KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ", k.sizes());
+        "Found shape ",
+        k.sizes());
     TORCH_CHECK(
         v.dim() == 3,
         "Expect V shape to be (total_KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ", v.sizes());
-  }
-  else {
+        "Found shape ",
+        v.sizes());
+  } else {
     TORCH_CHECK(
         q.dim() == 4,
         "Expect Q shape to be (batch_size, Q_seqlen, num_Q_heads, head_dim). ",
-        "Found shape ", q.sizes());
+        "Found shape ",
+        q.sizes());
     TORCH_CHECK(
         k.dim() == 4,
         "Expect K shape to be (batch_size, KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ", k.sizes());
+        "Found shape ",
+        k.sizes());
     TORCH_CHECK(
         v.dim() == 4,
         "Expect V shape to be (batch_size, KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ", v.sizes());
+        "Found shape ",
+        v.sizes());
   }
 
   if constexpr (kIsVarlen) {
@@ -138,16 +148,18 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
   if constexpr (kIsVarlen) {
     problem_shape = cute::make_tuple(
         VariableLength{
-            static_cast<int>(*max_seq_len_q), static_cast<int*>(cu_seqlens_q->data_ptr()), SQ},
+            static_cast<int>(*max_seq_len_q),
+            static_cast<int*>(cu_seqlens_q->data_ptr()),
+            SQ},
         VariableLength{
-            static_cast<int>(*max_seq_len_k), static_cast<int*>(cu_seqlens_k->data_ptr()), SK},
+            static_cast<int>(*max_seq_len_k),
+            static_cast<int*>(cu_seqlens_k->data_ptr()),
+            SK},
         D,
         cute::make_tuple(cute::make_tuple(H_R, H_K), B));
-  }
-  else {
+  } else {
     problem_shape = cute::make_tuple(
-        SQ, SK, D, cute::make_tuple(cute::make_tuple(H_R, H_K), B)
-    );
+        SQ, SK, D, cute::make_tuple(cute::make_tuple(H_R, H_K), B));
   }
 
   // Reshape to get strides
@@ -170,16 +182,17 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
       static_cast<int>(q_.stride(1)),
       _1{},
       make_stride(
-        make_stride(static_cast<int>(q_.stride(3)), static_cast<int>(q_.stride(2))),
-        static_cast<int>(q_.stride(0))));
+          make_stride(
+              static_cast<int>(q_.stride(3)), static_cast<int>(q_.stride(2))),
+          static_cast<int>(q_.stride(0))));
 
   // K shape = (B, K, H_K, 1, D)
   StrideK stride_K = make_stride(
       static_cast<int>(k_.stride(1)),
       _1{},
       make_stride(
-        make_stride(_0{}, static_cast<int>(k_.stride(2))),
-        static_cast<int>(k_.stride(0))));
+          make_stride(_0{}, static_cast<int>(k_.stride(2))),
+          static_cast<int>(k_.stride(0))));
   StrideV stride_V = stride_K;
 
   // O shape = (B, Q, H_K, H_R, D)
@@ -216,16 +229,17 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
   }
   arguments = {
       problem_shape,
-      seqlen_kv.has_value()
-          ? static_cast<const int*>(seqlen_kv->data_ptr())
-          : nullptr,
+      seqlen_kv.has_value() ? static_cast<const int*>(seqlen_kv->data_ptr())
+                            : nullptr,
       {
-          {
-              static_cast<Element*>(q.data_ptr()), stride_Q,
-              static_cast<Element*>(k.data_ptr()), stride_K,
-              static_cast<Element*>(v.data_ptr()), stride_V,
-              window_size_left, window_size_right
-          },
+          {static_cast<Element*>(q.data_ptr()),
+           stride_Q,
+           static_cast<Element*>(k.data_ptr()),
+           stride_K,
+           static_cast<Element*>(v.data_ptr()),
+           stride_V,
+           window_size_left,
+           window_size_right},
           static_cast<float>(softmax_scale.value_or(0.0f)) /* softmax_scale */,
           1.0f /* scale_q */,
           1.0f /* scale_k */,
@@ -234,12 +248,8 @@ std::tuple<at::Tensor, at::Tensor> fmha_fwd(
           window_size_left,
           window_size_right,
       },
-      {
-          block_O.get(), stride_O,
-          block_LSE.get(), stride_LSE
-      },
-      hw_info
-  };
+      {block_O.get(), stride_O, block_LSE.get(), stride_LSE},
+      hw_info};
 
   launch_fmha_op<Operation>(arguments);
   return std::make_tuple(

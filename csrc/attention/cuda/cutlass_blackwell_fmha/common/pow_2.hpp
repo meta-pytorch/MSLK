@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 // @nolint
 /***************************************************************************************************
  * Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -39,17 +47,17 @@
 
 namespace cutlass::fmha {
 
-struct Pow2 {                                                                   
-  int n;                                                                        
-  int log2_n;                                                                   
-                                                                                
+struct Pow2 {
+  int n;
+  int log2_n;
+
   explicit CUTE_DEVICE Pow2(int n) : n(n) {
 #ifdef __CUDA_ARCH__
     log2_n = __ffs(n) - 1;
 #endif
-  }                    
-                                                                                
-  template<class T>  
+  }
+
+  template<class T>
   CUTE_HOST_DEVICE T operator *(T const& b) const {
     return n * b;
   }
@@ -62,7 +70,7 @@ struct Pow2 {
     return n * N;
   }
 
-};                                                                              
+};
 
 template<class T>
 CUTE_HOST_DEVICE auto operator/(T const& a, Pow2 const& b) {
