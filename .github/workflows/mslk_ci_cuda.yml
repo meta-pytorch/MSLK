@@ -1,0 +1,94 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# This workflow is used for MSLK CUDA CI as well as nightly builds of MSLK CUDA
+# against PyTorch-CUDA Nightly.
+name: MSLK CUDA CI
+
+on:
+  # PR Trigger (enabled for regression checks and debugging)
+  #
+  pull_request:
+    branches:
+      - main
+
+  # Push Trigger (enable to catch errors coming out of multiple merges)
+  #
+  push:
+    branches:
+      - main
+
+  # Cron Trigger (UTC)
+  #
+  # Based on the Conda page for PyTorch-nightly, the GPU nightly releases appear
+  # around 02:30 PST every day (roughly 2 hours after the CPU releases)
+  #
+  schedule:
+    - cron:  '45 12 * * *'
+
+  # Manual Trigger
+  #
+  workflow_dispatch:
+    inputs:
+      pytorch-channel-version:
+        description: Package Channel + Version to Use for PyTorch Installation, in `<channel>[/<version>]` Format
+        type: string
+        required: false
+        default: ""
+      publish-to-pypi:
+        description: Publish Artifact to PyPI
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Cancel previous runs in the PR if a new commit is pushed
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-build-matrix:
+    if: ${{ github.repository_owner == 'pytorch' }}
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      targets: default,genai,hstu
+      variant: cuda
+      jobtype: build
+
+  build:
+    needs: generate-build-matrix
+    uses: ./.github/workflows/_mslk_cuda_build.yml
+    with:
+      matrix: ${{ needs.generate-build-matrix.outputs.matrix }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
+
+  generate-test-matrix:
+    needs: build
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      targets: default,genai,hstu
+      variant: cuda
+      jobtype: test
+
+  test:
+    needs: generate-test-matrix
+    uses: ./.github/workflows/_mslk_cuda_test.yml
+    with:
+      matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
+      publish-to-pypi: ${{ (github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true') }}
+      cuda-version-publish: 12.6.3
+      extra-env: >-
+        {
+          "ENFORCE_CUDA_DEVICE": 1
+        }
+    secrets:
+      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
