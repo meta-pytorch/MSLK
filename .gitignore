@@ -1,6 +1,3 @@
-external/composable_kernel/
-external/cutlass/
-external/hipify_torch/
 _skbuild/
 *.egg-info/
 dist/

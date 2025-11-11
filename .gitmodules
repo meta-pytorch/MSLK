@@ -1,0 +1,12 @@
+[submodule "external/googletest"]
+	path = external/googletest
+	url = https://github.com/google/googletest.git
+[submodule "external/composable_kernel"]
+	path = external/composable_kernel
+	url = https://github.com/ROCm/composable_kernel.git
+[submodule "external/cutlass"]
+	path = external/cutlass
+	url = https://github.com/jwfromm/cutlass.git
+[submodule "external/hipify_torch"]
+	path = external/hipify_torch
+	url = https://github.com/ROCm/hipify_torch.git
