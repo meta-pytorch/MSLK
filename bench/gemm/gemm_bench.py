@@ -35,6 +35,17 @@ except ImportError:
 from mslk.bench.gemm.gemm_ops import GemmOpBase, get_gemm_ops
 
 
+shape_registry = {}
+
+
+def register_shapes(name):
+    def decorator(op):
+        shape_registry[name] = op
+        return op
+
+    return decorator
+
+
 def generate_group_tensor(G, M):
     """
     Generate a tensor with G elements whose integer elements sum to A.
@@ -70,38 +81,47 @@ def set_amd_env_vars() -> None:
     os.environ["PYTORCH_TUNABLEOP_MAX_WARMUP_DURATION_MS"] = "30"
 
 
-def get_llama_shapes() -> list[tuple[int, int, int]]:
-    # Helper function that returns a list of shapes relevant to llama.
-
-    llama_shapes = []
-    for M in [1, 16, 32, 64, 96, 128, 16384]:
-        # Add shapes for llama3 70B
-        llama_shapes += [
+@register_shapes("llama3_70b")
+def llama3_70b_shapes() -> list[tuple[int, int, int]]:
+    shapes = []
+    for M in [1, 16, 32, 64, 96, 128]:
+        shapes += [
             (M, 1280, 8192),
             (M, 8192, 1024),
             (M, 7168, 8192),
             (M, 8192, 3584),
         ]
-        # Add shapes for llama3 405B
-        llama_shapes += [
+    return shapes
+
+
+@register_shapes("llama3_405b")
+def llama3_405b_shapes() -> list[tuple[int, int, int]]:
+    shapes = []
+    for M in [1, 16, 32, 64, 96, 128]:
+        shapes += [
             (M, 13312, 6656),
             (M, 13312, 16384),
             (M, 16384, 6656),
             (M, 16384, 16384),
         ]
-        # Add shapes for llama4 Scout/Maverick (17Bx{16,128})
-        llama_shapes += [
+    return shapes
+
+
+@register_shapes("llama4")
+def llama4_shapes() -> list[tuple[int, int, int]]:
+    shapes = []
+    for M in [1, 16, 32, 64, 96, 128]:
+        shapes += [
             (M, 896, 5120),
             (M, 5120, 640),
             (M, 2048, 5120),
             (M, 5120, 1024),
         ]
+    return shapes
 
-    return llama_shapes
 
-
-def get_ldm_shapes() -> list[tuple[int, int, int]]:
-    # Helper function that returns a list of shapes relevant to ldm.
+@register_shapes("ldm")
+def ldm_shapes() -> list[tuple[int, int, int]]:
     return [
         (1536, 3584, 3584),
         (8192, 9728, 3584),
@@ -486,14 +506,9 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     help="If set, use rotating buffer to benchmark.",
 )
 @click.option(
-    "--use-llama-shapes",
-    is_flag=True,
-    help="If set, benchmark using fixed shapes relevant to llama workloads.",
-)
-@click.option(
-    "--use-ldm-shapes",
-    is_flag=True,
-    help="If set, benchmark using fixed shapes relevant to ldm workloads.",
+    "--shapes",
+    default=None,
+    help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
 )
 @click.option(
     "--trace",
@@ -528,8 +543,7 @@ def invoke_main(
     total_m: Optional[str],
     no_cuda_graph: bool,
     use_rotating_buffer_bench: bool,
-    use_llama_shapes: bool,
-    use_ldm_shapes: bool,
+    shapes: Optional[str],
     trace: bool,
     disable_fast_accum: bool,
     torch_compile: bool,
@@ -574,10 +588,13 @@ def invoke_main(
         # Note this is a single grouped gemm.
         MNK = [[M, N, K]]
     else:
-        if use_llama_shapes:
-            MNK = get_llama_shapes()
-        elif use_ldm_shapes:
-            MNK = get_ldm_shapes()
+        if shapes:
+            if shapes not in shape_registry:
+                print(
+                    f"Shape {shapes} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
+                )
+                sys.exit(1)
+            MNK = shape_registry[shapes]()
         else:
             if m is None:
                 M = [1, 4, 8, 16, 32, 64, 128, 2048, 4096, 8192, 16384]
