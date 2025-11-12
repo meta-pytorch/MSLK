@@ -10,6 +10,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cutlass/util/device_memory.h>
 #include <cutlass/util/packed_stride.hpp>
 
@@ -164,6 +165,8 @@ at::Tensor f4f4bf16_grouped_impl(
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
     std::optional<at::Tensor> starting_row_after_padding) {
+  c10::cuda::CUDAGuard deviceGuard(XQ.device());
+
   // The number of groups the kernel uses may vary.
   const int64_t G = [&]() {
     if (M_sizes) {
@@ -240,8 +243,6 @@ at::Tensor f4f4bf16_grouped_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          //   void, // Indicate there is no beta scaling to save register
-          //   space.
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           AlignmentC,
