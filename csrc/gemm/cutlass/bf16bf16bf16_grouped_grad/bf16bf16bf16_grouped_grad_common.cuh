@@ -10,6 +10,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cutlass/util/device_memory.h>
 #include <cutlass/util/packed_stride.hpp>
 
@@ -115,6 +116,8 @@ at::Tensor bf16bf16bf16_grouped_grad_impl(
     at::Tensor W,
     at::Tensor output,
     std::optional<at::Tensor> M_sizes) {
+  c10::cuda::CUDAGuard deviceGuard(X.device());
+
   int64_t G;
   at::TensorOptions options;
   G = W.size(0);

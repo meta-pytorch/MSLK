@@ -10,6 +10,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "cutlass/cutlass.h"
 
@@ -45,6 +46,8 @@ at::Tensor _bf16i4bf16(
     at::Tensor w_scale_group,
     at::Tensor w_zero_group,
     at::Tensor Y) {
+  c10::cuda::CUDAGuard deviceGuard(X.device());
+
   // Get shape information from input tensors.
   int M = size_to_dim_(X.dim() - 1, X.sizes());
   int K = X.size(-1);
