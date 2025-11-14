@@ -168,7 +168,7 @@ at::Tensor dispatch_mx8_grouped_kernel(
     at::Tensor offsets) {
   // Select kernel to run via heuristics.
   auto kernel = [&]() {
-    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(
           M, N, K, G, XQ, WQ, x_scale, w_scale, output, offsets);
     } else {

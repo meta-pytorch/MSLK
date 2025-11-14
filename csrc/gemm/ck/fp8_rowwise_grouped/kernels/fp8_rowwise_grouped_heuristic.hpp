@@ -12,7 +12,7 @@
 
 namespace mslk::gemm {
 namespace {
-#if !defined(FBGEMM_GENAI_NO_EXTENDED_SHAPES)
+#if !defined(MSLK_NO_EXTENDED_SHAPES)
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash {
@@ -1298,7 +1298,7 @@ RowwiseGroupedKernel<InputType, OutputType> rowwise_grouped_heuristic_dispatch(
     int64_t N,
     int64_t K) {
 // Avoid compiling full range of kernels when building with PyTorch.
-#if !defined(FBGEMM_GENAI_NO_EXTENDED_SHAPES)
+#if !defined(MSLK_NO_EXTENDED_SHAPES)
   // First check if this shape is available in the direct lookup.
   int64_t padded_m = nextPowerOf2(total_M);
   padded_m = padded_m < G ? G : padded_m;

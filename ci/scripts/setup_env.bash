@@ -20,6 +20,7 @@ utils_scripts=(
     mslk_build.bash
     mslk_install.bash
     mslk_test.bash
+    mslk_lint.bash
     mslk_integration.bash
 )
 

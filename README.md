@@ -59,11 +59,8 @@ y = torch.ops.mslk.f8f8bf16_rowwise(
 
 ```bash
 # Full MSLK library
-pip install mslk-gpu==1.3.0
-pip install mslk-gpu==1.3.0 --index-url https://download.pytorch.org/whl/cu126
-
-# MSLK library with GenAI operator only
-pip install mslk-gpu-genai
+pip install mslk==0.1.0
+pip install mslk==0.1.0 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 # 2. **Llama 4 Related External Coverage**

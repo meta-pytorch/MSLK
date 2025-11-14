@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   generate-matrix:
-    if: ${{ github.repository_owner == 'pytorch' }}
+    if: ${{ github.repository_owner == 'meta-pytorch' }}
     uses: pytorch/test-infra/.github/workflows/generate_binary_build_matrix.yml@main
     with:
       package-type: wheel
@@ -38,7 +38,7 @@ jobs:
       with-cpu: disable
 
   filter-matrix:
-    if: ${{ github.repository_owner == 'pytorch' }}
+    if: ${{ github.repository_owner == 'meta-pytorch' }}
     needs: generate-matrix
     runs-on: linux.24_04.4x
     outputs:
@@ -65,7 +65,7 @@ jobs:
         echo "matrix=${MATRIX_BLOB}" >> "${GITHUB_OUTPUT}"
 
   build:
-    if: ${{ github.repository_owner == 'pytorch' }}
+    if: ${{ github.repository_owner == 'meta-pytorch' }}
     needs: filter-matrix
     strategy:
       fail-fast: false
@@ -73,8 +73,8 @@ jobs:
         include:
           - repository: meta-pytorch/MSLK
             smoke-test-script: ""
-            pre-script: ../.github/scripts/nova_prescript.bash
-            post-script: ../.github/scripts/nova_postscript.bash
+            pre-script: .github/scripts/nova_prescript.bash
+            post-script: .github/scripts/nova_postscript.bash
             env-var-script: .github/scripts/nova_dir.bash
             package-name: mslk
     name: ${{ matrix.repository }}
@@ -88,7 +88,7 @@ jobs:
       pre-script: ${{ matrix.pre-script }}
       post-script: ${{ matrix.post-script }}
       package-name: ${{ matrix.package-name }}
-      build-target: genai
+      build-target: default
       env-var-script: ${{ matrix.env-var-script }}
       smoke-test-script: ${{ matrix.smoke-test-script }}
       trigger-event: ${{ github.event_name }}

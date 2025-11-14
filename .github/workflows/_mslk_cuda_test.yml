@@ -147,7 +147,7 @@ jobs:
       run: if . $PRELUDE && which conda; then collect_pytorch_env_info $BUILD_ENV; fi
 
     - name: Install MSLK dependencies (pip)
-      run: . $PRELUDE; cd mslk; install_mslk_deps $BUILD_ENV
+      run: . $PRELUDE; install_mslk_deps $BUILD_ENV
 
     - name: Download Wheel Artifact from GHA
       if: ${{ inputs.mslk-channel-version == '' }}

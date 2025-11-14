@@ -141,7 +141,10 @@ class MSLKBuild:
         return self.args.build_variant
 
     def package_name(self) -> str:
-        pkg_name: str = "mslk"
+        if self.target() == "default":
+            pkg_name: str = "mslk"
+        else:
+            pkg_name: str = f"mslk_{self.target()}"
 
         if self.nova_flag() is None:
             pkg_name += f"-{self.variant()}-{self.args.package_channel}"
@@ -487,8 +490,6 @@ class MSLKInstall(PipInstall):
     @classmethod
     def generate_version_file(cls, build: MSLKBuild) -> None:
         with open("mslk/version.py", "w") as file:
-            package_version = build.package_version()
-
             print(
                 f"[SETUP.PY] Generating version file at: {os.path.realpath(file.name)}"
             )
@@ -501,7 +502,7 @@ class MSLKInstall(PipInstall):
                 # This source code is licensed under the BSD-style license found in the
                 # LICENSE file in the root directory of this source tree.
 
-                __version__: str = "{package_version}"
+                __version__: str = "{build.package_version()}"
                 __target__: str = "{build.target()}"
                 __variant__: str = "{build.variant()}"
                 """

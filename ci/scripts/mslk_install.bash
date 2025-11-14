@@ -128,6 +128,15 @@ __mslk_post_install_checks () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
+  # Move to another directory, to avoid Python package import confusion, since
+  # there exists a mslk/ subdirectory in the MSLK repo
+  mkdir -p _tmp_dir_mslk || return 1
+  pushd _tmp_dir_mslk || return 1
+
+  # Check that the MSLK package is installed correctly
+  local installed_dir=$(conda run --no-capture-output ${env_prefix} python -c 'import mslk; import os; print(os.path.dirname(mslk.__file__))')
+  print_exec ls -la "${installed_dir}"
+
   # Print PyTorch and CUDA versions for sanity check
   __install_print_dependencies_info         || return 1
 
@@ -139,6 +148,8 @@ __mslk_post_install_checks () {
 
   # Check operator registrations are working
   __install_check_operator_registrations    || return 1
+
+  popd || return 1
 }
 
 uninstall_mslk_wheel () {

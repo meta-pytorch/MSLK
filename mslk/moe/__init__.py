@@ -6,6 +6,7 @@
 
 # pyre-unsafe
 
+import mslk  # noqa F401
 import torch
 
 from mslk.utils.torch.library import load_library_buck

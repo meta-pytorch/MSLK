@@ -32,7 +32,7 @@ try:
 except Exception:
     __variant__: str = "INTERNAL"
     __version__: str = "INTERNAL"
-    __target__: str = "INTERNAL"
+    __target__: str = "default"
 
 _default_libraries = [
     "mslk",

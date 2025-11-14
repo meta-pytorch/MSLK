@@ -844,7 +844,7 @@ at::Tensor f8f8bf16_rowwise_grouped_mm(
 
   // Select kernel to run via heuristics or tuning.
   auto kernel = [&]() {
-    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(M, N, K, XQ, WQ, x_scale, w_scale, kernel_args, out);
     } else {
       return get_kernel_via_heuristic<at::Tensor, at::Tensor>(M, N, K);

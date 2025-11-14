@@ -41,6 +41,7 @@
 
 #include "cute/layout.hpp"
 #include "cutlass/cutlass.h"
+#include "cutlass/pipeline/pipeline.hpp"
 
 namespace cutlass::fmha::collective {
 

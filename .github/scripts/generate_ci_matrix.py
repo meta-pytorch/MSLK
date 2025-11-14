@@ -30,9 +30,8 @@ JOBTYPE_TEST = "test"
 JOBTYPE_INSTALL = "install"
 ALL_JOB_TYPES = [JOBTYPE_BUILD, JOBTYPE_TEST, JOBTYPE_INSTALL]
 
-REPO_OWNER_PYTORCH = "pytorch"
-REPO_OWNER_FACEBOOKRESEARCH = "facebookresearch"
-ALL_REPO_OWNERS = [REPO_OWNER_PYTORCH, REPO_OWNER_FACEBOOKRESEARCH]
+REPO_OWNER_META_PYTORCH = "meta-pytorch"
+ALL_REPO_OWNERS = [REPO_OWNER_META_PYTORCH]
 
 REFS_MAIN = "refs/heads/main"
 
@@ -178,8 +177,8 @@ class BuildConfigScheme:
         parser.add_argument(
             "--repo-owner",
             required=False,
-            choices=[REPO_OWNER_PYTORCH, REPO_OWNER_FACEBOOKRESEARCH],
-            default=REPO_OWNER_PYTORCH,
+            choices=[REPO_OWNER_META_PYTORCH],
+            default=REPO_OWNER_META_PYTORCH,
             help=f"Repository owner: {', '.join(ALL_REPO_OWNERS)}",
         )
         return parser
@@ -260,14 +259,14 @@ class BuildConfigScheme:
             VARIANT_CUDA,
             VARIANT_ROCM,
         ]:
-            raise ValueError("GenAI target must be CUDA or ROCM")
+            raise ValueError("Target must be CUDA or ROCM")
 
         return self
 
     def python_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
             return ["3.13"]
-        if self.repo_owner != REPO_OWNER_PYTORCH:
+        if self.repo_owner != REPO_OWNER_META_PYTORCH:
             return ["3.13"]
         if self.variant == VARIANT_ROCM:
             # Save on ROCm compute resources
@@ -277,7 +276,7 @@ class BuildConfigScheme:
     def compilers(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
             return ["gcc"]
-        if self.repo_owner != REPO_OWNER_PYTORCH:
+        if self.repo_owner != REPO_OWNER_META_PYTORCH:
             return ["gcc"]
         else:
             return ["gcc", "clang"]
@@ -297,7 +296,7 @@ class BuildConfigScheme:
         # For the list of available instance types:
         # https://github.com/pytorch/test-infra/blob/main/.github/scale-config.yml
 
-        if self.repo_owner != REPO_OWNER_PYTORCH:
+        if self.repo_owner != REPO_OWNER_META_PYTORCH:
             if self.jobtype == JOBTYPE_BUILD:
                 return [{"arch": "x86", "instance": "32-core-ubuntu"}]
             else:

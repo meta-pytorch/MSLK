@@ -50,12 +50,12 @@ concurrency:
 
 jobs:
   generate-build-matrix:
-    if: ${{ github.repository_owner == 'pytorch' }}
+    if: ${{ github.repository_owner == 'meta-pytorch' }}
     uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
     with:
       repo-owner: ${{ github.repository_owner }}
       repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
-      targets: default,genai,hstu
+      targets: default
       variant: cuda
       jobtype: build
 
@@ -73,7 +73,7 @@ jobs:
     with:
       repo-owner: ${{ github.repository_owner }}
       repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
-      targets: default,genai,hstu
+      targets: default
       variant: cuda
       jobtype: test
 

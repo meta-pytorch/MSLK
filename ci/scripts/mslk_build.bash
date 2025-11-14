@@ -37,10 +37,13 @@ prepare_mslk_build () {
     git config --global --add safe.directory "${GITHUB_WORKSPACE}"
   fi
 
-  # echo "[BUILD] Running git submodules update ..."
-  # (exec_with_retries 3 git submodule sync) || return 1
-  # (exec_with_retries 3 git submodule update --init --recursive) || return 1
-  # echo "[BUILD] Successfully ran git submodules update"
+  # Run git submodule checkout only if building using OSS tooling
+  if [[ -z "${BUILD_FB_CODE}" || "${BUILD_FB_CODE}" == "0" ]]; then
+    echo "[BUILD] Running git submodules update ..."
+    (exec_with_retries 3 git submodule sync) || return 1
+    (exec_with_retries 3 git submodule update --init --recursive) || return 1
+    echo "[BUILD] Successfully ran git submodules update"
+  fi
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
@@ -525,9 +528,9 @@ __build_mslk_common_pre_steps () {
   (test_binpath "${env_name}" c++)  || return 1
   (test_binpath "${env_name}" g++)  || return 1
 
-  # Set the default the MSLK build variant to be default (i.e. MSLK)
+  # Set the default the MSLK build variant to be "default"
   # shellcheck disable=SC2076
-  if [[ ! " genai hstu default " =~ " $mslk_build_target " ]]; then
+  if [[ ! " default " =~ " $mslk_build_target " ]]; then
     echo "################################################################################"
     echo "[BUILD] Unknown MSLK build TARGET: ${mslk_build_target}"
     echo "[BUILD] Exiting ..."
@@ -663,12 +666,11 @@ build_mslk_package () {
   if [ "$mslk_build_target_variant" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME RELEASE_CHANNEL TARGET/VARIANT [VARIANT_TARGETS]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env release cpu                            # Default build target, CPU-only build variant"
-    echo "    ${FUNCNAME[0]} build_env release docs                           # Default build target, CPU-only (docs) build variant"
-    echo "    ${FUNCNAME[0]} build_env nightly genai/cuda                     # GenAI build target, CUDA build variant, default variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                    # Default build target, CUDA build variant, custom variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test rocm                              # Default build target, ROCm build variant, default variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test genai/rocm 'gfx906;gfx908;gfx90a' # GenAI build target, ROCm build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env release docs                             # Default build target, CPU-only (docs) build variant"
+    echo "    ${FUNCNAME[0]} build_env nightly default/cuda                     # Default build target, CUDA build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                      # Default build target, CUDA build variant, custom variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test rocm                                # Default build target, ROCm build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test default/rocm 'gfx906;gfx908;gfx90a' # Default build target, ROCm build variant, custom variant target(s)"
     return 1
   fi
 
@@ -737,12 +739,12 @@ build_mslk_install () {
   if [ "$mslk_build_target_variant" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME TARGET/VARIANT [TARGETS]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env release cpu                            # Default build target, CPU-only build variant"
-    echo "    ${FUNCNAME[0]} build_env release docs                           # Default build target, CPU-only (docs) build variant"
-    echo "    ${FUNCNAME[0]} build_env nightly genai/cuda                     # GenAI build target, CUDA build variant, default variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                    # Default build target, CUDA build variant, custom variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test rocm                              # Default build target, ROCm build variant, default variant target(s)"
-    echo "    ${FUNCNAME[0]} build_env test genai/rocm 'gfx906;gfx908;gfx90a' # GenAI build target, ROCm build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env release cpu                              # Default build target, CPU-only build variant"
+    echo "    ${FUNCNAME[0]} build_env release docs                             # Default build target, CPU-only (docs) build variant"
+    echo "    ${FUNCNAME[0]} build_env nightly default/cuda                     # Default build target, CUDA build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                      # Default build target, CUDA build variant, custom variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test rocm                                # Default build target, ROCm build variant, default variant target(s)"
+    echo "    ${FUNCNAME[0]} build_env test default/rocm 'gfx906;gfx908;gfx90a' # Default build target, ROCm build variant, custom variant target(s)"
     return 1
   fi
 

@@ -117,18 +117,15 @@ jobs:
       if: ${{ success() || failure() }}
       run: if . $PRELUDE && which conda; then collect_pytorch_env_info $BUILD_ENV; fi
 
-    - name: Install cuDNN
-      run: . $PRELUDE; install_cudnn $BUILD_ENV "$(pwd)/build_only/cudnn" ${{ matrix.cuda-version }}
-
     - name: Prepare MSLK Build
-      run: . $PRELUDE; cd mslk; prepare_mslk_build $BUILD_ENV
+      run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
 
     - name: Build MSLK Wheel
-      run: . $PRELUDE; cd mslk; build_mslk_package $BUILD_ENV nightly ${{ matrix.build-target }}/cuda
+      run: . $PRELUDE; build_mslk_package $BUILD_ENV nightly ${{ matrix.build-target }}/cuda
 
     - name: Upload Built Wheel as GHA Artifact
       uses: actions/upload-artifact@v4
       with:
         name: mslk_${{ matrix.build-target }}_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_cu${{ matrix.cuda-version }}.whl
-        path: mslk/dist/*.whl
+        path: dist/*.whl
         if-no-files-found: error

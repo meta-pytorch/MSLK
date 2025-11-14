@@ -243,7 +243,7 @@ at::Tensor dispatch_fp8_grouped_kernel(
     std::optional<at::Tensor> M_sizes = std::nullopt) {
   // Select kernel to run via heuristics or tuning.
   auto kernel = [&]() {
-    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(
           total_M,
           max_N,

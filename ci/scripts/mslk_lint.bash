@@ -74,7 +74,7 @@ lint_mslk_flake8 () {
     echo ""
   fi
 
-  echo "::add-matcher::mslk/test/lint/flake8_problem_matcher.json"
+  echo "::add-matcher::test/lint/flake8_problem_matcher.json"
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")

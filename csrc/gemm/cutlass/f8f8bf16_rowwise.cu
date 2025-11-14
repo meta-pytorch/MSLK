@@ -169,7 +169,7 @@ at::Tensor dispatch_fp8_rowwise_kernel(
 
   // Select kernel to run via heuristics or tuning.
   auto kernel = [&]() {
-    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(
           M, N, K, XQ, WQ, x_scale, w_scale, use_fast_accum, bias, output);
     } else {

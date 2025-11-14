@@ -62,13 +62,8 @@ start_time=${end_time}
 echo "[NOVA] Time taken to collect PyTorch environment information: ${runtime} seconds"
 
 # Set the build target
-if [[ ${BUILD_TARGET} == "genai" ]]; then
-  echo "[NOVA] Setting the MSLK build target: genai ..."
-  export mslk_build_target="genai"
-else
-  echo "[NOVA] Setting the MSLK build target: default ..."
-  export mslk_build_target="default"
-fi
+echo "[NOVA] Setting the MSLK build target: ${BUILD_TARGET} ..."
+export mslk_build_target="${BUILD_TARGET}"
 
 # Set the build variant
 if [[ $CU_VERSION = cu* ]]; then
@@ -125,7 +120,7 @@ else
 fi
 
 # Install the necessary Python eggs for building
-cd "${MSLK_REPO}/mslk" || exit 1
+cd "${MSLK_REPO}" || exit 1
 prepare_mslk_build "${BUILD_ENV_NAME}"
 end_time=$(date +%s)
 runtime=$((end_time-start_time))
@@ -147,13 +142,3 @@ end_time=$(date +%s)
 runtime=$((end_time-start_time))
 start_time=${end_time}
 echo "[NOVA] Time taken to build the package: ${runtime} seconds / $(display_time ${runtime})"
-
-# Temporary workaround - copy dist/ to root repo for smoke test
-echo "[NOVA] Copying dist folder to root repo ..."
-if print_exec cp -r "${MSLK_REPO}/mslk/dist" "${MSLK_REPO}"; then
-  echo "[NOVA] dist folder has been copied to ${MSLK_REPO}"
-  ls -al "${MSLK_REPO}/dist"
-else
-  echo "[NOVA] Failed to copy dist/ folder to ${MSLK_REPO}"
-  exit 1
-fi

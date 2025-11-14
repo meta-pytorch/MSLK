@@ -1417,55 +1417,6 @@ def triton_rms_quantize_mx4_unpack(
     return out.view(list(orig_shape[:-1]) + [-1]), scale
 
 
-@triton.jit
-def _fp32_to_e8m0(
-    unscale,
-    mbits: tl.constexpr,
-    scale_round_mode: tl.constexpr,
-):
-    E8M0_EXPONENT_BIAS: tl.constexpr = 127  # type: ignore[Incompatible variable type]
-    sign = tl.where(unscale < 0, -1.0, 1.0)
-    abs_tensor = tl.abs(unscale)
-
-    # MBITS_F32 = 23
-    if scale_round_mode == "even":
-        val_to_add = (1 << (23 - mbits - 1)) - 1
-    elif scale_round_mode == "ceil":
-        val_to_add = (1 << 23) - 1
-    else:
-        val_to_add = 0
-
-    mask_exponent = ((1 << (8 + 1)) - 1) << 23
-    mask_mantissa = (1 << 23) - 1
-
-    fp32_bits = tl.extra.cuda.libdevice.float_as_int(abs_tensor)
-    fp32_bits_exp = (fp32_bits + val_to_add) & mask_exponent
-    exponent = (fp32_bits_exp >> 23) & 0xFF
-
-    if scale_round_mode == "nv_round":
-        mantissa = fp32_bits & mask_mantissa
-        is_denormal = (exponent == 0) & (mantissa != 0)
-        is_normal = ~is_denormal
-        condition1 = is_normal & (exponent < 254) & (mantissa > 0)
-        condition2 = is_denormal & (mantissa / (2**23) > 0.5)
-
-        exponent = tl.where(condition1 | condition2, exponent + 1, exponent)
-
-    exponent = exponent.to(tl.float32)
-    e8m0_values = sign * tl.exp2(exponent - E8M0_EXPONENT_BIAS)
-
-    unscale = e8m0_values
-    # In case unscale=0 (scale will be inf), or unscale=inf or nan, we set the scale to 1.0
-    unscale_invalid_mask = (
-        (e8m0_values == 0)
-        | (e8m0_values == float("inf"))
-        | (e8m0_values == float("nan"))
-    )
-    unscale = tl.where(unscale_invalid_mask, 1.0, unscale)
-
-    return unscale
-
-
 def unsigned_fp32_to_e8m0(
     tensor: torch.Tensor, mbits: tl.constexpr, scale_round_mode: tl.constexpr
 ) -> torch.Tensor:

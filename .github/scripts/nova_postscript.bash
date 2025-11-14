@@ -38,7 +38,7 @@ start_time=${end_time}
 echo "[NOVA] Time taken to collect PyTorch environment information: ${runtime} seconds"
 
 # Install the wheel
-install_mslk_wheel "${BUILD_ENV_NAME}" mslk/dist/*.whl
+install_mslk_wheel "${BUILD_ENV_NAME}" dist/*.whl
 end_time=$(date +%s)
 runtime=$((end_time-start_time))
 start_time=${end_time}

@@ -15,8 +15,12 @@ from datetime import datetime
 from functools import partial
 
 import mslk.moe  # noqa F401
-
 import torch
+from torch.distributed import launcher
+from torch.distributed.launcher.api import LaunchConfig
+
+# pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
+from torch.profiler import profile, ProfilerActivity
 
 if torch.cuda.is_available():
     from mslk.moe.layers import BaselineMoE, MetaShufflingMoE, MoEArgs
@@ -42,11 +46,6 @@ else:
         init_parallel,
     )
 
-from torch.distributed import launcher
-from torch.distributed.launcher.api import LaunchConfig
-
-# pyre-fixme[21]: Could not find name `ProfilerActivity` in `torch.profiler`.
-from torch.profiler import profile, ProfilerActivity
 
 TRACE_DIR: str = "/tmp/"
 WARM_UP_ITERS = 15

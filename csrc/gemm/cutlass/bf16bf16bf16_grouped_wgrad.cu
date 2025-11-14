@@ -1021,7 +1021,7 @@ at::Tensor dispatch_bf16_grouped_kernel(
 
   // Select kernel to run via heuristics or tuning.
   auto kernel = [&]() {
-    if (std::getenv("FBGEMM_AUTOTUNE_ENABLE")) {
+    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(
           arch, G, total_M, N, K, X, W, M_sizes, output, output_accum);
     } else {

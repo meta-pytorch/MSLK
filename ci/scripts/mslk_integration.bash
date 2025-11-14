@@ -75,7 +75,7 @@ integration_mslk_build_and_install () {
   if [ "$build_target_variant" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME BUILD_TARGET_VARIANT"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env genai/cuda   # Build and install MSLK-GenAI for CUDA (All Steps)"
+    echo "    ${FUNCNAME[0]} build_env default/cuda   # Build and install MSLK for CUDA (All Steps)"
     return 1
   else
     echo "################################################################################"
@@ -102,7 +102,8 @@ integration_mslk_build_and_install () {
 
   # Move to another directory, to avoid Python package import confusion, since
   # there exists a mslk/ subdirectory in the MSLK repo
-  pushd "/"                                                 || return 1
+  mkdir -p _tmp_dir_mslk                                    || return 1
+  pushd _tmp_dir_mslk                                       || return 1
   # Uninstall the MSLK package (if installed)
   uninstall_mslk_wheel  "${env_name}"                       || return 1
   # Install the MSLK package and test the package import
@@ -196,7 +197,7 @@ integration_mslk_pip_install_matrix_run () {
     3.13
   )
 
-  if [ "$variant_type" == "cuda" ] || [ "$variant_type" == "genai" ]; then
+  if [ "$variant_type" == "cuda" ]; then
     local variant_versions=(
       12.6.3
       12.8.1

@@ -31,7 +31,7 @@ class TuningCache final {
   // kernelName should be unique for each type of kernel, as it is used to
   // construct the filename.
   explicit TuningCache(const std::string& kernelName)
-      : useCudaGraph_(std::getenv("FBGEMM_AUTOTUNE_USE_CUDA_GRAPH") != nullptr),
+      : useCudaGraph_(std::getenv("MSLK_AUTOTUNE_USE_CUDA_GRAPH") != nullptr),
         cacheDirectory_(getCacheDirectory()),
         cacheFilename_(getCacheFilename(kernelName)),
         detailedFilename_(getDetailedFilename(kernelName)) {
@@ -87,19 +87,18 @@ class TuningCache final {
     TORCH_CHECK(
         it != kernels.end(),
         "Failed to find kernel keyed by " + kernel_key +
-            ". Consider deleting your fbgemm cache (~/.fbgemm).");
+            ". Consider deleting your MSLK cache (~/.mslk).");
     return it->second;
   }
 
   std::string getCacheDirectory() {
     // If the environment variable is set, use that instead of the default
-    const char* cache_dir = std::getenv("FBGEMM_CACHE_DIR");
+    const char* cache_dir = std::getenv("MSLK_CACHE_DIR");
     if (cache_dir) {
       return cache_dir;
     }
 
-    return std::string(std::getenv("HOME")) + "/" +
-        std::string(FBGEMM_CACHE_DIR);
+    return std::string(std::getenv("HOME")) + "/" + std::string(MSLK_CACHE_DIR);
   }
 
   std::string getCacheFilename(const std::string& kernel_name) {
@@ -131,7 +130,7 @@ class TuningCache final {
       // If the directory still doesn't exist, error out
       TORCH_CHECK(
           cacheDirExists(),
-          "FBGEMM cache directory creation at " + cacheDirectory_ +
+          "MSLK cache directory creation at " + cacheDirectory_ +
               " failed: " + error);
     }
   }
@@ -270,7 +269,7 @@ class TuningCache final {
         best_time = time;
         best_kernel = kernel_name;
       }
-      if (std::getenv("FBGEMM_AUTOTUNE_COLLECT_STATS")) {
+      if (std::getenv("MSLK_AUTOTUNE_COLLECT_STATS")) {
         detailedTuningInfo_[cache_key].push_back({kernel_name, time});
       }
     }
@@ -278,12 +277,12 @@ class TuningCache final {
     return best_kernel;
   }
 
-  constexpr static std::string_view FBGEMM_CACHE_DIR = ".fbgemm";
+  constexpr static std::string_view MSLK_CACHE_DIR = ".mslk";
 
   at::cuda::CUDAEvent start_ = at::cuda::CUDAEvent(cudaEventDefault);
   at::cuda::CUDAEvent stop_ = at::cuda::CUDAEvent(cudaEventDefault);
 
-  // If FBGEMM_AUTOTUNE_USE_CUDA_GRAPH is set, use CUDA graph for benchmarking.
+  // If MSLK_AUTOTUNE_USE_CUDA_GRAPH is set, use CUDA graph for benchmarking.
   // CUDA graphs use a separate memory pool to do allocation in PyTorch
   // CUDACachingAllocator to ensure the memory is valid throughout the graph,
   // which can memory fragmentation (and higher chance of CUDA OOM). We can
@@ -298,7 +297,7 @@ class TuningCache final {
   std::string detailedFilename_;
   // (cache key, best kernel)
   std::unordered_map<std::string, std::string> cache_;
-  // If FBGEMM_AUTOTUNE_COLLECT_STATS is set, we will log the timing for each
+  // If MSLK_AUTOTUNE_COLLECT_STATS is set, we will log the timing for each
   // kernel for each problem shape. This is useful to distill the best kernels
   // into a smaller set.
   std::unordered_map<std::string, std::vector<std::pair<std::string, float>>>

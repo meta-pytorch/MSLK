@@ -334,8 +334,8 @@ test_all_mslk_modules () {
   fi
 
   if [ "$repo" == "" ]; then
-    echo "[TEST]: repo argument not provided, defaulting to ~/MSLK"
-    repo=~/MSLK
+    echo "[TEST]: repo argument not provided, defaulting to current directory"
+    repo=$(pwd)
   fi
 
   # shellcheck disable=SC2155
@@ -343,7 +343,8 @@ test_all_mslk_modules () {
 
   # Move to another directory, to avoid Python package import confusion, since
   # there exists a mslk/ subdirectory in the MSLK repo
-  pushd "${repo}/.."  || return 1
+  mkdir -p _tmp_dir_mslk || return 1
+  pushd _tmp_dir_mslk || return 1
 
   # Determine the MSLK build target and variant
   # shellcheck disable=SC2086
