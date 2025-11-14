@@ -37,6 +37,19 @@ def register_shapes(name: str) -> Callable[[ShapeFunction], ShapeFunction]:
     return decorator
 
 
+@register_shapes("llm_eval")
+def llm_eval() -> list[tuple[int, int]]:
+    return [
+        (1, 5120),
+        (1024, 5120),
+        (2000, 5120),
+        (4096, 5120),
+        (16384, 5120),
+        (1024, 7168),
+        (4096, 4096),
+    ]
+
+
 @register_shapes("decode_1024")
 def decode_1024_shapes() -> list[tuple[int, int]]:
     return [
@@ -53,7 +66,7 @@ def decode_1024_shapes() -> list[tuple[int, int]]:
 @register_shapes("prefill_1024")
 def prefill_1024_shapes() -> list[tuple[int, int]]:
     shapes = []
-    for M in [2048, 4096]:
+    for M in [2048, 4096, 8192, 16384]:
         shapes += [
             (M, 1024),
             (M, 2048),
@@ -89,12 +102,17 @@ def get_problem_shapes(
     pair_mk: bool,
 ) -> list[tuple[int, int]]:
     if shapes:
-        if shapes not in shape_registry:
-            print(
-                f"Shape {shapes} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
-            )
-            sys.exit(1)
-        return shape_registry[shapes]()
+        all_shapes = set()
+
+        for shape in shapes.strip().split(","):
+            if shape not in shape_registry:
+                print(
+                    f"Shape {shape} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
+                )
+                sys.exit(1)
+            all_shapes.update(shape_registry[shape]())
+
+        return list(all_shapes)
 
     if m is None:
         raise Exception("M must be non-empty.")
