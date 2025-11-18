@@ -60,7 +60,7 @@ y = torch.ops.mslk.f8f8bf16_rowwise(
 ```bash
 # Full MSLK library
 pip install mslk==0.1.0
-pip install mslk==0.1.0 --index-url https://download.pytorch.org/whl/cu126
+pip install mslk==0.1.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 # 2. **Llama 4 Related External Coverage**

@@ -567,9 +567,9 @@ __build_mslk_common_pre_steps () {
   # shellcheck disable=SC2086
   print_exec conda run --no-capture-output ${env_prefix} python setup.py clean
 
-  # echo "[BUILD] Printing git status ..."
-  # print_exec git status
-  # print_exec git diff
+  echo "[BUILD] Printing git status ..."
+  print_exec git status
+  print_exec git diff
 }
 
 __verify_library_symbols () {
