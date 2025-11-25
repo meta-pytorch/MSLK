@@ -34,11 +34,6 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractproperty
-    def name(self) -> str:
-        """Name of the operator."""
-        pass
-
-    @abc.abstractproperty
     def hip(self) -> bool:
         """Whether this operator supports AMD or not."""
         pass
@@ -47,6 +42,11 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
     def cuda(self) -> bool:
         """Whether this operator supports Nvidia or not."""
         pass
+
+    @property
+    def name(self) -> str:
+        """Name of this operator."""
+        return self.__class__.__name__
 
     @property
     def supported(self) -> bool:
@@ -72,20 +72,20 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
             return triton.testing.do_bench(lambda: self.quantize(A), rep=200)
 
 
-op_registry: list[QuantizeOpBase] = []
+op_registry: dict[str, QuantizeOpBase] = {}
 
 T = TypeVar("T", bound=QuantizeOpBase)
 
 
 def register_op(op_class: type[T]) -> type[T]:
     """Decorator function for assembling all quantize ops."""
-    op_registry.append(op_class())
+    op_registry[op_class.__name__] = op_class()
     return op_class
 
 
 def get_ops() -> list[QuantizeOpBase]:
     """Get all registered quantize ops."""
-    return op_registry
+    return list(op_registry.values())
 
 
 @register_op
@@ -98,10 +98,6 @@ class TritonFP8Rowwise(QuantizeOpBase):
         scale: torch.Tensor
         input_quantized, scale = args
         return dequantize_fp8_row(input_quantized, scale)
-
-    @property
-    def name(self) -> str:
-        return "TritonFP8Rowwise"
 
     @property
     def hip(self) -> bool:
@@ -131,10 +127,6 @@ class TritonFP8Blockwise(QuantizeOpBase):
         return dequantize_fp8_block(input_quantized, scale, self.block_m, self.block_k)
 
     @property
-    def name(self) -> str:
-        return "TritonFP8Blockwise"
-
-    @property
     def hip(self) -> bool:
         return True
 
@@ -162,10 +154,6 @@ class TritonFP8Groupwise(QuantizeOpBase):
             -1, input_quantized.shape[1] // self.group_size, self.group_size
         ) * scale.unsqueeze(-1)
         return dequantized.view(input_quantized.shape)
-
-    @property
-    def name(self) -> str:
-        return "TritonFP8Groupwise"
 
     @property
     def hip(self) -> bool:
