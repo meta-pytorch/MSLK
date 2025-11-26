@@ -178,6 +178,11 @@ at::Tensor f8f8bf16_cublas(
     bool use_fast_accum = true,
     std::optional<at::Tensor> output = std::nullopt);
 
+at::Tensor bf16x9_gemm(
+    at::Tensor A,
+    at::Tensor B,
+    std::optional<at::Tensor> output = std::nullopt);
+
 at::Tensor bf16i4bf16_shuffled(
     at::Tensor X,
     at::Tensor W,
