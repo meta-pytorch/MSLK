@@ -14,11 +14,7 @@ import torch
 from hypothesis import given, settings, strategies as st, Verbosity
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.grouped_gemm import (
-        _HAS_WS_SUPPORT,
-        grouped_gemm,
-        grouped_gemm_fp8_rowwise,
-    )
+    from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
 
 _MAX_SAMPLES = 32
@@ -41,7 +37,6 @@ class TestGroupedGEMM(unittest.TestCase):
         warp_specialization=st.sampled_from(
             [False]
             # TODO(T224502057): Re-enable the test after fixing WS hanging issue.
-            # [True, False] if _HAS_WS_SUPPORT else [False]
         ),
         fuse_scatter_add=st.sampled_from([True, False]),
     )
@@ -157,9 +152,7 @@ class TestGroupedGEMM(unittest.TestCase):
         M=st.sampled_from([0, 128, 2048, 16384]),
         N=st.sampled_from([256, 451]),
         K=st.sampled_from([100, 256, 257]),
-        warp_specialization=st.sampled_from(
-            [True, False] if torch.cuda.is_available() and _HAS_WS_SUPPORT else [False]
-        ),
+        warp_specialization=st.sampled_from([False]),
         fuse_scatter_add=st.sampled_from([True, False]),
     )
     @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)

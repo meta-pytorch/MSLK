@@ -41,63 +41,6 @@ _NV_CONFIGS = [
     for num_ctas in [1]
 ]
 
-_HAS_WS_SUPPORT = None
-
-
-def _check_ws_support():
-    if not hasattr(tl, "async_task"):
-        return False
-    config_signature = inspect.signature(triton.Config).parameters
-    if (
-        "num_consumer_groups" not in config_signature
-        or "num_buffers_warp_spec" not in config_signature
-    ):
-        return False
-    if not utils.HAS_TMA_DESC:
-        return False
-    return True
-
-
-def _set_ws_support():
-    global _HAS_WS_SUPPORT
-    if _HAS_WS_SUPPORT is None:
-        _HAS_WS_SUPPORT = _check_ws_support()
-
-
-_set_ws_support()
-
-if _HAS_WS_SUPPORT:
-    _NV_WS_CONFIGS = [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": block_size_m,
-                "BLOCK_SIZE_N": block_size_n,
-                "BLOCK_SIZE_K": block_size_k,
-                "NUM_CONSUMER_GROUPS": max(1, num_consumer_groups),
-                "USE_TMA_LOAD_ON_SCALES": use_tma_load_on_scales,
-                "USE_TMA_STORE": use_tma_store,
-            },
-            num_stages=num_stages,
-            num_warps=num_warps,
-            num_ctas=num_ctas,
-            num_consumer_groups=num_consumer_groups,
-            num_buffers_warp_spec=num_stages,
-        )
-        for block_size_m in [64, 128, 256]
-        for block_size_n in [64, 128, 256]
-        for block_size_k in [64, 128, 256]
-        for num_stages in [2, 3, 4]
-        for num_warps in [4, 8, 16]
-        # TODO(shikaili): Resolve LLVM error.
-        for num_ctas in [1]
-        for num_consumer_groups in [0, 2]
-        for use_tma_load_on_scales in [True, False]
-        # TODO(shikaili): Resolve compatibility with ws.
-        for use_tma_store in [False]
-    ]
-else:
-    _NV_WS_CONFIGS = _NV_CONFIGS
-
 
 _AMD_CONFIGS = [
     triton.Config(
@@ -451,7 +394,7 @@ def _mslk_grouped_gemm(
 
 # TODO(shikaili): Too much code duplication. Need to refactor.
 @triton.autotune(
-    configs=_NV_WS_CONFIGS,
+    configs=_NV_CONFIGS,
     key=["G", "M_BUCKET", "N", "K"],
     prune_configs_by={"early_config_prune": early_config_prune_ws},
     restore_value=["c_ptr"],  # restore for scatter_add fusion
@@ -763,7 +706,7 @@ def _mslk_grouped_gemm_fp8_rowwise(
 
 # TODO(shikaili): Too much code duplication. Need to refactor.
 @triton.autotune(
-    configs=_NV_WS_CONFIGS,
+    configs=_NV_CONFIGS,
     key=["G", "M_BUCKET", "N", "K"],
     prune_configs_by={
         "early_config_prune": functools.partial(
@@ -974,7 +917,7 @@ def _grouped_gemm(
         )
         use_warp_specialization = False
 
-    if use_warp_specialization and not _HAS_WS_SUPPORT:
+    if use_warp_specialization:
         warnings.warn(
             "Warp specialization is disabled as the Triton build in current environment doesn't have such support. Please build from https://github.com/facebookexperimental/triton/tree/ws-3.2.x to enable it for best performance on Nvidia's SM90 GPUs.",
             stacklevel=2,
