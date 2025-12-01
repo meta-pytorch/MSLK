@@ -7,7 +7,6 @@
 # pyre-unsafe
 
 import functools
-import inspect
 import warnings
 
 from typing import Optional
