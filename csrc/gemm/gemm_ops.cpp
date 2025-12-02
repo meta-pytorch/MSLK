@@ -67,6 +67,7 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f8f8bf16_groupwise_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
   m.def(
       "f8f8bf16_cublas(Tensor A, Tensor B, Tensor? Ainvs=None, Tensor? Binvs=None, bool use_fast_accum=True, Tensor(a!)? output=None) -> Tensor");
+  m.def("bf16x9_gemm(Tensor A, Tensor B, Tensor(a!)? output=None) -> Tensor");
   m.def(
       "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");
   m.def(
@@ -120,6 +121,7 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
+  m.impl("bf16x9_gemm", bf16x9_gemm);
   m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
@@ -167,6 +169,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
+  m.impl("bf16x9_gemm", bf16x9_gemm);
   m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
@@ -307,6 +310,16 @@ at::Tensor f8f8bf16_cublas_meta(
   const at::SymInt M = X.sym_size(0);
   const at::SymInt N = W.sym_size(0);
   auto Y = at::empty_symint({M, N}, X.options().dtype(at::kBFloat16));
+  return Y;
+}
+
+at::Tensor bf16x9_gemm_meta(
+    at::Tensor A,
+    at::Tensor B,
+    std::optional<at::Tensor> /* output = std::nullopt */) {
+  const at::SymInt M = A.sym_size(0);
+  const at::SymInt N = B.sym_size(0);
+  auto Y = at::empty_symint({M, N}, A.options().dtype(at::kFloat));
   return Y;
 }
 
@@ -526,6 +539,7 @@ TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   m.impl("f4f4bf16", f4f4bf16_meta);
   m.impl("f8f8bf16", f8f8bf16_meta);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas_meta);
+  m.impl("bf16x9_gemm", bf16x9_gemm_meta);
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched_meta);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise_meta);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise_meta);

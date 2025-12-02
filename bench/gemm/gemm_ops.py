@@ -220,6 +220,90 @@ def get_gemm_ops() -> list[GemmOpBase]:
 
 
 @register_gemm_op
+class FP32Baseline(GemmOpBase):
+    """
+    FP32 matmul baseline.
+    """
+
+    def quantize(self, x, w):
+        if isinstance(x, list):
+            x = [i.float() for i in x]
+            w = [torch.transpose(i, -2, -1).float() for i in w]
+        else:
+            x = x.float()
+            w = torch.transpose(w, -2, -1).float()
+        return x, w
+
+    def compute(self, x, w):
+        # Handle both grouped and standard gemm.
+        if isinstance(x, list):
+            output = []
+            for i in range(len(x)):
+                output.append(torch.matmul(x[i], w[i]))
+            return output
+        return torch.matmul(x, w)
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def name(self) -> str:
+        return "fp32_baseline"
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_gemm_op
+class TF32Baseline(GemmOpBase):
+    """
+    TF32 matmul baseline.
+    """
+
+    def quantize(self, x, w):
+        if isinstance(x, list):
+            x = [i.float() for i in x]
+            w = [torch.transpose(i, -2, -1).float() for i in w]
+        else:
+            x = x.float()
+            w = torch.transpose(w, -2, -1).float()
+        return x, w
+
+    def compute(self, x, w):
+        # Handle both grouped and standard gemm.
+        original_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision("high")
+        if isinstance(x, list):
+            output = []
+            for i in range(len(x)):
+                output.append(torch.matmul(x[i], w[i]))
+            return output
+        out = torch.matmul(x, w)
+        torch.set_float32_matmul_precision(original_precision)
+        return out
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def name(self) -> str:
+        return "tf32_baseline"
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_gemm_op
 class BF16Baseline(GemmOpBase):
     """
     Baseline BF16 matmul.
@@ -328,6 +412,46 @@ class ScaledMMBaseline(GemmOpBase):
     @property
     def name(self) -> str:
         return "scaled_mm"
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_gemm_op
+class BF16X9Baseline(GemmOpBase):
+    """
+    FP32 matmul implemented with BF16X9 emulation.
+    """
+
+    def quantize(self, x, w):
+        if isinstance(x, list):
+            x = [i.float() for i in x]
+            w = [i.float() for i in w]
+        else:
+            x = x.float()
+            w = w.float()
+        return x, w
+
+    def compute(self, x, w):
+        # Handle both grouped and standard gemm.
+        if isinstance(x, list):
+            output = []
+            for i in range(len(x)):
+                output.append(torch.ops.mslk.bf16x9_gemm(x[i], w[i]))
+            return output
+        return torch.ops.mslk.bf16x9_gemm(x, w)
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def name(self) -> str:
+        return "bf16x9_gemm"
 
     @property
     def hip(self) -> bool:
