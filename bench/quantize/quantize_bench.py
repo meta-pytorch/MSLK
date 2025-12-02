@@ -158,13 +158,15 @@ def benchmark(
     # Benchmark each operator.
     for quantize_op in quantize_ops:
         metrics = Metrics(op=quantize_op.name, M=m, K=k)
-        quantized = quantize_op.quantize(A)
+        args = quantize_op.preprocess(A)
+        quantized = quantize_op.quantize(A, *args)
         dequantized = quantize_op.dequantize(*quantized)
         metrics.sim = torch.mean(torch.pow(dequantized - A, 2)).item()
 
         for _ in range(num_iters):
             ms_runtime = quantize_op.benchmark(
                 A,
+                args,
                 use_cuda_graph=use_cuda_graph,
             )
 
