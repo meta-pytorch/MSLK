@@ -81,28 +81,11 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
 # Build Shared Library
 ################################################################################
 
-set(MSLK_LIB_NAME mslk)
-
-# Customizations for PyTorch build integration
-IF(DEFINED CAFFE2_THIRD_PARTY_ROOT)
-  # Keep lib prefix
-  set(KEEP_PREFIX ON)
-  # Install the library in the build directory
-  set(DESTINATION ${CMAKE_INSTALL_LIBDIR})
-else()
-  set(KEEP_PREFIX OFF)
-  set(DESTINATION "")
-endif()
-
 gpu_cpp_library(
   PREFIX
-    ${MSLK_LIB_NAME}
+    mslk
   TYPE
     SHARED
-  DESTINATION
-    ${DESTINATION}
-  KEEP_PREFIX
-    ${KEEP_PREFIX}
   INCLUDE_DIRS
     ${mslk_include_directories}
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/cuda/cutlass_blackwell_fmha
@@ -122,4 +105,4 @@ gpu_cpp_library(
 
 add_to_package(
   DESTINATION mslk
-  TARGETS ${MSLK_LIB_NAME})
+  TARGETS mslk)
