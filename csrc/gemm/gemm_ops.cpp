@@ -78,7 +78,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f8i4bf16_shuffled_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group, Tensor M_sizes) -> Tensor");
   m.def(
       "bf16i4bf16_shuffled_grouped(Tensor X, Tensor WQ, Tensor w_scale_group, Tensor w_zero_group, Tensor M_sizes) -> Tensor");
-  m.def("f8f8bf16_lite(Tensor XQ, Tensor WQ, Tensor scale) -> Tensor");
   m.def(
       "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
   m.def(
@@ -122,7 +121,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16x9_gemm", bf16x9_gemm);
-  m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
   m.impl("bf16i4bf16_shuffled", bf16i4bf16_shuffled);
@@ -170,7 +168,6 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16", f8f8bf16);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas);
   m.impl("bf16x9_gemm", bf16x9_gemm);
-  m.impl("f8f8bf16_lite", f8f8bf16_lite);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
   m.impl("bf16i4bf16_shuffled", bf16i4bf16_shuffled);
@@ -358,13 +355,6 @@ at::Tensor f8f8bf16_tensorwise_meta(
   return Y;
 }
 
-at::Tensor f8f8bf16_lite_meta(at::Tensor X, at::Tensor W, at::Tensor scale) {
-  const at::SymInt M = X.sym_size(0);
-  const at::SymInt N = W.sym_size(0);
-  auto Y = at::empty_symint({M, N}, X.options().dtype(at::kBFloat16));
-  return Y;
-}
-
 at::Tensor f8i4bf16_rowwise_meta(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // INT4
@@ -545,7 +535,6 @@ TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise_meta);
   m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched_meta);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched_meta);
-  m.impl("f8f8bf16_lite", f8f8bf16_lite_meta);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled_meta);
   m.impl("preshuffle_i4", preshuffle_i4_meta);
 #endif

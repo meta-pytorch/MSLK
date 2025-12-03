@@ -1782,53 +1782,6 @@ class MXFP8Tests(unittest.TestCase):
 
 
 @unittest.skipIf(
-    not SUPPORTS_FP8, "Skip if FP8LiteTests is not supported on this device."
-)
-@unittest.skipIf(not torch.version.cuda, "Skip if not CUDA device.")
-class FP8LiteTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.device = torch.accelerator.current_accelerator()
-
-    @settings(deadline=None)
-    @given(
-        M=st.sampled_from([1, 4]),
-        N=st.sampled_from([1024, 6144]),
-        K=st.sampled_from([512, 3584]),
-        CudaGraph=st.sampled_from([True, False]),
-    )
-    def test_gemm(self, M: int, N: int, K: int, CudaGraph: bool) -> None:
-        x = (
-            torch.randn(
-                size=(M, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.1
-        )
-        w = (
-            torch.randn(
-                size=(N, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.01
-        )
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
-        if CudaGraph:
-            zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
-            g.replay()
-        else:
-            zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
-        zq_ref = (x @ w.T).to(torch.bfloat16)
-        torch.testing.assert_close(zq, zq_ref, atol=9.0e-2, rtol=9.0e-2)
-
-
-@unittest.skipIf(
     not SUPPORTS_BF16, "Skip if BF16Tests is not supported on this device."
 )
 class BF16Tests(unittest.TestCase):
