@@ -10,7 +10,7 @@ import math
 import unittest
 from typing import Optional, Tuple
 
-import mslk
+import mslk.quantize  # noqa: F401
 import torch
 from hypothesis import given, settings, strategies as st
 
@@ -69,6 +69,18 @@ def scale_mx4(x: torch.Tensor, exp: torch.Tensor, group_size: int = 32) -> torch
     return scaled_x.view(orig_shape)
 
 
+def global_scale_nvfp4(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+    FP8_E4M3_MAX = 448.0
+    FP4_E2M1_MAX = 6.0
+    global_scale = torch.tensor(
+        [FP8_E4M3_MAX * FP4_E2M1_MAX], device=x.device
+    ) / torch.amax(torch.abs(x))
+    return global_scale.to(torch.float32)
+
+
 def scale_nvfp4(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -100,6 +112,23 @@ def sample_scales() -> st.SearchStrategy[Optional[torch.Tensor]]:
         ]
         if torch.cuda.is_available()
         else [None]
+    )
+
+
+def dequantize_nvfp4(
+    input_quantized: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    group_size: int = 16,
+) -> torch.Tensor:
+    M = input_quantized.shape[0]
+    # Two FP4 values are packed into one uint8.
+    N = input_quantized.shape[1] * 2
+    # Convert blocked scale format back to (M, num_groups) layout.
+    scale = _from_blocked(scale, (M, math.ceil(N / group_size)))
+    input_quantized_float = fp4_to_float(input_quantized)
+    return scale_nvfp4(input_quantized_float, scale, global_scale, group_size).to(
+        torch.bfloat16
     )
 
 
@@ -247,22 +276,15 @@ class TestNVFp4Quantize(unittest.TestCase):
             if mimic_mx4_as_nvfp4:
                 x_global_scale = cal_global_scale_mx4_as_nvfp4(x)
             else:
-                x_global_scale = torch.tensor([448.0 * 6.0]).to(
-                    device=x.device
-                ) / torch.amax(x.flatten(), dim=-1)
+                x_global_scale = global_scale_nvfp4(x)
             xq, x_scale = triton_scale_nvfp4_quant(
                 x,
                 x_global_scale,
                 group_size=group_size,
                 use_e8m0_scale=mimic_mx4_as_nvfp4,
             )
-            # Convert blocked x_scale format back to (M, num_groups) layout.
-            x_scale = _from_blocked(x_scale, (M, math.ceil(N / group_size)))
-            # Dequantize and check that results are similar.
-            xq_float = fp4_to_float(xq)
-            xq_dequant = scale_nvfp4(xq_float, x_scale, x_global_scale, group_size).to(
-                torch.bfloat16
-            )
+
+            xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
             torch.testing.assert_close(xq_dequant, x, atol=1, rtol=1)
 
         _test_silu_quantize_nvfp4((1, 128))
@@ -339,9 +361,7 @@ class TestNVFp4SiluQuantize(unittest.TestCase):
             group_size = 16
             x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
             w = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-            x_global_scale = torch.tensor([448.0 * 6.0]).to(
-                device=x.device
-            ) / torch.amax(x.flatten(), dim=-1)
+            x_global_scale = global_scale_nvfp4(x)
             xq, x_scale = triton_scale_nvfp4_quant_silu(
                 x,
                 w,
@@ -351,13 +371,8 @@ class TestNVFp4SiluQuantize(unittest.TestCase):
 
             intermediate = silu_mul(x.reshape(-1, 16), w.reshape(-1, 16))
             intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-            # Convert blocked x_scale format back to (M, num_groups) layout.
-            x_scale = _from_blocked(x_scale, (M, math.ceil(N / group_size)))
-            # Dequantize and check that results are similar.
-            xq_float = fp4_to_float(xq)
-            xq_dequant = scale_nvfp4(xq_float, x_scale, x_global_scale, group_size).to(
-                torch.bfloat16
-            )
+
+            xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
             torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
 
         _test_silu_quantize_nvfp4((1, 128))
@@ -385,9 +400,7 @@ class TestNVFp4RmsQuantize(unittest.TestCase):
             group_size = 16
             x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
             w = torch.randn(group_size, dtype=torch.bfloat16, device=device)
-            x_global_scale = torch.tensor([448.0 * 6.0]).to(
-                device=x.device
-            ) / torch.amax(x.flatten(), dim=-1)
+            x_global_scale = global_scale_nvfp4(x)
             xq, x_scale = triton_scale_nvfp4_quant_rms(
                 x,
                 w.repeat(M * N // group_size),
@@ -398,13 +411,8 @@ class TestNVFp4RmsQuantize(unittest.TestCase):
 
             intermediate = rms_norm(x.reshape(-1, 16), w, eps=1e-5)
             intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-            # Convert blocked x_scale format back to (M, num_groups) layout.
-            x_scale = _from_blocked(x_scale, (M, math.ceil(N / group_size)))
-            # Dequantize and check that results are similar.
-            xq_float = fp4_to_float(xq)
-            xq_dequant = scale_nvfp4(xq_float, x_scale, x_global_scale, group_size).to(
-                torch.bfloat16
-            )
+
+            xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
             torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
 
         _test_rms_quantize_nvfp4((1, 128))

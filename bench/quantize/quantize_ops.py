@@ -11,12 +11,17 @@ from typing import Any, TypeVar
 
 import torch
 import triton  # @manual=//triton:triton
+from mslk.quantize.triton.fp4_quantize import triton_scale_nvfp4_quant
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
     triton_quantize_fp8_block,
     triton_quantize_fp8_group,
     triton_quantize_fp8_row,
+)
+from mslk.test.quantize.triton.fp4_quantize_test import (
+    dequantize_nvfp4,
+    global_scale_nvfp4,
 )
 
 
@@ -43,6 +48,10 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
         """Whether this operator supports Nvidia or not."""
         pass
 
+    def preprocess(self, input: torch.Tensor) -> Any:
+        """This is used for ops that require additional preprocessing. This method will not be counted in benchmarking."""
+        return ()
+
     @property
     def name(self) -> str:
         """Name of this operator."""
@@ -61,15 +70,17 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
     def benchmark(
         self,
         A: torch.Tensor,
+        args: Any,
         use_cuda_graph: bool = True,
     ) -> float:
+        def fn() -> Any:
+            return self.quantize(A, *args)
+
         if use_cuda_graph:
             with torch.cuda.stream(torch.cuda.Stream()):
-                return triton.testing.do_bench_cudagraph(
-                    lambda: self.quantize(A), rep=200
-                )
+                return triton.testing.do_bench_cudagraph(fn, rep=200)
         else:
-            return triton.testing.do_bench(lambda: self.quantize(A), rep=200)
+            return triton.testing.do_bench(fn, rep=200)
 
 
 op_registry: dict[str, QuantizeOpBase] = {}
@@ -158,6 +169,38 @@ class TritonFP8Groupwise(QuantizeOpBase):
     @property
     def hip(self) -> bool:
         return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
+class TritonNVFP4(QuantizeOpBase):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def preprocess(self, input: torch.Tensor) -> Any:
+        global_scale = global_scale_nvfp4(input)
+        return (global_scale,)
+
+    def quantize(self, input: torch.Tensor, *args: Any) -> Any:
+        global_scale: torch.Tensor
+        global_scale = args[0]
+        input_quantized, scales = triton_scale_nvfp4_quant(input, global_scale)
+        return input_quantized, scales, global_scale
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        input_quantized: torch.Tensor
+        scale: torch.Tensor
+        global_scale: torch.Tensor
+        input_quantized, scale, global_scale = args
+
+        return dequantize_nvfp4(input_quantized, scale, global_scale)
+
+    @property
+    def hip(self) -> bool:
+        return False
 
     @property
     def cuda(self) -> bool:
