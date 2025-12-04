@@ -19,6 +19,12 @@
 
 #include <ostream>
 
+#if !defined(FBGEMM_FBCODE) && ROCM_VERSION >= 70000
+using GPUEvent = at::hip::HIPEvent;
+#else
+using GPUEvent = at::cuda::CUDAEvent;
+#endif
+
 namespace mslk {
 
 /**
@@ -279,8 +285,8 @@ class TuningCache final {
 
   constexpr static std::string_view MSLK_CACHE_DIR = ".mslk";
 
-  at::cuda::CUDAEvent start_ = at::cuda::CUDAEvent(cudaEventDefault);
-  at::cuda::CUDAEvent stop_ = at::cuda::CUDAEvent(cudaEventDefault);
+  GPUEvent start_ = GPUEvent(cudaEventDefault);
+  GPUEvent stop_ = GPUEvent(cudaEventDefault);
 
   // If MSLK_AUTOTUNE_USE_CUDA_GRAPH is set, use CUDA graph for benchmarking.
   // CUDA graphs use a separate memory pool to do allocation in PyTorch
