@@ -205,3 +205,23 @@ class TritonNVFP4(QuantizeOpBase):
     @property
     def cuda(self) -> bool:
         return True
+
+
+@register_op
+class CudaFP8Rowwise(QuantizeOpBase):
+    def quantize(self, input: torch.Tensor) -> Any:
+        return torch.ops.mslk.quantize_fp8_per_row(input)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        input_quantized: torch.Tensor
+        scale: torch.Tensor
+        input_quantized, scale = args
+        return dequantize_fp8_row(input_quantized, scale)
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
