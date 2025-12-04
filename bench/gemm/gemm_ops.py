@@ -513,6 +513,55 @@ class ScaledMMRowwise(GemmOpBase):
 
 
 @register_gemm_op
+class ScaledMMMXFP8(GemmOpBase):
+    def __init__(self):
+        self.torch_compile = False
+
+    def quantize(self, x, w):
+        x_scale, xq = to_mxfp8(x)
+        x_scale = _to_blocked(x_scale)
+        w_scale, wq = to_mxfp8(w)
+        w_scale = _to_blocked(w_scale)
+        return xq, wq.t(), x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        if self.torch_compile:
+            f = torch.compile(
+                torch._scaled_mm,
+                options={
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON,CK,CUTLASS,ATEN",
+                },
+            )
+        else:
+            f = torch._scaled_mm
+
+        return f(
+            xq,
+            wq,
+            bias=None,
+            out_dtype=torch.bfloat16,
+            scale_a=x_scale,
+            scale_b=w_scale,
+        )
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def name(self) -> str:
+        return "scaled_mm_mxfp8"
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_gemm_op
 class FP8TensorwiseGemm(GemmOpBase):
     """
     FP8 matmul with tensorwise scaling.
@@ -539,142 +588,6 @@ class FP8TensorwiseGemm(GemmOpBase):
     def hip(self) -> bool:
         # Need to add support for better quantize kernel.
         # Also may have an issue with cuda graphs.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_gemm_op
-class BF16OSSFastGemv(GemmOpBase):
-    """
-    BF16 OSS fast gemv kernel.
-    """
-
-    def quantize(self, x, w):
-        # dummy quantize
-        return x, w
-
-    def compute(self, x, w):
-        out = torch.ops.mslk.bf16_fast_gemv(x, w)
-        return out
-
-    def quantize_and_compute(self, x, w):
-        x, w = self.quantize(x, w)
-        return self.compute(x, w)
-
-    @property
-    def name(self) -> str:
-        return "bf16_oss_fast_gemv"
-
-    @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_gemm_op
-class BF16Fp8OSSFastGemv(GemmOpBase):
-    """
-    BF16FP8 OSS fast gemv kernel.
-    """
-
-    def quantize(self, x, w):
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
-        return x, wq, w_scale
-
-    def compute(self, x, wq, w_scale):
-        out = torch.ops.mslk.bf16fp8bf16_fast_gemv(x, wq, w_scale)
-        return out
-
-    def quantize_and_compute(self, x, w):
-        x, wq, w_scale = self.quantize(x, w)
-        return self.compute(x, wq, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "bf16fp8_oss_fast_gemv"
-
-    @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_gemm_op
-class Fp8Fp8OSSFastGemv(GemmOpBase):
-    """
-    FP8FP8 OSS fast gemv kernel.
-    """
-
-    def quantize(self, x, w):
-        # rowwise quantize
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_row(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        out = torch.ops.mslk.fp8fp8bf16_fast_gemv(
-            xq, wq, x_scale, w_scale, is_batched=False
-        )
-        return out
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "fp8fp8_oss_fast_gemv"
-
-    @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_gemm_op
-class Fp8OSSFastGemvBatched(GemmOpBase):
-    """
-    Batched fp8 fast gemv kernel
-    """
-
-    def quantize(self, x, w):
-        # rowwise quantize
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_row(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        out = torch.ops.mslk.fp8fp8bf16_fast_gemv(
-            xq, wq, x_scale, w_scale, is_batched=True
-        )
-        return out
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "fp8fp8_oss_fast_gemv_batched"
-
-    @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
         return False
 
     @property
@@ -1592,40 +1505,6 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
     @property
     def hip(self) -> bool:
         return True
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_gemm_op
-class FP8LiteGemm(GemmOpBase):
-    """
-    FP8 lite matmul for memory bound.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        return torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "cuda_lite"
-
-    @property
-    def hip(self) -> bool:
-        # Need to add support for better quantize kernel.
-        # Also may have an issue with cuda graphs.
-        return False
 
     @property
     def cuda(self) -> bool:

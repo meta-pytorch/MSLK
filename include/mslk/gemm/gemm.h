@@ -168,8 +168,6 @@ at::Tensor f8f8bf16(
     at::Tensor scale,
     bool use_fast_accum = true);
 
-at::Tensor f8f8bf16_lite(at::Tensor XQ, at::Tensor WQ, at::Tensor scale);
-
 at::Tensor f8f8bf16_cublas(
     at::Tensor A,
     at::Tensor B,

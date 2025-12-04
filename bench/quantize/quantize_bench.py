@@ -9,16 +9,14 @@
 import itertools
 import os
 import sys
-
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import click
-
 import pandas as pd
 import torch
-
+import triton  # @manual=//triton:triton
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
 
@@ -81,18 +79,33 @@ def prefill_1024_shapes() -> list[tuple[int, int]]:
 
 @dataclass
 class Metrics:
-    op_name: str
-
+    op: str
+    M: int = 0
+    K: int = 0
     sim: float = 0.0
     us: float = 0.0
     gbps: float = 0.0
+    memory_bw_util: float = 0.0
+
+    @staticmethod
+    def header() -> str:
+        header = f"{'OpName':<20} {'Problem Shape':<15} {'Sim':<10} {'Us':<10} {'GB/s':<10} {'Mem BW Util %':<10}"
+        divider = "-" * len(header)
+        return f"Quantize Bench\n{divider}\n{header}\n{divider}"
 
     def __str__(self) -> str:
-        return (
-            f"{self.op_name} sim: {self.sim:.3f}.\n"
-            f"{self.op_name} us: {self.us:.3f}.\n"
-            f"{self.op_name} GB/s: {self.gbps:.3f}."
-        )
+        problem_shape = f"({self.M}, {self.K})"
+        return f"{self.op:<20} {problem_shape:<15} {self.sim:<10.3f} {self.us:<10.3f} {self.gbps:<10.2f} {self.memory_bw_util:<10.2f}"
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "M": self.M,
+            "K": self.K,
+            f"{self.op}_sim": self.sim,
+            f"{self.op}_us": self.us,
+            f"{self.op}_gb/s": self.gbps,
+            f"{self.op}_memory_bw_util": self.memory_bw_util,
+        }
 
 
 def get_problem_shapes(
@@ -133,24 +146,27 @@ def benchmark(
     quantize_ops: list[QuantizeOpBase],
     m: int,
     k: int,
+    mem_bw_roofline_gbps: float,
     use_cuda_graph: bool = True,
     num_iters: int = 1,
-) -> dict[str, Any]:
+) -> list[Metrics]:
     # Create input tensors.
     A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
 
     # Keep track of results.
-    results: dict[str, Any] = {"M": m, "K": k}
+    results = []
     # Benchmark each operator.
     for quantize_op in quantize_ops:
-        metrics = Metrics(op_name=quantize_op.name)
-        quantized = quantize_op.quantize(A)
+        metrics = Metrics(op=quantize_op.name, M=m, K=k)
+        args = quantize_op.preprocess(A)
+        quantized = quantize_op.quantize(A, *args)
         dequantized = quantize_op.dequantize(*quantized)
         metrics.sim = torch.mean(torch.pow(dequantized - A, 2)).item()
 
         for _ in range(num_iters):
             ms_runtime = quantize_op.benchmark(
                 A,
+                args,
                 use_cuda_graph=use_cuda_graph,
             )
 
@@ -158,17 +174,13 @@ def benchmark(
             output_bytes = sum(t.numel() * t.element_size() for t in quantized)
             metrics.gbps += (input_bytes + output_bytes) / (ms_runtime / 1e3) / 1e9
             metrics.us += ms_runtime * 1000
+            metrics.memory_bw_util += metrics.gbps / mem_bw_roofline_gbps
 
-        # Print out results for this op.
         metrics.us /= num_iters
         metrics.gbps /= num_iters
-        print(f"Average metrics over {num_iters} iterations:")
-        print(metrics)
+        metrics.memory_bw_util /= num_iters
 
-        # Save results for this operator.
-        results[f"{quantize_op.name}_us"] = metrics.us
-        results[f"{quantize_op.name}_gb/s"] = metrics.gbps
-        results[f"{quantize_op.name}_sim"] = metrics.sim
+        results.append(metrics)
 
     return results
 
@@ -262,29 +274,44 @@ def invoke_main(
         print("Warning: Number of iterations must be at least 1.")
         num_iters = 1
 
+    mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
     MK = get_problem_shapes(shapes, m, k, pair_mk)
     # Iterate over shapes and benchmark.
     benchmark_results = []
+    csv = []
     for M, K in MK:
-        print(f"Benchmarking M={M}, K={K}.")
         quantize_measurements = benchmark(
             quantize_ops,
             M,
             K,
+            mem_bw_roofline_gbps,
             not no_cuda_graph,
             num_iters,
         )
-        benchmark_results.append(quantize_measurements)
+        benchmark_results.extend(quantize_measurements)
+        csv_row = {}
+        for metric in quantize_measurements:
+            csv_row.update(metric.as_dict())
+        csv.append(csv_row)
+
+    print(Metrics.header())
+    for metric in benchmark_results:
+        print(metric)
+
+    print("")
+    print(f"Hardware: {torch.cuda.get_device_name()}")
+    print(f"Memory BW Roofline: {mem_bw_roofline_gbps} GB/s")
+
     if export_csv:
         os.makedirs(output_dir, exist_ok=True)
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_file = os.path.join(
             output_dir, f"quantize_ops_benchmark_{datetime_str}.csv"
         )
-        print(f"CSV saved to {csv_file}")
         # Export results to a CSV file.
-        df = pd.DataFrame(benchmark_results)
+        df = pd.DataFrame(csv)
         df.to_csv(csv_file, na_rep="NaN", index=False)
+        print(f"CSV saved to {csv_file}")
 
 
 if __name__ == "__main__":
