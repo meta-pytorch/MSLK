@@ -1,12 +1,18 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # @nolint # fbcode
-import itertools
+
 from typing import Optional
-from einops import rearrange
 import pytest
 
 import torch
 import torch.nn.functional as F
 from mslk.attention.flash_attn import flash_attn_varlen_func
+
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
@@ -46,28 +52,29 @@ def test_varlen(
     )
 
     ok = check_backward_vs_torch_flash(
-        q, k, v, 
-        cu_seqlens_q, cu_seqlens_k, 
-        total_q=total_q, total_k=total_k, 
-        softmax_scale=softmax_scale, 
+        q, k, v,
+        cu_seqlens_q, cu_seqlens_k,
+        total_q=total_q, total_k=total_k,
+        softmax_scale=softmax_scale,
         causal=causal,
         mha_type=mha_type,
     )
     assert ok
 
+
 def check_backward_vs_torch_flash(
-    q, k, v, 
-    cu_seqlens_q=None, 
-    cu_seqlens_k=None, 
-    seqused_q=None, 
-    seqused_k=None, 
+    q, k, v,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
     total_q=None,
     total_k=None,
-    softmax_scale=None, 
+    softmax_scale=None,
     causal=True,
     mha_type='mha',
     softcap=0.0,
-    atol=3e-2, 
+    atol=3e-2,
     rtol=3e-2,
 ):
     assert q.requires_grad and k.requires_grad and v.requires_grad, "Set requires_grad=True on inputs"
@@ -77,7 +84,7 @@ def check_backward_vs_torch_flash(
         return c
 
     q_fa, k_fa, v_fa = map(clone_like, (q, k, v))
-    q_t,  k_t,  v_t  = map(clone_like, (q, k, v))
+    q_t, k_t, v_t = map(clone_like, (q, k, v))
 
     if cu_seqlens_q is not None:
         cu_seqlens_q_fa = cu_seqlens_q.clone()
@@ -108,14 +115,14 @@ def check_backward_vs_torch_flash(
     )
 
     out_t = torch_flash_ref(
-        q_t, k_t, v_t, 
-        cu_seqlens_q=cu_seqlens_q_t, 
-        cu_seqlens_k=cu_seqlens_k_t, 
+        q_t, k_t, v_t,
+        cu_seqlens_q=cu_seqlens_q_t,
+        cu_seqlens_k=cu_seqlens_k_t,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
         total_q=total_q,
         total_k=total_k,
-        softmax_scale=softmax_scale, 
+        softmax_scale=softmax_scale,
         causal=causal,
         mha_type=mha_type,
     )
@@ -146,6 +153,7 @@ def check_backward_vs_torch_flash(
     # print(f"Close? dQ={ok_q}, dK={ok_k}, dV={ok_v}")
     return ok_q and ok_k and ok_v
 
+
 def generate_varlen_args(
     batch_size=8,
     n_heads=16,
@@ -153,7 +161,7 @@ def generate_varlen_args(
     min_len=32,
     max_len=64,
     mha_type="mha",
-    dtype = torch.bfloat16,
+    dtype=torch.bfloat16,
 ):
 
     torch.manual_seed(0)
@@ -169,7 +177,7 @@ def generate_varlen_args(
 
     total_q = cu_seqlens_q[-1]
     total_k = cu_seqlens_k[-1]
-    
+
     cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     cu_seqlens_k = cu_seqlens_k.contiguous().to(dtype=torch.int32, device=device)
 
@@ -178,7 +186,7 @@ def generate_varlen_args(
         H_kv = n_heads
     elif mha_type == "mha":
         H = H_kv = n_heads
-    else: # MQA
+    else:  # MQA
         H = n_heads
         H_kv = 1
 
@@ -190,19 +198,20 @@ def generate_varlen_args(
 
     return q, k, v, cu_seqlens_q, cu_seqlens_k, total_q, total_k
 
+
 # Simple for loop over batch dim implementation
 def torch_flash_ref(
-        q: torch.Tensor, 
-        k: torch.Tensor, 
-        v: torch.Tensor, 
-        cu_seqlens_q: torch.Tensor = None, 
-        cu_seqlens_k: torch.Tensor = None, 
-        total_q: int = 0,
-        total_k: int = 0,
-        softmax_scale: Optional[float] = None, 
-        causal: bool = False, 
-        **kwargs
-    ):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor = None,
+    cu_seqlens_k: torch.Tensor = None,
+    total_q: int = 0,
+    total_k: int = 0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    **kwargs
+):
 
     """
     q: (total_q, H, d) if cu_seqlens_q is not None, otherwise (B, L, H, d)
@@ -241,7 +250,7 @@ def torch_flash_ref(
         B_kv = k.shape[0]
 
     d = q.shape[-1]
-    d_v = v.shape[-1]
+    # d_v = v.shape[-1]
 
     assert H_kv == v.shape[-2]
     assert d == k.shape[-1]
@@ -259,19 +268,19 @@ def torch_flash_ref(
     outs = []
     for b in range(B):
         if hcseq_q is not None:
-            q_start, q_end = int(hcseq_q[b]), int(hcseq_q[b+1])
-            qb = q[q_start:q_end]        
+            q_start, q_end = int(hcseq_q[b]), int(hcseq_q[b + 1])
+            qb = q[q_start:q_end]
         else:
             qb = q[b]
 
         if hcseq_k is not None:
-            k_start, k_end = int(hcseq_k[b]), int(hcseq_k[b+1])
+            k_start, k_end = int(hcseq_k[b]), int(hcseq_k[b + 1])
             kb = k[k_start:k_end]
             vb = v[k_start:k_end]
         else:
             kb = k[b]
             vb = v[b]
-            
+
         qb = qb.permute(1, 0, 2).unsqueeze(0)
         kb = kb.permute(1, 0, 2).unsqueeze(0)
         vb = vb.permute(1, 0, 2).unsqueeze(0)
@@ -282,7 +291,7 @@ def torch_flash_ref(
             dropout_p=0.0,
             is_causal=causal,
             scale=softmax_scale,
-            enable_gqa=H_kv!=H
+            enable_gqa=(H_kv != H)
         )
 
         ob = ob.squeeze(0).permute(1, 0, 2).contiguous()
@@ -293,6 +302,7 @@ def torch_flash_ref(
     else:
         out = torch.stack(outs, dim=0).to(device=device, dtype=dtype)
     return out
+
 
 @torch.no_grad()
 def _stats(name, a, b, atol, rtol):

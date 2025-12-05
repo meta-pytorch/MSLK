@@ -2,11 +2,11 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Type, Tuple, Callable
+from typing import Optional, Type, Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import T, dsl_user_op

@@ -1,4 +1,11 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # @nolint # fbcode
+
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
 import math
@@ -169,7 +176,7 @@ def test_flash_attn_output(
         else:
             q_descale, k_descale, v_descale = None, None, None
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
-        qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
+        qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None # noqa F841
         out_ref, attn_ref = attention_ref(
             q_ref,
             k_ref,
@@ -616,7 +623,7 @@ def test_flash_attn_varlen_output(
             and False
         ):
             g_unpad = torch.randn_like(out_unpad)
-            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2) # noqa F841
             # import flash_attn_3_cuda
             # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,
@@ -828,10 +835,10 @@ def test_flash_attn_kvcache(
             query_padding_mask = generate_random_padding_mask(
                 seqlen_q, batch_size, device, mode="random"
             )
-            q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(
+            q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input( # noqa F841
                 q, query_padding_mask
             )
-            output_pad_fn = lambda output_unpad: pad_input(
+            output_pad_fn = lambda output_unpad: pad_input( # noqa F841
                 output_unpad, indices_q, batch_size, seqlen_q
             )
             qv_unpad = (
@@ -841,7 +848,7 @@ def test_flash_attn_kvcache(
             query_padding_mask = None
             q_unpad = q
             qv_unpad = qv
-            cu_seqlens_q, max_seqlen_q = None, None
+            cu_seqlens_q, max_seqlen_q = None, None # noqa F841
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
@@ -1116,7 +1123,7 @@ def test_flash_attn_kvcache(
             #     )
             # else:
             #     scheduler_metadata = None
-            scheduler_metadata = None
+            # scheduler_metadata = None
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:

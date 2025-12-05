@@ -196,9 +196,9 @@ def compute_block_sparsity(
         return _compute_sparsity(config, device, aux_tensors)
 
 
-## ---------------------------------------------------------------------------
-## Fixed-Length Sequence Kernels
-## ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Fixed-Length Sequence Kernels
+# ------------------------------------------------------------------------------
 
 
 def _compute_sparsity(
@@ -303,9 +303,9 @@ def _compute_sparsity(
     return full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx
 
 
-## ---------------------------------------------------------------------------
-## Variable-Length Sequence Kernels
-## ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Variable-Length Sequence Kernels
+# ---------------------------------------------------------------------------
 
 
 def _compute_varlen_sparsity(
@@ -468,8 +468,8 @@ def _compute_causal_varlen_blocks(
     **kwargs,
 ):
     """Computes causal block sparsity for a single varlen sequence."""
-    is_full_fn = lambda m_start, m_end, n_start, n_end: (m_start >= n_end - 1)
-    is_partial_fn = lambda m_start, m_end, n_start, n_end: (m_end - 1 >= n_start)
+    is_full_fn = lambda m_start, m_end, n_start, n_end: (m_start >= n_end - 1) # noqa: E266
+    is_partial_fn = lambda m_start, m_end, n_start, n_end: (m_end - 1 >= n_start) # noqa: E266
 
     for m_local in range(n_blocks_q):
         full_blocks, partial_blocks = [], []
