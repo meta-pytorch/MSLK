@@ -100,6 +100,7 @@ __install_check_operator_registrations () {
     test_operators+=(
       torch.ops.mslk.coalesce_batches
       torch.ops.mslk.rope_qkv_decoding
+      torch.ops.mslk.f8f8bf16_rowwise
     )
   fi
 

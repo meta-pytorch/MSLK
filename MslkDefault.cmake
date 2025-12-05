@@ -13,6 +13,7 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/attention/cuda/gqa_attn_splitk/*.cpp
   csrc/coalesce/*.cpp
   csrc/comm/*.cpp
+  csrc/gemm/*.cpp
   csrc/kv_cache/*.cpp
   csrc/moe/*.cpp
   csrc/quantize/*.cpp)
