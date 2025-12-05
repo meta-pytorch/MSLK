@@ -20,6 +20,7 @@ from mslk.quantize.triton.fp4_quantize import (
     quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
 )
+from parameterized import parameterized
 
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
@@ -1779,6 +1780,140 @@ class MXFP8Tests(unittest.TestCase):
 
         # Assert outputs are close.
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            ("offsets_not_divisible_by_32", [500, 1000, 1500, 2048], 2048),
+            ("offsets_exceed_total_k", [512, 1024, 1536, 2560], 2048),
+        ]
+    )
+    def test_grouped_gemm_2d_2d_invalid_offsets(
+        self, name: str, offsets: list[int], total_k: int
+    ) -> None:
+        """Test that device-side assertion is raised for invalid offsets"""
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        # Simulate 2d-2d grouped gemm in backward pass with groups along K dimension
+        G = len(offsets)
+        M = 256
+        N = 256
+        K = total_k
+        block_size = 32
+
+        # Create offsets tensor from the provided offsets list
+        input_group_end_offsets = torch.tensor(
+            offsets, dtype=torch.int32, device=self.device
+        )
+
+        # For the "offsets_exceed_total_k" case, we need to handle gracefully
+        # The quantization will fail if we try to slice beyond total_K
+        # So we'll create tensors and only quantize valid slices
+        X = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize per group along K dimension
+        x_list = []
+        w_list = []
+        x_blocked_scale_list = []
+        w_blocked_scale_list = []
+
+        def round_up(x: int, y: int) -> int:
+            return ((x + y - 1) // y) * y
+
+        for group_idx in range(G):
+            prev_group_end_offset = (
+                0 if group_idx == 0 else input_group_end_offsets[group_idx - 1]
+            )
+            curr_group_end_offset = min(
+                input_group_end_offsets[group_idx].item(), K
+            )  # Cap at K for quantization
+            group_size = curr_group_end_offset - prev_group_end_offset
+            if group_size > 0:
+                x_slice = X[:, prev_group_end_offset:curr_group_end_offset].contiguous()
+                w_slice = W[:, prev_group_end_offset:curr_group_end_offset].contiguous()
+                x_scale_slice, xq_slice = to_mxfp8(x_slice)
+                w_scale_slice, wq_slice = to_mxfp8(w_slice)
+                x_list.append(xq_slice)
+                w_list.append(wq_slice)
+
+                x_scale_slice_blocked = _to_blocked(x_scale_slice)
+                w_scale_slice_blocked = _to_blocked(w_scale_slice)
+                x_blocked_scale_list.append(x_scale_slice_blocked)
+                w_blocked_scale_list.append(w_scale_slice_blocked)
+
+        # Assemble the full XQ and WQ
+        xq = torch.cat(x_list, dim=1).contiguous()
+        wq = torch.cat(w_list, dim=1).contiguous()
+
+        # Combine all blocked scales
+        x_blocked_scales = torch.cat(x_blocked_scale_list, dim=0)
+        M_rounded = round_up(M, 128)
+        x_blocked_scales = x_blocked_scales.reshape(M_rounded, -1)
+
+        w_blocked_scales = torch.cat(w_blocked_scale_list, dim=0)
+        N_rounded = round_up(N, 128)
+        w_blocked_scales = w_blocked_scales.reshape(N_rounded, -1)
+
+        # Allocate output tensor
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        # Execute and expect an exception due to invalid offsets
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"group sizes along K dim",
+        ):
+            torch.ops.mslk.mx8mx8bf16_grouped_mm(
+                xq,
+                wq.transpose(-2, -1),
+                x_blocked_scales,
+                w_blocked_scales,
+                input_group_end_offsets,
+                out,
+            )
+
+
+@unittest.skipIf(not torch.version.cuda, "Skip if not CUDA device.")
+class FP8LiteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 4]),
+        N=st.sampled_from([1024, 6144]),
+        K=st.sampled_from([512, 3584]),
+        CudaGraph=st.sampled_from([True, False]),
+    )
+    def test_gemm(self, M: int, N: int, K: int, CudaGraph: bool) -> None:
+        x = (
+            torch.randn(
+                size=(M, K),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            * 0.1
+        )
+        w = (
+            torch.randn(
+                size=(N, K),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            * 0.01
+        )
+        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
+        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
+        if CudaGraph:
+            zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
+            g.replay()
+        else:
+            zq = torch.ops.mslk.f8f8bf16_lite(xq, wq, x_scale * w_scale)
+        zq_ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(zq, zq_ref, atol=9.0e-2, rtol=9.0e-2)
 
 
 @unittest.skipIf(
