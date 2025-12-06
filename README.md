@@ -18,11 +18,10 @@ pip install mslk==0.1.0 --index-url https://download.pytorch.org/whl/cu128
 For questions, support, news updates, or feature requests, please feel free to:
 
 * File a ticket in [GitHub Issues](https://github.com/meta-pytorch/MSLK/issues)
-* Post a discussion in [GitHub Discussions](https://github.com/meta-pytorch/MSLK/discussions)
 
 For contributions, please see the [`CONTRIBUTING`](./CONTRIBUTING.md) file for
 ways to help out.
 
 ## License
 
-MSLK is BSD licensed, as found in the LICENSE file.
+MSLK is BSD licensed, as found in the [`LICENSE`](./LICENSE) file.
