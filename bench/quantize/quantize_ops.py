@@ -7,6 +7,7 @@
 # pyre-strict
 
 import abc
+import copy
 from typing import Any, TypeVar
 
 import torch
@@ -69,18 +70,64 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
 
     def benchmark(
         self,
-        A: torch.Tensor,
+        input: torch.Tensor,
         args: Any,
         use_cuda_graph: bool = True,
+        use_rotating_buffer: bool = True,
     ) -> float:
+        if use_rotating_buffer:
+            return self.benchmark_with_rotating_buffer(
+                input, args, use_cuda_graph=use_cuda_graph
+            )
+
         def fn() -> Any:
-            return self.quantize(A, *args)
+            return self.quantize(input, *args)
 
         if use_cuda_graph:
             with torch.cuda.stream(torch.cuda.Stream()):
                 return triton.testing.do_bench_cudagraph(fn, rep=200)
         else:
             return triton.testing.do_bench(fn, rep=200)
+
+    def benchmark_with_rotating_buffer(
+        self, input: torch.Tensor, args: Any, use_cuda_graph: bool = True
+    ) -> float:
+        # torch.cuda.get_device_properties does not have L2/L3 cache size, instead we just use 50MB as a reasonable overapproximation.
+        buffer_size_bytes = 50 * 1024 * 1024
+
+        all_args = (input, *args)
+        input_size_bytes = sum(
+            t.element_size() * t.numel()
+            for t in all_args
+            if isinstance(t, torch.Tensor)
+        )
+        # Make at least one copy of the inputs
+        copy_cnt = max(buffer_size_bytes // input_size_bytes, 1)
+
+        args_list = [all_args]
+        for _ in range(copy_cnt):
+            args_list.append(copy.deepcopy(all_args))
+
+        # We benchmark on a different stream, so a sync is required.
+        torch.cuda.synchronize()
+
+        def rotating_buffer_fn(args_list: list[Any]) -> None:
+            for args in args_list:
+                self.quantize(*args)
+
+        if use_cuda_graph:
+            with torch.cuda.stream(torch.cuda.Stream()):
+                # A rotating_buffer_fn contains multiple runs of the fn to benchmark,
+                # so divide time accordingly
+                return triton.testing.do_bench_cudagraph(
+                    lambda: rotating_buffer_fn(args_list),
+                    rep=200,
+                ) / len(args_list)
+        else:
+            return triton.testing.do_bench(
+                lambda: rotating_buffer_fn(args_list),
+                rep=200,
+            ) / len(args_list)
 
 
 op_registry: dict[str, QuantizeOpBase] = {}

@@ -148,33 +148,36 @@ def benchmark(
     k: int,
     mem_bw_roofline_gbps: float,
     use_cuda_graph: bool = True,
+    use_rotating_buffer: bool = False,
     num_iters: int = 1,
 ) -> list[Metrics]:
     # Create input tensors.
-    A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    input = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
 
     # Keep track of results.
     results = []
     # Benchmark each operator.
     for quantize_op in quantize_ops:
         metrics = Metrics(op=quantize_op.name, M=m, K=k)
-        args = quantize_op.preprocess(A)
-        quantized = quantize_op.quantize(A, *args)
+        args = quantize_op.preprocess(input)
+        quantized = quantize_op.quantize(input, *args)
         dequantized = quantize_op.dequantize(*quantized)
-        metrics.sim = torch.mean(torch.pow(dequantized - A, 2)).item()
+        metrics.sim = torch.mean(torch.pow(dequantized - input, 2)).item()
 
         for _ in range(num_iters):
             ms_runtime = quantize_op.benchmark(
-                A,
+                input,
                 args,
                 use_cuda_graph=use_cuda_graph,
+                use_rotating_buffer=use_rotating_buffer,
             )
 
-            input_bytes = A.numel() * A.element_size()
+            input_bytes = input.numel() * input.element_size()
             output_bytes = sum(t.numel() * t.element_size() for t in quantized)
-            metrics.gbps += (input_bytes + output_bytes) / (ms_runtime / 1e3) / 1e9
+            total_size_bytes = input_bytes + output_bytes
+            metrics.gbps += (total_size_bytes / 1e9) / (ms_runtime / 1e3)
             metrics.us += ms_runtime * 1000
-            metrics.memory_bw_util += metrics.gbps / mem_bw_roofline_gbps
+            metrics.memory_bw_util += (metrics.gbps / mem_bw_roofline_gbps) * 100
 
         metrics.us /= num_iters
         metrics.gbps /= num_iters
@@ -246,6 +249,11 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
     help="If set, do not use cuda graph for benchmarking.",
 )
 @click.option(
+    "--no-rotating-buffer",
+    is_flag=True,
+    help="If set, do not use rotating buffer for benchmarking.",
+)
+@click.option(
     "--shapes",
     default=None,
     help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
@@ -259,6 +267,7 @@ def invoke_main(
     k: Optional[str],
     pair_mk: bool,
     no_cuda_graph: bool,
+    no_rotating_buffer: bool,
     shapes: Optional[str],
 ) -> None:
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
@@ -286,6 +295,7 @@ def invoke_main(
             K,
             mem_bw_roofline_gbps,
             not no_cuda_graph,
+            not no_rotating_buffer,
             num_iters,
         )
         benchmark_results.extend(quantize_measurements)
@@ -300,7 +310,12 @@ def invoke_main(
 
     print("")
     print(f"Hardware: {torch.cuda.get_device_name()}")
-    print(f"Memory BW Roofline: {mem_bw_roofline_gbps} GB/s")
+    print(f"    Memory BW Roofline: {mem_bw_roofline_gbps} GB/s")
+
+    print("")
+    print("Benchmark Settings:")
+    print(f"    CUDA graph: {not no_cuda_graph}")
+    print(f"    Buffer rotation: {not no_rotating_buffer}")
 
     if export_csv:
         os.makedirs(output_dir, exist_ok=True)
