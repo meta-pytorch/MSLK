@@ -1,7 +1,10 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_preprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
+
 import math
 import operator
 from typing import Callable, Type, Optional

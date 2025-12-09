@@ -1,5 +1,8 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
+
 import math
 from typing import Callable, Optional
 from functools import partial

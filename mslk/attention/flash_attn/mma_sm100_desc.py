@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Copyright (c) 2025, Tri Dao.
 # Ported Cutlass code from C++ to Python:
 # https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp

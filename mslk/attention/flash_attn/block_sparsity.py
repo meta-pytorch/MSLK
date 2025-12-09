@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 """
 Computes block-sparse attention masks for Flex Attention.
 

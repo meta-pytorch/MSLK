@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention

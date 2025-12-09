@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 import math
 from typing import Optional
 

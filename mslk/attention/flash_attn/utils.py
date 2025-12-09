@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Copyright (c) 2025, Tri Dao.
 
 import math

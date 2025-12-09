@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 import math
 from typing import Callable, Optional, Type
 from functools import partial

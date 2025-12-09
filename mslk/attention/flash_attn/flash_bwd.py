@@ -1,7 +1,10 @@
+# flake8: noqa
 # @nolint # fbcode
+
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/mainloop_bwd_sm80.hpp
 # from Cutlass C++ to Cute-DSL.
+
 import math
 from types import SimpleNamespace
 from typing import Type, Callable, Optional
@@ -401,7 +404,7 @@ class FlashAttentionBackwardSm80:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
 
-        # Uses seqlen k, etc. since main bwd kernel's blocks are over n 
+        # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
@@ -415,7 +418,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
         )
-        
+
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -999,7 +1002,7 @@ class FlashAttentionBackwardSm80:
         num_head: cutlass.Int32,
         batch_size: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        d_head: cutlass.Int32, 
+        d_head: cutlass.Int32,
         d_head_v: cutlass.Int32
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)

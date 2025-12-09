@@ -1,4 +1,6 @@
+# flake8: noqa
 # @nolint # fbcode
+
 from typing import Callable, Optional
 
 import random
