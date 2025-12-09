@@ -98,6 +98,7 @@ __install_check_operator_registrations () {
   if [ "$installed_mslk_target" == "default" ]; then
     test_operators+=(
       torch.ops.mslk.rope_qkv_decoding
+      torch.ops.mslk.f8f8bf16_rowwise
     )
   fi
 
