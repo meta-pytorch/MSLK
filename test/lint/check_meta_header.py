@@ -37,23 +37,39 @@ PY_HEADER = process_header(HEADER, "#")
 CPP_HEADER = process_header(HEADER, "//")
 
 
-def dfs(root_path: str) -> list[str]:
+def dfs(root_path: str, ignore_patterns: list[str] = None) -> list[str]:
     """DFS source code tree to find python files missing header
 
     Parameters
     ----------
     root_path : str
         root source directory path
+    ignore_patterns : list[str], optional
+        list of file or directory patterns to ignore
 
     Returns
     -------
     list[str]
         file list missing header
     """
+    if ignore_patterns is None:
+        ignore_patterns = []
+
     ret = []
+
     for root, _, files in os.walk(root_path, topdown=False):
         for name in files:
             path = os.path.join(root, name)
+
+            should_ignore = False
+            for pattern in ignore_patterns:
+                if pattern in path:
+                    should_ignore = True
+                    break
+
+            if should_ignore:
+                continue
+
             if path.endswith(".py"):
                 with open(path) as fi:
                     src = fi.read()
@@ -86,13 +102,20 @@ def fix_header(file_list: list[str]) -> None:
 
 @click.command()
 @click.option(
-    "--path", help="Root directory of source to be checked", required=True, type=str
+    "--path", type=str, required=True, help="Root directory of source to be checked"
 )
 @click.option(
-    "--fixit", default=False, help="Fix missing header", required=False, type=bool
+    "--fixit", type=bool, required=False, default=False, help="Fix missing header"
 )
-def check_header(path, fixit):
-    ret = dfs(path)
+@click.option(
+    "--ignore",
+    type=str,
+    required=False,
+    default="",
+    help="File or directory patterns to ignore (can be specified multiple times)",
+)
+def check_header(path, fixit, ignore):
+    ret = dfs(path, ignore.split(","))
     if len(ret) == 0:
         sys.exit(0)
     print("Need to add Meta header to the following files.")
