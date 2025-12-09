@@ -578,7 +578,7 @@ __verify_library_symbols () {
     if [ "$symbol" == "" ]; then
       echo "Usage: ${FUNCNAME[0]} SYMBOL"
       echo "Example(s):"
-      echo "    ${FUNCNAME[0]} mslk::coalesce::coalesce_batches_cpu"
+      echo "    ${FUNCNAME[0]} mslk::gemm::f4f4bf16"
       return 1
     fi
 
@@ -600,8 +600,7 @@ __verify_library_symbols () {
   # This is by no means an exhaustive set, and should be updated accordingly
   if [ "${mslk_build_target}" == "default" ]; then
     local lib_symbols_to_check=(
-      mslk::coalesce::coalesce_batches_cpu
-      mslk::coalesce::coalesce_batches_gpu
+      mslk::gemm::f8f8bf16_rowwise
       mslk::kv_cache::rope_qkv_decoding
       mslk::moe::index_shuffling_torch
       mslk::quantize::quantize_fp8_per_row

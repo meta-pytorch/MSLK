@@ -11,8 +11,8 @@
 glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cpp
   csrc/attention/cuda/gqa_attn_splitk/*.cpp
-  csrc/coalesce/*.cpp
   csrc/comm/*.cpp
+  csrc/gemm/*.cpp
   csrc/kv_cache/*.cpp
   csrc/moe/*.cpp
   csrc/quantize/*.cpp)
@@ -20,7 +20,6 @@ glob_files_nohip(mslk_cpp_source_files_cpu
 glob_files_nohip(mslk_cpp_source_files_gpu
   csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cu
   csrc/attention/cuda/gqa_attn_splitk/*.cu
-  csrc/coalesce/*.cu
   csrc/comm/*.cu
   csrc/kv_cache/*.cu
   csrc/moe/*.cu
@@ -65,6 +64,8 @@ endif()
 
 # CUDA-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_cuda
+  csrc/gemm/cublas/*.cu
+  csrc/gemm/cublas/**/*.cu
   csrc/gemm/cutlass/*.cu
   csrc/gemm/cutlass/**/*.cu
   csrc/quantize/cutlass/*.cu

@@ -252,7 +252,7 @@ test_library_symbol () {
   if [ "$lib_symbol" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} LIB_PATH FULL_NAMESPACE_PATH_LIB_SYMBOL"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} mslk_py.so mslk::coalesce::coalesce_batches_cpu"
+    echo "    ${FUNCNAME[0]} mslk_py.so mslk::gemm::f4f4bf16"
     return 1
   fi
 

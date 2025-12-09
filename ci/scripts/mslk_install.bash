@@ -69,7 +69,6 @@ __install_check_subpackages () {
   echo "[INSTALL] Check for installation of Python sources ..."
   local subpackages=(
     mslk.attention
-    mslk.coalesce
     mslk.comm
     mslk.gemm
     mslk.kv_cache
@@ -98,8 +97,8 @@ __install_check_operator_registrations () {
 
   if [ "$installed_mslk_target" == "default" ]; then
     test_operators+=(
-      torch.ops.mslk.coalesce_batches
       torch.ops.mslk.rope_qkv_decoding
+      torch.ops.mslk.f8f8bf16_rowwise
     )
   fi
 
