@@ -1,0 +1,10 @@
+[flake8]
+exclude =
+    .git,
+    __pycache__,
+    *.egg-info,
+    venv,
+    env,
+    .venv,
+    mslk/attention/flash_attn,
+    test/attention,
