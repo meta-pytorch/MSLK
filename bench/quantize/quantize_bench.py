@@ -175,9 +175,10 @@ def benchmark(
             input_bytes = input.numel() * input.element_size()
             output_bytes = sum(t.numel() * t.element_size() for t in quantized)
             total_size_bytes = input_bytes + output_bytes
-            metrics.gbps += (total_size_bytes / 1e9) / (ms_runtime / 1e3)
+            gbps = (total_size_bytes / 1e9) / (ms_runtime / 1e3)
+            metrics.gbps += gbps
             metrics.us += ms_runtime * 1000
-            metrics.memory_bw_util += (metrics.gbps / mem_bw_roofline_gbps) * 100
+            metrics.memory_bw_util += (gbps / mem_bw_roofline_gbps) * 100
 
         metrics.us /= num_iters
         metrics.gbps /= num_iters
