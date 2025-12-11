@@ -10,3 +10,6 @@
 [submodule "external/hipify_torch"]
 	path = external/hipify_torch
 	url = https://github.com/ROCm/hipify_torch.git
+[submodule "external/composable_kernel_fmha"]
+	path = external/composable_kernel_fmha
+	url = https://github.com/ROCm/composable_kernel.git
