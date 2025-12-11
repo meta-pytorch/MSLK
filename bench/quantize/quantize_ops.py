@@ -19,6 +19,7 @@ from mslk.quantize.triton.fp8_quantize import (
     triton_quantize_fp8_block,
     triton_quantize_fp8_group,
     triton_quantize_fp8_row,
+    triton_quantize_fp8_tensor,
 )
 from mslk.test.quantize.triton.fp4_quantize_test import (
     dequantize_nvfp4,
@@ -264,6 +265,46 @@ class CudaFP8Rowwise(QuantizeOpBase):
         scale: torch.Tensor
         input_quantized, scale = args
         return dequantize_fp8_row(input_quantized, scale)
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
+class CudaFP8Tensorwise(QuantizeOpBase):
+    def quantize(self, input: torch.Tensor) -> Any:
+        return torch.ops.mslk.quantize_fp8_per_tensor(input)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        input_quantized: torch.Tensor
+        scale: torch.Tensor
+        input_quantized, scale = args
+        return input_quantized.to(torch.float32) * scale
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
+class TritonFP8Tensorwise(QuantizeOpBase):
+    def quantize(self, input: torch.Tensor) -> Any:
+        return triton_quantize_fp8_tensor(input)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        input_quantized: torch.Tensor
+        scale: torch.Tensor
+        input_quantized, scale = args
+        return input_quantized.to(torch.float32) * scale
 
     @property
     def hip(self) -> bool:
