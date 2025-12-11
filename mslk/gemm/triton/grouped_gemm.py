@@ -16,8 +16,25 @@ import torch
 import triton
 import triton.language as tl
 
-from mslk.gemm.triton import utils
 from triton.runtime import driver  # @manual
+
+try:
+    # @manual=//triton:triton
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    TMA_AVAILABLE = True
+except ImportError:
+    TMA_AVAILABLE = False
+    pass
+
+
+def _grouped_gemm_set_block_size_hook(nargs):
+    BLOCK_M = nargs["BLOCK_SIZE_M"]
+    BLOCK_N = nargs["BLOCK_SIZE_N"]
+    BLOCK_K = nargs["BLOCK_SIZE_K"]
+    if nargs["USE_TMA_LOAD"]:
+        nargs["a_desc_ptr"].block_shape = [BLOCK_M, BLOCK_K]
+        nargs["b_desc_ptr"].block_shape = [BLOCK_N, BLOCK_K]
 
 
 _NV_CONFIGS = [
@@ -31,6 +48,7 @@ _NV_CONFIGS = [
         num_stages=num_stages,
         num_warps=num_warps,
         num_ctas=num_ctas,
+        pre_hook=_grouped_gemm_set_block_size_hook,
     )
     for block_size_m in [64, 128]
     for block_size_n in [64, 128, 256]
@@ -39,6 +57,32 @@ _NV_CONFIGS = [
     for num_warps in [4, 8]
     for num_ctas in [1]
 ]
+
+if TMA_AVAILABLE:
+    _NV_WS_CONFIGS = [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": block_size_m,
+                "BLOCK_SIZE_N": block_size_n,
+                "BLOCK_SIZE_K": block_size_k,
+                "NUM_CONSUMER_GROUPS": 1,
+                "USE_TMA_STORE": use_tma_store,
+            },
+            num_stages=num_stages,
+            num_warps=num_warps,
+            num_ctas=num_ctas,
+            pre_hook=_grouped_gemm_set_block_size_hook,
+        )
+        for block_size_m in [64, 128, 256]
+        for block_size_n in [64, 128, 256]
+        for block_size_k in [64, 128, 256]
+        for num_stages in [2, 3, 4]
+        for num_warps in [4, 8, 16]
+        for num_ctas in [1]
+        for use_tma_store in [False]
+    ]
+else:
+    _NV_WS_CONFIGS = _NV_CONFIGS
 
 
 _AMD_CONFIGS = [
@@ -149,7 +193,6 @@ def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs
             BLOCK_K,
             num_stages,
             num_warps,
-            num_consumer_groups,
             use_tma_load_on_scales,
         ) = (
             kw["BLOCK_SIZE_M"],
@@ -157,7 +200,6 @@ def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs
             kw["BLOCK_SIZE_K"],
             config.num_stages,
             config.num_warps,
-            config.num_consumer_groups,
             kw.get("USE_TMA_LOAD_ON_SCALES", False),
         )
         G, M, N = (
@@ -177,16 +219,10 @@ def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs
         if required_shared_memory > max_shared_memory:
             continue
 
-        use_warp_specialization = num_consumer_groups >= 1
-
         M_PER_GROUP = M // G
         MIN_M_TILES = 32 if torch.version.hip else 64
         # 2. make sure we don't load M tiles that are too big
-        if (
-            not use_warp_specialization
-            and BLOCK_M > MIN_M_TILES
-            and BLOCK_M > (M_PER_GROUP * 2)
-        ):
+        if BLOCK_M > MIN_M_TILES and BLOCK_M > (M_PER_GROUP * 2):
             continue
         # 3. make sure we don't load N tiles that are too small
         if BLOCK_M < 128 and BLOCK_M < (M_PER_GROUP // 2):
@@ -198,26 +234,11 @@ def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs
         N_TILES = (N + BLOCK_N - 1) // BLOCK_N
         MIN_N_TILES = 32 if torch.version.hip else 64
         # 4. make sure we don't load N tiles that are too big
-        if (
-            not use_warp_specialization
-            and BLOCK_N > MIN_N_TILES
-            and M * N_TILES < num_sm
-        ):
+        if BLOCK_N > MIN_N_TILES and M * N_TILES < num_sm:
             continue
         # 5. make sure we don't load N tiles that are too small
         if BLOCK_N < 128 and M * N_TILES > 2 * num_sm:
             continue
-
-        # 6. make sure we can partition for ws
-        if use_warp_specialization:
-            if num_warps != 4:
-                continue
-
-            # "tritongpu-warp-spec-data-partition"
-            m_slice = BLOCK_M // num_consumer_groups
-            n_slice = BLOCK_N // num_consumer_groups
-            if m_slice < 64 and n_slice < 256:
-                continue
 
         if dtsize >= 2:
             if use_tma_load_on_scales:
@@ -305,18 +326,8 @@ def _mslk_grouped_gemm(
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
-                        a = tl._experimental_descriptor_load(
-                            a_desc_ptr,
-                            [m_offset, k_offset],
-                            [BLOCK_SIZE_M, BLOCK_SIZE_K],
-                            dtype,
-                        )
-                        b = tl._experimental_descriptor_load(
-                            b_desc_ptr,
-                            [n_offset, k_offset],
-                            [BLOCK_SIZE_N, BLOCK_SIZE_K],
-                            dtype,
-                        )
+                        a = a_desc_ptr.load([m_offset, k_offset])
+                        b = b_desc_ptr.load([n_offset, k_offset])
                         if USE_FAST_ACCUM:
                             accumulator = tl.dot(a, b.T, accumulator)
                         else:
@@ -393,7 +404,7 @@ def _mslk_grouped_gemm(
 
 # TODO(shikaili): Too much code duplication. Need to refactor.
 @triton.autotune(
-    configs=_NV_CONFIGS,
+    configs=_NV_WS_CONFIGS,
     key=["G", "M_BUCKET", "N", "K"],
     prune_configs_by={"early_config_prune": early_config_prune_ws},
     restore_value=["c_ptr"],  # restore for scatter_add fusion
@@ -419,11 +430,9 @@ def _mslk_grouped_gemm_ws(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_CONSUMER_GROUPS: tl.constexpr,
-    USE_TMA_LOAD_ON_SCALES: tl.constexpr,
     USE_TMA_STORE: tl.constexpr,
 ) -> None:
     tl.static_assert(USE_TMA_LOAD, "Always use TMA load with warp specialziation!")
-    tl.static_assert(not USE_TMA_LOAD_ON_SCALES, "Not supported!")
     tl.static_assert(
         not (FUSE_SCATTER_ADD and USE_TMA_STORE),
         "Cannot fuse scatter add with TMA store!",
@@ -475,18 +484,8 @@ def _mslk_grouped_gemm_ws(
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
-                        a = tl._experimental_descriptor_load(
-                            a_desc_ptr,
-                            [m_offset, k_offset],
-                            [BLOCK_SIZE_M, BLOCK_SIZE_K],
-                            dtype,
-                        )
-                        b = tl._experimental_descriptor_load(
-                            b_desc_ptr,
-                            [n_offset, k_offset],
-                            [BLOCK_SIZE_N, BLOCK_SIZE_K],
-                            dtype,
-                        )
+                        a = a_desc_ptr.load([m_offset, k_offset])
+                        b = b_desc_ptr.load([n_offset, k_offset])
                         if USE_FAST_ACCUM:
                             accumulator = tl.dot(a, b.T, accumulator)
                         else:
@@ -621,18 +620,8 @@ def _mslk_grouped_gemm_fp8_rowwise(
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
-                        a = tl._experimental_descriptor_load(
-                            a_desc_ptr,
-                            [m_offset, k_offset],
-                            [BLOCK_SIZE_M, BLOCK_SIZE_K],
-                            dtype,
-                        )
-                        b = tl._experimental_descriptor_load(
-                            b_desc_ptr,
-                            [n_offset, k_offset],
-                            [BLOCK_SIZE_N, BLOCK_SIZE_K],
-                            dtype,
-                        )
+                        a = a_desc_ptr.load([m_offset, k_offset])
+                        b = b_desc_ptr.load([n_offset, k_offset])
                         if USE_FAST_ACCUM:
                             accumulator = tl.dot(a, b.T, accumulator)
                         else:
@@ -705,7 +694,7 @@ def _mslk_grouped_gemm_fp8_rowwise(
 
 # TODO(shikaili): Too much code duplication. Need to refactor.
 @triton.autotune(
-    configs=_NV_CONFIGS,
+    configs=_NV_WS_CONFIGS,
     key=["G", "M_BUCKET", "N", "K"],
     prune_configs_by={
         "early_config_prune": functools.partial(
@@ -720,7 +709,6 @@ def _mslk_grouped_gemm_fp8_rowwise_ws(
     a_scale_ptr,
     b_desc_ptr,
     b_scale_ptr,
-    b_scale_desc_ptr,
     c_ptr,
     scatter_add_indices,
     m_sizes,
@@ -738,7 +726,6 @@ def _mslk_grouped_gemm_fp8_rowwise_ws(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     NUM_CONSUMER_GROUPS: tl.constexpr,
-    USE_TMA_LOAD_ON_SCALES: tl.constexpr,
     USE_TMA_STORE: tl.constexpr,
 ) -> None:
     tl.static_assert(USE_TMA_LOAD, "Always use TMA load with warp specialziation!")
@@ -748,8 +735,6 @@ def _mslk_grouped_gemm_fp8_rowwise_ws(
     )
 
     tidx = tl.program_id(0)
-
-    dtype = TT_FP8_DTYPE
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -794,51 +779,25 @@ def _mslk_grouped_gemm_fp8_rowwise_ws(
                     m_offset = (M_start_offset + tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
                     n_offset = (N_start_offset + tile_n_idx * BLOCK_SIZE_N).to(tl.int32)
                     for k_offset in range(0, K, BLOCK_SIZE_K):
-                        a = tl._experimental_descriptor_load(
-                            a_desc_ptr,
-                            [m_offset, k_offset],
-                            [BLOCK_SIZE_M, BLOCK_SIZE_K],
-                            dtype,
-                        )
-                        b = tl._experimental_descriptor_load(
-                            b_desc_ptr,
-                            [n_offset, k_offset],
-                            [BLOCK_SIZE_N, BLOCK_SIZE_K],
-                            dtype,
-                        )
+                        a = a_desc_ptr.load([m_offset, k_offset])
+                        b = b_desc_ptr.load([n_offset, k_offset])
                         if USE_FAST_ACCUM:
                             accumulator = tl.dot(a, b.T, accumulator)
                         else:
                             accumulator += tl.dot(a, b.T)
 
-                    if USE_TMA_LOAD_ON_SCALES:
-                        b_scale = tl._experimental_descriptor_load(
-                            b_scale_desc_ptr,
-                            [n_offset],
-                            [BLOCK_SIZE_N],
-                            tl.float32,
-                        )
-
-                        offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-                        a_scale = tl.load(
-                            a_scale_ptr + M_start_offset + offs_am[:, None],
-                            mask=offs_am[:, None] < m_size,
-                            cache_modifier=".ca",
-                        )
-                        c = accumulator.to(tl.float32) * a_scale * b_scale[None, :]
-                    else:
-                        offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-                        offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-                        a_scale = tl.load(
-                            a_scale_ptr + M_start_offset + offs_am[:, None],
-                            mask=offs_am[:, None] < m_size,
-                            cache_modifier=".ca",
-                        )
-                        b_scale = tl.load(
-                            b_scale_ptr + N_start_offset + offs_bn[None, :],
-                            cache_modifier=".ca",
-                        )
-                        c = accumulator.to(tl.float32) * a_scale * b_scale
+                    offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                    offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                    a_scale = tl.load(
+                        a_scale_ptr + M_start_offset + offs_am[:, None],
+                        mask=offs_am[:, None] < m_size,
+                        cache_modifier=".ca",
+                    )
+                    b_scale = tl.load(
+                        b_scale_ptr + N_start_offset + offs_bn[None, :],
+                        cache_modifier=".ca",
+                    )
+                    c = accumulator.to(tl.float32) * a_scale * b_scale
 
                     if USE_TMA_STORE:
                         m_offset = (tile_m_idx * BLOCK_SIZE_M).to(tl.int32)
@@ -893,20 +852,8 @@ def _grouped_gemm(
     output_tensor: Optional[torch.Tensor],
     scatter_add_indices: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    USE_TMA_LOAD = not torch.version.hip
+    USE_TMA_LOAD = not torch.version.hip and TMA_AVAILABLE
     USE_TMA_STORE = False
-
-    if USE_TMA_LOAD and not utils.HAS_TMA_DESC:
-        USE_TMA_LOAD = False
-        warnings.warn(
-            "TMA load is disabled as there is no TMA descriptor support!", stacklevel=2
-        )
-
-    if USE_TMA_STORE and not utils.HAS_TMA_DESC:
-        USE_TMA_STORE = False
-        warnings.warn(
-            "TMA store is disabled as there is no TMA descriptor support!", stacklevel=2
-        )
 
     # TODO(shikaili): Check the readniess of WS on ROCm side in Meta's Triton.
     if use_warp_specialization and torch.version.hip:
@@ -917,14 +864,7 @@ def _grouped_gemm(
         use_warp_specialization = False
 
     if use_warp_specialization:
-        warnings.warn(
-            "Warp specialization is disabled as the Triton build in current environment doesn't have such support. Please build from https://github.com/facebookexperimental/triton/tree/ws-3.2.x to enable it for best performance on Nvidia's SM90 GPUs.",
-            stacklevel=2,
-        )
-        use_warp_specialization = False
-
-    if use_warp_specialization:
-        assert utils.HAS_TMA_DESC
+        assert TMA_AVAILABLE, "TMA is not available"
         USE_TMA_STORE = True  # Tuning decision
 
     G = m_sizes.shape[0]
@@ -968,20 +908,19 @@ def _grouped_gemm(
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
-    desc_helper = None
-    desc_x = x
-    desc_w = w
-    desc_ws = w_scale
+    # A dummy block value that will be overwritten in the pre_hook when we have the real block size
+    dummy_block = [1, 1]
 
     if USE_TMA_LOAD:
-        desc_helper = utils.TmaAutoTuneHelper()
-        desc_helper.init_tma_descriptor("x")
-        desc_helper.init_tma_descriptor("w")
-        desc_x = desc_helper.get_tma_descriptor_kernel_param("x")
-        desc_w = desc_helper.get_tma_descriptor_kernel_param("w")
-        if use_warp_specialization and w_scale is not None:
-            desc_helper.init_tma_descriptor("ws")
-            desc_ws = desc_helper.get_tma_descriptor_kernel_param("ws")
+        # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+        # argument, expected `List[int]` but got `Size`
+        desc_x = TensorDescriptor(x, x.shape, x.stride(), dummy_block)
+        # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+        # argument, expected `List[int]` but got `Size`
+        desc_w = TensorDescriptor(w, w.shape, w.stride(), dummy_block)
+    else:
+        desc_x = x
+        desc_w = w
 
     if USE_TMA_STORE:
 
@@ -991,37 +930,6 @@ def _grouped_gemm(
         triton.set_allocator(alloc_fn)
 
     def grid(META):
-        if USE_TMA_LOAD:
-            nonlocal desc_helper  # noqa: F824
-            desc_helper.fill_2d_tma_descriptor(
-                "x",
-                x.data_ptr(),
-                M,
-                K,
-                META["BLOCK_SIZE_M"] // META["NUM_CONSUMER_GROUPS"],
-                META["BLOCK_SIZE_K"],
-                x.element_size(),
-            )
-
-            desc_helper.fill_2d_tma_descriptor(
-                "w",
-                w.data_ptr(),
-                N * G,
-                K,
-                META["BLOCK_SIZE_N"],
-                META["BLOCK_SIZE_K"],
-                w.element_size(),
-            )
-
-            if META.get("USE_TMA_LOAD_ON_SCALES", False):
-                desc_helper.fill_1d_tma_descriptor(
-                    "ws",
-                    w_scale.data_ptr(),
-                    N * G,
-                    META["BLOCK_SIZE_N"],
-                    w_scale.element_size(),
-                )
-
         return (NUM_SMS,)
 
     M_BUCKET_CAP = 16384
@@ -1034,27 +942,44 @@ def _grouped_gemm(
             if use_warp_specialization
             else _mslk_grouped_gemm_fp8_rowwise
         )
-        args = (
-            desc_x,
-            x_scale,
-            desc_w,
-            w_scale,
-            desc_ws,
-            y,
-            scatter_add_indices,
-            m_sizes,
-            G,
-            M_BUCKET,
-            N,
-            K,
-            NUM_SMS,
-            FUSE_SCATTER_ADD,
-            USE_TMA_LOAD,
-        )
         if use_warp_specialization:
-            args += (use_fast_accum,)
+            args = (
+                desc_x,
+                x_scale,
+                desc_w,
+                w_scale,
+                y,
+                scatter_add_indices,
+                m_sizes,
+                G,
+                M_BUCKET,
+                N,
+                K,
+                NUM_SMS,
+                FUSE_SCATTER_ADD,
+                USE_TMA_LOAD,
+                use_fast_accum,
+            )
         else:
-            args += (USE_TMA_STORE, use_fast_accum)
+            args = (
+                desc_x,
+                x_scale,
+                desc_w,
+                w_scale,
+                w_scale,  # b_scale_desc_ptr (unused, just passed for API compatibility)
+                y,
+                scatter_add_indices,
+                m_sizes,
+                G,
+                M_BUCKET,
+                N,
+                K,
+                NUM_SMS,
+                FUSE_SCATTER_ADD,
+                USE_TMA_LOAD,
+                USE_TMA_STORE,
+                use_fast_accum,
+            )
         fn[grid](*args)
     else:
         assert x_scale is None

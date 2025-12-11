@@ -206,6 +206,9 @@ __configure_mslk_build_docs () {
 __configure_mslk_build_rocm () {
   local mslk_variant_targets="$1"
 
+  # Fetch ROCm version to $rocm_version_arr
+  __fetch_rocm_version_array ${env_name} || return 1
+
   # By default, we build for a limited number of target architectures to save on
   # build time.  This list needs to be updated if the CI ROCm machines have
   # different hardware.
@@ -224,13 +227,17 @@ __configure_mslk_build_rocm () {
     # the value set to 0), we are building in Nova.  Nova machines take much
     # longer time to build MSLK for ROCm, so we have to limit to just the
     # latest model.
-    echo "[BUILD] Building in Nova environment, ignoring the provided PYTORCH_ROCM_ARCH list and limiting ROCm targets ..."
+    echo "[BUILD] Building in Nova environment, which is resource-constrained - will be ignoring the provided PYTORCH_ROCM_ARCH list and limiting ROCm targets ..."
     local arch_list="gfx942"
 
   else
     # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
     # sufficient resources, so we can build for more AMD Instinct architectures.
-    local arch_list="gfx908,gfx90a,gfx942"
+    if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
+      local arch_list="gfx90a,gfx942,gfx950"
+    else
+      local arch_list="gfx90a,gfx942"
+    fi
   fi
 
   echo "[BUILD] Setting the following ROCm targets: ${arch_list}"
