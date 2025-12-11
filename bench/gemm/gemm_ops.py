@@ -6,6 +6,8 @@
 
 # Keep a registry of all quantize operators.
 import abc
+import functools
+from enum import auto, Enum
 
 import numpy as np
 import torch
@@ -85,6 +87,36 @@ try:
     MACHETE_ENABLED = True
 except ImportError:
     MACHETE_ENABLED = False
+
+
+class Accelerator(Enum):
+    NVIDIA_SM90 = auto()
+    NVIDIA_SM100 = auto()
+    AMD_MI300X = auto()
+
+
+class GemmType(Enum):
+    REGULAR = auto()
+    GROUPED = auto()
+
+
+@functools.cache
+def get_current_accelerator() -> Accelerator | None:
+    if not torch.cuda.is_available():
+        raise Exception("Cannot run gemm_bench without accelerator.")
+
+    if torch.version.hip is not None:
+        device_name = torch.cuda.get_device_name()
+        if "MI300X" in device_name.upper():
+            return Accelerator.AMD_MI300X
+    elif torch.version.cuda is not None:
+        major, minor = torch.cuda.get_device_capability()
+        if major == 9 and minor == 0:
+            return Accelerator.NVIDIA_SM90
+        elif major == 10 and minor == 0:
+            return Accelerator.NVIDIA_SM100
+
+    raise Exception("Cannot detect hardware that is supported by gemm_bench.")
 
 
 gemm_op_registry = []
@@ -188,24 +220,18 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractproperty
-    def hip(self) -> bool:
-        """Whether this operator supports AMD or not."""
-        pass
-
-    @abc.abstractproperty
-    def cuda(self) -> bool:
-        """Whether this operator supports Nvidia or not."""
+    def supported_accelerators(self) -> set[Accelerator]:
         pass
 
     @property
     def supported(self) -> bool:
         """Whether this op will run on the current device."""
-        if torch.version.hip is not None:
-            return self.hip
-        elif torch.version.cuda is not None:
-            return self.cuda
-        else:
-            return False
+        accelerator = get_current_accelerator()
+        return accelerator in self.supported_accelerators
+
+    @abc.abstractproperty
+    def supported_gemm_types(self) -> set[GemmType]:
+        pass
 
 
 def register_gemm_op(op):
@@ -251,12 +277,12 @@ class FP32Baseline(GemmOpBase):
         return "fp32_baseline"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR, GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -295,12 +321,12 @@ class TF32Baseline(GemmOpBase):
         return "tf32_baseline"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR, GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -335,12 +361,12 @@ class BF16Baseline(GemmOpBase):
         return "bf16_baseline"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR, GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -414,12 +440,12 @@ class ScaledMMBaseline(GemmOpBase):
         return "scaled_mm"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -454,12 +480,15 @@ class BF16X9Baseline(GemmOpBase):
         return "bf16x9_gemm"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR, GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -504,12 +533,12 @@ class ScaledMMRowwise(GemmOpBase):
         return "scaled_mm_rowwise"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -553,12 +582,12 @@ class ScaledMMMXFP8(GemmOpBase):
         return "scaled_mm_mxfp8"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -585,14 +614,12 @@ class FP8TensorwiseGemm(GemmOpBase):
         return "cutlass_tensorwise"
 
     @property
-    def hip(self) -> bool:
-        # Need to add support for better quantize kernel.
-        # Also may have an issue with cuda graphs.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -621,13 +648,12 @@ class FP8CublasRowwiseGemm(GemmOpBase):
         return "cublas_rowwise"
 
     @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -654,13 +680,12 @@ class FP8CublasTensorwiseGemm(GemmOpBase):
         return "cublas_tensorwise"
 
     @property
-    def hip(self) -> bool:
-        # This implementation is specific to cublas.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -735,12 +760,16 @@ class FP8RowwiseGemm(GemmOpBase):
             return "ck_rowwise"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -760,19 +789,15 @@ class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
 
     @property
     def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_rowwise_preshuffle"
-        else:
-            return "ck_rowwise_preshuffle"
+        return "ck_rowwise_preshuffle"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X}
 
     @property
-    def cuda(self) -> bool:
-        # Not yet supported on nvidia.
-        return False
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -858,12 +883,16 @@ class FP8RowwiseGroupedGemm(GemmOpBase):
             return "ck_rowwise_grouped"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -897,12 +926,12 @@ class BF16TritonStackedGroupedGemm(GemmOpBase):
         return "triton_bf16_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -981,12 +1010,12 @@ class FP8TritonStackedGroupedGemm(GemmOpBase):
         return "triton_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1077,12 +1106,14 @@ class DeepGemmStacked(GemmOpBase):
         return "deepgemm_stacked"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if DEEPGEMM_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        return DEEPGEMM_ENABLED
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1184,12 +1215,14 @@ class DeepGemmBlockwise(GemmOpBase):
         return "deepgemm_blockwise"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if DEEPGEMM_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1227,12 +1260,14 @@ class DeepGemmRowwise(GemmOpBase):
         return "deepgemm_rowwise"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if DEEPGEMM_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        return DEEPGEMM_ENABLED
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1277,12 +1312,16 @@ class FP8StackedGroupedGemm(GemmOpBase):
             return "ck_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1310,12 +1349,12 @@ class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
         return "ck_grouped_stacked_torch_2d3d"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X}
 
     @property
-    def cuda(self) -> bool:
-        return False
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1352,12 +1391,15 @@ class ScaledGroupedMMRowwise(FP8StackedGroupedGemmTorch):
         return "scaled_grouped_mm_rowwise"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1396,18 +1438,15 @@ class FP8StackedGroupwiseGroupedGemm(GemmOpBase):
 
     @property
     def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_groupwise_grouped"
-        else:
-            return "ck_groupwise_grouped"
+        return "cutlass_groupwise_grouped"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1465,12 +1504,16 @@ class BF16GroupedGemm(GemmOpBase):
             return "ck_bf16_grouped"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -1503,15 +1546,20 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
             return "ck_rowwise_batched"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
-@register_gemm_op
+# This kernel is broken and causes GPU to lock up, needs some investigation
+# @register_gemm_op
 class TritonFP8RowwiseGemm(GemmOpBase):
     """
     FP8 matmul with rowwise scaling implemented with Triton.
@@ -1547,13 +1595,12 @@ class TritonFP8RowwiseGemm(GemmOpBase):
         return "triton_rowwise"
 
     @property
-    def hip(self) -> bool:
-        # triton FP8 matmuls do not currently compile on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1580,13 +1627,12 @@ class FP8TritonBlockwiseGemm(GemmOpBase):
         return "triton_blockwise"
 
     @property
-    def hip(self) -> bool:
-        # Currently has some issues.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1618,12 +1664,15 @@ class FP8CutlassBlockwiseGemm(GemmOpBase):
             return "ck_blockwise"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1654,107 +1703,15 @@ class FP8CutlassGroupwiseGemm(GemmOpBase):
 
     @property
     def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_groupwise"
-        else:
-            return "ck_groupwise"
+        return "cutlass_groupwise"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
-
-
-####################################################################################################
-# CUTLASS kernel v2
-####################################################################################################
-
-
-@register_gemm_op
-class CutlassFP8TensorwiseGemm_v2(GemmOpBase):
-    """
-    FP8 matmul with tensorwise scaling.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        if hasattr(torch.ops.cutlass_extensions, "f8f8bf16"):
-            return torch.ops.cutlass_extensions.f8f8bf16(xq, wq, x_scale * w_scale)
-        else:
-            raise RuntimeError(
-                "Skipping cutlass_extensions_v2 runs as it is not supported"
-            )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "cutlass_tensorwise_v2"
-
-    @property
-    def hip(self) -> bool:
-        # Need to add support for better quantize kernel.
-        # Also may have an issue with cuda graphs.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-# CUTLASS kernel v2
-@register_gemm_op
-class CutlassFP8RowwiseGemm_v2(GemmOpBase):
-    """
-    FP8 matmul with rowwise scaling.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = quantize_fp8_row(x)
-        wq, w_scale = quantize_fp8_row(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        if hasattr(torch.ops.cutlass_extensions, "f8f8bf16_rowwise"):
-            return torch.ops.cutlass_extensions.f8f8bf16_rowwise(
-                xq, wq, x_scale, w_scale
-            )
-        else:
-            raise RuntimeError(
-                "Skipping cutlass_extensions_v2 runs as it is not supported"
-            )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        return "cutlass_rowwise_v2"
-
-    @property
-    def hip(self) -> bool:
-        # Need to add support for better quantize kernel.
-        # Also may have an issue with cuda graphs.
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-####################################################################################################
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1824,13 +1781,12 @@ class F8I4RowwiseGemm(GemmOpBase):
         return "cutlass_f8i4_rowwise"
 
     @property
-    def hip(self) -> bool:
-        # Not yet supported on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1870,13 +1826,12 @@ class F8I4ShuffledGemm(GemmOpBase):
         return "cutlass_f8i4_preshuffle"
 
     @property
-    def hip(self) -> bool:
-        # Not yet supported on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1913,13 +1868,12 @@ class BF16I4ShuffledGemm(GemmOpBase):
         return "cutlass_bf16i4_preshuffle"
 
     @property
-    def hip(self) -> bool:
-        # Not yet supported on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -1954,13 +1908,12 @@ class BF16I4ShuffledBatchedGemm(GemmOpBase):
         return "cutlass_bf16i4_preshuffle_batched"
 
     @property
-    def hip(self) -> bool:
-        # Not yet supported on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2014,12 +1967,12 @@ class F8I4ShuffledGroupedGemm(GemmOpBase):
             return "ck_f8i4_grouped_preshuffle"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2067,18 +2020,15 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
 
     @property
     def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_bf16i4_grouped_preshuffle"
-        else:
-            return "ck_bf16i4_grouped_preshuffle"
+        return "cutlass_bf16i4_grouped_preshuffle"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2118,12 +2068,12 @@ class BF16GroupedGrad(GemmOpBase):
         return "bf16_grouped_grad"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2164,12 +2114,12 @@ class BF16GroupedWGrad(GemmOpBase):
         return "bf16_grouped_wgrad"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2204,12 +2154,16 @@ class BF16GroupedStacked(GemmOpBase):
         return "bf16_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return True
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.AMD_MI300X,
+        }
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2242,13 +2196,12 @@ class BF16I4RowwiseGemm(F8I4RowwiseGemm):
         return "cutlass_bf16i4_rowwise"
 
     @property
-    def hip(self) -> bool:
-        # Not yet supported on AMD.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM90}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2279,14 +2232,14 @@ class TinyGemmBF16I4(GemmOpBase):
         return "tinygemm_bf16i4"
 
     @property
-    def hip(self) -> bool:
-        # Tinygemm only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if TINYGEMM_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        # Only enabled if import works.
-        return TINYGEMM_ENABLED
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2312,14 +2265,14 @@ class MarlinBF16I4(GemmOpBase):
         return "marlin_bf16i4"
 
     @property
-    def hip(self) -> bool:
-        # Marlin only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if MARLIN_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        # This op is not always supported.
-        return MARLIN_ENABLED
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2347,14 +2300,14 @@ class MacheteBF16I4(GemmOpBase):
         return "machete_bf16i4"
 
     @property
-    def hip(self) -> bool:
-        # Machete only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        if MACHETE_ENABLED:
+            return {Accelerator.NVIDIA_SM90}
+        return set()
 
     @property
-    def cuda(self) -> bool:
-        # This op is not always supported.
-        return MACHETE_ENABLED
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2391,13 +2344,12 @@ class NVFP4Gemm(GemmOpBase):
         return "cutlass_nv_f4f4bf16"
 
     @property
-    def hip(self) -> bool:
-        # F4F4BF16 only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2476,13 +2428,12 @@ class NVFP4Quantize(GemmOpBase):
         return "nvfp4_quantize"
 
     @property
-    def hip(self) -> bool:
-        # F4F4BF16 only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2508,13 +2459,12 @@ class MXFP4Gemm(GemmOpBase):
         return "cutlass_f4f4bf16"
 
     @property
-    def hip(self) -> bool:
-        # F4F4BF16 only supported for cuda.
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
 
 
 @register_gemm_op
@@ -2585,12 +2535,12 @@ class MXFP4StackedGroupedGemm(GemmOpBase):
         return "cutlass_f4f4bf16_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2729,15 +2679,16 @@ class NVFP4StackedGroupedGemm(GemmOpBase):
         return "cutlass_nv_f4f4bf16_grouped_stacked"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
-@register_gemm_op
+# Broken with cuda graph
+# @register_gemm_op
 class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
     """
     NVFP4 grouped matmul with blockwise scaling and stacked inputs.
@@ -2897,12 +2848,12 @@ class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
         return "cutlass_nv_f4f4bf16_grouped_stacked_pack_unpack"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -2941,12 +2892,12 @@ class BF16GroupedGemm2d3d(GemmOpBase):
         return "bf16_baseline_grouped_2d_3d"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return set(Accelerator)
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -3027,12 +2978,12 @@ class MXFP8GroupedGemm2d3d(GemmOpBase):
         return "cutlass_mx8mx8bf16_grouped_mm_2d_3d"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 @register_gemm_op
@@ -3140,9 +3091,9 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
         return "cutlass_mx8mx8bf16_grouped_mm_2d_2d"
 
     @property
-    def hip(self) -> bool:
-        return False
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100}
 
     @property
-    def cuda(self) -> bool:
-        return True
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
