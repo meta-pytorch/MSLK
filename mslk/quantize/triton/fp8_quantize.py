@@ -1626,6 +1626,205 @@ def dequantize_fp8_packed_row(
 
 
 @triton.jit
+def _kernel_quantize_fp8_tensor(
+    A,
+    A_fp8,
+    global_max_ptr,
+    blocks_done_ptr,
+    scale_ready_ptr,
+    scale_out_ptr,
+    N,
+    num_sms,
+    TL_FP8_DTYPE: tl.constexpr,
+    MAX_FP8: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """Fused persistent kernel that finds global max and quantizes.
+
+    Uses a persistent kernel approach where we launch exactly num_sms blocks,
+    guaranteeing all blocks run concurrently and avoiding deadlocks.
+    Each block processes multiple chunks of the input in a loop.
+
+    Args:
+        A (Tensor): Flattened input tensor.
+        A_fp8 (Tensor): Output fp8 tensor.
+        global_max_ptr (Tensor): Pointer to global max value (initialized to 0).
+        blocks_done_ptr (Tensor): Pointer to atomic counter (initialized to 0).
+        scale_ready_ptr (Tensor): Pointer to ready flag (initialized to 0).
+        scale_out_ptr (Tensor): Pointer to output scale value.
+        N (int): Total number of elements.
+        num_sms (int): Number of SMs (equals number of blocks launched).
+        TL_FP8_DTYPE (tl.dtype): Target fp8 datatype.
+        MAX_FP8 (float): Maximum expressible value for FP8.
+        EPS (float): Epsilon for numerical stability.
+        BLOCK_SIZE (int): Block size for processing.
+    """
+    pid = tl.program_id(0)
+
+    # Phase 1: Each block finds max across all its assigned chunks
+    local_max = 0.0
+    chunk_id = pid
+    num_chunks = tl.cdiv(N, BLOCK_SIZE)
+
+    while chunk_id < num_chunks:
+        offset = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        a = tl.load(A + offset, mask=offset < N, other=0.0)
+        chunk_max = tl.max(tl.abs(a))
+        local_max = tl.maximum(local_max, chunk_max)
+        chunk_id += num_sms
+
+    # Atomically update global max using integer atomics on float bits
+    local_max_int = local_max.to(tl.float32, bitcast=False).to(tl.int32, bitcast=True)
+    tl.atomic_max(global_max_ptr, local_max_int)
+
+    # Increment completed block counter
+    old_count = tl.atomic_add(blocks_done_ptr, 1)
+
+    # Last block to finish computes the scale
+    if old_count == num_sms - 1:
+        global_max_int = tl.load(global_max_ptr)
+        global_max_float = global_max_int.to(tl.float32, bitcast=True)
+        global_max_float = tl.maximum(global_max_float, EPS)
+        scale = tl.div_rn(global_max_float, MAX_FP8)
+        tl.store(scale_out_ptr, scale)
+        tl.atomic_xchg(scale_ready_ptr, 1)
+
+    # Phase 2: Spin-wait for scale to be ready
+    # Safe because all num_sms blocks are guaranteed to be running
+    while tl.atomic_add(scale_ready_ptr, 0) == 0:
+        pass
+
+    # Load scale and quantize all assigned chunks
+    scale = tl.load(scale_out_ptr)
+    chunk_id = pid
+
+    while chunk_id < num_chunks:
+        offset = chunk_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        a = tl.load(A + offset, mask=offset < N, other=0.0)
+        a_fp8 = a * tl.div_rn(1.0, scale)
+        a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
+        tl.store(A_fp8 + offset, a_fp8, mask=offset < N)
+        chunk_id += num_sms
+
+
+def _get_num_sms(device: torch.device) -> int:
+    """Get the number of SMs on the current GPU device."""
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def triton_quantize_fp8_tensor(
+    a: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Triton implementation to quantize a tensor to fp8 with a single scale.
+
+    Uses a fused persistent kernel with atomic operations for inter-block
+    coordination. By launching exactly num_sms blocks, we guarantee all
+    blocks run concurrently, avoiding deadlocks from spin-waiting.
+
+    Args:
+        a (Tensor): Input tensor to be quantized.
+
+    Returns:
+        torch.Tensor: fp8 quantized tensor.
+        torch.Tensor: scalar reciprocal scale tensor (fp32).
+    """
+    pt_dtype, tl_dtype, max_fp8, eps = get_fp8_constants()
+    N = a.numel()
+
+    BLOCK_SIZE = 4096
+    # Launch exactly num_sms blocks to guarantee concurrent execution
+    num_sms = _get_num_sms(a.device)
+
+    # Allocate synchronization buffers (initialized to 0)
+    global_max = torch.zeros(1, device=a.device, dtype=torch.int32)
+    blocks_done = torch.zeros(1, device=a.device, dtype=torch.int32)
+    scale_ready = torch.zeros(1, device=a.device, dtype=torch.int32)
+    scale_out = torch.empty((), device=a.device, dtype=torch.float32)
+
+    # Output tensor matches shape of a but is contiguous.
+    a_fp8 = torch.empty_like(a, dtype=pt_dtype)
+
+    with torch.cuda.device(a.device.index):
+        _kernel_quantize_fp8_tensor[(num_sms,)](
+            a,
+            a_fp8,
+            global_max,
+            blocks_done,
+            scale_ready,
+            scale_out,
+            N,
+            num_sms,
+            # pyre-ignore[6]: Incompatible parameter type
+            TL_FP8_DTYPE=tl_dtype,
+            # pyre-ignore[6]: Incompatible parameter type
+            MAX_FP8=max_fp8,
+            # pyre-ignore[6]: Incompatible parameter type
+            EPS=eps,
+            # pyre-ignore[6]: Incompatible parameter type
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+    return a_fp8, scale_out
+
+
+@torch.library.custom_op("triton::quantize_fp8_tensor", mutates_args=())
+def quantize_fp8_tensor(
+    a: torch.Tensor,
+    use_triton: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to fp8 with a single scale factor across the entire tensor.
+
+    The scale is computed as MAX_FP8 / max(abs(a)) and applied uniformly.
+    Handles non-contiguous input tensors and returns a contiguous output.
+
+    Args:
+        a (Tensor): Input tensor of any shape. May be non-contiguous.
+        use_triton (bool): Whether to use optimized triton kernel.
+
+    Returns:
+        torch.Tensor: fp8 quantized tensor (contiguous, same shape as input).
+        torch.Tensor: scalar reciprocal scale tensor (fp32).
+    """
+    if a.device == torch.device("cpu"):
+        use_triton = False
+
+    if use_triton:
+        a_fp8, reciprocal_scale = triton_quantize_fp8_tensor(a)
+        return a_fp8, reciprocal_scale
+
+    # Fallback to PyTorch implementation
+    pt_dtype, _, max_fp8, eps = get_fp8_constants()
+
+    tensor_max = torch.max(torch.abs(a)).to(torch.float32)
+    tensor_max = torch.clamp(tensor_max, min=eps)
+
+    scale = max_fp8 / tensor_max  # pyre-ignore[58]
+    a_scaled = a.to(torch.float32) * scale
+    a_scaled = torch.clamp(a_scaled, -max_fp8, max_fp8)
+    a_fp8 = a_scaled.to(pt_dtype)
+
+    reciprocal_scale = (1.0 / scale).to(torch.float32)  # pyre-ignore[16]
+
+    return a_fp8, reciprocal_scale
+
+
+@quantize_fp8_tensor.register_fake
+def quantize_fp8_tensor_meta(
+    a: torch.Tensor,
+    use_triton: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Shape function for torch compile."""
+    dtype = get_fp8_constants()[0]
+    # Preserve memory format (e.g., channels_last_3d) from input tensor
+    fake_out = torch.empty_like(a, dtype=dtype)
+    fake_scale = torch.empty((), device=a.device, dtype=torch.float32)
+    return fake_out, fake_scale
+
+
+@triton.jit
 def _kernel_dequantize_fp8_block(
     xq_ptr,
     x_scale_ptr,
