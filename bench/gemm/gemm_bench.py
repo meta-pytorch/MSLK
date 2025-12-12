@@ -32,7 +32,7 @@ except ImportError:
             super().__init__()
 
 
-from mslk.bench.gemm.gemm_ops import GemmOpBase, get_gemm_ops
+from mslk.bench.gemm.gemm_ops import GemmOpBase, GemmType, get_gemm_ops
 
 
 shape_registry = {}
@@ -214,11 +214,15 @@ def benchmark_grouped(
             gemm_op.fast_accum = fast_accum
         if hasattr(gemm_op, "torch_compile"):
             gemm_op.torch_compile = torch_compile
-        # Get the quantized tensors for this operator.
-        preprocessed_args = gemm_op.preprocess(A, B)
-        quantized_vals = gemm_op.quantize(*preprocessed_args)
-        # Compute the output given quantized values.
-        output = gemm_op.compute(*quantized_vals)
+        try:
+            # Get the quantized tensors for this operator.
+            preprocessed_args = gemm_op.preprocess(A, B)
+            quantized_vals = gemm_op.quantize(*preprocessed_args)
+            # Compute the output given quantized values.
+            output = gemm_op.compute(*quantized_vals)
+        except Exception as e:
+            print(f"GEMM op {gemm_op.name} failed to run due to error: {e}.")
+            continue
         # Some kernels may pad output, just take the first m values of each row.
         if isinstance(output, torch.Tensor) and output.ndim == 2:
             # Output is stacked and needs to be split.
@@ -311,12 +315,16 @@ def benchmark(
             gemm_op.fast_accum = fast_accum
         if hasattr(gemm_op, "torch_compile"):
             gemm_op.torch_compile = torch_compile
-        # Preprocess data if needed.
-        preprocessed_args = gemm_op.preprocess(A, B)
-        # Get the quantized tensors for this operator.
-        quantized_vals = gemm_op.quantize(*preprocessed_args)
-        # Compute the output given quantized values.
-        output = gemm_op.compute(*quantized_vals)
+        try:
+            # Preprocess data if needed.
+            preprocessed_args = gemm_op.preprocess(A, B)
+            # Get the quantized tensors for this operator.
+            quantized_vals = gemm_op.quantize(*preprocessed_args)
+            # Compute the output given quantized values.
+            output = gemm_op.compute(*quantized_vals)
+        except Exception as e:
+            print(f"GEMM op {gemm_op.name} failed to run due to error: {e}.")
+            continue
         # Compare the quantize op output to reference as a sanity check.
         # TODO(shikaili): This calculation is incorrect for scatter add fusion.
         metrics.sim = torch.mean(torch.pow(output - out_ref, 2)).item()
@@ -395,9 +403,15 @@ def plot_benchmark(results: list[dict[str, Any]], output_dir: str) -> None:
     print(f"Plot saved to {img_fn}")
 
 
-def collect_kernels_to_profile(kernels: Optional[list[str]]) -> list[GemmOpBase]:
-    # Get existing quantization operators.
-    gemm_ops = [op for op in get_gemm_ops() if op.supported]
+def collect_kernels_to_profile(
+    kernels: Optional[list[str]], is_grouped: bool
+) -> list[GemmOpBase]:
+    gemm_type = GemmType.GROUPED if is_grouped else GemmType.REGULAR
+    gemm_ops = [
+        op
+        for op in get_gemm_ops()
+        if op.supported and gemm_type in op.supported_gemm_types
+    ]
     if kernels is None:
         return gemm_ops
     return [op for op in gemm_ops if op.name in kernels]
@@ -405,12 +419,13 @@ def collect_kernels_to_profile(kernels: Optional[list[str]]) -> list[GemmOpBase]
 
 def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     data = sorted(
-        [
-            (op.name, "Yes" if op.cuda else "No", "Yes" if op.hip else "No")
-            for op in get_gemm_ops()
-        ]
+        (
+            op.name,
+            ",".join(accelerator.name for accelerator in op.supported_accelerators),
+        )
+        for op in get_gemm_ops()
     )
-    print(tabulate(data, headers=["Name", "CUDA", "ROCm"], tablefmt="orgtbl"))
+    print(tabulate(data, headers=["Name", "Accelerators"], tablefmt="orgtbl"))
 
 
 @click.command()
@@ -563,7 +578,7 @@ def invoke_main(
 
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
     all_kernels = kernels.strip().split(",") if kernels else None
-    gemm_ops = collect_kernels_to_profile(all_kernels)
+    gemm_ops = collect_kernels_to_profile(all_kernels, grouped)
 
     if len(gemm_ops) == 0:
         print("No valid kernels to benchmark. Available kernels:")

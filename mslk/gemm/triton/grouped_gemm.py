@@ -192,14 +192,12 @@ def early_config_prune_ws(configs, named_args, dtsize=None, dtype=None, **kwargs
             BLOCK_N,
             BLOCK_K,
             num_stages,
-            num_warps,
             use_tma_load_on_scales,
         ) = (
             kw["BLOCK_SIZE_M"],
             kw["BLOCK_SIZE_N"],
             kw["BLOCK_SIZE_K"],
             config.num_stages,
-            config.num_warps,
             kw.get("USE_TMA_LOAD_ON_SCALES", False),
         )
         G, M, N = (
@@ -283,8 +281,6 @@ def _mslk_grouped_gemm(
     )
 
     tidx = tl.program_id(0)
-
-    dtype: tl.dtype = c_ptr.dtype.element_ty
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
@@ -440,8 +436,6 @@ def _mslk_grouped_gemm_ws(
 
     tidx = tl.program_id(0)
 
-    dtype: tl.dtype = c_ptr.dtype.element_ty
-
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
     iterated_tiles = 0
@@ -578,8 +572,6 @@ def _mslk_grouped_gemm_fp8_rowwise(
     )
 
     tidx = tl.program_id(0)
-
-    dtype = TT_FP8_DTYPE
 
     M_end_offset = 0
     M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
