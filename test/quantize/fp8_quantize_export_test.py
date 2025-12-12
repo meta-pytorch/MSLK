@@ -13,7 +13,11 @@ from typing import Any, Callable, List
 import mslk.quantize  # noqa: F401
 import torch
 from hypothesis import given, settings, strategies as st
-from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+from mslk.quantize.triton.fp8_quantize import (
+    quantize_fp8_block,
+    quantize_fp8_row,
+    quantize_fp8_tensor,
+)
 
 
 @unittest.skipIf(
@@ -50,6 +54,7 @@ class Fp8QuantizeExportTest(unittest.TestCase):
             [
                 quantize_fp8_row,
                 quantize_fp8_block,
+                quantize_fp8_tensor,
                 torch.ops.mslk.quantize_fp8_per_row,
                 torch.ops.mslk.quantize_fp8_per_col,
                 torch.ops.mslk.quantize_fp8_per_tensor,
