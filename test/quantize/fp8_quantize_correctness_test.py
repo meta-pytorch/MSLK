@@ -13,7 +13,11 @@ from typing import Any, Callable, List
 import mslk.quantize  # noqa: F401
 import torch
 from hypothesis import given, settings, strategies as st
-from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+from mslk.quantize.triton.fp8_quantize import (
+    quantize_fp8_block,
+    quantize_fp8_row,
+    quantize_fp8_tensor,
+)
 
 
 def undo_tensorwise_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -64,6 +68,7 @@ class FP8CorrectnessTest(unittest.TestCase):
             [
                 [quantize_fp8_row, undo_rowwise_quant],
                 [quantize_fp8_block, undo_blockwise_quant],
+                [quantize_fp8_tensor, undo_tensorwise_quant],
                 [torch.ops.mslk.quantize_fp8_per_row, undo_rowwise_quant],
                 [torch.ops.mslk.quantize_fp8_per_col, undo_colwise_quant],
                 [torch.ops.mslk.quantize_fp8_per_tensor, undo_tensorwise_quant],
