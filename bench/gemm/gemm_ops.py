@@ -92,6 +92,7 @@ except ImportError:
 class Accelerator(Enum):
     NVIDIA_SM90 = auto()
     NVIDIA_SM100 = auto()
+    NVIDIA_SM103 = auto()
     AMD_MI300X = auto()
 
 
@@ -115,6 +116,8 @@ def get_current_accelerator() -> Accelerator | None:
             return Accelerator.NVIDIA_SM90
         elif major == 10 and minor == 0:
             return Accelerator.NVIDIA_SM100
+        elif major == 10 and minor == 3:
+            return Accelerator.NVIDIA_SM103
 
     raise Exception("Cannot detect hardware that is supported by gemm_bench.")
 
@@ -484,6 +487,7 @@ class BF16X9Baseline(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
         }
 
     @property
@@ -583,7 +587,63 @@ class ScaledMMMXFP8(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+
+@register_gemm_op
+class ScaledMMNVFP4(GemmOpBase):
+    def __init__(self):
+        self.torch_compile = False
+
+    def quantize(self, x, w):
+        x_global_scale = torch.tensor([1.0], device=x.device, dtype=torch.float32)
+        w_global_scale = torch.tensor([1.0], device=w.device, dtype=torch.float32)
+
+        xq, x_scale = triton_scale_nvfp4_quant(x, x_global_scale)
+        wq, w_scale = triton_scale_nvfp4_quant(w, w_global_scale)
+
+        return (
+            xq.view(torch.float4_e2m1fn_x2),
+            wq.view(torch.float4_e2m1fn_x2),
+            x_scale.view(torch.float8_e4m3fn),
+            w_scale.view(torch.float8_e4m3fn),
+        )
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        if self.torch_compile:
+            f = torch.compile(
+                torch._scaled_mm,
+                options={
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "TRITON,CK,CUTLASS,ATEN",
+                },
+            )
+        else:
+            f = torch._scaled_mm
+
+        return f(
+            xq,
+            wq.t(),
+            bias=None,
+            out_dtype=torch.bfloat16,
+            scale_a=x_scale,
+            scale_b=w_scale,
+        )
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def name(self) -> str:
+        return "scaled_mm_nvfp4"
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -649,7 +709,11 @@ class FP8CublasRowwiseGemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -681,7 +745,11 @@ class FP8CublasTensorwiseGemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -764,6 +832,7 @@ class FP8RowwiseGemm(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -887,6 +956,7 @@ class FP8RowwiseGroupedGemm(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -1316,6 +1386,7 @@ class FP8StackedGroupedGemm(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -1508,6 +1579,7 @@ class BF16GroupedGemm(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -1550,6 +1622,7 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -2069,7 +2142,11 @@ class BF16GroupedGrad(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2115,7 +2192,11 @@ class BF16GroupedWGrad(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90, Accelerator.NVIDIA_SM100}
+        return {
+            Accelerator.NVIDIA_SM90,
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2158,6 +2239,7 @@ class BF16GroupedStacked(GemmOpBase):
         return {
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
             Accelerator.AMD_MI300X,
         }
 
@@ -2267,7 +2349,11 @@ class MarlinBF16I4(GemmOpBase):
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         if MARLIN_ENABLED:
-            return {Accelerator.NVIDIA_SM90}
+            return {
+                Accelerator.NVIDIA_SM90,
+                Accelerator.NVIDIA_SM100,
+                Accelerator.NVIDIA_SM103,
+            }
         return set()
 
     @property
@@ -2345,7 +2431,7 @@ class NVFP4Gemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2429,7 +2515,7 @@ class NVFP4Quantize(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2460,7 +2546,7 @@ class MXFP4Gemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2536,7 +2622,7 @@ class MXFP4StackedGroupedGemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2680,7 +2766,7 @@ class NVFP4StackedGroupedGemm(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2849,7 +2935,7 @@ class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2979,7 +3065,7 @@ class MXFP8GroupedGemm2d3d(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -3092,7 +3178,7 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
