@@ -76,37 +76,35 @@ try:
         attention, logsumexp, rng_state, _, _ = ret
         return attention, logsumexp, rng_state
 
-        @torch.library.register_fake("mslk_flash_mtia::flash_fwd")
-        def _flash_fwd_abstract(
-            query,
-            key,
-            value,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            p,
-            softmax_scale,
-            is_causal,
-            window_left,
-            window_right,
-            return_softmax,
-            block_tables,
-        ):
-            out = torch.empty_like(query)
-            if cu_seqlens_q is None:
-                B, M, H, K = query.shape
-                lse_shape = [B, H, M]  # XXXX ?
-            else:
-                M, H, K = query.shape
-                B = cu_seqlens_q.shape[0] - 1
-                lse_shape = [H, M]
-            softmax_lse = torch.empty(
-                lse_shape, device=query.device, dtype=torch.float32
-            )
-            rng_state = torch.empty([2], device=query.device, dtype=torch.int64)
-            return out, softmax_lse, rng_state
+    @torch.library.register_fake("mslk_flash_mtia::flash_fwd")
+    def _flash_fwd_abstract(
+        query,
+        key,
+        value,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        p,
+        softmax_scale,
+        is_causal,
+        window_left,
+        window_right,
+        return_softmax,
+        block_tables,
+    ):
+        out = torch.empty_like(query)
+        if cu_seqlens_q is None:
+            B, M, H, K = query.shape
+            lse_shape = [B, H, M]  # XXXX ?
+        else:
+            M, H, K = query.shape
+            B = cu_seqlens_q.shape[0] - 1
+            lse_shape = [H, M]
+        softmax_lse = torch.empty(lse_shape, device=query.device, dtype=torch.float32)
+        rng_state = torch.empty([2], device=query.device, dtype=torch.int64)
+        return out, softmax_lse, rng_state
 
     @torch.library.custom_op(
         "mslk_flash_mtia::flash_bwd",
