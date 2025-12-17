@@ -9,6 +9,8 @@
 # shellcheck disable=SC1091,SC2128
 . "$( dirname -- "$BASH_SOURCE"; )/utils_base.bash"
 # shellcheck disable=SC1091,SC2128
+. "$( dirname -- "$BASH_SOURCE"; )/utils_pip.bash"
+# shellcheck disable=SC1091,SC2128
 . "$( dirname -- "$BASH_SOURCE"; )/utils_pytorch.bash"
 
 ################################################################################
@@ -105,7 +107,7 @@ integration_mslk_build_and_install () {
   mkdir -p _tmp_dir_mslk                                    || return 1
   pushd _tmp_dir_mslk                                       || return 1
   # Uninstall the MSLK package (if installed)
-  uninstall_mslk_wheel  "${env_name}"                       || return 1
+  uninstall_pip_wheel  "${env_name}" "mslk-"                || return 1
   # Install the MSLK package and test the package import
   install_mslk_wheel    "${env_name}" ${repo}/dist/*.whl    || return 1
   # Return to the repo root directory

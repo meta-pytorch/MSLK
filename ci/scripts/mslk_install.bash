@@ -151,37 +151,6 @@ __mslk_post_install_checks () {
   popd || return 1
 }
 
-uninstall_mslk_wheel () {
-  local env_name="$1"
-  if [ "$env_name" == "" ]; then
-    echo "Usage: ${FUNCNAME[0]} ENV_NAME"
-    echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env     # Uninstall the MSLK wheel (if installed)"
-    return 1
-  else
-    echo "################################################################################"
-    echo "# Uninstall MSLK Wheel (If Installed)"
-    echo "#"
-    echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
-    echo "################################################################################"
-    echo ""
-  fi
-
-  # shellcheck disable=SC2155
-  local env_prefix=$(env_name_or_prefix "${env_name}")
-
-  # shellcheck disable=SC2155,SC2086
-  local packages=$(conda run ${env_prefix} python -m pip list --format=freeze | grep "mslk-" | cut -d"=" -f1)
-
-  if [ -n "$packages" ]; then
-    echo "[UNINSTALL] Uninstalling the following packages: $packages"
-    # shellcheck disable=SC2086
-    print_exec conda run ${env_prefix} python -m pip uninstall -y $packages || return 1
-  else
-    echo "[UNINSTALL] No matching packages found."
-  fi
-}
-
 install_mslk_wheel () {
   local env_name="$1"
   local wheel_path="$2"
