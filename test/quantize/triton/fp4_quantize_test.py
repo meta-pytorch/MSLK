@@ -16,15 +16,22 @@ from hypothesis import given, settings, strategies as st
 
 from mslk.quantize.triton.fp4_quantize import (
     _from_blocked,
+    _to_blocked,
     cal_global_scale_mx4_as_nvfp4,
+    FP4_E2M1_MAX,
+    FP4_EBITS,
+    FP4_MBITS,
+    FP8_E4M3_MAX,
     RoundingMode,
     triton_quantize_mx4_unpack,
+    triton_quantize_nvfp4,
     triton_rms_quantize_mx4_unpack,
-    triton_scale_nvfp4_quant,
     triton_scale_nvfp4_quant_rms,
     triton_scale_nvfp4_quant_silu,
     triton_silu_quantize_mx4_unpack,
 )
+
+from torch.testing._internal.common_quantized import _f32_to_floatx_unpacked, pack_uint4
 
 # pyre-fixme [16]
 open_source: bool = getattr(mslk, "open_source", False)
@@ -73,12 +80,9 @@ def global_scale_nvfp4(
     x: torch.Tensor,
 ) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    FP8_E4M3_MAX = 448.0
-    FP4_E2M1_MAX = 6.0
-    global_scale = torch.tensor(
-        [FP8_E4M3_MAX * FP4_E2M1_MAX], device=x.device
-    ) / torch.amax(torch.abs(x))
-    return global_scale.to(torch.float32)
+    amax = torch.amax(torch.abs(x)).to(torch.float32)
+    global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax
+    return global_scale
 
 
 def scale_nvfp4(
@@ -271,19 +275,18 @@ class TestNVFp4Quantize(unittest.TestCase):
             mimic_mx4_as_nvfp4: bool = False,
         ) -> None:
             M, N = shape
-            group_size = 16
             x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
             if mimic_mx4_as_nvfp4:
                 x_global_scale = cal_global_scale_mx4_as_nvfp4(x)
             else:
                 x_global_scale = global_scale_nvfp4(x)
-            xq, x_scale = triton_scale_nvfp4_quant(
+            xq, x_scale = triton_quantize_nvfp4(
                 x,
                 x_global_scale,
-                group_size=group_size,
                 use_e8m0_scale=mimic_mx4_as_nvfp4,
             )
 
+            xq = xq.view(torch.uint8)
             xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
             torch.testing.assert_close(xq_dequant, x, atol=1, rtol=1)
 
@@ -340,6 +343,63 @@ class TestNVFp4Quantize(unittest.TestCase):
 
         y_ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(fake_quant_y, y_ref, atol=0.1, rtol=0.1)
+
+    @settings(deadline=None)
+    @given(
+        problem_shape=st.sampled_from(
+            [
+                (128, 64),  # canonical layout
+                (5, 64),  # canonical layout with M padding
+                (128, 16),  # canonical layout with N padding
+                (5, 16),  # canonical layout with M and N padding
+                (256, 64),  # two canonical layouts over M
+                (128, 128),  # two canonical layouts over N
+                (150, 64),  # two canonical layouts over M with padding
+                (128, 144),  # two canonical layouts over N with padding
+                (4096, 4096),  # large square matrix
+                (4000, 4096),  # large matrix with m padding
+                (4096, 4080),  # large square matrix with n padding
+                (4000, 4080),  # large square matrix with m and n padding
+            ]
+        ),
+    )
+    def test_numerical_correctness(self, problem_shape):
+        """
+        Quantize against torch NVFP4 reference and compare for numerical correctness.
+        """
+        torch.manual_seed(0)
+        M, N = problem_shape
+        x = torch.randn(M, N, dtype=torch.bfloat16, device=self.device)
+
+        x_global_scale = global_scale_nvfp4(x)
+        x_fp4, x_scales = triton_quantize_nvfp4(x, x_global_scale)
+        x_fp4_ref, x_scales_ref, x_global_scale_ref = data_to_nvfp4_with_global_scale(
+            x, 16
+        )
+        # Compare the scales with padding to ensure the padding zero'd out.
+        x_scales_ref = _to_blocked(x_scales_ref).view(x_scales.shape)
+
+        torch.testing.assert_close(x_global_scale, x_global_scale_ref.reciprocal())
+        torch.testing.assert_close(x_scales, x_scales_ref)
+        torch.testing.assert_close(x_fp4, x_fp4_ref)
+
+    @settings(deadline=None)
+    @given(
+        test_case=st.sampled_from(
+            [
+                ((1024, 5), "N must be divisible by 16 for NVFP4 quantization"),
+            ]
+        ),
+    )
+    def test_invalid_inputs(self, test_case):
+        torch.manual_seed(0)
+        problem_shape, error_msg = test_case
+        M, N = problem_shape
+        x = torch.randn(M, N, dtype=torch.bfloat16, device=self.device)
+
+        x_global_scale = global_scale_nvfp4(x)
+        with self.assertRaisesRegex(AssertionError, error_msg):
+            triton_quantize_nvfp4(x, x_global_scale)
 
 
 @unittest.skipIf(
@@ -420,3 +480,49 @@ class TestNVFp4RmsQuantize(unittest.TestCase):
         _test_rms_quantize_nvfp4((128, 1024))
         _test_rms_quantize_nvfp4((1024, 10240))
         # Note, large testing tensors may lead to slight numerical differences
+
+
+# When the below functions is added to Torch core, remove it and use it there instead.
+def data_to_nvfp4_with_global_scale(x, block_size):
+    # Simple (slow) reference implementation of NVFP4 two-level-scaling
+    orig_shape = x.shape
+    x = x.reshape(-1, block_size).to(torch.float32)
+
+    # Per-block-amax
+    block_max = torch.amax(torch.abs(x), 1) + 1e-12
+
+    # Per-tensor max
+    global_max = x.abs().max()
+    assert global_max.dtype == torch.float32
+
+    # Constants
+    # Global encoding scale for block-scales
+    S_enc = (FP8_E4M3_MAX * FP4_E2M1_MAX) / global_max
+    S_dec = 1.0 / S_enc
+
+    # Per-block decode-scale
+    S_dec_b = block_max / FP4_E2M1_MAX
+
+    # Stored scaled-e4m3 per-block decode scales
+    S_dec_b_e4m3 = (S_dec_b * S_enc).to(torch.float8_e4m3fn)
+
+    # Actual per-block encoding scale
+    S_enc_b = S_enc / S_dec_b_e4m3.float()
+
+    # scale & reshape input, reshape scales
+    x = (S_enc_b.unsqueeze(1) * x).reshape(orig_shape)
+    S_dec_b_e4m3 = S_dec_b_e4m3.reshape(orig_shape[0], -1)
+
+    # cast input
+    x_fp4 = _float32_to_float4_e2m1fn_x2(x)
+
+    # fp4x2, fp8_e4m3, float respectively
+    return x_fp4, S_dec_b_e4m3, S_dec.float()
+
+
+def _float32_to_float4_e2m1fn_x2(x):
+    assert x.dtype == torch.float
+    x = _f32_to_floatx_unpacked(x, FP4_EBITS, FP4_MBITS)
+    x = pack_uint4(x)
+    x = x.view(torch.float4_e2m1fn_x2)
+    return x

@@ -12,7 +12,7 @@ from typing import Any, TypeVar
 
 import torch
 import triton  # @manual=//triton:triton
-from mslk.quantize.triton.fp4_quantize import triton_scale_nvfp4_quant
+from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
@@ -235,8 +235,8 @@ class TritonNVFP4(QuantizeOpBase):
     def quantize(self, input: torch.Tensor, *args: Any) -> Any:
         global_scale: torch.Tensor
         global_scale = args[0]
-        input_quantized, scales = triton_scale_nvfp4_quant(input, global_scale)
-        return input_quantized, scales, global_scale
+        input_quantized, scales = triton_quantize_nvfp4(input, global_scale)
+        return input_quantized.view(torch.uint8), scales, global_scale
 
     def dequantize(self, *args: Any) -> torch.Tensor:
         input_quantized: torch.Tensor
