@@ -373,62 +373,6 @@ class BF16Baseline(GemmOpBase):
 
 
 @register_gemm_op
-class GroupedBF16Baseline(GemmOpBase):
-    """
-    Baseline BF16 grouped matmul.
-    """
-
-    def __init__(self):
-        self.torch_compile = False
-
-    def preprocess(self, x, w):
-        m_values = [i.shape[0] for i in x]
-        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
-        offsets = torch.cumsum(m_sizes, dim=0, dtype=torch.int32)
-        # view inputs as single tensors.
-        x = torch.concat(x, dim=0).contiguous()
-        w = torch.stack(w, dim=0).contiguous()
-        return x, w, offsets
-
-    def quantize(self, x, w, offsets):
-        return x, w, offsets
-
-    def compute(self, x, w, offsets):
-        if self.torch_compile:
-            f = torch.compile(
-                torch._grouped_mm,
-                options={
-                    "max_autotune": True,
-                    "max_autotune_gemm_backends": "TRITON,CK,CUTLASS,ATEN",
-                },
-            )
-        else:
-            f = torch._grouped_mm
-
-        return f(
-            x,
-            w.transpose(-2, -1),
-            offs=offsets,
-            out_dtype=torch.bfloat16,
-        )
-
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
-    @property
-    def name(self) -> str:
-        return "bf16_grouped_baseline"
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return set(Accelerator)
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR, GemmType.GROUPED}
-
-
-@register_gemm_op
 class ScaledMMBaseline(GemmOpBase):
     """
     Reference FP8 matmul implemented in native torch with cublas or hipblas.
