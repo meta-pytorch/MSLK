@@ -309,7 +309,7 @@ class BuildConfigScheme:
             if self.jobtype == JOBTYPE_BUILD:
                 table = {
                     TARGET_DEFAULT: [
-                        {"arch": "x86", "instance": "linux.12xlarge.memory"}
+                        {"arch": "x86", "instance": "linux.24xlarge.memory"}
                     ],
                 }
                 return table[self.target]
