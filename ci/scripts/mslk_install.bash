@@ -69,6 +69,7 @@ __install_check_subpackages () {
   echo "[INSTALL] Check for installation of Python sources ..."
   local subpackages=(
     mslk.attention
+    mslk.conv
     mslk.comm
     mslk.gemm
     mslk.kv_cache
@@ -99,6 +100,12 @@ __install_check_operator_registrations () {
     test_operators+=(
       torch.ops.mslk.rope_qkv_decoding
       torch.ops.mslk.f8f8bf16_rowwise
+    )
+  fi
+
+  if [ "$installed_mslk_variant" == "cuda" ]; then
+    test_operators+=(
+      torch.ops.mslk.f8f8bf16_conv
     )
   fi
 
