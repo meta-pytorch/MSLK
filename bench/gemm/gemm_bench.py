@@ -188,6 +188,7 @@ def benchmark_grouped(
     num_iters: int = 1,
     fast_accum: bool = True,
     torch_compile: bool = False,
+    rep: int = 200,
 ) -> dict[str, Any]:
     num_groups = len(m)
     # Create input tensors.
@@ -246,6 +247,7 @@ def benchmark_grouped(
                         bench_quantize=True,
                         use_rotating_buffer_bench=use_rotating_buffer_bench,
                         use_cuda_graph=use_cuda_graph,
+                        rep=rep,
                     )
             else:
                 with profiler_or_nullcontext(enabled=trace, with_stack=True):
@@ -254,6 +256,7 @@ def benchmark_grouped(
                         bench_quantize=False,
                         use_rotating_buffer_bench=use_rotating_buffer_bench,
                         use_cuda_graph=use_cuda_graph,
+                        rep=rep,
                     )
 
             # Print out results for this op.
@@ -298,6 +301,7 @@ def benchmark(
     num_iters: int = 1,
     fast_accum: bool = True,
     torch_compile: bool = False,
+    rep: int = 200,
 ) -> dict[str, Any]:
     # Create input tensors.
     A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -339,6 +343,7 @@ def benchmark(
                         bench_quantize=True,
                         use_rotating_buffer_bench=use_rotating_buffer_bench,
                         use_cuda_graph=use_cuda_graph,
+                        rep=rep,
                     )
             else:
                 with profiler_or_nullcontext(enabled=trace, with_stack=True):
@@ -347,6 +352,7 @@ def benchmark(
                         bench_quantize=False,
                         use_rotating_buffer_bench=use_rotating_buffer_bench,
                         use_cuda_graph=use_cuda_graph,
+                        rep=rep,
                     )
 
             # Print out results for this op.
@@ -540,6 +546,12 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     is_flag=True,
     help="If set, torch.compile will be used for scaled_mm backed ops.",
 )
+@click.option(
+    "--rep",
+    default=200,
+    type=int,
+    help="Repetition time in ms (int) for triton.testing.do_bench",
+)
 def invoke_main(
     output_dir: str,
     num_iters: int,
@@ -562,6 +574,7 @@ def invoke_main(
     trace: bool,
     disable_fast_accum: bool,
     torch_compile: bool,
+    rep: int,
 ):
     if enable_amd_env_vars:
         set_amd_env_vars()
@@ -678,6 +691,7 @@ def invoke_main(
             num_iters,
             not disable_fast_accum,
             torch_compile,
+            rep,
         )
         benchmark_results.append(quantize_measurements)
     if export_csv or plot:

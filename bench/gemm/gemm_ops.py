@@ -147,7 +147,9 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         """Preprocess inputs before benchmarking. These outputs will be passed to quantize."""
         return args
 
-    def bench_with_rotating_buffer(self, fn, args, use_cuda_graph: bool = True):
+    def bench_with_rotating_buffer(
+        self, fn, args, use_cuda_graph: bool = True, rep: int = 200
+    ):
         import copy
         import pickle
 
@@ -177,12 +179,12 @@ class GemmOpBase(metaclass=abc.ABCMeta):
                 # so divide time accordingly
                 return triton.testing.do_bench_cudagraph(
                     lambda: rotating_buffer_fn(self.compute, args_list, copy_cnt + 1),
-                    rep=200,
+                    rep=rep,
                 ) / (copy_cnt + 1)
         else:
             return triton.testing.do_bench(
                 lambda: rotating_buffer_fn(self.compute, args_list, copy_cnt + 1),
-                rep=200,
+                rep=rep,
             ) / (copy_cnt + 1)
 
     def benchmark(
@@ -191,6 +193,7 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         bench_quantize: bool = False,
         use_rotating_buffer_bench: bool = False,
         use_cuda_graph: bool = True,
+        rep: int = 200,
         **kwargs,
     ) -> float:
         """Benchmark runtime of this operator."""
@@ -198,23 +201,27 @@ class GemmOpBase(metaclass=abc.ABCMeta):
             if use_cuda_graph:
                 with torch.cuda.stream(torch.cuda.Stream()):
                     t = triton.testing.do_bench_cudagraph(
-                        lambda: self.quantize_and_compute(*args, **kwargs), rep=200
+                        lambda: self.quantize_and_compute(*args, **kwargs), rep=rep
                     )
             else:
                 t = triton.testing.do_bench(
-                    lambda: self.quantize_and_compute(*args, **kwargs)
+                    lambda: self.quantize_and_compute(*args, **kwargs), rep=rep
                 )
         else:
             if use_rotating_buffer_bench:
-                t = self.bench_with_rotating_buffer(self.compute, args, use_cuda_graph)
+                t = self.bench_with_rotating_buffer(
+                    self.compute, args, use_cuda_graph, rep=rep
+                )
             else:
                 if use_cuda_graph:
                     with torch.cuda.stream(torch.cuda.Stream()):
                         t = triton.testing.do_bench_cudagraph(
-                            lambda: self.compute(*args, **kwargs), rep=200
+                            lambda: self.compute(*args, **kwargs), rep=rep
                         )
                 else:
-                    t = triton.testing.do_bench(lambda: self.compute(*args, **kwargs))
+                    t = triton.testing.do_bench(
+                        lambda: self.compute(*args, **kwargs), rep=rep
+                    )
         return t
 
     @abc.abstractproperty
