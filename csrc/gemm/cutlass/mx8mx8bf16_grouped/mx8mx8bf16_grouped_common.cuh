@@ -120,10 +120,8 @@ at::Tensor mx8mx8bf16_grouped_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          //   void, // Indicate there is no beta scaling to save register
-          //   space.
-          ElementC,
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
+          void, // no beta for C
+          void, // don't read C
           128 / cutlass::sizeof_bits<ElementC>::value,
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
@@ -297,6 +295,7 @@ at::Tensor mx8mx8bf16_grouped_impl(
       wq_ptr,
       reinterpret_cast<ScaleDtype*>(x_scale.data_ptr()),
       x_scale_ptr,
+      x_scale.numel(),
       reinterpret_cast<ScaleDtype*>(w_scale.data_ptr()),
       w_scale_ptr,
       reinterpret_cast<ElementC*>(output.data_ptr()),
