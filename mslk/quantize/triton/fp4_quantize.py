@@ -22,6 +22,11 @@ except ImportError:
     except ImportError:
         from triton.language.math import rsqrt as tl_rsqrt
 
+FP4_E2M1_MAX = 6.0
+FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448
+# exponent and mantissa bits of `torch.float4_e2m1fn_x2`
+FP4_EBITS, FP4_MBITS = 2, 1
+
 
 class RoundingMode(IntEnum):
     """Rounding options for quantization."""
@@ -1455,6 +1460,7 @@ def unsigned_fp32_to_e8m0(
     return unscale
 
 
+# DO NOT USE, WILL BE REMOVED SOON!!!
 @triton.jit
 def _kernel_nvfp4_quantize(
     A,
@@ -1660,148 +1666,6 @@ def _kernel_nvfp4_quantize(
         input_offset += GROUP_LOAD * GROUP_SIZE
         exp_offset += GROUP_LOAD
         output_offset += GROUP_LOAD * GROUP_SIZE // 8
-
-
-def triton_scale_nvfp4_quant(
-    input: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    group_size: int = 16,
-    ebits: int = 2,
-    mbits: int = 1,
-    rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
-    stochastic_casting: bool = False,
-    EPS: float = 1e-5,
-    use_e8m0_scale: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to nvfp4 format using efficient triton kernels.
-
-    Args:
-        a (Tensor): [M] higher precision input tensor.
-        group_size (int): Size of chunks that will use the same shared exponent.
-        ebits (int): Number of bits to use for exponent in target nvfp4 format.
-        mbits (int): Number of bits to use for mantissa in target nvfp4 format.
-        rounding_mode (Union[RoundingMode, int]): Which type of rounding to use
-        when calculating shared exponent. Defaults to pre-rounding to nearest even int.
-        stochastic_casting (bool): Whether to use stochastic casting.
-        use_e8m0_scale (bool): Whether to use E8M0 for quantization
-            (set to True when we want to mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale)
-
-    Returns:
-        torch.Tensor: [M / 2] nvfp4 scaled tensor packed into int8
-        torch.Tensor: [M / group_size] nvfp4 shared exponents into int8
-
-        eg.
-        Input with shape [1, 8192] will be quantized to [1, 4096 + 512] as
-        each value contain two elements packed into an int8 and
-        there are 32 elements per group.
-    """
-
-    orig_shape = input.shape
-    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
-    other_dims = 1 if input.ndim == 1 else -1
-    input = input.reshape(other_dims, input.shape[-1])
-    M, K = input.shape
-    block_size = group_size
-    device = input.device
-
-    assert K % block_size == 0, f"last dim has to be multiple of 16, but got {K}."
-    assert input.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
-
-    # Two fp4 values will be packed into an uint8.
-    out = torch.empty((M, K // 8), device=device, dtype=torch.uint32)
-
-    # We use the rounded values to store the swizzled values. Due to the
-    # requirement of the Tensor Core, the minimum tile is 128x4 for the scales.
-    # So, we first pad the scales to multiples of 128 and 4. Then, the scales
-    # (in float8_e4m3fn) int8. More:
-    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x
-    def round_up(x: int, y: int) -> int:
-        return (x + y - 1) // y * y
-
-    rounded_M = round_up(M, 128)
-    scale_K = K // block_size
-    rounded_K = round_up(scale_K, 4)
-    scale = torch.empty((rounded_M, rounded_K), device=device, dtype=torch.uint8)
-
-    # In this kernel, we want each row to be divisible by group_size.
-    # If the rows are not, then we will pad them. Find the number of
-    # groups per row after padding.
-    groups_per_row = math.ceil(K / group_size)
-    num_groups = M * groups_per_row
-    # Find how many groups each thread should process. We do this
-    # by assuming that it is good to distribute work evenly over threads.
-    num_threads = math.ceil(math.sqrt(input.numel()))
-    # Data is loaded in chunks of GROUP_LOAD elements, so theres no reason
-    # to ever fewer groups per thread than it.
-    GROUP_LOAD = 128
-    groups_per_thread = max(math.ceil(num_groups / num_threads), GROUP_LOAD)
-    # Determine how much padding, if any is needed for each row.
-    if K % group_size != 0:
-        padding = group_size - (K % group_size)
-    else:
-        padding = 0
-
-    # If using stochastic rounding, create random noise for each group.
-    # We use the same random bits as seeds when doing stochastic downcasting.
-    if rounding_mode == RoundingMode.stochastic or stochastic_casting:
-        # Each group will need a seed.
-        rand_bits = torch.randint(
-            low=0,
-            high=2**31 - 1,
-            size=(num_groups,),
-            dtype=torch.int32,
-            device=input.device,
-        )
-    else:
-        rand_bits = None
-
-    # Check if we need to use int64 for indexing.
-    use_int64 = num_threads * groups_per_thread * group_size > 2**31 - 1
-    # Invoke triton quantization kernel over rows.
-
-    grid = (num_threads,)
-    _kernel_nvfp4_quantize[grid](
-        input,
-        input_global_scale,
-        out,
-        scale,
-        rand_bits=rand_bits,
-        M=M,
-        K=K,
-        GROUPS_PER_ROW=groups_per_row,
-        GROUPS_PER_THREAD=groups_per_thread,
-        ROW_PADDING=padding,
-        # pyre-ignore[6]
-        EPS=EPS,
-        # pyre-ignore[6]
-        GROUP_SIZE=group_size,
-        # pyre-ignore[6]
-        EBITS=ebits,
-        # pyre-ignore[6]
-        MBITS=mbits,
-        # pyre-ignore[6]
-        ROUNDING_MODE=rounding_mode.value
-        if isinstance(rounding_mode, RoundingMode)
-        else rounding_mode,
-        # pyre-ignore[6]
-        STOCHASTIC_CASTING=stochastic_casting,
-        FP4_EXP_BIAS=get_mx4_exp_bias(ebits),
-        # pyre-ignore[6]
-        GROUP_LOAD=GROUP_LOAD,
-        # pyre-ignore[6]
-        USE_INT64=use_int64,
-        # pyre-ignore[6]
-        SCALE_K=rounded_K,
-        # pyre-ignore[6]
-        USE_E8M0_SCALE=use_e8m0_scale,
-    )
-
-    scale = scale.flatten()
-    return out.view(list(orig_shape[:-1]) + [-1]).view(torch.uint8), scale
 
 
 @triton.jit
@@ -5807,7 +5671,7 @@ def quantize_nvfp4_naive(
     """
     xqs, x_scales = zip(
         *(
-            triton_scale_nvfp4_quant(x, global_scale)
+            triton_quantize_nvfp4(x, global_scale)
             for x, global_scale in zip(xs, global_scales)
         )
     )
@@ -5833,3 +5697,246 @@ def cal_global_scale_mx4_as_nvfp4(x: torch.Tensor):
     global_scale = 256.0 / global_amax_in_mx4_range
 
     return global_scale
+
+
+def triton_quantize_nvfp4(
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+    use_e8m0_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a tensor to NVFP4 format.
+
+    Args:
+        x (torch.Tensor): Input tensor to be quantized.
+        global_scale (torch.Tensor): Per-tensor scale for two-level quantization.
+        use_e8m0_scale (bool): Whether to use E8M0 for quantization. If True will mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Quantized tensor and scales tensor in swizzled layout.
+    """
+    # reshape to 2d
+    orig_leading_dims, orig_N = x.shape[:-2], x.shape[-1]
+    x = x.reshape(-1, orig_N)
+
+    M, N = x.shape
+    assert N % 16 == 0, "N must be divisible by 16 for NVFP4 quantization"
+
+    # Calculate blocks needed
+    num_scales = N // 16
+    n_row_blocks = triton.cdiv(M, 128)
+    n_col_blocks = triton.cdiv(num_scales, 4)
+    padded_rows = n_row_blocks * 128
+    padded_cols = n_col_blocks * 4
+
+    xq = x.new_empty(M, N // 2, dtype=torch.uint8)
+    scales = x.new_empty(padded_rows, padded_cols, dtype=torch.float8_e4m3fn)
+
+    # For small M use lower M_PER_BLOCK to reduce wasted FP32 math
+    M_PER_BLOCK = min(triton.next_power_of_2(M), 128)
+    # We don't support multiple 128x4 layouts per block
+    assert M_PER_BLOCK <= 128
+
+    # If we are not aligned to M_PER_BLOCK * 64, use a mask
+    USE_MASK = M % M_PER_BLOCK != 0 or N % 64 != 0
+
+    grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
+    # If M_PER_BLOCK is not 128 launch an extra set of blocks along M to handle zeroing scales.
+    # This is needed as otherwise the kernel would not visit those scales, and the spec requires padded scales to be zero.
+    if M_PER_BLOCK != 128:
+        grid = (grid[0], grid[1] + 1)
+
+    triton_quantize_nvfp4_kernel[grid](
+        x,
+        global_scale,
+        xq,
+        scales,
+        x.stride(0),
+        x.stride(1),
+        M,
+        N,
+        # pyre-ignore[6]
+        M_PER_BLOCK=M_PER_BLOCK,
+        # pyre-ignore[6]
+        USE_MASK=USE_MASK,
+        # pyre-ignore[6]
+        USE_E8M0_SCALE=use_e8m0_scale,
+    )
+
+    # reshape back to original shape
+    scales = scales.view(*orig_leading_dims, -1, padded_cols)
+    xq = xq.view(*orig_leading_dims, -1, N // 2)
+
+    return xq.view(torch.float4_e2m1fn_x2), scales
+
+
+@triton.jit
+def triton_quantize_nvfp4_kernel(
+    x_ptr,
+    global_scale_ptr,
+    q_ptr,
+    s_ptr,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    M_PER_BLOCK: tl.constexpr,
+    USE_MASK: tl.constexpr,
+    USE_E8M0_SCALE: tl.constexpr,
+):
+    E4M3_EPS = 1.5258789e-05
+
+    NUM_ELEM_PER_LAYOUT = 128 * 4
+    NUM_N_BLOCKS = tl.cdiv(N, 64)
+
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
+
+    # Special blocks that zeros out tail M scales if M_PER_BLOCK != 128
+    # Technically this is a data race as we zero out scales another block has also zero'd out.
+    # Since we write the same value, it shouldn't be an issue.
+    if M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
+        # This is only used (and supported) when M < 128.
+        tl.device_assert(pid_m == 1, "pid_m != 1 when M_PER_BLOCK != 128")
+
+        # Offset of the 128x4 layout
+        layout_off = pid_n * NUM_ELEM_PER_LAYOUT
+        offs_m = tl.arange(0, 128)[:, None]
+        scale_offs = layout_off + nvfp4_scale_swizzle(offs_m)
+
+        oob_mask = (offs_m >= M) & tl.full((4,), True, dtype=tl.int1)[None, :]
+        zero_scales = tl.full([128, 4], 0, dtype=tl.float8e4nv)
+        tl.store(s_ptr + scale_offs, zero_scales, mask=oob_mask)
+        return
+
+    offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
+    if USE_MASK:
+        mask = (offs_m < M) & (offs_n < N)
+        other = 0.0
+    else:
+        mask = None
+        other = None
+
+    global_scale = tl.load(global_scale_ptr)  # Scalar
+
+    x = tl.load(
+        x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other
+    )  # [M_PER_BLOCK, 64]
+    x_blocks = x.to(tl.float32).reshape(M_PER_BLOCK, 4, 16)  # [M_PER_BLOCK, 4, 16]
+
+    # Block-wise max
+    block_amax = tl.max(tl.abs(x_blocks), axis=2)  # [M_PER_BLOCK, 4]
+
+    if USE_E8M0_SCALE:
+        scales = tl.div_rn(block_amax, 4.0) * global_scale
+        scales = _fp32_to_e8m0(scales, mbits=1, scale_round_mode="even")
+    else:
+        scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * global_scale
+        scales = tl.clamp(scales, E4M3_EPS, FP8_E4M3_MAX)
+
+    scales = scales.to(tl.float8e4nv)  # [M_PER_BLOCK, 4]
+
+    # Apply combined scale to data
+    total_scale = tl.div_rn(
+        global_scale, scales.to(tl.float32)[:, :, None]
+    )  # [M_PER_BLOCK, 4, 1]
+    x_blocks = x_blocks * total_scale  # [M_PER_BLOCK, 4, 16]
+
+    if USE_MASK:
+        scale_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
+        scale_mask = (offs_m < M) & (scale_offs_n < (N // 16))
+
+        # Mask out scales to 0 if we are not aligned to M_PER_BLOCK x 64
+        scales = tl.where(
+            scale_mask,
+            scales,
+            0.0,
+        )
+
+    offs_m = (pid_m * M_PER_BLOCK % 128) + tl.arange(0, M_PER_BLOCK)[:, None]
+    # Offset of the 128x4 layout
+    layout_off = (
+        (pid_m * M_PER_BLOCK) // 128
+    ) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
+    scale_offs = layout_off + nvfp4_scale_swizzle(offs_m)
+    tl.store(
+        s_ptr + scale_offs,
+        scales,
+    )
+
+    # Convert to FP4
+    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
+    if USE_MASK:
+        mask = (offs_m < M) & (offs_n < N // 2)
+    else:
+        mask = None
+    tl.store(q_ptr + offs_m * (N // 2) + offs_n, x_fp4x2, mask=mask)
+
+
+@triton.jit
+def nvfp4_scale_swizzle(offs_m):
+    """
+    Produces scale offsets swizzled according to the blackwell 128x4 scale layout.
+    Each 128x4 layout can be viewed as 32 4x4 layouts, each of which we'll refer to below as a sub_layout.
+
+    The returned offsets assume a 128x4 layout starting at 0. offs_m could be a subset of rows within a 128x4 layout.
+    """
+    # Offset of the 4x4 sub_layout within the 128x4 layout
+    sub_layout_idx = offs_m % 32
+    sub_layout_stride = 16
+    sub_layout_off = sub_layout_idx * sub_layout_stride
+    # Which row within the 4x4 sub_layout
+    sub_layout_row = offs_m // 32
+    # Offsets of the elements within 4x4 sub_layout
+    elems = tl.arange(0, 4)[None, :]
+    sub_layout_elem_offs = sub_layout_row * 4 + elems
+
+    scale_offs = sub_layout_off + sub_layout_elem_offs
+
+    return scale_offs
+
+
+@triton.jit
+def convert_fp32_to_fp4_packed(x_pairs):
+    """Convert FP32 pairs to packed FP4 format.
+
+    This function takes tensor where consecutive values along the last dimension
+    are packed together into single bytes.
+
+    Args:
+        x_pairs: [Tensor, Tensor] both w/ shapes [..., 1] where zipped last dimension contains
+                interleaved pairs of FP32 values to be packed together.
+
+    Returns:
+        Packed tensor with shape [...] (last dimension removed) where each
+        element is an int8 containing 2 FP4 values:
+        - First value of pair → low nibble (bits 0-3)
+        - Second value of pair → high nibble (bits 4-7)
+
+    Example:
+        Input:  [128, 32, 2] containing FP32 pairs
+        Output: [128, 32] containing packed FP4 bytes
+
+    """
+
+    x_fp4x2 = tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b8 byte0, byte1, byte2, byte3;
+        cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
+        cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
+        cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
+        cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
+        mov.b32 $0, {byte0, byte1, byte2, byte3};
+        }
+        """,
+        constraints=("=r,r,r,r,r,r,r,r,r"),
+        args=x_pairs,
+        dtype=tl.uint8,
+        is_pure=True,
+        pack=4,
+    )
+
+    return x_fp4x2
