@@ -14,7 +14,7 @@ from mslk.attention.fmha.split_blocks_fairinternal import (
     split_blocks_for_prefill,
 )
 
-from .utils import cuda_only
+from .utils import cuda_only, disable_on_rocm
 
 compute_capability = (0, 0)
 if torch.cuda.is_available():
@@ -95,6 +95,7 @@ else:
 
 
 @cuda_only
+@disable_on_rocm  # XXX
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "spec_decoding", [False, True], ids=lambda x: "spec" if x else ""

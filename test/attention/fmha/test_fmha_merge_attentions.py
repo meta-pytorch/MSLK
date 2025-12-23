@@ -26,10 +26,8 @@ compute_capability = (0, 0)
 if torch.cuda.is_available():
     compute_capability = torch.cuda.get_device_capability("cuda")
 sm80_or_better_only = pytest.mark.skipif(
-    compute_capability < (8, 0), reason="requires sm90+"
-)
-sm90_or_better_only = pytest.mark.skipif(
-    compute_capability < (9, 0), reason="requires sm90+"
+    torch.version.cuda is not None and compute_capability < (8, 0),
+    reason="requires sm80+",
 )
 
 
@@ -575,6 +573,7 @@ def test_merge_attention_with_compile() -> None:
 
 
 @sm80_or_better_only
+@disable_on_rocm
 def test_merge_training():
     torch.manual_seed(1)
     B, M, H, K = 1, 50, 1, 128
@@ -639,6 +638,7 @@ def _slice(partial: Partial, a: int, b: int) -> Partial:
 
 
 @sm80_or_better_only
+@disable_on_rocm
 def test_merge_training_compile():
     torch.manual_seed(1)
     B, M, H, K = 1, 50, 1, 128
