@@ -172,7 +172,7 @@ def _fwd_kernel_splitK(  # noqa: C901
 
     start_m = tl.program_id(0)
     off_zhg = tl.program_id(1)
-    off_z = off_zhg // (H * G)
+    off_z = (off_zhg // (H * G)).to(tl.int64)
     off_hg = off_zhg % (H * G)
     off_h = off_hg // G
     off_g = off_hg % G
