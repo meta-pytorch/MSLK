@@ -155,6 +155,7 @@ def _custom_mask_type(bias: Optional[Union[torch.Tensor, AttentionBias]]) -> int
             LowerTriangularFromBottomRightMask,
             LowerTriangularFromBottomRightLocalAttentionMask,
             attn_bias.BlockDiagonalCausalFromBottomRightMask,
+            BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalWithOffsetPaddedKeysMask,
             BlockDiagonalCausalLocalAttentionFromBottomRightMask,
             PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
