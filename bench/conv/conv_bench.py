@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import torch
+import triton  # @manual=//triton:triton
 
 from mslk.bench.common import profiler
 from mslk.bench.conv.conv_ops import ConvOpBase, get_conv_ops
@@ -76,26 +77,63 @@ def default_shapes() -> (
 
 @dataclass
 class Metrics:
-    op_name: str
+    op: str
+    N: int = 0
+    D: int = 0
+    H: int = 0
+    W: int = 0
+    C: int = 0
+    K: int = 0
+    T: int = 0
+    R: int = 0
+    S: int = 0
+    pad: int = 0
+    stride: int = 0
+    dilation: int = 0
 
     sim: float = 0.0
     ms: float = 0.0
     tflops: float = 0.0
     gbps: float = 0.0
 
-    def __str__(self) -> str:
-        return (
-            "%s sim: %.3f.\n%s ms: %.3f. \n" "%s TFLOPS: %.3f. \n%s GB/s: %.3f."
-        ) % (
-            self.op_name,
-            self.sim,
-            self.op_name,
-            self.ms,
-            self.op_name,
-            self.tflops,
-            self.op_name,
-            self.gbps,
+    @staticmethod
+    def header() -> str:
+        header = (
+            f"{'OpName':<20} {'(N,D,H,W,C,K,T,R,S,pad,stride,dilation)':<50} "
+            f"{'Sim':<10} {'ms':<10} {'TFLOPS':<10} {'GB/s':<10}"
         )
+        divider = "-" * len(header)
+        return f"Conv Bench\n{divider}\n{header}\n{divider}"
+
+    def __str__(self) -> str:
+        problem_shape = (
+            f"({self.N},{self.D},{self.H},{self.W},{self.C},{self.K},"
+            f"{self.T},{self.R},{self.S},{self.pad},{self.stride},{self.dilation})"
+        )
+        return (
+            f"{self.op:<20} {problem_shape:<50} "
+            f"{self.sim:<10.3f} {self.ms:<10.3f} {self.tflops:<10.2f} {self.gbps:<10.2f}"
+        )
+
+    def as_dict(self) -> dict[str, float]:
+        return {
+            "N": self.N,
+            "D": self.D,
+            "H": self.H,
+            "W": self.W,
+            "C": self.C,
+            "K": self.K,
+            "T": self.T,
+            "R": self.R,
+            "S": self.S,
+            "pad": self.pad,
+            "stride": self.stride,
+            "dilation": self.dilation,
+            f"{self.op}_sim": self.sim,
+            f"{self.op}_ms": self.ms,
+            f"{self.op}_tflops": self.tflops,
+            f"{self.op}_gb/s": self.gbps,
+        }
 
 
 def benchmark(
@@ -117,7 +155,7 @@ def benchmark(
     trace: bool = False,
     num_iters: int = 1,
     torch_compile: bool = False,
-) -> dict[str, Any]:
+) -> list[Metrics]:
     # Create input tensors in NCDHW format
     activation = torch.randn(n, c, d, h, w, device="cuda", dtype=torch.bfloat16)
     # Create filter tensors in KCTRS format
@@ -140,24 +178,30 @@ def benchmark(
     )
 
     # Keep track of results.
-    results: dict[str, Any] = {
-        "N": n,
-        "C": c,
-        "D": d,
-        "H": h,
-        "W": w,
-        "K": k,
-        "T": t,
-        "R": r,
-        "S": s,
-        "pad": pad,
-        "stride": stride,
-        "dilation": dilation,
-    }
+    results = []
 
     # Benchmark each operator.
     for conv_op in conv_ops:
-        metrics = Metrics(op_name=conv_op.name)
+        print(
+            f"Benchmarking {conv_op.name} with "
+            f"(N={n}, D={d}, H={h}, W={w}, C={c}, K={k}, T={t}, R={r}, S={s}, "
+            f"pad={pad}, stride={stride}, dilation={dilation})"
+        )
+        metrics = Metrics(
+            op=conv_op.name,
+            N=n,
+            D=d,
+            H=h,
+            W=w,
+            C=c,
+            K=k,
+            T=t,
+            R=r,
+            S=s,
+            pad=pad,
+            stride=stride,
+            dilation=dilation,
+        )
         if hasattr(conv_op, "torch_compile"):
             conv_op.torch_compile = torch_compile
         # Preprocess data if needed.
@@ -170,6 +214,11 @@ def benchmark(
         output = conv_op.compute(*quantized_vals)
         # Compare the quantize op output to reference as a sanity check.
         metrics.sim = torch.mean(torch.pow(output - out_ref, 2)).item()
+
+        # Compute output spatial dimensions
+        z = 1 + (d + 2 * pad - ((t - 1) * dilation + 1)) // stride
+        p = 1 + (h + 2 * pad - ((r - 1) * dilation + 1)) // stride
+        q = 1 + (w + 2 * pad - ((s - 1) * dilation + 1)) // stride
 
         for _ in range(num_iters):
             # Now perform benchmark.
@@ -191,11 +240,6 @@ def benchmark(
 
             # Compute performance metrics
             # FLOPs for convolution: 2 * N * Z * P * Q * K * T * R * S * C
-            # where Z, P, Q are output spatial dimensions
-            z = 1 + (d + 2 * pad - ((t - 1) * dilation + 1)) // stride
-            p = 1 + (h + 2 * pad - ((r - 1) * dilation + 1)) // stride
-            q = 1 + (w + 2 * pad - ((s - 1) * dilation + 1)) // stride
-
             flops = 2 * n * z * p * q * k * t * r * s * c
             metrics.tflops += flops / (ms_runtime / 1e3) / 1e12
 
@@ -210,18 +254,12 @@ def benchmark(
             )
             metrics.ms += ms_runtime
 
-        # Print out results for this op.
+        # Average metrics over iterations.
         metrics.ms /= num_iters
         metrics.tflops /= num_iters
         metrics.gbps /= num_iters
-        print(f"Average metrics over {num_iters} iterations:")
-        print(metrics)
 
-        # Save results for this operator.
-        results[f"{conv_op.name}_sim"] = metrics.sim
-        results[f"{conv_op.name}_ms"] = metrics.ms
-        results[f"{conv_op.name}_tflops"] = metrics.tflops
-        results[f"{conv_op.name}_gb/s"] = metrics.gbps
+        results.append(metrics)
 
     return results
 
@@ -455,10 +493,8 @@ def invoke_main(
 
     # Iterate over shapes and benchmark.
     benchmark_results = []
+    csv = []
     for n, d, h, w, c, k, t, r, s, pad, stride, dilation in conv_shapes:
-        print(
-            f"Benchmarking N={n}, D={d}, H={h}, W={w}, C={c}, K={k}, T={t}, R={r}, S={s}, pad={pad}, stride={stride}, dilation={dilation}."
-        )
         conv_measurements = benchmark(
             conv_ops,
             n,
@@ -479,19 +515,39 @@ def invoke_main(
             num_iters,
             torch_compile,
         )
-        benchmark_results.append(conv_measurements)
+        benchmark_results.extend(conv_measurements)
+        csv_row = {}
+        for metric in conv_measurements:
+            csv_row.update(metric.as_dict())
+        csv.append(csv_row)
+
+    print(Metrics.header())
+    for metric in benchmark_results:
+        print(metric)
+
+    mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
+
+    print("")
+    print(f"Hardware: {torch.cuda.get_device_name()}")
+    print(f"    Memory BW Roofline: {mem_bw_roofline_gbps} GB/s")
+
+    print("")
+    print("Benchmark Settings:")
+    print(f"    CUDA graph: {not no_cuda_graph}")
+    print(f"    Bench quantize: {bench_quantize}")
+    print(f"    Torch compile: {torch_compile}")
 
     if export_csv or plot:
         os.makedirs(output_dir, exist_ok=True)
     if export_csv:
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_file = os.path.join(output_dir, f"conv_ops_benchmark_{datetime_str}.csv")
-        print(f"CSV saved to {csv_file}")
         # Export results to a CSV file.
-        df = pd.DataFrame(benchmark_results)
-        df.to_csv(csv_file, index=False)
+        df = pd.DataFrame(csv)
+        df.to_csv(csv_file, na_rep="NaN", index=False)
+        print(f"CSV saved to {csv_file}")
     if plot:
-        plot_benchmark(benchmark_results, output_dir)
+        plot_benchmark(csv, output_dir)
 
 
 if __name__ == "__main__":
