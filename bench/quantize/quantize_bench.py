@@ -17,6 +17,8 @@ import click
 import pandas as pd
 import torch
 import triton  # @manual=//triton:triton
+
+from mslk.bench.common import profiler
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
 
@@ -147,6 +149,7 @@ def benchmark(
     m: int,
     k: int,
     mem_bw_roofline_gbps: float,
+    trace: bool,
     use_cuda_graph: bool = True,
     use_rotating_buffer: bool = False,
     num_iters: int = 1,
@@ -165,12 +168,13 @@ def benchmark(
         metrics.sim = torch.mean(torch.pow(dequantized - input, 2)).item()
 
         for _ in range(num_iters):
-            ms_runtime = quantize_op.benchmark(
-                input,
-                args,
-                use_cuda_graph=use_cuda_graph,
-                use_rotating_buffer=use_rotating_buffer,
-            )
+            with profiler(enabled=trace, with_stack=True):
+                ms_runtime = quantize_op.benchmark(
+                    input,
+                    args,
+                    use_cuda_graph=use_cuda_graph,
+                    use_rotating_buffer=use_rotating_buffer,
+                )
 
             input_bytes = input.numel() * input.element_size()
             output_bytes = sum(t.numel() * t.element_size() for t in quantized)
@@ -259,6 +263,11 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
     default=None,
     help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
 )
+@click.option(
+    "--trace",
+    is_flag=True,
+    help="If set, produce a performance trace of the benchmark.",
+)
 def invoke_main(
     output_dir: str,
     num_iters: int,
@@ -270,6 +279,7 @@ def invoke_main(
     no_cuda_graph: bool,
     no_rotating_buffer: bool,
     shapes: Optional[str],
+    trace: bool,
 ) -> None:
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
     all_kernels = kernels.strip().split(",") if kernels else None
@@ -295,6 +305,7 @@ def invoke_main(
             M,
             K,
             mem_bw_roofline_gbps,
+            trace,
             not no_cuda_graph,
             not no_rotating_buffer,
             num_iters,
