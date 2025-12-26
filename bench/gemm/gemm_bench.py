@@ -20,19 +20,10 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from tabulate import tabulate
 
-try:
-    from accelerators.utils.torch_profiler import profiler_or_nullcontext
-except ImportError:
-    from contextlib import nullcontext
-
-    class profiler_or_nullcontext(nullcontext):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-
-
+from mslk.bench.common import profiler
 from mslk.bench.gemm.gemm_ops import GemmOpBase, GemmType, get_gemm_ops
+from tabulate import tabulate
 
 
 shape_registry = {}
@@ -241,7 +232,7 @@ def benchmark_grouped(
             # Now perform benchmark.
             if bench_quantize:
                 # Benchmark both quantize and compute.
-                with profiler_or_nullcontext(enabled=trace, with_stack=True):
+                with profiler(enabled=trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *preprocessed_args,
                         bench_quantize=True,
@@ -250,7 +241,7 @@ def benchmark_grouped(
                         rep=rep,
                     )
             else:
-                with profiler_or_nullcontext(enabled=trace, with_stack=True):
+                with profiler(enabled=trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *quantized_vals,
                         bench_quantize=False,
@@ -337,7 +328,7 @@ def benchmark(
             # Now perform benchmark.
             if bench_quantize:
                 # Benchmark both quantize and compute.
-                with profiler_or_nullcontext(enabled=trace, with_stack=True):
+                with profiler(enabled=trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *preprocessed_args,
                         bench_quantize=True,
@@ -346,7 +337,7 @@ def benchmark(
                         rep=rep,
                     )
             else:
-                with profiler_or_nullcontext(enabled=trace, with_stack=True):
+                with profiler(enabled=trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *quantized_vals,
                         bench_quantize=False,
