@@ -10,6 +10,7 @@ import sys
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any, Optional
 
 import click
@@ -20,6 +21,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
+
+import triton  # @manual=//triton:triton
 
 from mslk.bench.common import profiler
 from mslk.bench.gemm.gemm_ops import GemmOpBase, GemmType, get_gemm_ops
@@ -143,28 +146,87 @@ def ldm_shapes() -> list[tuple[int, int, int]]:
     ]
 
 
+class ShapeMode(Enum):
+    REGULAR = "regular"  # (M, N, K)
+    GROUPED = "grouped"  # G, (M, N, K)
+    GROUPED_TOTAL_M = "grouped_total_m"  # G, (TotalM, N, K)
+    GROUPED_TOTAL_K = "grouped_total_k"  # G, (M, N, TotalK)
+
+
 @dataclass
 class Metrics:
-    op_name: str
+    op: str
+    M: Any = 0
+    N: Any = 0
+    K: Any = 0
+    groups: Optional[int] = None
+    shape_mode: ShapeMode = ShapeMode.REGULAR
 
     sim: float = 0.0
     ms: float = 0.0
     tflops: float = 0.0
     gbps: float = 0.0
+    mem_bw_util: float = 0.0
+
+    @staticmethod
+    def header(shape_mode: ShapeMode = ShapeMode.REGULAR) -> str:
+        is_grouped = shape_mode in (
+            ShapeMode.GROUPED,
+            ShapeMode.GROUPED_TOTAL_M,
+            ShapeMode.GROUPED_TOTAL_K,
+        )
+        if shape_mode == ShapeMode.GROUPED_TOTAL_M:
+            shape_col = "(TotalM, N, K)"
+        elif shape_mode == ShapeMode.GROUPED_TOTAL_K:
+            shape_col = "(M, N, TotalK)"
+        else:
+            shape_col = "(M, N, K)"
+
+        group_col = f"{'G':<6}" if is_grouped else ""
+        header = (
+            f"{'OpName':<30} {group_col} {shape_col:<25} "
+            f"{'Sim':<10} {'Ms':<10} {'TFLOPS':<10} "
+            f"{'GB/s':<10} {'Mem BW Util %':<10}"
+        )
+        divider = "-" * len(header)
+        return f"GEMM Bench\n{divider}\n{header}\n{divider}"
 
     def __str__(self) -> str:
-        return (
-            "%s sim: %.3f.\n%s ms: %.3f. \n" "%s TFLOPS: %.3f. \n%s GB/s: %.3f."
-        ) % (
-            self.op_name,
-            self.sim,
-            self.op_name,
-            self.ms,
-            self.op_name,
-            self.tflops,
-            self.op_name,
-            self.gbps,
+        is_grouped = self.shape_mode in (
+            ShapeMode.GROUPED,
+            ShapeMode.GROUPED_TOTAL_M,
+            ShapeMode.GROUPED_TOTAL_K,
         )
+        if self.shape_mode == ShapeMode.GROUPED_TOTAL_M:
+            total_m = sum(self.M) if isinstance(self.M, list) else self.M
+            shape = f"({total_m}, {self.N}, {self.K})"
+        elif self.shape_mode == ShapeMode.GROUPED_TOTAL_K:
+            total_k = sum(self.K) if isinstance(self.K, list) else self.K
+            shape = f"({self.M}, {self.N}, {total_k})"
+        else:
+            shape = f"({self.M}, {self.N}, {self.K})"
+
+        group_col = f"{self.groups:<6}" if is_grouped else ""
+        return (
+            f"{self.op:<30} {group_col} {shape:<25} "
+            f"{self.sim:<10.3f} {self.ms:<10.3f} "
+            f"{self.tflops:<10.2f} {self.gbps:<10.2f} {self.mem_bw_util:<10.2f}"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "M": self.M,
+            "N": self.N,
+            "K": self.K,
+            f"{self.op}_sim": self.sim,
+            f"{self.op}_ms": self.ms,
+            f"{self.op}_tflops": self.tflops,
+            f"{self.op}_gb/s": self.gbps,
+            f"{self.op}_mem_bw_util": self.mem_bw_util,
+        }
+        if self.groups is not None:
+            result["groups"] = self.groups
+        return result
 
 
 def benchmark_grouped(
@@ -172,6 +234,7 @@ def benchmark_grouped(
     m: list[int],
     n: list[int],
     k: list[int],
+    mem_bw_roofline_gbps: float,
     bench_quantize: bool = False,
     use_rotating_buffer_bench: bool = False,
     use_cuda_graph: bool = True,
@@ -180,7 +243,8 @@ def benchmark_grouped(
     fast_accum: bool = True,
     torch_compile: bool = False,
     rep: int = 200,
-) -> dict[str, Any]:
+    shape_mode: ShapeMode = ShapeMode.GROUPED,
+) -> list[Metrics]:
     num_groups = len(m)
     # Create input tensors.
     A = []
@@ -197,10 +261,27 @@ def benchmark_grouped(
     log_m = m[0] if len(np.unique(m)) == 1 else m
     log_n = n[0] if len(np.unique(n)) == 1 else n
     log_k = k[0] if len(np.unique(k)) == 1 else k
-    results: dict[str, Any] = {"M": log_m, "N": log_n, "K": log_k, "groups": num_groups}
+    results: list[Metrics] = []
     # Benchmark each operator.
     for gemm_op in gemm_ops:
-        metrics = Metrics(op_name=gemm_op.name)
+        # Build progress message based on shape mode.
+        if shape_mode == ShapeMode.GROUPED_TOTAL_M:
+            total_m = sum(m)
+            shape_str = f"(G={num_groups}, TotalM={total_m}, N={log_n}, K={log_k})"
+        elif shape_mode == ShapeMode.GROUPED_TOTAL_K:
+            total_k = sum(k)
+            shape_str = f"(G={num_groups}, M={log_m}, N={log_n}, TotalK={total_k})"
+        else:
+            shape_str = f"(G={num_groups}, M={log_m}, N={log_n}, K={log_k})"
+        print(f"Benchmarking {gemm_op.name} with {shape_str}")
+        metrics = Metrics(
+            op=gemm_op.name,
+            M=log_m,
+            N=log_n,
+            K=log_k,
+            groups=num_groups,
+            shape_mode=shape_mode,
+        )
         # Set fast accum mode if applicable.
         if hasattr(gemm_op, "fast_accum"):
             gemm_op.fast_accum = fast_accum
@@ -250,12 +331,11 @@ def benchmark_grouped(
                         rep=rep,
                     )
 
-            # Print out results for this op.
             for i in range(num_groups):
                 metrics.tflops += 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
                 output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
                 if m[i] > 0:
-                    metrics.gbps += (
+                    gbps = (
                         (
                             m[i] * k[i] * quantized_vals[0][0].element_size()
                             + n[i] * k[i] * quantized_vals[1][0].element_size()
@@ -264,18 +344,15 @@ def benchmark_grouped(
                         / (ms_runtime / 1e3)
                         / 1e9
                     )
+                    metrics.gbps += gbps
+                    metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
             metrics.ms += ms_runtime
         metrics.ms /= num_iters
         metrics.tflops /= num_iters
         metrics.gbps /= num_iters
-        print(f"Average metrics over {num_iters} iterations:")
-        print(metrics)
+        metrics.mem_bw_util /= num_iters
 
-        # Save results for this operator.
-        results[f"{gemm_op.name}_sim"] = metrics.sim
-        results[f"{gemm_op.name}_ms"] = metrics.ms
-        results[f"{gemm_op.name}_tflops"] = metrics.tflops
-        results[f"{gemm_op.name}_gb/s"] = metrics.gbps
+        results.append(metrics)
 
     return results
 
@@ -285,6 +362,7 @@ def benchmark(
     m: int,
     n: int,
     k: int,
+    mem_bw_roofline_gbps: float,
     bench_quantize: bool = False,
     use_rotating_buffer_bench: bool = False,
     use_cuda_graph: bool = True,
@@ -293,7 +371,8 @@ def benchmark(
     fast_accum: bool = True,
     torch_compile: bool = False,
     rep: int = 200,
-) -> dict[str, Any]:
+    shape_mode: ShapeMode = ShapeMode.REGULAR,
+) -> list[Metrics]:
     # Create input tensors.
     A = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
@@ -301,10 +380,12 @@ def benchmark(
     # Compute baseline output for correctness checking.
     out_ref = torch.matmul(A, torch.transpose(B, -2, -1))
     # Keep track of results.
-    results: dict[str, Any] = {"M": m, "N": n, "K": k}
+    results: list[Metrics] = []
     # Benchmark each operator.
     for gemm_op in gemm_ops:
-        metrics = Metrics(op_name=gemm_op.name)
+        shape_str = f"(M={m}, N={n}, K={k})"
+        print(f"Benchmarking {gemm_op.name} with {shape_str}")
+        metrics = Metrics(op=gemm_op.name, M=m, N=n, K=k, shape_mode=shape_mode)
         # Set fast accum mode if applicable.
         if hasattr(gemm_op, "fast_accum"):
             gemm_op.fast_accum = fast_accum
@@ -346,9 +427,8 @@ def benchmark(
                         rep=rep,
                     )
 
-            # Print out results for this op.
             metrics.tflops += 2 * m * n * k / (ms_runtime / 1e3) / 1e12
-            metrics.gbps += (
+            gbps = (
                 (
                     quantized_vals[0].numel() * quantized_vals[0].element_size()
                     + quantized_vals[1].numel() * quantized_vals[1].element_size()
@@ -357,36 +437,27 @@ def benchmark(
                 / (ms_runtime / 1e3)
                 / 1e9
             )
+            metrics.gbps += gbps
+            metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
             metrics.ms += ms_runtime
-        # Print out results for this op.
         metrics.ms /= num_iters
         metrics.tflops /= num_iters
         metrics.gbps /= num_iters
-        print(f"Average metrics over {num_iters} iterations:")
-        print(metrics)
+        metrics.mem_bw_util /= num_iters
 
-        # Save results for this operator.
-        results[f"{gemm_op.name}_sim"] = metrics.sim
-        results[f"{gemm_op.name}_ms"] = metrics.ms
-        results[f"{gemm_op.name}_tflops"] = metrics.tflops
-        results[f"{gemm_op.name}_gb/s"] = metrics.gbps
+        results.append(metrics)
 
     return results
 
 
-def plot_benchmark(results: list[dict[str, Any]], output_dir: str) -> None:
+def plot_benchmark(results: list[Metrics], output_dir: str) -> None:
     """Create a barplot visualizing the TFLOPS of each kernel."""
     # Reprocess into new dataframe with proper graph format.
     data = []
     # Extract measurements for each shape.
-    for impl in results:
-        mnk = f"{impl['M']}, {impl['N']}, {impl['K']}"
-        # Iterate over keys to find tflops entries.
-        for key in impl:
-            if "tflops" in key:
-                op_name = key.split("_tflops")[0]
-                op_tflops = impl[key]
-                data.append({"MNK": mnk, "kernel": op_name, "TFLOPS": op_tflops})
+    for metric in results:
+        mnk = f"{metric.M}, {metric.N}, {metric.K}"
+        data.append({"MNK": mnk, "kernel": metric.op, "TFLOPS": metric.tflops})
 
     # Create a barplot using seaborn.
     df = pd.DataFrame(data)
@@ -650,6 +721,7 @@ def invoke_main(
                 for tm in total_m_list
                 for _, n, k in MNK
             ]
+            shape_mode = ShapeMode.GROUPED_TOTAL_M
         elif total_k:
             total_k_list = [int(tk) for tk in total_k.strip().split(",")]
             MNK = [
@@ -662,19 +734,27 @@ def invoke_main(
                 for tk in total_k_list
                 for m, n, _ in MNK
             ]
+            shape_mode = ShapeMode.GROUPED_TOTAL_K
         else:
             MNK = [[[m] * g, [n] * g, [k] * g] for g in groups_list for m, n, k in MNK]
+            shape_mode = ShapeMode.GROUPED
+    elif grouped:
+        shape_mode = ShapeMode.GROUPED
+    else:
+        shape_mode = ShapeMode.REGULAR
 
     # Iterate over shapes and benchmark.
-    benchmark_results = []
+    mem_bw_gbps = triton.testing.get_dram_gbps()
+    benchmark_results: list[Metrics] = []
+    csv: list[dict[str, Any]] = []
+    benchmark_func = benchmark_grouped if grouped else benchmark
     for m, n, k in MNK:
-        print(f"Benchmarking M={m}, N={n}, K={k}.")
-        benchmark_func = benchmark_grouped if grouped else benchmark
-        quantize_measurements = benchmark_func(
+        shape_measurements = benchmark_func(
             gemm_ops,
             m,  # pyre-ignore[6]: Incompatible parameter type [6]
             n,  # pyre-ignore[6]: Incompatible parameter type [6]
             k,  # pyre-ignore[6]: Incompatible parameter type [6]
+            mem_bw_gbps,
             bench_quantize,
             use_rotating_buffer_bench,
             not no_cuda_graph,
@@ -683,17 +763,39 @@ def invoke_main(
             not disable_fast_accum,
             torch_compile,
             rep,
+            shape_mode,
         )
-        benchmark_results.append(quantize_measurements)
+        benchmark_results.extend(shape_measurements)
+        csv_row: dict[str, Any] = {}
+        for metric in shape_measurements:
+            csv_row.update(metric.as_dict())
+        csv.append(csv_row)
+
+    print("")
+    print(Metrics.header(shape_mode))
+    for metric in benchmark_results:
+        print(metric)
+
+    print("")
+    print(f"Hardware: {torch.cuda.get_device_name()}")
+    print(f"    Memory BW: {mem_bw_gbps:.2f} GB/s")
+
+    print("")
+    print("Benchmark Settings:")
+    print(f"    CUDA graph: {not no_cuda_graph}")
+    print(f"    Buffer rotation: {use_rotating_buffer_bench}")
+    print(f"    Fast accumulation: {not disable_fast_accum}")
+    print(f"    Torch compile: {torch_compile}")
+
     if export_csv or plot:
         os.makedirs(output_dir, exist_ok=True)
     if export_csv:
         datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_file = os.path.join(output_dir, f"gemm_ops_benchmark_{datetime_str}.csv")
-        print(f"CSV saved to {csv_file}")
         # Export results to a CSV file.
-        df = pd.DataFrame(benchmark_results)
-        df.to_csv(csv_file, index=False)
+        df = pd.DataFrame(csv)
+        df.to_csv(csv_file, na_rep="NaN", index=False)
+        print(f"CSV saved to {csv_file}")
     if plot:
         plot_benchmark(benchmark_results, output_dir)
 
