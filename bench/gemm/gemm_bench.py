@@ -24,7 +24,7 @@ import torch
 
 import triton  # @manual=//triton:triton
 
-from mslk.bench.common import profiler
+from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.gemm.gemm_ops import GemmOpBase, GemmType, get_gemm_ops
 from tabulate import tabulate
 
@@ -235,14 +235,8 @@ def benchmark_grouped(
     n: list[int],
     k: list[int],
     mem_bw_roofline_gbps: float,
+    opts: BenchOptions,
     bench_quantize: bool = False,
-    use_rotating_buffer_bench: bool = False,
-    use_cuda_graph: bool = True,
-    trace: bool = False,
-    num_iters: int = 1,
-    fast_accum: bool = True,
-    torch_compile: bool = False,
-    rep: int = 200,
     shape_mode: ShapeMode = ShapeMode.GROUPED,
 ) -> list[Metrics]:
     num_groups = len(m)
@@ -284,9 +278,9 @@ def benchmark_grouped(
         )
         # Set fast accum mode if applicable.
         if hasattr(gemm_op, "fast_accum"):
-            gemm_op.fast_accum = fast_accum
+            gemm_op.fast_accum = opts.fast_accum
         if hasattr(gemm_op, "torch_compile"):
-            gemm_op.torch_compile = torch_compile
+            gemm_op.torch_compile = opts.torch_compile
         try:
             # Get the quantized tensors for this operator.
             preprocessed_args = gemm_op.preprocess(A, B)
@@ -309,26 +303,22 @@ def benchmark_grouped(
                 metrics.sim += float(
                     torch.mean(torch.pow(output[i] - out_ref[i], 2)).item()
                 )
-        for _ in range(num_iters):
+        for _ in range(opts.num_iters):
             # Now perform benchmark.
             if bench_quantize:
                 # Benchmark both quantize and compute.
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *preprocessed_args,
+                        opts=opts,
                         bench_quantize=True,
-                        use_rotating_buffer_bench=use_rotating_buffer_bench,
-                        use_cuda_graph=use_cuda_graph,
-                        rep=rep,
                     )
             else:
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *quantized_vals,
+                        opts=opts,
                         bench_quantize=False,
-                        use_rotating_buffer_bench=use_rotating_buffer_bench,
-                        use_cuda_graph=use_cuda_graph,
-                        rep=rep,
                     )
 
             for i in range(num_groups):
@@ -347,10 +337,10 @@ def benchmark_grouped(
                     metrics.gbps += gbps
                     metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
             metrics.ms += ms_runtime
-        metrics.ms /= num_iters
-        metrics.tflops /= num_iters
-        metrics.gbps /= num_iters
-        metrics.mem_bw_util /= num_iters
+        metrics.ms /= opts.num_iters
+        metrics.tflops /= opts.num_iters
+        metrics.gbps /= opts.num_iters
+        metrics.mem_bw_util /= opts.num_iters
 
         results.append(metrics)
 
@@ -363,14 +353,8 @@ def benchmark(
     n: int,
     k: int,
     mem_bw_roofline_gbps: float,
+    opts: BenchOptions,
     bench_quantize: bool = False,
-    use_rotating_buffer_bench: bool = False,
-    use_cuda_graph: bool = True,
-    trace: bool = False,
-    num_iters: int = 1,
-    fast_accum: bool = True,
-    torch_compile: bool = False,
-    rep: int = 200,
     shape_mode: ShapeMode = ShapeMode.REGULAR,
 ) -> list[Metrics]:
     # Create input tensors.
@@ -388,9 +372,9 @@ def benchmark(
         metrics = Metrics(op=gemm_op.name, M=m, N=n, K=k, shape_mode=shape_mode)
         # Set fast accum mode if applicable.
         if hasattr(gemm_op, "fast_accum"):
-            gemm_op.fast_accum = fast_accum
+            gemm_op.fast_accum = opts.fast_accum
         if hasattr(gemm_op, "torch_compile"):
-            gemm_op.torch_compile = torch_compile
+            gemm_op.torch_compile = opts.torch_compile
         try:
             # Preprocess data if needed.
             preprocessed_args = gemm_op.preprocess(A, B)
@@ -405,26 +389,22 @@ def benchmark(
         # TODO(shikaili): This calculation is incorrect for scatter add fusion.
         metrics.sim = torch.mean(torch.pow(output - out_ref, 2)).item()
 
-        for _ in range(num_iters):
+        for _ in range(opts.num_iters):
             # Now perform benchmark.
             if bench_quantize:
                 # Benchmark both quantize and compute.
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *preprocessed_args,
+                        opts=opts,
                         bench_quantize=True,
-                        use_rotating_buffer_bench=use_rotating_buffer_bench,
-                        use_cuda_graph=use_cuda_graph,
-                        rep=rep,
                     )
             else:
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = gemm_op.benchmark(
                         *quantized_vals,
+                        opts=opts,
                         bench_quantize=False,
-                        use_rotating_buffer_bench=use_rotating_buffer_bench,
-                        use_cuda_graph=use_cuda_graph,
-                        rep=rep,
                     )
 
             metrics.tflops += 2 * m * n * k / (ms_runtime / 1e3) / 1e12
@@ -440,10 +420,10 @@ def benchmark(
             metrics.gbps += gbps
             metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
             metrics.ms += ms_runtime
-        metrics.ms /= num_iters
-        metrics.tflops /= num_iters
-        metrics.gbps /= num_iters
-        metrics.mem_bw_util /= num_iters
+        metrics.ms /= opts.num_iters
+        metrics.tflops /= opts.num_iters
+        metrics.gbps /= opts.num_iters
+        metrics.mem_bw_util /= opts.num_iters
 
         results.append(metrics)
 
@@ -748,6 +728,17 @@ def invoke_main(
     benchmark_results: list[Metrics] = []
     csv: list[dict[str, Any]] = []
     benchmark_func = benchmark_grouped if grouped else benchmark
+
+    opts = BenchOptions(
+        num_iters=num_iters,
+        cuda_graph=not no_cuda_graph,
+        rotating_buffer=use_rotating_buffer_bench,
+        rep_ms=rep,
+        trace=trace,
+        fast_accum=not disable_fast_accum,
+        torch_compile=torch_compile,
+    )
+
     for m, n, k in MNK:
         shape_measurements = benchmark_func(
             gemm_ops,
@@ -755,14 +746,8 @@ def invoke_main(
             n,  # pyre-ignore[6]: Incompatible parameter type [6]
             k,  # pyre-ignore[6]: Incompatible parameter type [6]
             mem_bw_gbps,
+            opts,
             bench_quantize,
-            use_rotating_buffer_bench,
-            not no_cuda_graph,
-            trace,
-            num_iters,
-            not disable_fast_accum,
-            torch_compile,
-            rep,
             shape_mode,
         )
         benchmark_results.extend(shape_measurements)

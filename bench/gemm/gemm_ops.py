@@ -11,8 +11,8 @@ from enum import auto, Enum
 
 import numpy as np
 import torch
-import triton  # @manual=//triton:triton
 
+from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
@@ -134,12 +134,12 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractmethod
-    def compute(self, *args, **kwargs):
+    def compute(self, *args):
         """Function which performs main compute operation."""
         pass
 
     @abc.abstractmethod
-    def quantize_and_compute(self, *args, **kwargs):
+    def quantize_and_compute(self, *args):
         """Function which quantizes inputs and performs main compute operation."""
         pass
 
@@ -147,81 +147,20 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         """Preprocess inputs before benchmarking. These outputs will be passed to quantize."""
         return args
 
-    def bench_with_rotating_buffer(
-        self, fn, args, use_cuda_graph: bool = True, rep: int = 200
-    ):
-        import copy
-        import pickle
-
-        # torch.cuda.get_device_properties does not have L2/L3 cache size,
-        # so hard code an overapproximation of L2/L3 cache size to ensure L2/L3 cache flush
-        total_buffer_size = 512 * 1024 * 1024
-
-        # Use pickle to serialize model input to estimate total sizes of input
-        input_sizes = len(pickle.dumps(args))
-
-        # Make at least one copy of the inputs
-        copy_cnt = total_buffer_size // input_sizes
-        if copy_cnt == 0:
-            copy_cnt = 1
-
-        args_list = [args]
-        for _ in range(copy_cnt):
-            args_list.append(copy.deepcopy(args))
-
-        def rotating_buffer_fn(fn, args_list, copy_cnt):
-            for i in range(copy_cnt):
-                fn(*(args_list[i]))
-
-        if use_cuda_graph:
-            with torch.cuda.stream(torch.cuda.Stream()):
-                # A rotating_buffer_fn contains multiple runs of the fn to benchmark,
-                # so divide time accordingly
-                return triton.testing.do_bench_cudagraph(
-                    lambda: rotating_buffer_fn(self.compute, args_list, copy_cnt + 1),
-                    rep=rep,
-                ) / (copy_cnt + 1)
-        else:
-            return triton.testing.do_bench(
-                lambda: rotating_buffer_fn(self.compute, args_list, copy_cnt + 1),
-                rep=rep,
-            ) / (copy_cnt + 1)
-
     def benchmark(
         self,
         *args,
-        bench_quantize: bool = False,
-        use_rotating_buffer_bench: bool = False,
-        use_cuda_graph: bool = True,
-        rep: int = 200,
-        **kwargs,
+        opts: BenchOptions,
+        bench_quantize: bool,
     ) -> float:
         """Benchmark runtime of this operator."""
-        if bench_quantize:
-            if use_cuda_graph:
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    t = triton.testing.do_bench_cudagraph(
-                        lambda: self.quantize_and_compute(*args, **kwargs), rep=rep
-                    )
-            else:
-                t = triton.testing.do_bench(
-                    lambda: self.quantize_and_compute(*args, **kwargs), rep=rep
-                )
-        else:
-            if use_rotating_buffer_bench:
-                t = self.bench_with_rotating_buffer(
-                    self.compute, args, use_cuda_graph, rep=rep
-                )
-            else:
-                if use_cuda_graph:
-                    with torch.cuda.stream(torch.cuda.Stream()):
-                        t = triton.testing.do_bench_cudagraph(
-                            lambda: self.compute(*args, **kwargs), rep=rep
-                        )
-                else:
-                    t = triton.testing.do_bench(
-                        lambda: self.compute(*args, **kwargs), rep=rep
-                    )
+        t = do_bench(
+            lambda *a: self.quantize_and_compute(*a)
+            if bench_quantize
+            else self.compute(*a),
+            args,
+            opts,
+        )
         return t
 
     @abc.abstractproperty
