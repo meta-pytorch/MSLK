@@ -10,7 +10,8 @@ import abc
 import mslk.conv  # noqa: F401
 
 import torch
-import triton  # @manual=//triton:triton
+
+from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_tensor
 
 
@@ -42,30 +43,17 @@ class ConvOpBase(metaclass=abc.ABCMeta):
     def benchmark(
         self,
         *args,
-        bench_quantize: bool = False,
-        use_cuda_graph: bool = True,
-        **kwargs,
+        opts: BenchOptions,
+        bench_quantize: bool,
     ) -> float:
         """Benchmark runtime of this operator."""
-        if bench_quantize:
-            if use_cuda_graph:
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    t = triton.testing.do_bench_cudagraph(
-                        lambda: self.quantize_and_compute(*args, **kwargs), rep=200
-                    )
-            else:
-                t = triton.testing.do_bench(
-                    lambda: self.quantize_and_compute(*args, **kwargs)
-                )
-        else:
-            if use_cuda_graph:
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    t = triton.testing.do_bench_cudagraph(
-                        lambda: self.compute(*args, **kwargs), rep=200
-                    )
-            else:
-                t = triton.testing.do_bench(lambda: self.compute(*args, **kwargs))
-        return t
+        return do_bench(
+            lambda *a: self.quantize_and_compute(*a)
+            if bench_quantize
+            else self.compute(*a),
+            args,
+            opts,
+        )
 
     @abc.abstractproperty
     def name(self) -> str:
