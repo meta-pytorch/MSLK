@@ -21,7 +21,7 @@ import seaborn as sns
 import torch
 import triton  # @manual=//triton:triton
 
-from mslk.bench.common import profiler
+from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.conv.conv_ops import ConvOpBase, get_conv_ops
 from tabulate import tabulate
 
@@ -150,11 +150,8 @@ def benchmark(
     pad: int,
     stride: int,
     dilation: int,
+    opts: BenchOptions,
     bench_quantize: bool = False,
-    use_cuda_graph: bool = True,
-    trace: bool = False,
-    num_iters: int = 1,
-    torch_compile: bool = False,
 ) -> list[Metrics]:
     # Create input tensors in NCDHW format
     activation = torch.randn(n, c, d, h, w, device="cuda", dtype=torch.bfloat16)
@@ -203,7 +200,7 @@ def benchmark(
             dilation=dilation,
         )
         if hasattr(conv_op, "torch_compile"):
-            conv_op.torch_compile = torch_compile
+            conv_op.torch_compile = opts.torch_compile
         # Preprocess data if needed.
         preprocessed_args = conv_op.preprocess(
             activation, filter, padding, stride_vec, dilation_vec
@@ -220,22 +217,22 @@ def benchmark(
         p = 1 + (h + 2 * pad - ((r - 1) * dilation + 1)) // stride
         q = 1 + (w + 2 * pad - ((s - 1) * dilation + 1)) // stride
 
-        for _ in range(num_iters):
+        for _ in range(opts.num_iters):
             # Now perform benchmark.
             if bench_quantize:
                 # Benchmark both quantize and compute.
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = conv_op.benchmark(
                         *preprocessed_args,
+                        opts=opts,
                         bench_quantize=True,
-                        use_cuda_graph=use_cuda_graph,
                     )
             else:
-                with profiler(enabled=trace, with_stack=True):
+                with profiler(enabled=opts.trace, with_stack=True):
                     ms_runtime = conv_op.benchmark(
                         *quantized_vals,
+                        opts=opts,
                         bench_quantize=False,
-                        use_cuda_graph=use_cuda_graph,
                     )
 
             # Compute performance metrics
@@ -255,9 +252,9 @@ def benchmark(
             metrics.ms += ms_runtime
 
         # Average metrics over iterations.
-        metrics.ms /= num_iters
-        metrics.tflops /= num_iters
-        metrics.gbps /= num_iters
+        metrics.ms /= opts.num_iters
+        metrics.tflops /= opts.num_iters
+        metrics.gbps /= opts.num_iters
 
         results.append(metrics)
 
@@ -494,6 +491,13 @@ def invoke_main(
     # Iterate over shapes and benchmark.
     benchmark_results = []
     csv = []
+    opts = BenchOptions(
+        num_iters=num_iters,
+        cuda_graph=not no_cuda_graph,
+        trace=trace,
+        torch_compile=torch_compile,
+    )
+
     for n, d, h, w, c, k, t, r, s, pad, stride, dilation in conv_shapes:
         conv_measurements = benchmark(
             conv_ops,
@@ -509,11 +513,8 @@ def invoke_main(
             pad,
             stride,
             dilation,
+            opts,
             bench_quantize,
-            not no_cuda_graph,
-            trace,
-            num_iters,
-            torch_compile,
         )
         benchmark_results.extend(conv_measurements)
         csv_row = {}
@@ -533,9 +534,9 @@ def invoke_main(
 
     print("")
     print("Benchmark Settings:")
-    print(f"    CUDA graph: {not no_cuda_graph}")
+    print(f"    CUDA graph: {opts.cuda_graph}")
     print(f"    Bench quantize: {bench_quantize}")
-    print(f"    Torch compile: {torch_compile}")
+    print(f"    Torch compile: {opts.torch_compile}")
 
     if export_csv or plot:
         os.makedirs(output_dir, exist_ok=True)
