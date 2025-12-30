@@ -25,8 +25,40 @@ import torch
 import triton  # @manual=//triton:triton
 
 from mslk.bench.common.utils import BenchOptions, profiler
-from mslk.bench.gemm.gemm_ops import GemmOpBase, GemmType, get_gemm_ops
+from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from tabulate import tabulate
+
+
+# Compute theoretical roofline values in TFLOPS for GPU and dtype combinations.
+COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
+    "NVIDIA H100": {
+        ComputeDtype.FP8: 1979.0,
+        ComputeDtype.BF16: 989.0,
+        ComputeDtype.TF32: 494.5,
+        ComputeDtype.FP32: 67.0,  # non-tensorcore
+    },
+    "NVIDIA B200": {
+        ComputeDtype.FP4: 9000.0,
+        ComputeDtype.FP8: 4500.0,
+        ComputeDtype.BF16: 2250.0,
+        ComputeDtype.TF32: 1100.0,
+        ComputeDtype.FP32: 75.0,  # non-tensorcore
+    },
+    "NVIDIA GB200": {
+        ComputeDtype.FP4: 10000.0,
+        ComputeDtype.FP8: 5000.0,
+        ComputeDtype.BF16: 2500.0,
+        ComputeDtype.TF32: 1250.0,
+        ComputeDtype.FP32: 80.0,  # non-tensorcore
+    },
+}
+
+
+def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
+    gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(torch.cuda.get_device_name())
+    if gpu_rooflines is None:
+        return None
+    return gpu_rooflines.get(compute_dtype)
 
 
 shape_registry = {}
@@ -167,6 +199,7 @@ class Metrics:
     tflops: float = 0.0
     gbps: float = 0.0
     mem_bw_util: float = 0.0
+    compute_util: float = 0.0
 
     @staticmethod
     def header(shape_mode: ShapeMode = ShapeMode.REGULAR) -> str:
@@ -186,7 +219,7 @@ class Metrics:
         header = (
             f"{'OpName':<30} {group_col} {shape_col:<25} "
             f"{'Sim':<10} {'Ms':<10} {'TFLOPS':<10} "
-            f"{'GB/s':<10} {'Mem BW Util %':<10}"
+            f"{'GB/s':<10} {'Mem BW Util %':<14} {'Compute Util %':<10}"
         )
         divider = "-" * len(header)
         return f"GEMM Bench\n{divider}\n{header}\n{divider}"
@@ -207,10 +240,14 @@ class Metrics:
             shape = f"({self.M}, {self.N}, {self.K})"
 
         group_col = f"{self.groups:<6}" if is_grouped else ""
+        compute_util_str = (
+            f"{self.compute_util:<10.2f}" if self.compute_util > 0 else "N/A"
+        )
         return (
             f"{self.op:<30} {group_col} {shape:<25} "
             f"{self.sim:<10.3f} {self.ms:<10.3f} "
-            f"{self.tflops:<10.2f} {self.gbps:<10.2f} {self.mem_bw_util:<10.2f}"
+            f"{self.tflops:<10.2f} {self.gbps:<10.2f} "
+            f"{self.mem_bw_util:<14.2f} {compute_util_str}"
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -223,6 +260,7 @@ class Metrics:
             f"{self.op}_tflops": self.tflops,
             f"{self.op}_gb/s": self.gbps,
             f"{self.op}_mem_bw_util": self.mem_bw_util,
+            f"{self.op}_compute_util": self.compute_util,
         }
         if self.groups is not None:
             result["groups"] = self.groups
@@ -281,6 +319,10 @@ def benchmark_grouped(
             gemm_op.fast_accum = opts.fast_accum
         if hasattr(gemm_op, "torch_compile"):
             gemm_op.torch_compile = opts.torch_compile
+
+        # Get compute roofline for this op's compute dtype.
+        compute_roofline_tflops = get_compute_roofline_tflops(gemm_op.compute_dtype)
+
         try:
             # Get the quantized tensors for this operator.
             preprocessed_args = gemm_op.preprocess(A, B)
@@ -322,9 +364,9 @@ def benchmark_grouped(
                     )
 
             for i in range(num_groups):
-                metrics.tflops += 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
                 output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
                 if m[i] > 0:
+                    tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
                     gbps = (
                         (
                             m[i] * k[i] * quantized_vals[0][0].element_size()
@@ -335,12 +377,16 @@ def benchmark_grouped(
                         / 1e9
                     )
                     metrics.gbps += gbps
+                    metrics.tflops += tflops
                     metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
+                    if compute_roofline_tflops is not None:
+                        metrics.compute_util += (tflops / compute_roofline_tflops) * 100
             metrics.ms += ms_runtime
         metrics.ms /= opts.num_iters
         metrics.tflops /= opts.num_iters
         metrics.gbps /= opts.num_iters
         metrics.mem_bw_util /= opts.num_iters
+        metrics.compute_util /= opts.num_iters
 
         results.append(metrics)
 
@@ -375,6 +421,10 @@ def benchmark(
             gemm_op.fast_accum = opts.fast_accum
         if hasattr(gemm_op, "torch_compile"):
             gemm_op.torch_compile = opts.torch_compile
+
+        # Get compute roofline for this op's compute dtype.
+        compute_roofline_tflops = get_compute_roofline_tflops(gemm_op.compute_dtype)
+
         try:
             # Preprocess data if needed.
             preprocessed_args = gemm_op.preprocess(A, B)
@@ -407,7 +457,8 @@ def benchmark(
                         bench_quantize=False,
                     )
 
-            metrics.tflops += 2 * m * n * k / (ms_runtime / 1e3) / 1e12
+            tflops = 2 * m * n * k / (ms_runtime / 1e3) / 1e12
+            metrics.tflops += tflops
             gbps = (
                 (
                     quantized_vals[0].numel() * quantized_vals[0].element_size()
@@ -419,11 +470,14 @@ def benchmark(
             )
             metrics.gbps += gbps
             metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
+            if compute_roofline_tflops is not None:
+                metrics.compute_util += (tflops / compute_roofline_tflops) * 100
             metrics.ms += ms_runtime
         metrics.ms /= opts.num_iters
         metrics.tflops /= opts.num_iters
         metrics.gbps /= opts.num_iters
         metrics.mem_bw_util /= opts.num_iters
+        metrics.compute_util /= opts.num_iters
 
         results.append(metrics)
 

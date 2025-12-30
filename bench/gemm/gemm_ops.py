@@ -101,6 +101,14 @@ class GemmType(Enum):
     GROUPED = auto()
 
 
+class ComputeDtype(Enum):
+    FP32 = auto()
+    TF32 = auto()
+    BF16 = auto()
+    FP8 = auto()
+    FP4 = auto()
+
+
 @functools.cache
 def get_current_accelerator() -> Accelerator | None:
     if not torch.cuda.is_available():
@@ -182,6 +190,11 @@ class GemmOpBase(metaclass=abc.ABCMeta):
     def supported_gemm_types(self) -> set[GemmType]:
         pass
 
+    @abc.abstractproperty
+    def compute_dtype(self) -> ComputeDtype:
+        """The dtype used by tensor cores for the compute."""
+        pass
+
 
 def register_gemm_op(op):
     """Decorator function for assembling all quantize ops."""
@@ -233,6 +246,10 @@ class FP32Baseline(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR, GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP32
+
 
 @register_gemm_op
 class TF32Baseline(GemmOpBase):
@@ -277,6 +294,10 @@ class TF32Baseline(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR, GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.TF32
+
 
 @register_gemm_op
 class BF16Baseline(GemmOpBase):
@@ -316,6 +337,10 @@ class BF16Baseline(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR, GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -396,6 +421,10 @@ class ScaledMMBaseline(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class BF16X9Baseline(GemmOpBase):
@@ -439,6 +468,10 @@ class BF16X9Baseline(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR, GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -490,6 +523,10 @@ class ScaledMMRowwise(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class ScaledMMMXFP8(GemmOpBase):
@@ -538,6 +575,10 @@ class ScaledMMMXFP8(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -595,6 +636,10 @@ class ScaledMMNVFP4(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
 
 @register_gemm_op
 class FP8TensorwiseGemm(GemmOpBase):
@@ -626,6 +671,10 @@ class FP8TensorwiseGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -665,6 +714,10 @@ class FP8CublasRowwiseGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class FP8CublasTensorwiseGemm(GemmOpBase):
@@ -700,6 +753,10 @@ class FP8CublasTensorwiseGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -786,6 +843,10 @@ class FP8RowwiseGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
@@ -813,6 +874,10 @@ class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -910,6 +975,10 @@ class FP8RowwiseGroupedGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class BF16TritonStackedGroupedGemm(GemmOpBase):
@@ -948,6 +1017,10 @@ class BF16TritonStackedGroupedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -1032,6 +1105,10 @@ class FP8TritonStackedGroupedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1130,6 +1207,10 @@ class DeepGemmStacked(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1240,6 +1321,10 @@ class DeepGemmBlockwise(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class DeepGemmRowwise(GemmOpBase):
@@ -1284,6 +1369,10 @@ class DeepGemmRowwise(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1340,6 +1429,10 @@ class FP8StackedGroupedGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
@@ -1372,6 +1465,10 @@ class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1417,6 +1514,10 @@ class ScaledGroupedMMRowwise(FP8StackedGroupedGemmTorch):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1464,6 +1565,10 @@ class FP8StackedGroupwiseGroupedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1533,6 +1638,10 @@ class BF16GroupedGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class FP8RowwiseBatchedGemm(GemmOpBase):
@@ -1575,6 +1684,10 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 # This kernel is broken and causes GPU to lock up, needs some investigation
@@ -1621,6 +1734,10 @@ class TritonFP8RowwiseGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class FP8TritonBlockwiseGemm(GemmOpBase):
@@ -1652,6 +1769,10 @@ class FP8TritonBlockwiseGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1693,6 +1814,10 @@ class FP8CutlassBlockwiseGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class FP8CutlassGroupwiseGemm(GemmOpBase):
@@ -1731,6 +1856,10 @@ class FP8CutlassGroupwiseGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -1807,6 +1936,10 @@ class F8I4RowwiseGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class F8I4ShuffledGemm(GemmOpBase):
@@ -1852,6 +1985,10 @@ class F8I4ShuffledGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class BF16I4ShuffledGemm(GemmOpBase):
@@ -1894,6 +2031,10 @@ class BF16I4ShuffledGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class BF16I4ShuffledBatchedGemm(GemmOpBase):
@@ -1933,6 +2074,10 @@ class BF16I4ShuffledBatchedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -1993,6 +2138,10 @@ class F8I4ShuffledGroupedGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
 
 @register_gemm_op
 class BF16I4ShuffledGroupedGemm(GemmOpBase):
@@ -2049,6 +2198,10 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class BF16GroupedGrad(GemmOpBase):
@@ -2097,6 +2250,10 @@ class BF16GroupedGrad(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -2148,6 +2305,10 @@ class BF16GroupedWGrad(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class BF16GroupedStacked(GemmOpBase):
@@ -2193,6 +2354,10 @@ class BF16GroupedStacked(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class BF16I4RowwiseGemm(F8I4RowwiseGemm):
@@ -2230,6 +2395,10 @@ class BF16I4RowwiseGemm(F8I4RowwiseGemm):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -2269,6 +2438,10 @@ class TinyGemmBF16I4(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class MarlinBF16I4(GemmOpBase):
@@ -2306,6 +2479,10 @@ class MarlinBF16I4(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
 
 @register_gemm_op
 class MacheteBF16I4(GemmOpBase):
@@ -2340,6 +2517,10 @@ class MacheteBF16I4(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -2382,6 +2563,10 @@ class NVFP4Gemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
 
 
 @register_gemm_op
@@ -2467,6 +2652,10 @@ class NVFP4Quantize(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
 
 @register_gemm_op
 class MXFP4Gemm(GemmOpBase):
@@ -2497,6 +2686,10 @@ class MXFP4Gemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
 
 
 @register_gemm_op
@@ -2573,6 +2766,10 @@ class MXFP4StackedGroupedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
 
 
 @register_gemm_op
@@ -2717,6 +2914,10 @@ class NVFP4StackedGroupedGemm(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
 
 
 # Broken with cuda graph
@@ -2887,6 +3088,10 @@ class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
 
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
 
 @register_gemm_op
 class BF16GroupedGemm2d3d(GemmOpBase):
@@ -2930,6 +3135,10 @@ class BF16GroupedGemm2d3d(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
 
 
 @register_gemm_op
@@ -3016,6 +3225,10 @@ class MXFP8GroupedGemm2d3d(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
 
 
 @register_gemm_op
@@ -3129,3 +3342,7 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
     @property
     def supported_gemm_types(self) -> set[GemmType]:
         return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
