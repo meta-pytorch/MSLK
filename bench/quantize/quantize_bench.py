@@ -18,7 +18,7 @@ import pandas as pd
 import torch
 import triton  # @manual=//triton:triton
 
-from mslk.bench.common import profiler
+from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
 
@@ -149,10 +149,7 @@ def benchmark(
     m: int,
     k: int,
     mem_bw_roofline_gbps: float,
-    trace: bool,
-    use_cuda_graph: bool = True,
-    use_rotating_buffer: bool = False,
-    num_iters: int = 1,
+    opts: BenchOptions,
 ) -> list[Metrics]:
     # Create input tensors.
     input = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -167,13 +164,12 @@ def benchmark(
         dequantized = quantize_op.dequantize(*quantized)
         metrics.sim = torch.mean(torch.pow(dequantized - input, 2)).item()
 
-        for _ in range(num_iters):
-            with profiler(enabled=trace, with_stack=True):
+        for _ in range(opts.num_iters):
+            with profiler(enabled=opts.trace, with_stack=True):
                 ms_runtime = quantize_op.benchmark(
                     input,
                     args,
-                    use_cuda_graph=use_cuda_graph,
-                    use_rotating_buffer=use_rotating_buffer,
+                    opts=opts,
                 )
 
             input_bytes = input.numel() * input.element_size()
@@ -184,9 +180,9 @@ def benchmark(
             metrics.us += ms_runtime * 1000
             metrics.memory_bw_util += (gbps / mem_bw_roofline_gbps) * 100
 
-        metrics.us /= num_iters
-        metrics.gbps /= num_iters
-        metrics.memory_bw_util /= num_iters
+        metrics.us /= opts.num_iters
+        metrics.gbps /= opts.num_iters
+        metrics.memory_bw_util /= opts.num_iters
 
         results.append(metrics)
 
@@ -296,6 +292,14 @@ def invoke_main(
 
     mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
     MK = get_problem_shapes(shapes, m, k, pair_mk)
+
+    opts = BenchOptions(
+        num_iters=num_iters,
+        cuda_graph=not no_cuda_graph,
+        rotating_buffer=not no_rotating_buffer,
+        trace=trace,
+    )
+
     # Iterate over shapes and benchmark.
     benchmark_results = []
     csv = []
@@ -305,10 +309,7 @@ def invoke_main(
             M,
             K,
             mem_bw_roofline_gbps,
-            trace,
-            not no_cuda_graph,
-            not no_rotating_buffer,
-            num_iters,
+            opts,
         )
         benchmark_results.extend(quantize_measurements)
         csv_row = {}
@@ -326,8 +327,8 @@ def invoke_main(
 
     print("")
     print("Benchmark Settings:")
-    print(f"    CUDA graph: {not no_cuda_graph}")
-    print(f"    Buffer rotation: {not no_rotating_buffer}")
+    print(f"    CUDA graph: {opts.cuda_graph}")
+    print(f"    Buffer rotation: {opts.rotating_buffer}")
 
     if export_csv:
         os.makedirs(output_dir, exist_ok=True)
