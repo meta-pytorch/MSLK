@@ -2545,7 +2545,7 @@ class NVFP4Gemm(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale, global_scale):
         return torch.ops.mslk.f4f4bf16(
-            xq, wq, x_scale, w_scale, global_scale=global_scale, use_mx=False
+            xq, wq, x_scale, w_scale, global_scale=global_scale
         )
 
     def quantize_and_compute(self, x, w):
@@ -2634,7 +2634,7 @@ class NVFP4Quantize(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale, global_scale):
         return torch.ops.mslk.f4f4bf16(
-            xq, wq, x_scale, w_scale, global_scale=global_scale, use_mx=False
+            xq, wq, x_scale, w_scale, global_scale=global_scale
         )
 
     def quantize_and_compute(self, x, w):
