@@ -56,6 +56,7 @@ __global__ void set_grouped_gemm_args_kernel(
     LayoutSFA* layout_SFA,
     LayoutSFB* layout_SFB,
     GroupedGemmInputType gemm_type,
+    bool is_transposeAB,
     ElementGlobalScale* global_scale = nullptr,
     const ElementGlobalScale** global_scale_ptr = nullptr) {
   const uint32_t group_index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -174,9 +175,11 @@ __global__ void set_grouped_gemm_args_kernel(
       int total_K = K; // Name alias for clarity/readability.
 
       // Set problem shape.
-      // Main loop passes inputs in B,A order, so we have: (N, K_group) @
-      // (M, K_group)^T = (N, M) for each group.
-      problem_shape_ptr[group_index] = ProblemShape(N, M, K_group_size);
+      // We compute either C = A @ B or C^T = B^T @ A^T with swapped majorness.
+      const int problem_shape_m = is_transposeAB ? N : M;
+      const int problem_shape_n = is_transposeAB ? M : N;
+      problem_shape_ptr[group_index] =
+          ProblemShape(problem_shape_m, problem_shape_n, K_group_size);
 
       // Set pointers for this group.
       xq_ptr[group_index] = xq + xq_offset;
@@ -204,7 +207,7 @@ __global__ void set_grouped_gemm_args_kernel(
       // For output of this group, (M, K_group_size) @ (N, K_group_size)^T
       // = (M, N)
       stride_c_ptr[group_index] = cutlass::make_cute_packed_stride(
-          StrideC{}, cute::make_shape(int(N), int(M), 1));
+          StrideC{}, cute::make_shape(problem_shape_m, problem_shape_n, 1));
 
       // Set layouts for scale factors.
       // Groups of variable size are along the K dim, so we need to
@@ -271,8 +274,12 @@ __global__ void set_grouped_gemm_args_kernel(
       // nearest multiple of 128 * K rounded to nearest multiple of 4)
       w_scale_offset = group_index * N_rounded * K_rounded;
 
-      // Set problem shape
-      problem_shape_ptr[group_index] = ProblemShape(N, M_group_size, K);
+      // Set problem shape.
+      // We compute either C = A @ B or C^T = B^T @ A^T with swapped majorness.
+      const int problem_shape_m = is_transposeAB ? N : M_group_size;
+      const int problem_shape_n = is_transposeAB ? M_group_size : N;
+      problem_shape_ptr[group_index] =
+          ProblemShape(problem_shape_m, problem_shape_n, K);
 
       // Set pointers
       xq_ptr[group_index] = xq + xq_offset;
@@ -287,7 +294,7 @@ __global__ void set_grouped_gemm_args_kernel(
       stride_b_ptr[group_index] = cutlass::make_cute_packed_stride(
           StrideB{}, cute::make_shape(int(N), int(K), 1));
       stride_c_ptr[group_index] = cutlass::make_cute_packed_stride(
-          StrideC{}, cute::make_shape(int(N), int(M_group_size), 1));
+          StrideC{}, cute::make_shape(problem_shape_m, problem_shape_n, 1));
 
       // Set layouts for scale factors
       layout_SFA[group_index] = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(

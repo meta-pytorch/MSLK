@@ -58,7 +58,8 @@ template <
     int TB_K,
     int TBS_M,
     int TBS_N,
-    int TBS_K>
+    int TBS_K,
+    bool Transpose>
 at::Tensor mx8mx8bf16_grouped_impl(
     InputType XQ, // FP8
     InputType WQ, // FP8
@@ -85,13 +86,21 @@ at::Tensor mx8mx8bf16_grouped_impl(
   using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
   using ElementB = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
   using ElementC = cutlass::bfloat16_t;
-  using LayoutA = cutlass::layout::RowMajor;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using LayoutA_Transpose =
-      typename cutlass::layout::LayoutTranspose<LayoutA>::type;
-  using LayoutB_Transpose =
-      typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+  using LayoutA = cute::conditional_t<
+      Transpose,
+      typename cutlass::layout::LayoutTranspose<
+          cutlass::layout::RowMajor>::type,
+      cutlass::layout::RowMajor>;
+  using LayoutB = cute::conditional_t<
+      Transpose,
+      typename cutlass::layout::LayoutTranspose<
+          cutlass::layout::ColumnMajor>::type,
+      cutlass::layout::ColumnMajor>;
+  using LayoutC = cute::conditional_t<
+      Transpose,
+      typename cutlass::layout::LayoutTranspose<
+          cutlass::layout::RowMajor>::type,
+      cutlass::layout::RowMajor>;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
   using ElementAccumulator = float;
@@ -124,19 +133,19 @@ at::Tensor mx8mx8bf16_grouped_impl(
           void, // don't read C
           128 / cutlass::sizeof_bits<ElementC>::value,
           ElementC,
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
+          LayoutC*,
           128 / cutlass::sizeof_bits<ElementC>::value,
           EpilogueSchedule>::CollectiveOp;
 
-  using CollectiveMainloop =
+  using CollectiveMainloopTransposed =
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           cutlass::arch::OpClassBlockScaledTensorOp,
           ElementB,
-          LayoutB_Transpose*,
+          LayoutB*,
           AlignmentB,
           ElementA,
-          LayoutA_Transpose*,
+          LayoutA*,
           AlignmentA,
           ElementAccumulator,
           TileShape,
@@ -145,6 +154,27 @@ at::Tensor mx8mx8bf16_grouped_impl(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
           KernelSchedule>::CollectiveOp;
 
+  using CollectiveMainloopNormal =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag,
+          cutlass::arch::OpClassBlockScaledTensorOp,
+          ElementA,
+          LayoutA*,
+          AlignmentA,
+          ElementB,
+          LayoutB*,
+          AlignmentB,
+          ElementAccumulator,
+          TileShape,
+          ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+              sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          KernelSchedule>::CollectiveOp;
+
+  using CollectiveMainloop = cute::conditional_t<
+      Transpose,
+      CollectiveMainloopTransposed,
+      CollectiveMainloopNormal>;
   using GemmKernel = cutlass::gemm::kernel::
       GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -306,7 +336,8 @@ at::Tensor mx8mx8bf16_grouped_impl(
       offsets_ptr,
       layout_SFA,
       layout_SFB,
-      gemm_type);
+      gemm_type,
+      Transpose);
 
   cutlass::KernelHardwareInfo hw_info;
   // Change device_id to another value if you are running on a machine with
@@ -320,38 +351,53 @@ at::Tensor mx8mx8bf16_grouped_impl(
   using DataTypeA = typename ElementA::DataType;
   using DataTypeB = typename ElementB::DataType;
 
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      {kernel_groups, problem_shape_ptr, nullptr},
-      {
-          reinterpret_cast<const DataTypeB**>(wq_ptr),
-          stride_b_ptr,
-          reinterpret_cast<const DataTypeA**>(xq_ptr),
-          stride_a_ptr,
-          reinterpret_cast<const ScaleDtype**>(w_scale_ptr),
-          layout_SFB,
-          reinterpret_cast<const ScaleDtype**>(x_scale_ptr),
-          layout_SFA,
-      },
-      {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr},
-      hw_info};
+  typename Gemm::Arguments arguments = [&]() {
+    if constexpr (Transpose) {
+      return typename Gemm::Arguments{
+          cutlass::gemm::GemmUniversalMode::kGrouped,
+          {kernel_groups, problem_shape_ptr, nullptr},
+          {
+              reinterpret_cast<const DataTypeB**>(wq_ptr),
+              stride_b_ptr,
+              reinterpret_cast<const DataTypeA**>(xq_ptr),
+              stride_a_ptr,
+              reinterpret_cast<const ScaleDtype**>(w_scale_ptr),
+              layout_SFB,
+              reinterpret_cast<const ScaleDtype**>(x_scale_ptr),
+              layout_SFA,
+          },
+          {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr},
+          hw_info};
+    } else {
+      return typename Gemm::Arguments{
+          cutlass::gemm::GemmUniversalMode::kGrouped,
+          {kernel_groups, problem_shape_ptr, nullptr},
+          {
+              reinterpret_cast<const DataTypeA**>(xq_ptr),
+              stride_a_ptr,
+              reinterpret_cast<const DataTypeB**>(wq_ptr),
+              stride_b_ptr,
+              reinterpret_cast<const ScaleDtype**>(x_scale_ptr),
+              layout_SFA,
+              reinterpret_cast<const ScaleDtype**>(w_scale_ptr),
+              layout_SFB,
+          },
+          {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr},
+          hw_info};
+    }
+  }();
 
   Gemm gemm;
 
-  // Using the arguments, query for extra workspace required for matrix
-  // multiplication computation
   size_t workspace_size = Gemm::get_workspace_size(arguments);
 
-  // Allocate workspace memory
   at::Tensor workspace = at::empty(workspace_size, options.dtype(at::kByte));
 
-  // Check the problem size is supported or not
   cutlass::Status status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error("cutlass cannot implement");
   }
 
-  // Initialize CUTLASS kernel with arguments and workspace pointer
   status = gemm.initialize(
       arguments, reinterpret_cast<uint8_t*>(workspace.data_ptr()));
   if (status != cutlass::Status::kSuccess) {
