@@ -43,19 +43,13 @@ at::Tensor _f4f4bf16(
     at::Tensor WQ, // FP4
     at::Tensor x_scale,
     at::Tensor w_scale,
+    at::Tensor output,
     std::optional<at::Tensor> global_scale) {
   c10::cuda::CUDAGuard deviceGuard(XQ.device());
 
-  int M = XQ.size(0);
-  int N = WQ.size(0);
-  int K = XQ.size(1) * 2; // Since K is packed
-
-  TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
-  TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
-  TORCH_CHECK(x_scale.is_cuda() && x_scale.is_contiguous());
-  TORCH_CHECK(w_scale.is_cuda() && w_scale.is_contiguous());
-
-  auto Y = at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
+  const int M = XQ.size(0);
+  const int N = WQ.size(0);
+  const int K = XQ.size(1) * 2; // Since K is packed
 
   constexpr int TileShapeK = 128 * 8 / cutlass::sizeof_bits<InputType>::value;
 
@@ -205,9 +199,9 @@ at::Tensor _f4f4bf16(
        layout_SFA},
       {// Epilogue arguments
        {1, 0},
-       reinterpret_cast<ElementOutput*>(Y.data_ptr()),
+       reinterpret_cast<ElementOutput*>(output.data_ptr()),
        stride_output,
-       reinterpret_cast<ElementOutput*>(Y.data_ptr()),
+       reinterpret_cast<ElementOutput*>(output.data_ptr()),
        stride_output}};
 
   if constexpr (std::is_same_v<
@@ -250,7 +244,7 @@ at::Tensor _f4f4bf16(
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  return Y;
+  return output;
 }
 
 #endif

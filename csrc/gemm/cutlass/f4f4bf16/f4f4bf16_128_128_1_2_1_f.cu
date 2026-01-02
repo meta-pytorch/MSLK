@@ -17,10 +17,11 @@ at::Tensor f4f4bf16_128_128_1_2_1_f(
     at::Tensor WQ, // FP4
     at::Tensor x_scale,
     at::Tensor w_scale,
+    at::Tensor output,
     std::optional<at::Tensor> global_scale = std::nullopt) {
   // Dispatch this kernel to the correct underlying implementation.
   return _f4f4bf16<NVFP4, 128, 128, 1, 2, 1>(
-      XQ, WQ, x_scale, w_scale, global_scale);
+      XQ, WQ, x_scale, w_scale, output, global_scale);
 }
 
 #endif

@@ -144,14 +144,6 @@ at::Tensor i8i8bf16_dynamic(
     at::Tensor scale,
     int64_t split_k = 1);
 
-at::Tensor f4f4bf16(
-    at::Tensor XQ,
-    at::Tensor WQ,
-    at::Tensor x_scale,
-    at::Tensor w_scale,
-    std::optional<at::Tensor> global_scale = std::nullopt,
-    bool use_mx = true);
-
 at::Tensor f4f4bf16_grouped_stacked(
     at::Tensor XQ,
     at::Tensor WQ,
