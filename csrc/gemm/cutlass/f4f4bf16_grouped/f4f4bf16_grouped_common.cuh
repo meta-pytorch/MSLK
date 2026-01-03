@@ -431,6 +431,7 @@ at::Tensor f4f4bf16_grouped_impl(
         layout_SFA,
         layout_SFB,
         gemm_type,
+        true, // is_transposeAB
         is_nvfp4 ? reinterpret_cast<ElementGlobalScale*>(
                        global_scale.value().data_ptr())
                  : nullptr,
