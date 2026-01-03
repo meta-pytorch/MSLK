@@ -12,7 +12,7 @@ namespace mslk::gemm {
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
-at::Tensor mx8mx8bf16_grouped_256_256_256_2_1_1(
+at::Tensor mx8mx8bf16_grouped_256_128_256_2_1_1_ba(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // FP8
     at::Tensor x_scale,
@@ -20,7 +20,7 @@ at::Tensor mx8mx8bf16_grouped_256_256_256_2_1_1(
     at::Tensor output,
     int64_t G,
     at::Tensor offsets) {
-  return mx8mx8bf16_grouped_impl<at::Tensor, 256, 256, 256, 2, 1, 1>(
+  return mx8mx8bf16_grouped_impl<at::Tensor, 256, 128, 256, 2, 1, 1, true>(
       XQ, WQ, x_scale, w_scale, output, G, offsets);
 }
 

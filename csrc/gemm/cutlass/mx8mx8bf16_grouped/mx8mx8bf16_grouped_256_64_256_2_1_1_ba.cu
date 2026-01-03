@@ -6,22 +6,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include "f4f4bf16_common.cuh"
+#include "mx8mx8bf16_grouped_common.cuh"
 
 namespace mslk::gemm {
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
-at::Tensor f4f4bf16_256_256_4_1_1_f(
-    at::Tensor XQ, // FP4
-    at::Tensor WQ, // FP4
+at::Tensor mx8mx8bf16_grouped_256_64_256_2_1_1_ba(
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // FP8
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale = std::nullopt) {
-  // Dispatch this kernel to the correct underlying implementation.
-  return _f4f4bf16<NVFP4, 256, 256, 4, 1, 1>(
-      XQ, WQ, x_scale, w_scale, output, global_scale);
+    int64_t G,
+    at::Tensor offsets) {
+  return mx8mx8bf16_grouped_impl<at::Tensor, 256, 64, 256, 2, 1, 1, true>(
+      XQ, WQ, x_scale, w_scale, output, G, offsets);
 }
 
 #endif

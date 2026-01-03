@@ -16,6 +16,7 @@ namespace {
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash {
+  // NOLINTNEXTLINE(clang-diagnostic-unused-member-function)
   size_t operator()(
       const std::tuple<int64_t, int64_t, int64_t, int64_t>& t) const {
     auto hash1 = std::hash<int64_t>{}(std::get<0>(t));
