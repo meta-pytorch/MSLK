@@ -14,7 +14,11 @@ import torch
 from hypothesis import given, settings, strategies as st, Verbosity
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
+    from mslk.gemm.triton.grouped_gemm import (
+        grouped_gemm,
+        grouped_gemm_bias_scale,
+        grouped_gemm_fp8_rowwise,
+    )
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
 
 _MAX_SAMPLES = 32
@@ -240,4 +244,101 @@ class TestGroupedGEMM(unittest.TestCase):
 
         torch.testing.assert_close(
             result, expected_result, atol=1e-5, rtol=1.6e-2, msg=msg
+        )
+
+    @given(
+        G=st.sampled_from([1, 4, 16, 128]),
+        M=st.sampled_from([0, 128, 2048, 16384]),
+        N=st.sampled_from([256, 451]),
+        K=st.sampled_from([100, 256, 257]),
+        warp_specialization=st.sampled_from([False]),
+        has_bias=st.sampled_from([True, False]),
+        has_token_weights=st.sampled_from([True, False]),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
+    @unittest.skipIf(  # pyre-ignore [56]
+        (not torch.cuda.is_available())
+        or (torch.version.hip is None)
+        and (torch.cuda.get_device_properties(0).major < 9),
+        "Skip BF16 test on architectures before SM90.",
+    )
+    def test_grouped_gemm_bias_scale(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        warp_specialization: bool,
+        has_bias: bool,
+        has_token_weights: bool,
+    ) -> None:
+        torch.manual_seed(0)
+
+        device = torch.accelerator.current_accelerator()
+        a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+        b = torch.randn(N * G, K, dtype=torch.bfloat16, device=device)
+        m_ends, _ = torch.sort(
+            torch.randint(low=0, high=M, size=[G - 1], device=device, dtype=torch.int32)
+            if M > 0
+            else torch.zeros([G - 1], device=device, dtype=torch.int32)
+        )
+        m_ends = m_ends.tolist()
+        m_starts = [0] + m_ends
+        m_ends = m_ends + [M]
+        m_sizes = torch.tensor(
+            [m_ends[i] - m_starts[i] for i in range(G)], device=device
+        ).to(torch.int32)
+
+        # Generate optional bias and token_weights
+        # Use uniform distribution with values away from 0
+        bias = (
+            (torch.rand(G, N, dtype=torch.bfloat16, device=device) * 2 - 1)
+            if has_bias
+            else None
+        )
+        # Token weights typically represent router scores
+        token_weights = (
+            (torch.rand(M, dtype=torch.bfloat16, device=device) + 0.5)
+            if has_token_weights
+            else None
+        )
+
+        result = grouped_gemm_bias_scale(
+            a,
+            b,
+            m_sizes,
+            bias=bias,
+            token_weights=token_weights,
+            _use_warp_specialization=warp_specialization,
+        )
+        self.assertTrue(result.shape == (M, N))
+
+        if M == 0:
+            return
+
+        # Compute expected result: (a @ b.T + bias) * token_weights
+        expected_result = torch.zeros(M, N, dtype=torch.bfloat16, device=device)
+        for g in range(G):
+            m_start = m_starts[g]
+            m_end = m_ends[g]
+            # GEMM
+            group_result = a[m_start:m_end, :] @ b[g * N : (g + 1) * N, :].T
+            # Add bias (per-expert, broadcasted across tokens)
+            if has_bias and bias is not None:
+                group_result = group_result + bias[g, :].unsqueeze(0)
+            expected_result[m_start:m_end, :] = group_result
+
+        # Apply token weights (per-token, broadcasted across output dims)
+        if has_token_weights and token_weights is not None:
+            expected_result = expected_result * token_weights.unsqueeze(1)
+
+        def msg(s: str) -> str:
+            return (
+                f"{G=}, {M=}, {N=}, {K=}, {warp_specialization=}, "
+                f"{has_bias=}, {has_token_weights=}, {s}"
+            )
+
+        # Use higher tolerance due to accumulated floating-point errors
+        torch.testing.assert_close(
+            result, expected_result, atol=5e-2, rtol=1.6e-2, msg=msg
         )
