@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <ATen/ATen.h>
+#include <ATen/core/Tensor.h>
 
 #pragma once
 
