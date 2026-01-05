@@ -1,18 +1,11 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 #include "blackwell_fmha_fwd_template.cuh"
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
     const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
+    const at::Tensor& k, // (batch_size, KV_seqlen, num_KV_heads, head_dim) if non-paged or (num_blocks, page_block_size, num_KV_heads, head_dim) if paged
+    const at::Tensor& v, // (batch_size, KV_seqlen, num_KV_heads, head_dim) if non-paged or (num_blocks, page_block_size, num_KV_heads, head_dim) if paged
     const std::optional<at::Tensor>& cu_seqlens_q,
     const std::optional<at::Tensor>& cu_seqlens_k,
     std::optional<int64_t> max_seq_len_q,
@@ -20,9 +13,17 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
     std::optional<double> softmax_scale,
     bool causal,
     const std::optional<at::Tensor>& seqlen_kv,
+    const std::optional<at::Tensor>& page_table, // dim: (batch_size, max_num_pages_per_seq) , null if non-paged
+    std::optional<int64_t> seqlen_k,
     int64_t window_size_left,
     int64_t window_size_right,
     bool bottom_right) {
+
+  bool kIsPaged = false;
+  if (page_table && page_table->defined()) {
+    kIsPaged = true;
+  }
+
   // Handle local attention parameters
   bool local = (window_size_left >= 0 || window_size_right >= 0);
   if (local) {
@@ -46,6 +47,9 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
       window_size_right = max_seq_len_k.value();
     }
   }
+  if (causal){
+    window_size_right = 0;
+  }
 
   auto dispatch_fmha = [&](auto element,
                            auto element_out,
@@ -67,6 +71,8 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
         max_seq_len_k,
         softmax_scale,
         seqlen_kv,
+        page_table,
+        seqlen_k,
         window_size_left,
         window_size_right);
   };
@@ -101,6 +107,13 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
   };
 
   auto dispatch_mask = [&](auto varlen) {
+    int seq_k = kIsPaged
+        ? (varlen
+            ? static_cast<int>(*max_seq_len_k)
+            : static_cast<int>(*seqlen_k))
+        : (varlen
+            ? k.size(0)
+            : k.size(1));
     if (causal) {
       if (bottom_right) {
         return dispatch_head_dim(varlen, CausalMask</*kIsQBegin=*/false>{});
@@ -109,11 +122,11 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
       }
     } else if (local) {
       if (bottom_right) {
-        return dispatch_head_dim(varlen, LocalMask</*kIsQBegin=*/false>{});
+          return dispatch_head_dim(varlen, LocalMask</*kIsQBegin=*/false>{});
       } else {
         return dispatch_head_dim(varlen, LocalMask</*kIsQBegin=*/true>{});
       }
-    } else if (varlen || k.size(1) % 128 != 0) {
+    } else if (varlen || seq_k % 128 != 0) {
       // Use the residual mask for varlen or when K seqlen is not multiple of
       // blockN
       return dispatch_head_dim(varlen, ResidualMask{});
@@ -129,6 +142,31 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd(
   }
 }
 
+std::tuple<at::Tensor, at::Tensor> dispatch_fmha_fwd_meta(
+    const at::Tensor& q,
+    const at::Tensor& k, // (batch_size, KV_seqlen, num_KV_heads, head_dim) if non-paged or (num_blocks, page_block_size, num_KV_heads, head_dim) if paged
+    const at::Tensor& v, // (batch_size, KV_seqlen, num_KV_heads, head_dim) if non-paged or (num_blocks, page_block_size, num_KV_heads, head_dim) if paged
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const std::optional<at::Tensor>& cu_seqlens_k,
+    std::optional<c10::SymInt> max_seq_len_q,
+    std::optional<c10::SymInt> max_seq_len_k,
+    std::optional<double> softmax_scale,
+    bool causal,
+    const std::optional<at::Tensor>& seqlen_kv,
+    const std::optional<at::Tensor>& page_table, // dim: (batch_size, max_num_pages_per_seq) , null if non-paged
+    std::optional<c10::SymInt> seqlen_k,
+    c10::SymInt window_size_left,
+    c10::SymInt window_size_right,
+    bool bottom_right) {
+  auto output = at::empty_like(q);
+  bool k_is_varlen = max_seq_len_q.has_value();
+  auto SQ = k_is_varlen ? q.sym_size(0) : q.sym_size(1);
+  auto H_Q = k_is_varlen ? q.sym_size(1) : q.sym_size(2);
+  auto B = k_is_varlen ? 1 : q.sym_size(0);
+  auto logsumexp = q.new_empty_symint({B, H_Q, SQ}, q.options());
+  return std::make_tuple(output, logsumexp);
+}
+
 // -------------------------------------------------------------------------------------------------
 // Op registration
 // -------------------------------------------------------------------------------------------------
@@ -140,18 +178,23 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "    Tensor value, "
       "    Tensor? cu_seqlens_q=None, "
       "    Tensor? cu_seqlens_k=None, "
-      "    int? max_seq_len_q=None, "
-      "    int? max_seq_len_k=None, "
+      "    SymInt? max_seq_len_q=None, "
+      "    SymInt? max_seq_len_k=None, "
       "    float? softmax_scale=None, "
       "    bool causal=False, "
       "    Tensor? seqlen_kv=None, "
-      "    int window_size_left=-1, "
-      "    int window_size_right=-1, "
+      "    Tensor? page_table=None, "
+      "    SymInt? seqlen_k=None, "
+      "    SymInt window_size_left=-1, "
+      "    SymInt window_size_right=-1, "
       "    bool bottom_right=True"
       ") -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("fmha_fwd", dispatch_fmha_fwd);
+}
+TORCH_LIBRARY_IMPL(mslk, Meta, m) {
+  m.impl("fmha_fwd", dispatch_fmha_fwd_meta);
 }
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED

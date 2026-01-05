@@ -1,11 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 /***************************************************************************************************
  * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights
  *reserved. SPDX-License-Identifier: BSD-3-Clause
@@ -13,8 +6,8 @@
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
  *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  * this list of conditions and the following disclaimer in the documentation
@@ -26,15 +19,14 @@
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
 
@@ -63,8 +55,7 @@ TensorCreationResult init_tensors(int B, int H, int Hk, int D, int Sk) {
 
   at::TensorOptions options;
   try {
-    options =
-        at::TensorOptions().dtype(to_torch_type<Element>()).device(at::kCUDA);
+    options = at::TensorOptions().dtype(to_torch_type<Element>()).device(at::kCUDA);
     std::cout << "Successfully created tensor options" << std::endl;
   } catch (const std::exception& e) {
     std::cerr << "Failed to create tensor options: " << e.what() << std::endl;
@@ -79,8 +70,7 @@ TensorCreationResult init_tensors(int B, int H, int Hk, int D, int Sk) {
   at::Tensor v = at::empty_like(k);
 
   // Initialize tensors using CUTLASS reference functions
-  std::cout << "Initializing tensors with CUTLASS reference functions..."
-            << std::endl;
+  std::cout << "Initializing tensors with CUTLASS reference functions..." << std::endl;
 
   // Initialize Q tensor
   cutlass::reference::device::BlockFillRandomGaussian(
@@ -109,8 +99,7 @@ TensorCreationResult init_tensors(int B, int H, int Hk, int D, int Sk) {
   std::cout << "Input tensors initialized" << std::endl;
 
   // Create integer tensors using host-based initialization
-  std::cout << "Creating integer tensors with host initialization..."
-            << std::endl;
+  std::cout << "Creating integer tensors with host initialization..." << std::endl;
 
   // Create host vectors first
   std::vector<int> host_seqlen_kv(B, Sk);
@@ -137,8 +126,7 @@ TensorCreationResult init_tensors(int B, int H, int Hk, int D, int Sk) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char const** args) {
-  std::cout << "Running Blackwell Fused Multi-Head Attention Kernel"
-            << std::endl;
+  std::cout << "Running Blackwell Fused Multi-Head Attention Kernel" << std::endl;
 
   // Initialize CUDA context to prevent errors
   std::cout << "Initializing CUDA context..." << std::endl;
@@ -168,10 +156,9 @@ int main(int argc, char const** args) {
 
   int B = 2, H = 5, Hk = 1, D = 128, Sk = 1024;
   auto input_dtype = cutlass::float_e4m3_t{};
-  // auto input_dtype = cutlass::bfloat16_t{};
-  //  Test with different kernel types
-  const auto kernel_type =
-      static_cast<int>(KernelType::UMMA_I); // Can be "UMMA_I" or "UMMA_P"
+  //auto input_dtype = cutlass::bfloat16_t{};
+  // Test with different kernel types
+  const auto kernel_type = static_cast<int>(KernelType::UMMA_I); // Can be "UMMA_I" or "UMMA_P"
 
   // Use helper method to create and initialize tensors
   auto tensor_result = init_tensors<decltype(input_dtype)>(B, H, Hk, D, Sk);

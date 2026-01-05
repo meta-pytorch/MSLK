@@ -1,20 +1,13 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
  *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  * this list of conditions and the following disclaimer in the documentation
@@ -26,15 +19,14 @@
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
 
@@ -49,6 +41,7 @@ namespace cutlass::fmha::kernel {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct Sm100MlaIndividualTileScheduler {
+
   struct Params {
     dim3 grid;
   };
@@ -58,18 +51,13 @@ struct Sm100MlaIndividualTileScheduler {
   CUTLASS_DEVICE
   Sm100MlaIndividualTileScheduler(Params const&) {}
 
-  template <class ProblemShape, class ClusterShape>
+  template<class ProblemShape, class ClusterShape>
   static Params to_underlying_arguments(
-      ProblemShape const& problem_shape,
-      KernelHardwareInfo hw_info,
-      ClusterShape const& cluster_shape,
-      int const& split_kv) {
+      ProblemShape const& problem_shape, KernelHardwareInfo hw_info,
+      ClusterShape const& cluster_shape, int const& split_kv) {
     using namespace cute;
-    dim3 grid(
-        get<0>(cluster_shape),
-        get<3>(problem_shape) /* Batch */,
-        split_kv /*Maximum Split KV*/);
-    return Params{grid};
+    dim3 grid(get<0>(cluster_shape), get<3>(problem_shape) /* Batch */, split_kv /*Maximum Split KV*/);
+    return Params{ grid };
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -97,6 +85,7 @@ struct Sm100MlaIndividualTileScheduler {
 ////////////////////////////////////////////////////////////////////////////////
 
 struct Sm100MlaPersistentTileScheduler {
+
   struct Params {
     int num_blocks;
     FastDivmod divmod_m_block;
@@ -109,41 +98,33 @@ struct Sm100MlaPersistentTileScheduler {
   Params params;
 
   CUTLASS_DEVICE
-  Sm100MlaPersistentTileScheduler(Params const& params)
-      : block_idx(blockIdx.x), params(params) {}
+  Sm100MlaPersistentTileScheduler(Params const& params) : block_idx(blockIdx.x), params(params) {}
 
-  template <class ProblemShape, class ClusterShape>
+  template<class ProblemShape, class ClusterShape>
   static Params to_underlying_arguments(
-      ProblemShape const& problem_shape,
-      KernelHardwareInfo hw_info,
-      ClusterShape const& cluster_shape,
-      int const& split_kv) {
+      ProblemShape const& problem_shape, KernelHardwareInfo hw_info,
+      ClusterShape const& cluster_shape, int const& split_kv) {
     using namespace cute;
     // Get SM count if needed, otherwise use user supplied SM count
     int sm_count = hw_info.sm_count;
     if (sm_count <= 1 || sm_count % size<0>(cluster_shape) != 0) {
-      CUTLASS_TRACE_HOST(
-          "  WARNING: Arguments do not include a valid SM count.\n"
+      CUTLASS_TRACE_HOST("  WARNING: Arguments do not include a valid SM count.\n"
           "  For optimal performance, populate the arguments KernelHardwareInfo struct with the SM count.");
-      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(
-          hw_info.device_id);
+      sm_count = KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
     }
 
-    CUTLASS_TRACE_HOST(
-        "to_underlying_arguments(): Setting persistent grid SM count to "
-        << sm_count);
+    CUTLASS_TRACE_HOST("to_underlying_arguments(): Setting persistent grid SM count to " << sm_count);
     hw_info.sm_count = sm_count;
 
     int num_m_blocks = size<0>(cluster_shape);
-    int num_blocks = num_m_blocks * get<3>(problem_shape) /* Batch */;
+    int num_blocks = num_m_blocks * get<3>(problem_shape)  /* Batch */;
     num_blocks *= split_kv; /* Maximum Split KV*/
 
-    return Params{
-        num_blocks,
-        {num_m_blocks},
-        {get<3>(problem_shape)},
-        {split_kv},
-        hw_info};
+    return Params {
+      num_blocks,
+      { num_m_blocks}, { get<3>(problem_shape) }, {split_kv},
+      hw_info
+    };
   }
 
   static dim3 get_grid_shape(Params const& params) {
@@ -177,3 +158,4 @@ struct Sm100MlaPersistentTileScheduler {
 ////////////////////////////////////////////////////////////////////////////////
 
 } // namespace cutlass::fmha::kernel
+
