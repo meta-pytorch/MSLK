@@ -22,16 +22,6 @@
 #endif
 #include <cassert>
 
-namespace {
-
-inline int get_device_sm_cnt_() {
-  cudaDeviceProp* deviceProp =
-      at::cuda::getDeviceProperties(c10::cuda::current_device());
-  return deviceProp->multiProcessorCount;
-}
-
-} // namespace
-
 namespace mslk {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 9000
