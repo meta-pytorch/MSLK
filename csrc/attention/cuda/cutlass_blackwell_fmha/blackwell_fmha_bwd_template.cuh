@@ -1,11 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 #pragma once
 #include "blackwell_fmha_utils.hpp"
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
@@ -30,7 +23,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
     std::optional<int> max_seq_len_k,
     const std::optional<double> softmax_scale,
     const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right
+) {
   const auto device = q.device();
   at::cuda::CUDAGuard device_guard(device);
 
@@ -38,34 +32,21 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
 
   // Q K D D_VO ((H_R, H_K) B)
   using ProblemShapeType = std::conditional_t<
-      kIsVarlen,
-      cute::tuple<
-          VariableLength,
-          VariableLength,
-          int,
-          int,
-          cute::tuple<cute::tuple<int, int>, int>>,
-      cute::tuple<int, int, int, int, cute::tuple<cute::tuple<int, int>, int>>>;
+    kIsVarlen,
+    cute::tuple<VariableLength, VariableLength, int, int, cute::tuple<cute::tuple<int, int>, int>>,
+    cute::tuple<int, int, int, int, cute::tuple<cute::tuple<int, int>, int>>
+  >;
   using D_H = cute::Int<HeadDim>;
   using TileShape = Shape<_128, _128, D_H>;
 
-  using Operation = cutlass::fmha::device::Sm100FmhaBwd<
-      ProblemShapeType,
-      Element,
-      ElementAccumulator,
-      TileShape,
-      /*kIsMla=*/false,
-      ActiveMask,
-      kIsDeterministic>;
+  using Operation = cutlass::fmha::device::
+      Sm100FmhaBwd<ProblemShapeType, Element, ElementAccumulator, TileShape, /*kIsMla=*/false, ActiveMask, kIsDeterministic>;
 
-  using StrideQ =
-      Stride<int, _1, Stride<Stride<int, int>, int>>; // Q D    ((H_R, H_K), B)
-  using StrideK =
-      Stride<int, _1, Stride<Stride<_0, int>, int>>; // K D    ((H_R, H_K), B)
-  using StrideV = StrideK; // K D_VO ((H_R, H_K), B)
-  using StrideO = StrideQ; // Q D_VO ((H_R, H_K), B)
-  using StrideLSE =
-      Stride<_1, Stride<Stride<int, int>, int>>; // Q      ((H_R, H_K), B)
+  using StrideQ = Stride<int, _1, Stride<Stride<int, int>, int>>; // Q D    ((H_R, H_K), B)
+  using StrideK = Stride<int, _1, Stride<Stride<_0, int>, int>>;  // K D    ((H_R, H_K), B)
+  using StrideV = StrideK;                                        // K D_VO ((H_R, H_K), B)
+  using StrideO = StrideQ;                                        // Q D_VO ((H_R, H_K), B)
+  using StrideLSE = Stride<_1, Stride<Stride<int, int>, int>>;    // Q      ((H_R, H_K), B)
 
   // Backwards specific
   using StrideDQ = StrideQ;
@@ -77,34 +58,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
     TORCH_CHECK(
         q.dim() == 3,
         "Expect Q shape to be (total_Q_seqlen, num_Q_heads, head_dim) ",
-        "Found shape ",
-        q.sizes());
+        "Found shape ", q.sizes());
     TORCH_CHECK(
         k.dim() == 3,
         "Expect K shape to be (total_KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ",
-        k.sizes());
+        "Found shape ", k.sizes());
     TORCH_CHECK(
         v.dim() == 3,
         "Expect V shape to be (total_KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ",
-        v.sizes());
-  } else {
+        "Found shape ", v.sizes());
+  }
+  else {
     TORCH_CHECK(
         q.dim() == 4,
         "Expect Q shape to be (batch_size, Q_seqlen, num_Q_heads, head_dim). ",
-        "Found shape ",
-        q.sizes());
+        "Found shape ", q.sizes());
     TORCH_CHECK(
         k.dim() == 4,
         "Expect K shape to be (batch_size, KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ",
-        k.sizes());
+        "Found shape ", k.sizes());
     TORCH_CHECK(
         v.dim() == 4,
         "Expect V shape to be (batch_size, KV_seqlen, num_KV_heads, head_dim) ",
-        "Found shape ",
-        v.sizes());
+        "Found shape ", v.sizes());
   }
 
   if constexpr (kIsVarlen) {
@@ -129,19 +105,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
   if constexpr (kIsVarlen) {
     problem_shape = cute::make_tuple(
         VariableLength{
-            *max_seq_len_q,
-            static_cast<int*>(cu_seqlens_q->data_ptr()),
-            int(q.size(0))},
+            *max_seq_len_q, static_cast<int*>(cu_seqlens_q->data_ptr()), int(q.size(0))},
         VariableLength{
-            *max_seq_len_k,
-            static_cast<int*>(cu_seqlens_k->data_ptr()),
-            int(k.size(0))},
+            *max_seq_len_k, static_cast<int*>(cu_seqlens_k->data_ptr()), int(k.size(0))},
         D,
         D,
         make_shape(make_shape(H_R, H_K), B));
-  } else {
-    problem_shape =
-        cute::make_tuple(Q, K, D, D, make_shape(make_shape(H_R, H_K), B));
+  }
+  else {
+    problem_shape = cute::make_tuple(
+        Q, K, D, D, make_shape(make_shape(H_R, H_K), B));
   }
   TORCH_CHECK(D == HeadDim);
   TORCH_CHECK(D % 8 == 0); // Alignment
@@ -160,14 +133,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
   auto ndim = q_.dim();
 
   TORCH_CHECK(q_.stride(ndim - 1) == 1, "The head dim in Q must be contiguous");
-  TORCH_CHECK(
-      k_.stride(ndim - 1) == 1, "The head dim in KV must be contiguous");
+  TORCH_CHECK(k_.stride(ndim - 1) == 1, "The head dim in KV must be contiguous");
   TORCH_CHECK(o_.stride(ndim - 1) == 1, "The head dim in O must be contiguous");
-  TORCH_CHECK(
-      dO_.stride(ndim - 1) == 1, "The head dim in dO must be contiguous");
-  TORCH_CHECK(
-      lse_.stride(lse_.dim() - 1) == 1,
-      "The seqlen dim in LSE must be contiguous");
+  TORCH_CHECK(dO_.stride(ndim - 1) == 1, "The head dim in dO must be contiguous");
+  TORCH_CHECK(lse_.stride(lse_.dim() - 1) == 1, "The seqlen dim in LSE must be contiguous");
   if (H_R != 1) {
     TORCH_CHECK(k_.stride(3) == 0, "The shared KV head stride must be zero");
   }
@@ -175,20 +144,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
   // Note: We use a different layout from 77_blackwell_fmha_bwd.cu.
   // Q shape = (B, Q, H_K, H_R, D)
   StrideQ stride_Q = make_stride(
-      static_cast<int>(q_.stride(1)),
-      _1{},
+      static_cast<int>(q_.stride(1)), _1{},
       make_stride(
-          make_stride(
-              static_cast<int>(q_.stride(3)), static_cast<int>(q_.stride(2))),
-          static_cast<int>(q_.stride(0))));
+        make_stride(
+          static_cast<int>(q_.stride(3)),
+          static_cast<int>(q_.stride(2))),
+        static_cast<int>(q_.stride(0))));
 
   // K shape = (B, K, H_K, 1, D)
   StrideK stride_K = make_stride(
-      static_cast<int>(k_.stride(1)),
-      _1{},
+      static_cast<int>(k_.stride(1)), _1{},
       make_stride(
-          make_stride(_0{}, static_cast<int>(k_.stride(2))),
-          static_cast<int>(k_.stride(0))));
+        make_stride(_0{}, static_cast<int>(k_.stride(2))),
+        static_cast<int>(k_.stride(0))));
 
   StrideV stride_V = stride_K;
 
@@ -196,34 +164,36 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
   StrideLSE stride_LSE = make_stride(
       _1{},
       make_stride(
-          make_stride(
-              static_cast<int>(lse_.stride(2)),
-              static_cast<int>(lse_.stride(1))),
-          static_cast<int>(lse_.stride(0))));
+        make_stride(
+          static_cast<int>(lse_.stride(2)),
+          static_cast<int>(lse_.stride(1))),
+        static_cast<int>(lse_.stride(0))));
 
   // O shape = (B, Q, H_K, H_R, D)
   StrideO stride_O = make_stride(
-      static_cast<int>(o_.stride(1)),
-      _1{},
+      static_cast<int>(o_.stride(1)), _1{},
       make_stride(
-          make_stride(
-              static_cast<int>(o_.stride(3)), static_cast<int>(o_.stride(2))),
-          static_cast<int>(o_.stride(0))));
+        make_stride(
+          static_cast<int>(o_.stride(3)),
+          static_cast<int>(o_.stride(2))),
+        static_cast<int>(o_.stride(0))));
 
   // dO shape = (B, Q, H_K, H_R, D)
   StrideDO stride_dO = make_stride(
-      static_cast<int>(dO_.stride(1)),
-      _1{},
+      static_cast<int>(dO_.stride(1)), _1{},
       make_stride(
-          make_stride(
-              static_cast<int>(dO_.stride(3)), static_cast<int>(dO_.stride(2))),
-          static_cast<int>(dO_.stride(0))));
+        make_stride(
+          static_cast<int>(dO_.stride(3)),
+          static_cast<int>(dO_.stride(2))),
+        static_cast<int>(dO_.stride(0))));
 
   // Outputs are always contiguous
   StrideDQ stride_dQ = make_stride(
-      H_Q * D, _1{}, make_stride(make_stride(D, H_R * D), D * Q * H_Q));
+      H_Q * D, _1{},
+      make_stride(make_stride(D, H_R * D), D * Q * H_Q));
   StrideDK stride_dK = make_stride(
-      H_K * D, _1{}, make_stride(make_stride(_0{}, D), D * K * H_K));
+      H_K * D, _1{},
+      make_stride(make_stride(_0{}, D), D * K * H_K));
   StrideDV stride_dV = stride_dK;
 
   if constexpr (kIsVarlen) {
@@ -240,8 +210,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
     get<2, 1>(stride_dV) = 0;
   }
 
-  ElementAccumulator softmax_scale_value =
-      softmax_scale.has_value() ? softmax_scale.value() : (1.0f / sqrtf(D));
+  ElementAccumulator softmax_scale_value = softmax_scale.has_value() ? softmax_scale.value() : (1.0f / sqrtf(D));
 
   at::Tensor dQ = torch::empty_like(q);
   at::Tensor dK = torch::empty_like(k);
@@ -267,30 +236,30 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fmha_bwd(
   }
 
   typename Operation::Arguments arguments{
-      problem_shape,
-      static_cast<Element*>(q.data_ptr()),
-      stride_Q,
-      static_cast<Element*>(k.data_ptr()),
-      stride_K,
-      static_cast<Element*>(v.data_ptr()),
-      stride_V,
-      static_cast<Element*>(o.data_ptr()),
-      stride_O,
-      static_cast<ElementAccumulator*>(softmax_lse.data_ptr()),
-      stride_LSE,
-      static_cast<Element*>(dO.data_ptr()),
-      stride_dO,
-      static_cast<Element*>(dQ.data_ptr()),
-      stride_dQ,
-      static_cast<Element*>(dK.data_ptr()),
-      stride_dK,
-      static_cast<Element*>(dV.data_ptr()),
-      stride_dV,
-      softmax_scale_value,
-      dq_semaphore_ptr,
-      window_size_left,
-      window_size_right,
-      hw_info};
+    problem_shape,
+    static_cast<Element*>(q.data_ptr()),
+    stride_Q,
+    static_cast<Element*>(k.data_ptr()),
+    stride_K,
+    static_cast<Element*>(v.data_ptr()),
+    stride_V,
+    static_cast<Element*>(o.data_ptr()),
+    stride_O,
+    static_cast<ElementAccumulator*>(softmax_lse.data_ptr()),
+    stride_LSE,
+    static_cast<Element*>(dO.data_ptr()),
+    stride_dO,
+    static_cast<Element*>(dQ.data_ptr()),
+    stride_dQ,
+    static_cast<Element*>(dK.data_ptr()),
+    stride_dK,
+    static_cast<Element*>(dV.data_ptr()),
+    stride_dV,
+    softmax_scale_value,
+    dq_semaphore_ptr,
+    window_size_left,
+    window_size_right,
+    hw_info};
   launch_fmha_op<Operation>(arguments);
 
   return std::make_tuple(dQ, dK, dV);

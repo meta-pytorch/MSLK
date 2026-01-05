@@ -1,11 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 /***************************************************************************************************
  * Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -13,8 +6,8 @@
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
  *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
  *
  * 2. Redistributions in binary form must reproduce the above copyright notice,
  * this list of conditions and the following disclaimer in the documentation
@@ -26,15 +19,14 @@
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
 /*!
@@ -53,8 +45,8 @@
 #include "cutlass/trace.h"
 #endif // !defined(__CUDACC_RTC__)
 
-#include "kernel/sm100_fmha_mla_reduction.hpp"
 #include "kernel/sm100_fmha_mla_tma_warpspecialized.hpp"
+#include "kernel/sm100_fmha_mla_reduction.hpp"
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -63,13 +55,17 @@ namespace cutlass::fmha::device {
 using namespace cute;
 using namespace cutlass::fmha::kernel;
 
+
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////// CUTLASS 3.x API /////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
 
-template <class Kernel_>
+template<
+    class Kernel_
+>
 class MLA {
- public:
+public:
+
   using Kernel = Kernel_;
 
   using ReductionKernel = cutlass::fmha::kernel::Sm100FmhaMlaReductionKernel<
@@ -79,7 +75,7 @@ class MLA {
       Kernel::TileShapeH::value,
       Kernel::TileShapeL::value,
       256 /*Max split*/
-      >;
+  >;
 
   /// Argument structure: User API
   using KernelArguments = typename Kernel::Arguments;
@@ -95,43 +91,36 @@ class MLA {
     ReductionParams reduction_params;
   };
 
- private:
+private:
+
   /// Kernel API parameters object
   Params params_;
 
   bool is_initialized(bool set = false) {
     static bool initialized = false;
-    if (set)
-      initialized = true;
+    if (set) initialized = true;
     return initialized;
   }
 
   static ReductionArguments to_reduction_args(Arguments const& args) {
     auto [H, K, D, B] = args.problem_shape;
     return ReductionArguments{
-        nullptr,
-        args.epilogue.ptr_o,
-        nullptr,
-        args.epilogue.ptr_lse,
-        args.mainloop.softmax_scale,
-        B,
-        args.split_kv,
-        K,
-        args.mainloop.ptr_seq,
-        args.ptr_split_kv,
-        Kernel::TileShapeS::value};
+      nullptr, args.epilogue.ptr_o, nullptr, args.epilogue.ptr_lse,
+      args.mainloop.softmax_scale, B, args.split_kv, K, args.mainloop.ptr_seq, 
+      args.ptr_split_kv, Kernel::TileShapeS::value
+    };
   }
 
- public:
+public:
+
   /// Access the Params structure
   Params const& params() const {
     return params_;
   }
 
-  static void set_split_kv(KernelArguments& args) {
-    if (args.split_kv >= 1)
-      return;
-    auto [H, K, D, B] = args.problem_shape;
+  static void set_split_kv (KernelArguments& args) {
+    if (args.split_kv >= 1) return;
+    auto [H, K, D, B] = args.problem_shape; 
     int sm_count = args.hw_info.sm_count;
     int max_splits = ceil_div(K, 128);
     int sms_per_batch = max(1, sm_count / B);
@@ -140,30 +129,30 @@ class MLA {
     int k_waves = ceil_div(max_splits, split_heur);
     int split_wave_aware = ceil_div(max_splits, k_waves);
     if (args.is_fused_reduction && split_wave_aware > 1) {
-      args.split_kv =
-          std::min(split_wave_aware, static_cast<int>(sm_count / 2));
+      args.split_kv = std::min(split_wave_aware, static_cast<int>(sm_count/2));
     } else {
       args.split_kv = split_wave_aware;
     }
   }
 
   /// Determines whether the GEMM can execute the given problem.
-  static Status can_implement(Arguments const& args) {
-    if (!Kernel::can_implement(args)) {
+  static Status
+  can_implement(Arguments const& args) {
+    if (! Kernel::can_implement(args)) {
       return Status::kInvalid;
     }
-    if (!ReductionKernel::can_implement(to_reduction_args(args))) {
+    if (! ReductionKernel::can_implement(to_reduction_args(args))) {
       return Status::kInvalid;
     }
     return Status::kSuccess;
   }
 
   /// Gets the workspace size
-  static size_t get_workspace_size(Arguments const& args) {
+  static size_t
+  get_workspace_size(Arguments const& args) {
     size_t workspace_bytes = 0;
     workspace_bytes += Kernel::get_workspace_size(args);
-    workspace_bytes +=
-        ReductionKernel::get_workspace_size(to_reduction_args(args));
+    workspace_bytes += ReductionKernel::get_workspace_size(to_reduction_args(args));
     return workspace_bytes;
   }
 
@@ -184,8 +173,8 @@ class MLA {
       if (cudaSuccess != result) {
         result = cudaGetLastError(); // to clear the error bit
         CUTLASS_TRACE_HOST(
-            "  cudaFuncSetAttribute() returned error: "
-            << cudaGetErrorString(result));
+          "  cudaFuncSetAttribute() returned error: "
+          << cudaGetErrorString(result));
         return -1;
       }
     }
@@ -200,8 +189,8 @@ class MLA {
     if (cudaSuccess != result) {
       result = cudaGetLastError(); // to clear the error bit
       CUTLASS_TRACE_HOST(
-          "  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
-          << cudaGetErrorString(result));
+        "  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
+        << cudaGetErrorString(result));
       return -1;
     }
 
@@ -210,39 +199,32 @@ class MLA {
   }
 
   /// Initializes GEMM state from arguments.
-  Status initialize(
-      Arguments const& args,
-      void* workspace = nullptr,
-      cudaStream_t stream = nullptr) {
-    CUTLASS_TRACE_HOST(
-        "MLA::initialize() - workspace "
-        << workspace << ", stream: " << (stream ? "non-null" : "null"));
+  Status
+  initialize(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+    CUTLASS_TRACE_HOST("MLA::initialize() - workspace "
+      << workspace << ", stream: " << (stream ? "non-null" : "null"));
 
     // Initialize the workspace
     Status status = Kernel::initialize_workspace(args, workspace, stream);
     if (status != Status::kSuccess) {
       return status;
     }
-    status = ReductionKernel::initialize_workspace(
-        to_reduction_args(args), workspace, stream);
+    status = ReductionKernel::initialize_workspace(to_reduction_args(args), workspace, stream);
     if (status != Status::kSuccess) {
       return status;
     }
-    KernelParams kernel_params =
-        Kernel::to_underlying_arguments(args, workspace);
+    KernelParams kernel_params = Kernel::to_underlying_arguments(args, workspace);
 
     ReductionArguments reduction_args = to_reduction_args(args);
     if (reduction_args.split_kv > 1) {
-      reduction_args.ptr_oaccum = kernel_params.epilogue.ptr_o_acc;
+      reduction_args.ptr_oaccum   = kernel_params.epilogue.ptr_o_acc;
       reduction_args.ptr_lseaccum = kernel_params.epilogue.ptr_lse_acc;
     }
-    ReductionParams reduction_params =
-        ReductionKernel::to_underlying_arguments(reduction_args, workspace);
+    ReductionParams reduction_params = ReductionKernel::to_underlying_arguments(reduction_args, workspace);
     // Initialize the Params structure
-    params_ = Params{kernel_params, reduction_params};
+    params_ = Params {kernel_params, reduction_params};
 
-    if (is_initialized())
-      return Status::kSuccess;
+    if (is_initialized()) return Status::kSuccess;
 
     // account for dynamic smem capacity if needed
     // no dynamic smem is needed for reduction kernel
@@ -255,9 +237,7 @@ class MLA {
           smem_size);
       if (cudaSuccess != result) {
         result = cudaGetLastError(); // to clear the error bit
-        CUTLASS_TRACE_HOST(
-            "  cudaFuncSetAttribute() returned error: "
-            << cudaGetErrorString(result));
+        CUTLASS_TRACE_HOST("  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
         return Status::kErrorInternal;
       }
     }
@@ -267,9 +247,9 @@ class MLA {
     return Status::kSuccess;
   }
 
-  /// Update API is preserved in 3.0, but does not guarantee a lightweight
-  /// update of params.
-  Status update(Arguments const& args, void* workspace = nullptr) {
+  /// Update API is preserved in 3.0, but does not guarantee a lightweight update of params.
+  Status
+  update(Arguments const& args, void* workspace = nullptr) {
     CUTLASS_TRACE_HOST("MLA()::update() - workspace: " << workspace);
 
     size_t workspace_bytes = get_workspace_size(args);
@@ -281,21 +261,20 @@ class MLA {
 
     ReductionArguments reduction_args = to_reduction_args(args);
     if (reduction_args.split_kv > 1) {
-      reduction_args.ptr_oaccum = fmha_params.epilogue.ptr_o_acc;
+      reduction_args.ptr_oaccum   = fmha_params.epilogue.ptr_o_acc;
       reduction_args.ptr_lseaccum = fmha_params.epilogue.ptr_lse_acc;
     }
-    ReductionParams reduction_params =
-        ReductionKernel::to_underlying_arguments(reduction_args, workspace);
+    ReductionParams reduction_params = ReductionKernel::to_underlying_arguments(reduction_args, workspace); 
     // Initialize the Params structure
-    params_ = Params{fmha_params, reduction_params};
+    params_ = Params {fmha_params, reduction_params};
 
     return Status::kSuccess;
   }
 
-  /// Primary run() entry point API that is static allowing users to create and
-  /// manage their own params. Supplied params struct must be construct by
-  /// calling Kernel::to_underling_arguments()
-  static Status run(Params& params, cudaStream_t stream = nullptr) {
+  /// Primary run() entry point API that is static allowing users to create and manage their own params.
+  /// Supplied params struct must be construct by calling Kernel::to_underling_arguments()
+  static Status
+  run(Params& params, cudaStream_t stream = nullptr) {
     CUTLASS_TRACE_HOST("MLA::run()");
     dim3 const block = Kernel::get_block_shape();
     dim3 const grid = Kernel::get_grid_shape(params.fmha_params);
@@ -306,88 +285,72 @@ class MLA {
     int smem_size = Kernel::SharedStorageSize;
 
     Status launch_result;
-    if (params.fmha_params.is_fused_reduction &&
-        params.reduction_params.split_kv > 1) {
-      auto result = cudaMemsetAsync(
-          params.fmha_params.epilogue.ptr_o,
-          0,
-          sizeof(typename Kernel::ElementOut) * H * D_latent * B,
-          stream);
+    if (params.fmha_params.is_fused_reduction && params.reduction_params.split_kv > 1) {
+      auto result = cudaMemsetAsync(params.fmha_params.epilogue.ptr_o, 0, sizeof(typename Kernel::ElementOut) * H * D_latent * B, stream);
       if (cudaSuccess != result) {
         result = cudaGetLastError(); // to clear the error bit
         CUTLASS_TRACE_HOST(
-            "  cudaMemsetAsync() returned error: "
-            << cudaGetErrorString(result));
+        "  cudaMemsetAsync() returned error: "
+        << cudaGetErrorString(result));
         return Status::kErrorInternal;
       }
-      auto total_bytes =
-          H * B * (sizeof(int) + sizeof(typename Kernel::ElementLSE)) +
-          2 * B * sizeof(int);
-      uint8_t* ws = reinterpret_cast<uint8_t*>(
-          params.fmha_params.epilogue.ptr_lse_exchange_buff);
+      auto total_bytes = H * B * (sizeof(int) + sizeof(typename Kernel::ElementLSE)) + 2 * B * sizeof(int);
+      uint8_t* ws = reinterpret_cast<uint8_t*>(params.fmha_params.epilogue.ptr_lse_exchange_buff);
       result = cudaMemsetAsync(ws, 0, total_bytes, stream);
       if (cudaSuccess != result) {
         result = cudaGetLastError(); // to clear the error bit
         CUTLASS_TRACE_HOST(
-            "  cudaMemsetAsync() returned error: "
-            << cudaGetErrorString(result));
-        return Status::kErrorInternal;
-        ;
+        "  cudaMemsetAsync() returned error: "
+        << cudaGetErrorString(result));
+        return Status::kErrorInternal;;
       }
     }
     // Use extended launch API only for mainloops that use it
-    if constexpr (Kernel::ArchTag::kMinComputeCapability >= 90) {
-      dim3 cluster(
-          cute::size<0>(typename Kernel::ClusterShape{}),
-          cute::size<1>(typename Kernel::ClusterShape{}),
-          cute::size<2>(typename Kernel::ClusterShape{}));
-      void const* kernel = (void const*)device_kernel<Kernel>;
+    if constexpr(Kernel::ArchTag::kMinComputeCapability >= 90) {
+      dim3 cluster(cute::size<0>(typename Kernel::ClusterShape{}),
+                   cute::size<1>(typename Kernel::ClusterShape{}),
+                   cute::size<2>(typename Kernel::ClusterShape{}));
+      void const* kernel = (void const*) device_kernel<Kernel>;
       void* kernel_params[] = {&params.fmha_params};
-      launch_result = ClusterLauncher::launch(
-          grid, cluster, block, smem_size, stream, kernel, kernel_params);
-    } else {
+      launch_result = ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel, kernel_params);
+    }
+    else {
       launch_result = Status::kSuccess;
-      device_kernel<Kernel>
-          <<<grid, block, smem_size, stream>>>(params.fmha_params);
+      device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params.fmha_params);
     }
 
     cudaError_t result = cudaGetLastError();
     if (cudaSuccess != result or Status::kSuccess != launch_result) {
-      // return Status::kSuccess;
+      //return Status::kSuccess;
       CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << result);
       return Status::kErrorInternal;
     }
-    if (!params.fmha_params.is_fused_reduction &&
-        params.reduction_params.split_kv > 1) {
+    if (!params.fmha_params.is_fused_reduction && params.reduction_params.split_kv > 1) {
       // launch reduction kernel
       dim3 const block = ReductionKernel::get_block_shape();
-      dim3 const grid =
-          ReductionKernel::get_grid_shape(params.reduction_params);
-      device_kernel<ReductionKernel>
-          <<<grid, block, 0, stream>>>(params.reduction_params);
+      dim3 const grid  = ReductionKernel::get_grid_shape(params.reduction_params);
+      device_kernel<ReductionKernel><<<grid, block, 0, stream>>>(params.reduction_params);
       cudaError_t result = cudaGetLastError();
       if (cudaSuccess == result) {
         return Status::kSuccess;
-      } else {
+      }
+      else {
         CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << result);
         return Status::kErrorInternal;
       }
-    } else {
+    }
+    else {
       return Status::kSuccess;
     }
   }
 
   //
-  // Non-static launch overloads that first create and set the internal params
-  // struct of this kernel handle.
+  // Non-static launch overloads that first create and set the internal params struct of this kernel handle.
   //
 
-  /// Launches the kernel after first constructing Params internal state from
-  /// supplied arguments.
-  Status run(
-      Arguments const& args,
-      void* workspace = nullptr,
-      cudaStream_t stream = nullptr) {
+  /// Launches the kernel after first constructing Params internal state from supplied arguments.
+  Status
+  run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
     Status status = initialize(args, workspace, stream);
     if (Status::kSuccess == status) {
       status = run(params_, stream);
@@ -395,24 +358,21 @@ class MLA {
     return status;
   }
 
-  /// Launches the kernel after first constructing Params internal state from
-  /// supplied arguments.
-  Status operator()(
-      Arguments const& args,
-      void* workspace = nullptr,
-      cudaStream_t stream = nullptr) {
+  /// Launches the kernel after first constructing Params internal state from supplied arguments.
+  Status
+  operator()(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
     return run(args, workspace, stream);
   }
 
-  /// Overload that allows a user to re-launch the same kernel without updating
-  /// internal params struct.
-  Status run(cudaStream_t stream = nullptr) {
+  /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
+  Status
+  run(cudaStream_t stream = nullptr) {
     return run(params_, stream);
   }
 
-  /// Overload that allows a user to re-launch the same kernel without updating
-  /// internal params struct.
-  Status operator()(cudaStream_t stream = nullptr) {
+  /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
+  Status
+  operator()(cudaStream_t stream = nullptr) {
     return run(params_, stream);
   }
 };
