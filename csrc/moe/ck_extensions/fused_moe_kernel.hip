@@ -84,6 +84,8 @@ at::Tensor fused_moe_impl(
     TORCH_CHECK(false, "Unsupported data type");
   };
 
+  TORCH_CHECK(false, "Unsupported data type");
+
   auto prec_i = get_prec_str(input);
   auto prec_w = get_prec_str(gate_up_weight);
   auto prec_o = get_prec_str(output);
