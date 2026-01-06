@@ -175,6 +175,7 @@ template <uint32_t RegCount>
 CUTLASS_DEVICE void warpgroup_reg_set() {
   if constexpr (RegCount < 128) {
     cutlass::arch::warpgroup_reg_dealloc<RegCount>();
+    printf("RegCount %d < 128\n", RegCount);
   } else {
     cutlass::arch::warpgroup_reg_alloc<RegCount>();
   }
