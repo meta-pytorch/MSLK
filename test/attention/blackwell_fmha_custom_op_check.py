@@ -5,8 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-unsafe
-
-from typing import Optional, Tuple
+from typing import Optional
 
 import mslk.attention.cutlass_blackwell_fmha  # noqa
 
@@ -26,7 +25,7 @@ def get_varlen_args(
     dtype: torch.dtype,
     causal: bool,
     fwd_only: bool = False,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -36,6 +35,7 @@ def get_varlen_args(
     int,
     float,
     bool,
+    Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
     device = torch.accelerator.current_accelerator()
@@ -99,7 +99,8 @@ def get_varlen_args(
         max_seqlen_k,
         1.0,
         causal,
-        None,
+        None,  # seqlen_kv
+        None,  # page_table
     )
 
 
@@ -140,6 +141,7 @@ def get_sample_inputs():
             1.0,  # softmax_scale
             False,  # causal
             None,  # seqlen_kv
+            None,  # page_table
         ),
         get_varlen_args(
             batch_size=512,
@@ -209,6 +211,7 @@ def get_sample_inputs_for_backward():
             None,  # cu_seqlens_k
             None,  # max_seq_len_q
             None,  # max_seq_len_k
+            1.0,  # softmax_scale
             False,  # causal
         ),
     ]

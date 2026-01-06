@@ -1,11 +1,4 @@
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
-
+// @nolint
 #include "blackwell_fmha_bwd_template.cuh"
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
@@ -61,7 +54,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dispatch_fmha_bwd(
       window_size_right = max_seq_len_k.value();
     }
   }
-
+  if (causal) {
+    window_size_right = 0;
+  }
   auto dispatch_fmha = [&](auto element,
                            auto element_out,
                            auto head_dim,
@@ -178,6 +173,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dispatch_fmha_bwd(
   }
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> dispatch_fmha_bwd_meta(
+    const at::Tensor& dOutput,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& output,
+    const at::Tensor& softmax_lse,
+    const std::optional<at::Tensor>& cu_seqlens_q,
+    const std::optional<at::Tensor>& cu_seqlens_k,
+    std::optional<c10::SymInt> max_seq_len_q,
+    std::optional<c10::SymInt> max_seq_len_k,
+    std::optional<double> softmax_scale,
+    bool causal,
+    c10::SymInt window_size_left,
+    c10::SymInt window_size_right,
+    bool bottom_right,
+    bool deterministic) {
+  return std::make_tuple(at::empty_like(query), at::empty_like(key), at::empty_like(value));
+}
+
 // -------------------------------------------------------------------------------------------------
 // Op registration
 // -------------------------------------------------------------------------------------------------
@@ -192,12 +207,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "    Tensor softmax_lse, "
       "    Tensor? cu_seqlens_q=None, "
       "    Tensor? cu_seqlens_k=None, "
-      "    int? max_seq_len_q=None, "
-      "    int? max_seq_len_k=None, "
+      "    SymInt? max_seq_len_q=None, "
+      "    SymInt? max_seq_len_k=None, "
       "    float? softmax_scale=None, "
       "    bool causal=False, "
-      "    int window_size_left=-1, "
-      "    int window_size_right=-1, "
+      "    SymInt window_size_left=-1, "
+      "    SymInt window_size_right=-1, "
       "    bool bottom_right=True, "
       "    bool deterministic=False"
       ") -> (Tensor, Tensor, Tensor)");
@@ -205,5 +220,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("fmha_bwd", dispatch_fmha_bwd);
+}
+TORCH_LIBRARY_IMPL(mslk, Meta, m) {
+  m.impl("fmha_bwd", dispatch_fmha_bwd_meta);
 }
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED
