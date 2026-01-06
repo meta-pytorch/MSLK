@@ -10,7 +10,7 @@ import logging
 import math
 import random
 from contextlib import nullcontext
-from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
+from typing import List, Optional, Tuple, Type
 
 import pytest
 import torch
@@ -26,308 +26,50 @@ except ImportError:
 from mslk.attention import fmha
 from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
 from mslk.attention.fmha.attn_bias_utils import create_attn_bias, pack_kv_cache
-from mslk.attention.fmha.common import (
-    AttentionFwOpBase,
-    AttentionOpBase,
-    pack_fp8_tensorwise_per_head,
-)
+from mslk.attention.fmha.common import AttentionFwOpBase, pack_fp8_tensorwise_per_head
 from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list
 from mslk.attention.fmha.unbind import unbind
 from scipy.stats import binomtest  # type: ignore
 from torch.utils.checkpoint import checkpoint
 
+from .case_generation import (
+    _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    create_tensors,
+    get_bias_grad,
+    get_supported_attn_bias_types,
+    make_id,
+    sample_random_supported_fw,
+)
+
 from .utils import (
+    _devices,
+    _filter_unsupported_ops,
     add_q_fp8_to_inputs,
     assert_allclose,
+    compute_capability,
     construct_fp8_attention_inputs,
     cuda_only,
     cuda_or_mtia_only,
     disable_on_mtia,
     disable_on_rocm,
     disable_tf32,
+    nanify_oob_seqlen,
     ref_attention_bmhk_for_test,
     ref_attention_for_test,
     rocm_only,
+    skip_if_sm100_or_better,
+    sm100_or_better_only,
+    sm70_or_better_only,
+    sm75_or_better_only,
+    sm80_or_better_only,
+    sm90_or_better_only,
     use_cpu_ref,
-)
-
-compute_capability = (0, 0)
-if torch.cuda.is_available():
-    compute_capability = torch.cuda.get_device_capability("cuda")
-sm70_or_better_only = pytest.mark.skipif(
-    torch.version.cuda is not None and compute_capability < (7, 0),
-    reason="requires sm70+",
-)
-sm75_or_better_only = pytest.mark.skipif(
-    torch.version.cuda is not None and compute_capability < (7, 5),
-    reason="requires sm75+",
-)
-sm80_or_better_only = pytest.mark.skipif(
-    torch.version.cuda is not None and compute_capability < (8, 0),
-    reason="requires sm80+",
-)
-sm90_or_better_only = pytest.mark.skipif(
-    compute_capability < (9, 0),
-    reason="requires sm90+",
-)
-sm100_or_better_only = pytest.mark.skipif(
-    compute_capability < (10, 0), reason="requires sm100+"
-)
-skip_if_sm100_or_better = pytest.mark.skipif(
-    compute_capability >= (10, 0), reason="not supported on Blackwell"
-)
-
-skip_if_rocm = pytest.mark.skipif(
-    torch.version.hip is not None, reason="not supported on ROCm"
-)
-_devices = ["cpu"]
-_devices += ["cuda"] if torch.cuda.is_available() else []
-
-try:
-    import mtia.host_runtime.torch_mtia.dynamic_library  # noqa  # type: ignore
-
-    # torch.mtia.is_available() will not work here, since test collection can be done
-    # on a machine without MTIA devices
-    _devices.append("mtia")
-except (ImportError, OSError):
-    # Failed to load MTIA libraries, so just keep going without MTIA devices
-    pass
-
-T = TypeVar(
-    "T", Type[fmha.common.AttentionFwOpBase], Type[fmha.common.AttentionBwOpBase]
 )
 
 logger = logging.getLogger("xformers")
 
-
-def _filter_unsupported_ops(ops: Sequence[T]) -> List[T]:
-    return [
-        op
-        for op in ops
-        if (
-            "cpu" in op.SUPPORTED_DEVICES
-            or "mtia" in op.SUPPORTED_DEVICES
-            or (
-                op.CUDA_MINIMUM_COMPUTE_CAPABILITY <= compute_capability
-                and (
-                    (max_cap := op.CUDA_MAXIMUM_COMPUTE_CAPABILITY) is None
-                    or max_cap >= compute_capability
-                )
-            )
-        )
-        and op.is_available()
-    ]
-
-
 ALL_FW_OPS = _filter_unsupported_ops(ALL_FW_OPS)
 ALL_BW_OPS = _filter_unsupported_ops(ALL_BW_OPS)
-
-
-def sample_random_supported_fw(
-    inp: fmha.Inputs, seed, op_bw: Type[fmha.common.AttentionBwOpBase]
-) -> Type[fmha.common.AttentionFwOpBase]:
-    r = random.Random(seed)
-    fw_ops = list(ALL_FW_OPS)
-    if op_bw == fmha.cutlass_blackwell.BwOp:
-        fw_ops = [fmha.cutlass_blackwell.FwOp, fmha.flash.FwOp]
-    if (
-        isinstance(inp.attn_bias, fmha.attn_bias.VARLEN_BIASES)
-        and inp.attn_bias.q_seqinfo.seqstart.shape[0] > 2
-    ):
-        fw_ops = [
-            op for op in fw_ops if op.VARLEN_LSE_PACKED == op_bw.VARLEN_LSE_PACKED
-        ]
-    r.shuffle(fw_ops)
-    for op in fw_ops:
-        if op.supports(inp):
-            return op
-    raise NotImplementedError(f"Could not find a FW operator for: {inp}")
-
-
-def generate_test_shapes_B_Mq_Mkv_H_K_Kv(op):  # noqa: C901
-    shapes = []
-    for B in op._TEST_BATCH_SIZES:
-        for Mq in [32, 256]:
-            for Mkv in [32, 64, 256, 1024]:
-                for K in op._TEST_K:
-                    shapes.append((B, Mq, Mkv, 1, K, K))
-        Mq = 256
-        Mkv = 128
-        K = 32
-        H = 1
-        # Weird values of parameters
-        for M in [2, 3, 15, 31, 32, 34, 68, 72, 90, 132, 136]:
-            shapes.append((B, M, Mkv, H, K, K))
-            shapes.append((B, Mq, M, H, K, K))
-        Ks = [1, 2, 3, 31, 34, 36, 38, 40, 64, 80, 160, 256 + 2, 256 + 8, 512]
-        for _K in Ks:
-            if op.SUPPORTED_MIN_K <= _K <= op.SUPPORTED_MAX_K:
-                shapes.append((B, Mq, Mkv, H, _K, _K))
-        # Different value for K / Kv
-        if op.SUPPORTS_DIFFERENT_VALUE_EMBED:
-            for _K in [32, 36, 64, 256 + 8]:
-                shapes.append((B, Mq, Mkv, H, K, _K))
-                shapes.append((B, Mq, Mkv, H, _K, K))
-        # Exotic sizes
-        for K in op._TEST_K:
-            shapes.append((B, 16, 1024, H, K, K))
-            shapes.append((B, 1024, 16, H, K, K))
-        # Some number of heads
-        for H in [3, 5, 12]:
-            shapes.append((max(1, B // H), Mq, Mkv, H, K, K))
-    # Filter-out not supported shapes
-    shapes = [
-        shape
-        for shape in shapes
-        if len(
-            op.shape_not_supported_reasons(
-                Mq=shape[1], Mkv=shape[2], K=shape[4], Kv=shape[5]
-            )
-        )
-        == 0
-    ]
-    # Add some random shapes
-    if op in [
-        fmha.cutlass.FwOp,
-        fmha.cutlass.BwOp,
-        fmha.cutlass_blackwell.FwOp,
-        fmha.cutlass_blackwell.BwOp,
-        fmha.flash.BwOp,
-        fmha.ck.FwOp,
-    ]:
-        K_CHOICES = [8 * i for i in range(1, 256 // 8)]
-        r = random.Random(0)
-        found_count = 0
-        while found_count < 200:
-            B = r.randint(1, 400)
-            Mq = r.randint(1, 500)
-            Mkv = r.randint(1, 500)
-            H = r.randint(2, 11)
-            B = max(B // H, 1)
-            K = r.choice(K_CHOICES)
-            Kv = r.choice(K_CHOICES)
-            if not op.SUPPORTS_DIFFERENT_VALUE_EMBED:
-                Kv = K
-            if len(op.shape_not_supported_reasons(Mq, Mkv, K, Kv)):
-                continue
-            found_count += 1
-            shapes.append((B, Mq, Mkv, H, K, Kv))
-    return shapes
-
-
-def make_id(op, device, dtype, bias_type, *shape):
-    return (
-        f"{op.NAME}-{device}-{str(dtype)}-{bias_type.__name__}"
-        f"-{'-'.join([str(s) for s in shape])}"
-    )
-
-
-# This temporary working is necessary because the MTIA test collection might not happen
-# on the same device as the device the tests are actually executed on. If test collection
-# is done on a device without MTIA, the supported masks will contain masks that MTIA support
-# and the corresponding tests will get collected. But when it comes time to actually run the
-# tests, the mask won't be supported because it is run on an actual MTIA device.
-def get_supported_attn_bias_types(op):
-    supported_attn_bias_types = op.SUPPORTED_ATTN_BIAS_TYPES
-
-    try:
-        import mtia.host_runtime.torch_mtia.dynamic_library  # noqa
-
-        supported_attn_bias_types = [
-            b
-            for b in supported_attn_bias_types
-            if not issubclass(
-                b,
-                (
-                    fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-                    fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-                ),
-            )
-        ]
-    except (ImportError, OSError):
-        pass
-
-    return supported_attn_bias_types
-
-
-def _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(  # noqa: C901
-    ops_list: Sequence[Type[fmha.AttentionOpBase]], max_shapes_per_op: int = 65000
-):
-    r = random.Random(0)
-    combination = []
-    for op in ops_list:
-        op_count = 0
-        # Sort list of masks, so it's deterministic across runs
-        LIST_MASKS = sorted(get_supported_attn_bias_types(op), key=str)
-        for shape in generate_test_shapes_B_Mq_Mkv_H_K_Kv(op):
-            has_one = False
-            for device in _devices:
-                if device not in op.SUPPORTED_DEVICES:
-                    continue
-                # Sort set of dtypes to make it deterministic across runs
-                for dtype in sorted(op.SUPPORTED_DTYPES, key=str):
-                    # "normal_kernel_cuda" not implemented for 'Float8_e4m3fn'
-                    if dtype in [torch.float8_e4m3fn]:
-                        continue
-                    bias_type = r.choice(LIST_MASKS)
-                    # Avoid using too much memory
-                    B, Mq, Mkv, H, K, Kv = shape
-                    if bias_type not in [
-                        type(None),
-                        fmha.attn_bias.LowerTriangularMask,
-                    ]:
-                        B = min(B, 12)
-
-                        if bias_type in {
-                            fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
-                            fmha.attn_bias.BlockDiagonalCausalLocalAttentionFromBottomRightMask,
-                        }:
-                            Mq, Mkv = min(Mkv, Mq), max(Mkv, Mq) + 2
-                        elif bias_type in {
-                            fmha.attn_bias.BlockDiagonalCausalLocalAttentionPaddedKeysMask,
-                            fmha.attn_bias.BlockDiagonalLocalAttentionPaddedKeysMask,
-                            fmha.attn_bias.BlockDiagonalCausalWithOffsetGappyKeysMask,
-                            fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask,
-                            fmha.attn_bias.BlockDiagonalPaddedKeysMask,
-                            fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
-                            fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-                            fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
-                            fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-                        }:
-                            Mq, Mkv = min(Mkv, Mq), max(Mkv, Mq)
-                    new_shape = (B, Mq, Mkv, H, K, Kv)
-                    combination.append((op, device, dtype, bias_type, *new_shape))
-                    has_one = True
-            if has_one:
-                op_count += 1
-            if op_count > max_shapes_per_op:
-                break
-        # Some specific shapes for which we want to run without any mask
-        bias_type = type(None)
-        for shape in (
-            # Some strides/dims don't fit on an uint16
-            (1, 128, 128, 300, 128, 128),
-            (13, 1, 67, 200, 8, 8),
-            (1, 1 + 2**16, 4, 1, 8, 8),
-            (1, 4, 1 + 2**16, 1, 8, 8),
-            # TODO: Some strides don't fit on an uint32
-            # Crashes on Flash, Errors on Cutlass
-            # (1, 1, 64000, 300, 128, 128)
-        ):
-            for device in _devices:
-                if device not in op.SUPPORTED_DEVICES:
-                    continue
-                # Sort set of dtypes to make it deterministic across runs
-                for dtype in sorted(op.SUPPORTED_DTYPES, key=str):
-                    # "normal_kernel_cuda" not implemented for 'Float8_e4m3fn'
-                    if dtype in [torch.float8_e4m3fn]:
-                        continue
-                    combination.append((op, device, dtype, bias_type, *shape))
-    return {
-        "argvalues": combination,
-        "ids": [make_id(*c) for c in combination],
-    }
-
 
 parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = pytest.mark.parametrize(
     "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
@@ -337,280 +79,10 @@ parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametriz
     "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
     **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS, max_shapes_per_op=1),
 )
-parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = pytest.mark.parametrize(
-    "opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_BW_OPS),
-)
 parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametrize(
     "opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
     **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_BW_OPS, max_shapes_per_op=1),
 )
-
-
-def _rand_partition(r: random.Random, total: int, n: int) -> List[int]:
-    # returns list of n nonnegative integers summing to total
-    idx = {0, total}
-    while len(idx) < n + 1:
-        idx.add(r.randint(1, total - 1))
-    s = sorted(idx)
-    return [e - b for b, e in zip(s[:-1], s[1:])]
-
-
-def get_bias_grad(attn_bias, clear: bool = False) -> Optional[torch.Tensor]:
-    tensor_with_grad: Optional[torch.Tensor] = None
-    if isinstance(attn_bias, torch.Tensor):
-        tensor_with_grad = attn_bias
-    if tensor_with_grad is not None:
-        grad = tensor_with_grad.grad
-        if clear:
-            tensor_with_grad.grad = None
-        return grad
-    return None
-
-
-def create_tensors(  # noqa: C901
-    op: Optional[Type[AttentionOpBase]],
-    device,
-    dtype,
-    attn_bias_type,
-    B,
-    q_len,
-    kv_len,
-    h,
-    k,
-    kv,
-    *,
-    attn_bias_requires_grad: bool = False,
-    fmt: str = "BMK",
-    g: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
-    torch.manual_seed(B * q_len + kv_len * k + kv)
-
-    mask_is_bottom_right = attn_bias_type is not None and issubclass(
-        attn_bias_type,
-        (
-            fmha.attn_bias.LowerTriangularFromBottomRightMask,
-            fmha.attn_bias.LowerTriangularFromBottomRightLocalAttentionMask,
-            fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
-            fmha.attn_bias.BlockDiagonalCausalLocalAttentionFromBottomRightMask,
-            fmha.attn_bias.BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask,
-            fmha.attn_bias.BlockDiagonalCausalLocalAttentionMask,
-            fmha.attn_bias.LocalAttentionFromBottomRightMask,
-            fmha.attn_bias.PagedBlockDiagonalCausalLocalPaddedKeysMask,
-        ),
-    )
-    if mask_is_bottom_right and q_len > kv_len:
-        # Bottom-right attention and local-attention masks require q_len <= kv_len
-        kv_len = q_len
-
-    if attn_bias_type is not None and issubclass(
-        attn_bias_type,
-        (
-            fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-            fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-        ),
-    ):
-        page_size_choices = [256, 512]
-        if op is not None and issubclass(op, fmha.triton_splitk.FwOp):
-            # TODO: enable small pages for flash attention when that's implemented
-            page_size_choices.extend([64, 128])
-        page_size = random.choice(page_size_choices)
-        kv_len_paged = (kv_len + page_size - 1) // page_size * page_size
-    else:
-        kv_len_paged = kv_len
-        page_size = None
-
-    scale = 3
-    if fmt == "BMK":
-        query = torch.randn((B * h, q_len, k), device=device, dtype=dtype)
-        key = torch.randn((B * h, kv_len_paged, k), device=device, dtype=dtype)
-        value = torch.randn((B * h, kv_len_paged, kv), device=device, dtype=dtype)
-    elif fmt == "BMHK":
-        query = torch.randn((B, q_len, h, k), device=device, dtype=dtype)
-        key = torch.randn((B, kv_len_paged, h, k), device=device, dtype=dtype)
-        value = torch.randn((B, kv_len_paged, h, kv), device=device, dtype=dtype)
-    else:
-        assert fmt == "BMGHK"
-        query = torch.randn((B, q_len, g, h, k), device=device, dtype=dtype)
-        key = torch.randn((B, kv_len_paged, g, 1, k), device=device, dtype=dtype)
-        value = torch.randn((B, kv_len_paged, g, 1, kv), device=device, dtype=dtype)
-
-    for x in [query, key, value]:
-        x.mul_(scale)
-
-    if fmt == "BMGHK":
-        # Expand - after the in-place mul
-        key = key.expand((B, kv_len_paged, g, h, k))
-        value = value.expand((B, kv_len_paged, g, h, k))
-
-    if fmt == "BMK" and not fmha.common._is_bias_type_supported_in_BMK(attn_bias_type):
-        attn_bias_type = None
-    attn_bias = None
-    if attn_bias_type is not None:
-        attn_bias = create_attn_bias(
-            attn_bias_type,
-            batch_size=B,
-            num_heads=h,
-            num_heads_groups=g,
-            q_len=q_len,
-            kv_len=kv_len,
-            dtype=dtype,
-            device=device,
-            requires_grad=attn_bias_requires_grad,
-            fmt=fmt,
-            op=op,
-            page_size=page_size,
-        )
-        if isinstance(
-            attn_bias,
-            (
-                fmha.attn_bias.BlockDiagonalMask,
-                fmha.attn_bias.BlockDiagonalGappyKeysMask,
-                fmha.attn_bias.BlockDiagonalPaddedKeysMask,
-                fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-                fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-            ),
-        ):
-            query, key, value = [
-                x.reshape([1, -1, *x.shape[2:]]) for x in [query, key, value]
-            ]
-
-    inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
-    if op is not None:
-        reasons = op.not_supported_reasons(inputs)
-        if reasons:
-            err_msg = f"{op.NAME}: unsupported ({'/'.join(reasons)})"
-            # Ensure we free memory to avoid OOMs
-            del query, key, value, attn_bias, inputs
-            pytest.skip(err_msg)
-    return query, key, value, attn_bias
-
-
-def bmhk2bmk(tensor) -> torch.Tensor:
-    return (
-        tensor.permute((0, 2, 1, 3))
-        .contiguous()
-        .view([tensor.shape[0] * tensor.shape[2], tensor.shape[1], tensor.shape[3]])
-    )
-
-
-def bmk2bmhk(tensor, num_heads: int) -> torch.Tensor:
-    return tensor.reshape([-1, num_heads, tensor.shape[1], tensor.shape[2]]).permute(
-        (0, 2, 1, 3)
-    )
-
-
-def nanify_oob_seqlen(x: torch.Tensor) -> torch.Tensor:
-    align_to = 256
-    if x.shape[1] % align_to == 0:
-        return x
-    pad = [0, 0] * x.ndim
-    pad[-3] = align_to - (x.shape[1] % align_to)
-    x_pad = torch.nn.functional.pad(x, pad, value=math.nan)
-    return x_pad[:, : x.shape[1]]
-
-
-@pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
-@pytest.mark.parametrize("packed", [False, True])
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs):
-    (
-        op,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    ) = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-    if packed and issubclass(
-        bias_type,
-        (
-            fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-            fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-        ),
-    ):
-        pytest.skip(
-            "packed doesn't make sense with paged attention, since q has different shape than k/v"
-        )
-    if packed and not (k == kv and q_len == kv_len):
-        pytest.skip(
-            f"packed incompatible with `k ({k}) != kv ({kv})` or `q_len ({q_len}) != kv_len ({kv_len})`"
-        )
-    if fmt == "BMK" and not fmha.common._is_bias_type_supported_in_BMK(bias_type):
-        pytest.skip("BMK incompatible with this bias")
-
-    if op is fmha.ck.FwOp:
-        if (k > 256 or kv > 256) and issubclass(
-            bias_type,
-            (
-                fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-                fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-            ),
-        ):
-            pytest.skip("ck.FwOp hdim-512 is not supported when Paged-KVCache is used!")
-
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK" if packed else fmt,
-        **kwargs,
-    )
-    if attn_bias is not None:
-        assert type(attn_bias.to(query.device)) is type(attn_bias)
-
-    if packed:
-        c = torch.stack([query, key, value], 2)
-        if fmt == "BMK":
-            # bm3hk -> 3bhmk -> 3Bmk
-            c = c.permute(2, 0, 3, 1, 4).view([3, -1, q_len, k])
-            query, key, value = c[0], c[1], c[2]
-            # Re-create bias in the right format
-            attn_bias = create_attn_bias(
-                bias_type=bias_type,
-                batch_size=batch_size,
-                num_heads=h,
-                num_heads_groups=1,
-                q_len=q_len,
-                kv_len=kv_len,
-                device=device,
-                dtype=dtype,
-                requires_grad=False,
-                fmt=fmt,
-                op=op,
-            )
-        elif fmt == "BMHK":
-            # bm3hk -> 3 x bmhk
-            query, key, value = unbind(c, 2)
-        else:
-            raise AssertionError(f"Unsupport fmt {fmt} with packing")
-        assert not query.is_contiguous()
-
-    out = fmha.memory_efficient_attention_forward(query, key, value, attn_bias, op=op)
-    assert not out.isnan().any(), ("Output has NaNs", attn_bias)
-    out2 = fmha.memory_efficient_attention_forward(
-        nanify_oob_seqlen(query),
-        nanify_oob_seqlen(key),
-        nanify_oob_seqlen(value),
-        attn_bias,
-        op=op,
-    )
-    assert not out2.isnan().any(), "Output has NaNs - most likely reading out-of-bounds"
-    assert torch.allclose(out, out2, atol=0.0, rtol=0.0), (
-        "Non-deterministic behavior",
-        attn_bias,
-    )
-
-    ref = ref_attention_for_test(query, key, value, attn_bias)
-    assert out.shape == ref.shape, out.shape
-    assert_allclose(
-        out.float(),
-        ref,
-        atol=op.ERROR_ATOL[dtype],
-        rtol=op.ERROR_RTOL.get(dtype, 1e-5),
-    )
 
 
 def _block_diag_reshape_lse(
@@ -745,209 +217,6 @@ def test_logsumexp_mqa(op: Type[AttentionFwOpBase]):
     attn = (query.float() / query.shape[-1] ** 0.5) @ key.float().transpose(-2, -1)
     ref_lse = attn.logsumexp(-1)
     assert_allclose(lse[0, :, 0], ref_lse[:, 0], atol=2e-4)
-
-
-@disable_tf32
-@pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
-@pytest.mark.parametrize("grad_out_contiguous", [False, True])
-@parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-def test_backward(  # noqa: C901
-    opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-    grad_out_contiguous,
-    fmt,
-):
-    (
-        op_bw,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    ) = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-
-    # Big batch sizes can be slow on MTIA, especially older devices because
-    # it doesn't have attention fast paths. Testing on very big batch sizes
-    # doesn't meaningfully increase our test coverage here, as long as most
-    # permutations of parameters are tested on lower batch sizes.
-    if device.startswith("mtia") and batch_size >= 11:
-        pytest.skip("Skipping big batch test cases on MTIA")
-
-    attn_bias_requires_grad = (
-        random.Random(q_len + kv_len * batch_size).randint(0, 1) > 0
-    )
-    query, key, value, attn_bias = create_tensors(
-        *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        attn_bias_requires_grad=attn_bias_requires_grad,
-        fmt=fmt,
-    )
-
-    # To understand why we do this, check the comment on the
-    # `AttentionBwOpBase` class
-    scale = None
-    if op_bw.SUPPORTS_CUSTOM_SCALE and query.shape[-1] < 32:
-        scale = (1 / 32) ** 0.5
-    op_fw = (
-        sample_random_supported_fw(
-            fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias),
-            seed=q_len * kv + kv_len * k,
-            op_bw=op_bw,
-        )
-        if op_bw != fmha.cutlass.BwOp
-        else fmha.cutlass.FwOp
-    )
-
-    if op_bw == fmha.ck.BwOp:
-        op_fw = fmha.ck.FwOp
-        if dtype == torch.bfloat16:
-            # bfloat16 testing can be enabled by export ENABLE_HIP_FMHA_RTN_BF16_CONVERT=1 when
-            # building xformers and get accurate results
-            pytest.skip(
-                "CK Fmha backward for bfloat16 currently is not very accurate for some cases!"
-            )
-        if not grad_out_contiguous:
-            pytest.skip("CK Fmha does not support non-contiguous layout for grad_out!")
-        if k % 2 != 0:
-            pytest.skip(
-                "CK Fmha currently requires the headdim size of query input be an even value!"
-            )
-
-    qkv = None
-
-    if (
-        fmt == "BMHK"
-        and query.shape[3] == value.shape[3]
-        and query.shape[1] == value.shape[1]
-    ):
-        qkv = torch.stack([query, key, value], 2)
-        qkv.requires_grad_(True)
-        # bm3hk -> 3 x bmhk
-        query, key, value = unbind(qkv, 2)
-        assert not query.is_contiguous()
-
-    query.requires_grad_(True)
-    key.requires_grad_(True)
-    value.requires_grad_(True)
-
-    if not op_bw.supports(fmha.Inputs(query, key, value, attn_bias)):
-        pytest.skip("inputs not supported")
-
-    out = fmha.memory_efficient_attention(
-        query, key, value, attn_bias, scale=scale, op=(op_fw, op_bw)
-    )
-
-    grad_out = torch.randn_like(out)
-    if grad_out_contiguous is False:
-        grad_out = torch.tensor([1.0], dtype=query.dtype, device=device)[
-            None, None, :
-        ].expand_as(out)
-
-    out.backward(grad_out)
-
-    if qkv is None and op_bw == fmha.cutlass.BwOp:
-        assert query.stride() == query.grad.stride()
-
-    grads = []
-    if qkv is None:
-        grads = [query.grad, key.grad, value.grad]
-        query.grad = None
-        key.grad = None
-        value.grad = None
-    else:
-        grads = [qkv.grad]
-        qkv.grad = None
-    if attn_bias_requires_grad:
-        attn_bias_grad = get_bias_grad(attn_bias, clear=True)
-        if attn_bias_grad is not None:
-            grads.append(attn_bias_grad)
-
-    if use_cpu_ref(device):
-        query = query.detach().cpu()
-        key = key.detach().cpu()
-        value = value.detach().cpu()
-        grad_out = grad_out.detach().cpu()
-
-        if qkv is not None:
-            qkv = torch.stack([query, key, value], 2)
-            qkv.requires_grad_(True)
-            query, key, value = unbind(qkv, 2)
-
-        query.requires_grad_(True)
-        key.requires_grad_(True)
-        value.requires_grad_(True)
-        grad_out.requires_grad_(True)
-
-        if isinstance(attn_bias, torch.Tensor):
-            attn_bias = attn_bias.cpu()
-
-    ref = ref_attention_for_test(query, key, value, attn_bias, scale=scale)
-    ref.backward(grad_out)
-
-    assert_allclose(
-        out.float().to(ref.device),
-        ref.float(),
-        "fw pass",
-        atol=op_fw.ERROR_ATOL[dtype],
-        rtol=op_fw.ERROR_RTOL[dtype],
-    )
-
-    del out
-    del grad_out
-    del ref
-
-    atol = op_bw.ERROR_ATOL[dtype]
-    rtol = op_bw.ERROR_RTOL[dtype]
-
-    # This is a special case without masks where the accumulated numbers become so big that
-    # we lose too much precision, especially on bfloat16. For this reason, the default bfloat16
-    # tolerance for the backward pass is set to 0.9, but in some cases on MTIA we get up to 1.3,
-    # probably due to the fact that the implementation doesn't use the fused kernels yet, which
-    # increases the precision loss caused by the accumulation.
-    if (
-        device.startswith("mtia")
-        and issubclass(bias_type, type(None))
-        and q_len >= 2**16
-    ):
-        atol *= 1.6
-
-    grads_ref = []
-    grads_name = []
-    if qkv is None:
-        assert isinstance(query.grad, torch.Tensor)
-        assert isinstance(key.grad, torch.Tensor)
-        assert isinstance(value.grad, torch.Tensor)
-        grads_ref = [query.grad, key.grad, value.grad]
-        grads_name = ["query", "key", "value"]
-    else:
-        assert isinstance(qkv.grad, torch.Tensor)
-        grads_ref = [qkv.grad]
-        grads_name = ["qkv"]
-
-    if attn_bias_requires_grad:
-        attn_bias_grad = get_bias_grad(attn_bias)
-        if attn_bias_grad is not None:
-            grads_ref.append(attn_bias.grad)
-            grads_name.append("bias")
-
-    del query
-    del key
-    del value
-    del qkv
-
-    assert len(grads_ref) == len(
-        grads
-    ), "Wrong number of gradients (maybe bias grad didn't backprop?)"
-    for name, calc_grad, ref_grad in zip(grads_name, grads, grads_ref):
-        assert_allclose(
-            calc_grad.to(ref_grad.device),
-            ref_grad,
-            msg=f"{op_fw.NAME}+{op_bw.NAME}:{name}",
-            atol=atol,
-            rtol=rtol,
-        )
 
 
 def _vec_binom_test(x, n, p):
@@ -1139,7 +408,7 @@ def test_lowlevel_api_shapes(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt):
     inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
     op_bw = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
     op_fw = sample_random_supported_fw(
-        inputs, seed=f"{op_bw.NAME}{query.shape}", op_bw=op_bw
+        inputs, ALL_FW_OPS, seed=f"{op_bw.NAME}{query.shape}", op_bw=op_bw
     )
     out, lse = fmha.memory_efficient_attention_forward_requires_grad(
         query, key, value, attn_bias, op=op_fw
@@ -1247,7 +516,9 @@ def test_custom_scale(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
     inputs = fmha.Inputs(
         query=query, key=key, value=value, attn_bias=attn_bias, scale=scale
     )
-    op_fw = sample_random_supported_fw(inputs, seed=q_len * k + kv_len * k, op_bw=op_bw)
+    op_fw = sample_random_supported_fw(
+        inputs, ALL_FW_OPS, seed=q_len * k + kv_len * k, op_bw=op_bw
+    )
     grad_out = query.new_ones(B * H, q_len, Kv)
     query.requires_grad_(True)
     key.requires_grad_(True)
@@ -2078,96 +1349,6 @@ def test_window_size_materialize() -> None:
 
 
 @cuda_or_mtia_only
-@pytest.mark.parametrize("Mq", [1, 512])
-@pytest.mark.parametrize(
-    "opFW_biasT",
-    [
-        (op, biasT)
-        for op in ALL_FW_OPS
-        for biasT in get_supported_attn_bias_types(op)
-        if op.SUPPORTS_BMGHK
-    ],
-    ids=lambda o: f"{o[0].NAME}-{o[1].__name__}" if isinstance(o, tuple) else "",
-)
-def test_forward_gqa(opFW_biasT, Mq: int):
-    device = torch._C._get_accelerator().type
-
-    opFW, biasT = opFW_biasT
-    if Mq < 512 and (
-        issubclass(biasT, fmha.attn_bias.LowerTriangularMask)
-        or issubclass(biasT, fmha.attn_bias.BlockDiagonalCausalMask)
-    ):
-        pytest.skip("undefined upper left")
-    B_Mq_Mkv_H_K_Kv = (3, Mq, 512, 16, 128, 128)
-    test_forward(
-        (
-            opFW,
-            device,
-            torch.float16,
-            biasT,
-            *B_Mq_Mkv_H_K_Kv,
-        ),
-        packed=False,
-        fmt="BMGHK",
-        g=2,
-    )
-
-
-@cuda_or_mtia_only
-@pytest.mark.parametrize(
-    "opBW",
-    [
-        fmha.flash.BwOp,
-        fmha.ck.BwOp if torch.version.hip else fmha.cutlass.BwOp,
-        fmha.cutlass_blackwell.BwOp,
-    ],
-)
-def test_backward_gqa(opBW):
-    device = torch._C._get_accelerator().type
-
-    H = 8
-    B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
-    dtype = torch.float16
-    query, key, value, attn_bias = create_tensors(
-        *(opBW, device, dtype, type(None), *B_Mq_Mkv_H_K_Kv),
-        attn_bias_requires_grad=False,
-        fmt="BMHK",
-    )
-    op = (fmha.ck.FwOp if torch.version.hip else fmha.cutlass.FwOp, opBW)
-    key = key[:, :, :1].expand(-1, -1, H, -1)
-    value = value[:, :, :1].expand(-1, -1, H, -1)
-    key.requires_grad_(True)
-    out = fmha.memory_efficient_attention(query, key, value, attn_bias=attn_bias)
-    out.backward(query)
-    dk = key.grad
-    key.grad = None
-
-    if use_cpu_ref(device):
-        query = query.detach().cpu()
-        key = key.detach().cpu()
-        value = value.detach().cpu()
-        query.requires_grad_(True)
-        key.requires_grad_(True)
-        value.requires_grad_(True)
-
-    out_ref = ref_attention_bmhk_for_test(query, key, value, attn_bias=attn_bias)
-    out_ref.backward(query)
-
-    assert_allclose(
-        out.float().to(out_ref.device),
-        out_ref.float(),
-        atol=op[0].ERROR_ATOL[dtype],
-        rtol=op[0].ERROR_RTOL[dtype],
-    )
-    assert_allclose(
-        dk.float().to(key.grad.device),
-        key.grad.float(),
-        atol=op[1].ERROR_ATOL[dtype],
-        rtol=op[1].ERROR_RTOL[dtype],
-    )
-
-
-@cuda_or_mtia_only
 @pytest.mark.parametrize("opFW", [op for op in ALL_FW_OPS if op.SUPPORTS_BMGHK])
 def test_forward_gqa_one_group(opFW):
     device = torch._C._get_accelerator().type
@@ -2283,45 +1464,6 @@ def test_dispatch_decoding_bmghk() -> None:
         torch.empty([128, 8, 1, 32, 128]),
         torch.empty([128, 2048, 1, 1, 128]).expand(-1, -1, -1, 32, -1),
     ), "Should not use SplitK if B is big"
-
-
-shapes_triton_splitk = [
-    (1, 8, 2**16, 1, 128, 128),
-    (1, 4, 2**16, 1, 128, 128),
-    (1, 16, 2**16, 1, 128, 128),
-    (1, 16, 2**16, 1, 32, 32),
-    (1, 8, 1025, 1, 128, 128),
-    (2, 8, 4096, 1, 128, 128),
-    (10, 8, 2**16, 1, 128, 128),
-    (10, 15, 2**16, 1, 128, 128),
-    (1, 3, 2**16, 1, 128, 128),
-    (1, 3, 2**16 - 10, 1, 128, 128),
-    (2, 3, 73, 1, 128, 128),
-    (2, 7, 7328, 1, 128, 128),
-    (2, 7, 7328, 1, 120, 120),
-    (2, 7, 63, 1, 120, 120),
-]
-op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_splitk = [
-    (fmha.triton_splitk.FwOp, "cuda", torch.float16, type(None), *s)
-    for s in shapes_triton_splitk
-] + [
-    (fmha.triton_splitk.FwOp, "cuda", torch.bfloat16, type(None), *s)
-    for s in shapes_triton_splitk
-]
-
-
-@pytest.mark.parametrize(
-    "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_splitk,
-    ids=[make_id(*c) for c in op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_splitk],
-)
-@cuda_only
-def test_forward_splitk(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-    packed=False,
-    fmt="BMHK",
-):
-    test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed=packed, fmt=fmt)
 
 
 @cuda_or_mtia_only
@@ -3357,36 +2499,6 @@ def test_nans_in_padding(op):
     torch.testing.assert_close(out, out_ref, atol=4e-3, rtol=1e-4)
 
     torch.testing.assert_close(lse, lse_ref, atol=4e-3, rtol=1e-4)
-
-
-# end of file
-# @fairinternal-below
-
-
-class SplitKAutotune(fmha.triton_splitk.FwOp):
-    AUTOTUNE = True
-
-
-@cuda_only
-def test_forward_triton_split_k_autotune():
-    """
-    Generally we disable autotuning in tests for performance reasons,
-    add just one test with autotuning.
-    """
-    opFW = SplitKAutotune
-    biasT = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask
-    B_Mq_Mkv_H_K_Kv = (1, 1, 2048, 8, 128, 128)
-    test_forward(
-        (
-            opFW,
-            "cuda",
-            torch.bfloat16,
-            biasT,
-            *B_Mq_Mkv_H_K_Kv,
-        ),
-        packed=False,
-        fmt="BMHK",
-    )
 
 
 @sm80_or_better_only
