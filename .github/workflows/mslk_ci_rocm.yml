@@ -9,10 +9,28 @@ name: MSLK ROCm CI
 
 on:
   # PR Trigger (enabled for regression checks and debugging)
+  # Only run on PRs that touch ROCm/AMD-related files
   #
   pull_request:
     branches:
       - main
+    paths:
+      # Workflow and CI scripts
+      - '.github/workflows/mslk_ci_rocm.yml'
+      - 'ci/scripts/utils_rocm.bash'
+      # CMake ROCm/HIP configuration
+      - 'cmake/Hip.cmake'
+      - 'cmake/RocmSetup.cmake'
+      # External dependencies
+      - 'external/hipify_torch.submodule.txt'
+      - 'external/composable_kernel.submodule.txt'
+      # Python ROCm utilities
+      - 'mslk/testing/rocm.py'
+      # HIP source files (AMD GPU kernels)
+      - '**/*.hip'
+      # Any file/folder with 'ck' in the path (Composable Kernel)
+      - '**/ck/**'
+      - '**/ck_*/**'
 
   # Push Trigger (enable to catch errors coming out of multiple merges)
   #
