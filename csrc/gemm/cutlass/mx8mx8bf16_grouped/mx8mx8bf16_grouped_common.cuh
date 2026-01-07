@@ -52,7 +52,6 @@ inline int64_t _byte_align(int64_t offset) {
        out shape = (num_groups, M, N)
 */
 template <
-    typename InputType,
     int TB_M,
     int TB_N,
     int TB_K,
@@ -61,10 +60,10 @@ template <
     int TBS_K,
     bool Transpose>
 at::Tensor mx8mx8bf16_grouped_impl(
-    InputType XQ, // FP8
-    InputType WQ, // FP8
-    InputType x_scale,
-    InputType w_scale,
+    at::Tensor XQ, // FP8
+    at::Tensor WQ, // FP8
+    at::Tensor x_scale,
+    at::Tensor w_scale,
     at::Tensor output,
     int64_t G,
     at::Tensor offsets) {
@@ -78,7 +77,7 @@ at::Tensor mx8mx8bf16_grouped_impl(
   // WQ is shape (K,N) or (E,K,N) in column major layout, to align with
   // torch._scaled_grouped_mm. We transpose here to match cutlass kernel
   // requirements.
-  InputType WQ_contig = WQ.transpose(-2, -1);
+  at::Tensor WQ_contig = WQ.transpose(-2, -1);
 
   // Define gemm configuration.
   using ProblemShape =
