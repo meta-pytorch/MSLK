@@ -31,6 +31,9 @@ on:
       # Any file/folder with 'ck' in the path (Composable Kernel)
       - '**/ck/**'
       - '**/ck_*/**'
+      # Communication and quantization source files
+      - 'csrc/comm/**'
+      - 'csrc/quantize/**'
 
   # Push Trigger (enable to catch errors coming out of multiple merges)
   #
