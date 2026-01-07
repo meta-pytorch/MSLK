@@ -20,7 +20,7 @@ at::Tensor mx8mx8bf16_grouped_256_128_256_2_1_1_ba(
     at::Tensor output,
     int64_t G,
     at::Tensor offsets) {
-  return mx8mx8bf16_grouped_impl<at::Tensor, 256, 128, 256, 2, 1, 1, true>(
+  return mx8mx8bf16_grouped_impl<256, 128, 256, 2, 1, 1, true>(
       XQ, WQ, x_scale, w_scale, output, G, offsets);
 }
 
