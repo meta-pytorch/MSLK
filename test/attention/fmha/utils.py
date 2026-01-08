@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
+import math
 from functools import wraps
-from typing import Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Type, TypeVar
 
 import numpy as np
 import pytest
 import torch
+from mslk.attention import fmha
 from mslk.attention.fmha import Inputs
 from mslk.attention.fmha.attn_bias import (
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
@@ -449,3 +451,79 @@ def add_q_fp8_to_inputs(
         output_dtype=torch.bfloat16,
         quantize_qk_to_fp8=True,
     )
+
+
+compute_capability = (0, 0)
+if torch.cuda.is_available():
+    compute_capability = torch.cuda.get_device_capability("cuda")
+sm70_or_better_only = pytest.mark.skipif(
+    torch.version.cuda is not None and compute_capability < (7, 0),
+    reason="requires sm70+",
+)
+sm75_or_better_only = pytest.mark.skipif(
+    torch.version.cuda is not None and compute_capability < (7, 5),
+    reason="requires sm75+",
+)
+sm80_or_better_only = pytest.mark.skipif(
+    torch.version.cuda is not None and compute_capability < (8, 0),
+    reason="requires sm80+",
+)
+sm90_or_better_only = pytest.mark.skipif(
+    compute_capability < (9, 0),
+    reason="requires sm90+",
+)
+sm100_or_better_only = pytest.mark.skipif(
+    compute_capability < (10, 0), reason="requires sm100+"
+)
+skip_if_sm100_or_better = pytest.mark.skipif(
+    compute_capability >= (10, 0), reason="not supported on Blackwell"
+)
+
+skip_if_rocm = pytest.mark.skipif(
+    torch.version.hip is not None, reason="not supported on ROCm"
+)
+_devices = ["cpu"]
+_devices += ["cuda"] if torch.cuda.is_available() else []
+
+try:
+    import mtia.host_runtime.torch_mtia.dynamic_library  # noqa  # type: ignore
+
+    # torch.mtia.is_available() will not work here, since test collection can be done
+    # on a machine without MTIA devices
+    _devices.append("mtia")
+except (ImportError, OSError):
+    # Failed to load MTIA libraries, so just keep going without MTIA devices
+    pass
+
+T = TypeVar(
+    "T", Type[fmha.common.AttentionFwOpBase], Type[fmha.common.AttentionBwOpBase]
+)
+
+
+def _filter_unsupported_ops(ops: Sequence[T]) -> List[T]:
+    return [
+        op
+        for op in ops
+        if (
+            "cpu" in op.SUPPORTED_DEVICES
+            or "mtia" in op.SUPPORTED_DEVICES
+            or (
+                op.CUDA_MINIMUM_COMPUTE_CAPABILITY <= compute_capability
+                and (
+                    (max_cap := op.CUDA_MAXIMUM_COMPUTE_CAPABILITY) is None
+                    or max_cap >= compute_capability
+                )
+            )
+        )
+        and op.is_available()
+    ]
+
+
+def nanify_oob_seqlen(x: torch.Tensor) -> torch.Tensor:
+    align_to = 256
+    if x.shape[1] % align_to == 0:
+        return x
+    pad = [0, 0] * x.ndim
+    pad[-3] = align_to - (x.shape[1] % align_to)
+    x_pad = torch.nn.functional.pad(x, pad, value=math.nan)
+    return x_pad[:, : x.shape[1]]

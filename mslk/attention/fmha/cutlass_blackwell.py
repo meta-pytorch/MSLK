@@ -36,17 +36,17 @@ def _get_operator(name: str):
     def no_such_operator(*args, **kwargs):
         raise RuntimeError(
             "No such operator "
-            f"fbgemm_gpu.experimental.gen_ai.attention.cutlass_blackwell_fmha.{name} "
+            f"mslk.attention.cutlass_blackwell_fmha.{name} "
             "- did you forget to build xformers with `python setup.py develop`?"
         )
 
     try:
-        # type: ignore
-        from fbgemm_gpu.experimental.gen_ai.attention.cutlass_blackwell_fmha import (
+        # type: ignore  # pyre-ignore
+        from mslk.attention.cutlass_blackwell_fmha import (
             cutlass_blackwell_fmha_interface as fmha,
         )
 
-        return getattr(fmha, name)
+        return getattr(fmha, name)  # type: ignore  # pyre-ignore
     except (RuntimeError, ModuleNotFoundError):
         return no_such_operator
 
