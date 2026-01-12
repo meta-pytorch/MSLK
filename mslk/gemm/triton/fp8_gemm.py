@@ -11,16 +11,12 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import triton  # @manual
-
 import triton.language as tl  # @manual
-
 from mslk.gemm.triton.matmul_perf_model import early_config_prune, estimate_matmul_time
 from mslk.gemm.triton.utils import map_dtype_to_triton, TmaAutoTuneHelper
 from mslk.utils.triton.fp8_utils import get_fp8_constants, reinterpret_fp8_type
-
 from packaging import version
 from torch._tensor import Tensor
-
 from triton import Config  # @manual
 from triton.runtime.jit import TensorWrapper  # @manual
 
@@ -2047,9 +2043,9 @@ def matmul_fp8_block(
         return torch.zeros(output_shape, device=device, dtype=torch.bfloat16)
 
     # launch kernel
-    assert device != torch.device(
-        "cpu"
-    ), "Blockwise matmul not supported on cpu, please use row-wise instead."
+    assert device != torch.device("cpu"), (
+        "Blockwise matmul not supported on cpu, please use row-wise instead."
+    )
 
     if b.device != a.device:
         raise Exception("'b' must be on the same device as 'a'")
@@ -2206,9 +2202,9 @@ def prep_matmul(
     device = a.device
 
     # checks constraints
-    assert (
-        a.shape[1] == b.shape[1]
-    ), f"incompatible dimensions, a: {a.shape}, b: {b.shape}"
+    assert a.shape[1] == b.shape[1], (
+        f"incompatible dimensions, a: {a.shape}, b: {b.shape}"
+    )
     M, K = a.shape
     N, _ = b.shape
     m_key, n_key, k_key = get_matmul_tune(M, N, K)
@@ -2245,9 +2241,9 @@ def prep_matmul(
     if dot_out_dtype is None:
         dot_out_dtype_triton = tl.float32
     else:
-        assert isinstance(
-            dot_out_dtype, torch.dtype
-        ), f"dot_out_dtype type {type(dot_out_dtype)} must be a torch.dtype"
+        assert isinstance(dot_out_dtype, torch.dtype), (
+            f"dot_out_dtype type {type(dot_out_dtype)} must be a torch.dtype"
+        )
         dot_out_dtype_triton = map_dtype_to_triton(dot_out_dtype)
 
     return M, N, K, m_key, n_key, k_key, c, c_dtype_triton, dot_out_dtype_triton, device
@@ -2654,9 +2650,9 @@ def to_mxfp8(
         torch.bfloat16,
         torch.float,
     ), f"{data_hp.dtype} is not supported yet"
-    assert (
-        data_hp.shape[-1] % block_size == 0
-    ), f"the last dimension of shape {data_hp.shape} must be divisible by block_size {block_size}"
+    assert data_hp.shape[-1] % block_size == 0, (
+        f"the last dimension of shape {data_hp.shape} must be divisible by block_size {block_size}"
+    )
     assert data_hp.is_contiguous(), "unsupported"
 
     orig_shape = data_hp.shape

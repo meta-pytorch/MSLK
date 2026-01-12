@@ -8,14 +8,11 @@
 
 import functools
 import warnings
-
 from typing import Optional
 
 import torch
-
 import triton
 import triton.language as tl
-
 from triton.runtime import driver  # @manual
 
 try:
@@ -877,13 +874,13 @@ def _grouped_gemm(
             f"TMA load and warp specialization are disabled since K or N is not a multiple of 8: {K=}, {N=}.",
             stacklevel=2,
         )
-        assert (
-            x_scale is None
-        ), f"Quantisation is not supported yet when K or N is not a multiple of 8: {K=}, {N=}."
+        assert x_scale is None, (
+            f"Quantisation is not supported yet when K or N is not a multiple of 8: {K=}, {N=}."
+        )
 
-        assert (
-            output_tensor is None
-        ), f"Fused scatter add has large rounding error when K or N is not a multiple of 8: {K=}, {N=}."
+        assert output_tensor is None, (
+            f"Fused scatter add has large rounding error when K or N is not a multiple of 8: {K=}, {N=}."
+        )
 
     if output_tensor is None:
         FUSE_SCATTER_ADD = False

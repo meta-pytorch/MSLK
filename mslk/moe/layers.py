@@ -13,7 +13,6 @@ from functools import cached_property
 from typing import Callable, Optional, Union
 
 import torch
-
 from fairscale.nn.model_parallel.initialize import get_model_parallel_world_size
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.moe.activation import silu_mul, silu_mul_quant
@@ -24,7 +23,6 @@ from mslk.moe.gather_scatter import (
     scatter_add_padded_tokens,
 )
 from mslk.moe.shuffling import combine_shuffling, split_shuffling
-
 from mslk.quantize.triton.fp8_quantize import triton_quantize_fp8_row
 from pyre_extensions import none_throws
 from torch.distributed import get_rank, ProcessGroup
@@ -499,13 +497,13 @@ class MetaShufflingMoE(BaselineMoE):
     ) -> None:
         super().__init__(ep_group=ep_group, ep_mp_group=ep_mp_group, moe_args=moe_args)
 
-        assert (
-            self.mp_size == self.ep_mp_size
-        ), "MetaShuffling only supports mp_size = mp_size_for_routed_experts now"
+        assert self.mp_size == self.ep_mp_size, (
+            "MetaShuffling only supports mp_size = mp_size_for_routed_experts now"
+        )
 
-        assert (
-            self.top_k == 1
-        ), "MetaShuffling only supports top 1 routing at the moment"
+        assert self.top_k == 1, (
+            "MetaShuffling only supports top 1 routing at the moment"
+        )
 
         self.comm_stream: torch.cuda.Stream = torch.cuda.Stream()
         self.comp_end_event: torch.cuda.Event = torch.cuda.Event()
@@ -514,9 +512,9 @@ class MetaShufflingMoE(BaselineMoE):
         self.use_fast_accum: bool = moe_args.use_fast_accum
         self.dedup_comm: bool = moe_args.dedup_comm
         if self.dedup_comm:
-            assert (
-                self.ep_mp_size == self.mp_size
-            ), "TP2EP is not supported for dedup at the moment."
+            assert self.ep_mp_size == self.mp_size, (
+                "TP2EP is not supported for dedup at the moment."
+            )
 
         self.activation_scale_ub = None
 
@@ -670,9 +668,9 @@ class MetaShufflingMoE(BaselineMoE):
             expert_end=(self.ep_rank + 1) * self.num_local_experts,
         )
         assert shuffled_recv_tokens.shape == (self.ep_size * T, D)
-        assert shuffled_recv_token_counts.shape == (
-            self.num_local_experts + 1,
-        ), f"{shuffled_recv_token_counts.shape=}"
+        assert shuffled_recv_token_counts.shape == (self.num_local_experts + 1,), (
+            f"{shuffled_recv_token_counts.shape=}"
+        )
         routed_z = self._routed_expert(
             shuffled_recv_tokens,
             shuffled_recv_token_counts[:-1],

@@ -242,9 +242,9 @@ def test_backward(  # noqa: C901
     del value
     del qkv
 
-    assert len(grads_ref) == len(
-        grads
-    ), "Wrong number of gradients (maybe bias grad didn't backprop?)"
+    assert len(grads_ref) == len(grads), (
+        "Wrong number of gradients (maybe bias grad didn't backprop?)"
+    )
     for name, calc_grad, ref_grad in zip(grads_name, grads, grads_ref):
         assert_allclose(
             calc_grad.to(ref_grad.device),

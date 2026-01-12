@@ -11,7 +11,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import triton  # @manual
-
 import triton.language as tl  # @manual
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 from triton import Config  # @manual
@@ -419,7 +418,7 @@ def _kernel_quantize_fp8_packed_row(
             shr.b32 $3, $4, 24;
         }
             """,
-        constraints=("=r,=r,=r,=r," "r"),
+        constraints=("=r,=r,=r,=r,r"),
         # Let's pass in 1 uint32 value per iteration, containing 8 packed int4 values
         args=[1.0 / a_scale],
         dtype=(
@@ -954,9 +953,9 @@ def triton_quantize_fp8_block(
         torch.Tensor: [cdiv(M, block_m), cdiv(K, block_k)] reciprocal scale tensor per block
         if k_major is True, otherwise [cdiv(K, block_k), cdiv(M, block_M)].
     """
-    assert (
-        x.device != torch.device("cpu")
-    ), "Blockwise quantization not support on cpu, please use row-wise quantization instead."
+    assert x.device != torch.device("cpu"), (
+        "Blockwise quantization not support on cpu, please use row-wise quantization instead."
+    )
 
     if scale_ub is not None and scale_ub.device != x.device:
         raise Exception("'scale_ub' must be on the same device as 'a'")
@@ -1294,9 +1293,9 @@ def triton_quantize_fp8_group(
         torch.Tensor: [M, K] fp8 scaled tensor.
         torch.Tensor: [M, cdiv(K, group_size)] reciprocal scale tensor per group.
     """
-    assert x.device != torch.device(
-        "cpu"
-    ), "Triton groupwise quantization not supported on cpu."
+    assert x.device != torch.device("cpu"), (
+        "Triton groupwise quantization not supported on cpu."
+    )
 
     if scale_ub is not None and scale_ub.device != x.device:
         raise Exception("'scale_ub' must be on the same device as 'a'")
@@ -1385,9 +1384,9 @@ def quantize_fp8_group(
     pt_dtype, _, max_fp8, eps = get_fp8_constants()
 
     M, K = x.shape
-    assert (
-        K % group_size == 0
-    ), "K must be divisible by group_size for cpu implementation."
+    assert K % group_size == 0, (
+        "K must be divisible by group_size for cpu implementation."
+    )
     assert m_sizes is None, "m_sizes is not supported for cpu implementation."
     k_groups = triton.cdiv(K, group_size)
     # View input as colleciton of groups for reduction.
@@ -1483,9 +1482,9 @@ def dequantize_fp8_row(
         torch.Tensor: Dequantized BF16 tensor.
     """
 
-    assert (
-        xq.is_contiguous() and x_scale.is_contiguous()
-    ), "Input tensors must be contiguous"
+    assert xq.is_contiguous() and x_scale.is_contiguous(), (
+        "Input tensors must be contiguous"
+    )
     x_dequant = torch.empty_like(xq, dtype=torch.bfloat16)
 
     # Reshape to 2-d array keeping last dim only.
@@ -1877,9 +1876,9 @@ def dequantize_fp8_block(
         torch.Tensor: Dequantized BF16 tensor.
     """
 
-    assert (
-        xq.is_contiguous() and x_scale.is_contiguous()
-    ), "Input tensors must be contiguous"
+    assert xq.is_contiguous() and x_scale.is_contiguous(), (
+        "Input tensors must be contiguous"
+    )
     assert xq.dim() == 2 and x_scale.dim() == 2, "Input tensors must have 2 dimensions"
     M, K = xq.size()
     x_dequant = torch.empty_like(xq, dtype=torch.bfloat16)

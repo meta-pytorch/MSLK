@@ -8,7 +8,6 @@
 from typing import Optional
 
 import mslk.attention.cutlass_blackwell_fmha  # noqa
-
 import torch
 from torch.library import opcheck
 

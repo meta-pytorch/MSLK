@@ -753,9 +753,9 @@ class FwOp(AttentionFwOpBase):
         ):
             mqa_swap_seqlen_head = True
             if q_fp8_scale_shift is not None:
-                assert (
-                    q_fp8_scale_shift.shape == q.shape[:-1]
-                ), f"{q.shape=}, {q_fp8_scale_shift.shape=}"
+                assert q_fp8_scale_shift.shape == q.shape[:-1], (
+                    f"{q.shape=}, {q_fp8_scale_shift.shape=}"
+                )
                 if variable_q:
                     q_fp8_scale_shift = q_fp8_scale_shift.permute(0, 1, 3, 2).reshape(
                         1, -1, G, 1
@@ -1107,15 +1107,17 @@ def merge_attentions(
         and H == H1 == H2
         and M == M1 == M2
         and Kq == Kq1
-    ), f"Incompatible shapes: {attn_out.shape=}, {attn_split.shape=}, {lse_split.shape=}"
-    assert (
-        split_k == split_k1
-    ), f"Incompatible shapes: {attn_split.shape=}, {lse_split.shape=}"
+    ), (
+        f"Incompatible shapes: {attn_out.shape=}, {attn_split.shape=}, {lse_split.shape=}"
+    )
+    assert split_k == split_k1, (
+        f"Incompatible shapes: {attn_split.shape=}, {lse_split.shape=}"
+    )
     if lse_out is not None:
         B3, G3, H3, M3 = lse_out.shape
-        assert (
-            B == B3 and G == G3 and H == H3 and M == M3
-        ), f"Incompatible shapes: {attn_out.shape=}, {lse_out.shape=}"
+        assert B == B3 and G == G3 and H == H3 and M == M3, (
+            f"Incompatible shapes: {attn_out.shape=}, {lse_out.shape=}"
+        )
 
     num_warps = 4 if B * G * H < 32 or torch.version.hip else 2
     splitK_pow2 = triton.next_power_of_2(split_k)
@@ -1161,7 +1163,6 @@ def merge_attentions_varargs(
     import triton
 
     from ._triton.splitk_kernels import _splitK_reduce_varargs
-
     from ._triton.vararg_kernel import unroll_varargs
 
     attn_out = torch.empty(
@@ -1314,12 +1315,14 @@ def _prepare_reduce_kernel_params(
         and H == H1 == H2
         and M == M1 == M2
         and Kq == Kq1
-    ), f"Incompatible shapes: {attn_out.shape=}, {attn_split[0].shape=}, {lse_split[0].shape=}"
+    ), (
+        f"Incompatible shapes: {attn_out.shape=}, {attn_split[0].shape=}, {lse_split[0].shape=}"
+    )
     if lse_out is not None:
         B3, G3, H3, M3 = lse_out.shape
-        assert (
-            B == B3 and G == G3 and H == H3 and M == M3
-        ), f"Incompatible shapes: {attn_out.shape=}, {lse_out.shape=}"
+        assert B == B3 and G == G3 and H == H3 and M == M3, (
+            f"Incompatible shapes: {attn_out.shape=}, {lse_out.shape=}"
+        )
 
     attn_split_strides = {}
     lse_split_strides = {}

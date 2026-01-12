@@ -18,7 +18,6 @@ from mslk.attention.fmha.attn_bias import (
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-
 from mslk.attention.fmha.attn_bias_utils import (
     pack_kv_cache,
     ref_attention,

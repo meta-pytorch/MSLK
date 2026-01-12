@@ -12,7 +12,6 @@ from datetime import timedelta
 from typing import Optional
 
 import torch
-
 from fairscale.nn.model_parallel.initialize import (
     get_model_parallel_group,
     get_model_parallel_world_size,
@@ -98,9 +97,9 @@ def init_parallel(
         init_torch_distributed(backend=backend, timeout=timeout)
 
     if not model_parallel_is_initialized():
-        assert (
-            get_world_size() == model_parallel_size * data_parallel_size
-        ), f"world size must be equal to mp*dp, but got {get_world_size()} != {model_parallel_size} * {data_parallel_size}"
+        assert get_world_size() == model_parallel_size * data_parallel_size, (
+            f"world size must be equal to mp*dp, but got {get_world_size()} != {model_parallel_size} * {data_parallel_size}"
+        )
         initialize_model_parallel(model_parallel_size)
 
     global_rank = get_global_rank()

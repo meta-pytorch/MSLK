@@ -11,7 +11,6 @@ import torch
 
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
-
 from .utils.op_common import get_operator, register_operator
 
 

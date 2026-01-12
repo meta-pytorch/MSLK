@@ -38,7 +38,6 @@ from .common import (
     Gradients,
     Inputs,
 )
-
 from .utils.op_common import get_operator, register_operator
 
 
@@ -237,9 +236,9 @@ class FwOp(AttentionFwOpBase):
 
         # when the input is expanded 5-D, the group dimension has zero stride
         if inp.key.stride()[3] == 0:
-            assert (
-                inp.value.stride()[3] == 0
-            ), "key and value should be expanded in the same way"
+            assert inp.value.stride()[3] == 0, (
+                "key and value should be expanded in the same way"
+            )
             k_shape = inp.key.size()
             k_stride = inp.key.stride()
             key = inp.key.as_strided(

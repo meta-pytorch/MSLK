@@ -307,9 +307,9 @@ def maybe_make_paged(
         # so we need to reshape the block tables accordingly.
         block_tables = block_tables.view(attn_batch_size, -1)
     if isinstance(attn_bias, BlockDiagonalGappyKeysMask):
-        assert (
-            notional_padding is not None
-        ), "Notional padding must be specified to create gappy paged biases."
+        assert notional_padding is not None, (
+            "Notional padding must be specified to create gappy paged biases."
+        )
         return attn_bias.make_paged(
             block_tables=block_tables,
             page_size=page_size,

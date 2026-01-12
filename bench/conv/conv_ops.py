@@ -8,9 +8,7 @@
 import abc
 
 import mslk.conv  # noqa: F401
-
 import torch
-
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_tensor
 

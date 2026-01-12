@@ -7,20 +7,16 @@
 import itertools
 import os
 import sys
-
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
 import click
-
 import matplotlib.pyplot as plt
-
 import pandas as pd
 import seaborn as sns
 import torch
 import triton  # @manual=//triton:triton
-
 from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.conv.conv_ops import ConvOpBase, get_conv_ops
 from tabulate import tabulate
@@ -38,9 +34,9 @@ def register_shapes(name):
 
 
 @register_shapes("default")
-def default_shapes() -> (
-    list[tuple[int, int, int, int, int, int, int, int, int, int, int, int]]
-):
+def default_shapes() -> list[
+    tuple[int, int, int, int, int, int, int, int, int, int, int, int]
+]:
     """
     Default convolution shapes for benchmarking.
 
@@ -407,7 +403,7 @@ def print_kernels(kernels: Optional[list[str]]) -> list[ConvOpBase]:
 @click.option(
     "--shapes",
     default=None,
-    help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
+    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
 )
 @click.option(
     "--trace",
@@ -460,7 +456,7 @@ def invoke_main(
     if shapes:
         if shapes not in shape_registry:
             print(
-                f"Shape {shapes} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
+                f"Shape {shapes} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
             )
             sys.exit(1)
         conv_shapes = shape_registry[shapes]()

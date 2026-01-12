@@ -55,7 +55,6 @@ from .flash import (
     _post_process_lse,
     _window_size,
 )
-
 from .utils.op_common import get_operator, register_operator
 
 FLASH_VERSION = "0.0.0"
@@ -662,9 +661,9 @@ class FwOp(AttentionFwOpBase):
                     leftpad_k = cu_seqlens_k[:-1]
                 else:
                     # case #2: len(cu_seqlens_k) = batch_size
-                    assert (
-                        len(cu_seqlens_q) - len(cu_seqlens_k) == 1
-                    ), f"{len(cu_seqlens_q)=} {len(cu_seqlens_k)=}"
+                    assert len(cu_seqlens_q) - len(cu_seqlens_k) == 1, (
+                        f"{len(cu_seqlens_q)=} {len(cu_seqlens_k)=}"
+                    )
                     leftpad_k = cu_seqlens_k
             out, softmax_lse = cls.OPERATOR(
                 q,

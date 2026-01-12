@@ -26,9 +26,7 @@ from .attn_bias import (
     LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
 )
-
 from .common import AttentionBwOpBase, AttentionFwOpBase, Context, Gradients, Inputs
-
 from .utils.op_common import register_operator
 
 

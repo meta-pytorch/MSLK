@@ -17,7 +17,6 @@ import click
 import pandas as pd
 import torch
 import triton  # @manual=//triton:triton
-
 from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
@@ -122,7 +121,7 @@ def get_problem_shapes(
         for shape in shapes.strip().split(","):
             if shape not in shape_registry:
                 print(
-                    f"Shape {shape} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
+                    f"Shape {shape} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
                 )
                 sys.exit(1)
             all_shapes.update(shape_registry[shape]())
@@ -257,7 +256,7 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
 @click.option(
     "--shapes",
     default=None,
-    help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
+    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
 )
 @click.option(
     "--trace",

@@ -7,7 +7,6 @@
 
 import pytest
 import torch
-
 from mslk.attention import fmha
 from mslk.attention.fmha.split_blocks_fairinternal import (
     split_blocks_for_decoding,

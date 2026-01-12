@@ -10,7 +10,6 @@ from enum import IntEnum
 from typing import Any, Optional
 
 import mslk.attention.cutlass_blackwell_fmha  # noqa: F401
-
 import torch
 
 

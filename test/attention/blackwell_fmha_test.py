@@ -14,7 +14,6 @@ from typing import cast, Optional
 
 import torch
 from einops import rearrange
-
 from mslk.attention.cutlass_blackwell_fmha import (
     _cutlass_blackwell_fmha_forward,
     cutlass_blackwell_fmha_decode_forward,
@@ -417,9 +416,9 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
         self._allclose(out, out_ref, out_pt)
         # Validate LSE correctness (skip for FP8 since ref doesn't support LSE)
         if dtype != torch.float8_e4m3fn:
-            assert (
-                lse.shape == lse_ref.shape
-            ), f"LSE shape mismatch: {lse.shape} vs {lse_ref.shape}"
+            assert lse.shape == lse_ref.shape, (
+                f"LSE shape mismatch: {lse.shape} vs {lse_ref.shape}"
+            )
 
             lse_diff = (lse - lse_ref).abs().max().item()
             if DEBUG:
@@ -427,9 +426,9 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
                 print(f"LSE shape from reference: {lse_ref.shape}")
                 print(f"Max LSE difference: {lse_diff}")
 
-            assert (
-                lse_diff <= 1e-2
-            ), f"LSE comparison failed: max_diff={lse_diff:.6f} > 1e-2"
+            assert lse_diff <= 1e-2, (
+                f"LSE comparison failed: max_diff={lse_diff:.6f} > 1e-2"
+            )
 
     def _execute_cutlass_blackwell_attn_dense(
         self,
@@ -1121,9 +1120,9 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
         for i in range(batch_size + 1):
             cu_seqlens_k_padded[i] = i * kv_padding
 
-        assert torch.all(
-            seqused_k <= kv_padding
-        ), "Actual sequence lengths must be less than or equal to max sequence length"
+        assert torch.all(seqused_k <= kv_padding), (
+            "Actual sequence lengths must be less than or equal to max sequence length"
+        )
 
         if DEBUG:
             print("\n=== Testing Jagged KV vs Padded KV with seqlen_kv ===")
@@ -1675,9 +1674,9 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
         )
 
         # Validate LSE shapes match before comparing values
-        assert (
-            lse_fwd.shape == lse_ref.shape
-        ), f"LSE shape mismatch: {lse_fwd.shape} vs {lse_ref.shape}"
+        assert lse_fwd.shape == lse_ref.shape, (
+            f"LSE shape mismatch: {lse_fwd.shape} vs {lse_ref.shape}"
+        )
 
         if DEBUG:
             print(f"LSE shape from kernel: {lse_fwd.shape}")
@@ -1686,9 +1685,9 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
 
         # Compare LSE values with tolerance
         lse_diff = (lse_fwd - lse_ref).abs().max().item()
-        assert (
-            lse_diff <= 1e-2
-        ), f"LSE comparison failed: max_diff={lse_diff:.6f} > 1e-2"
+        assert lse_diff <= 1e-2, (
+            f"LSE comparison failed: max_diff={lse_diff:.6f} > 1e-2"
+        )
 
     @skip_cuda_lt_sm100
     @skip_rocm

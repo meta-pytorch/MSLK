@@ -27,9 +27,7 @@ from .attn_bias import (
     LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
 )
-
 from .flash import BwOp as BwOpCUDA, FwOp as FwOpCUDA
-
 from .utils.op_common import get_operator, register_operator
 
 try:

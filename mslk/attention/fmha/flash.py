@@ -46,7 +46,6 @@ from .common import (
     Inputs,
 )
 from .torch_attention_compat import is_pt_flash_old
-
 from .utils.op_common import get_operator, register_operator
 
 FLASH_VERSION = "0.0.0"
@@ -537,7 +536,7 @@ def _check_needs_no_topleft(d: Inputs, reasons: List[str]) -> None:
     elif isinstance(attn_bias, LowerTriangularMask):
         if d.query.shape[1] != d.key.shape[1]:
             reasons.append(
-                "Only support LowerTriangularMask if equal number of" "keys and queries"
+                "Only support LowerTriangularMask if equal number ofkeys and queries"
             )
 
 

@@ -6,7 +6,6 @@
 
 
 import torch
-
 from mslk.attention.cutlass_blackwell_fmha import cutlass_blackwell_fmha_func
 
 

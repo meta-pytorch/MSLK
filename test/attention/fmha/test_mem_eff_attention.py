@@ -40,7 +40,6 @@ from .case_generation import (
     make_id,
     sample_random_supported_fw,
 )
-
 from .utils import (
     _devices,
     _filter_unsupported_ops,
@@ -1187,7 +1186,6 @@ def test_attn_bias_blockdiag_doc() -> None:
     If this example needs to be updated, please also update the doc
     """
     import torch
-
     from mslk.attention import fmha
 
     if torch.version.hip:

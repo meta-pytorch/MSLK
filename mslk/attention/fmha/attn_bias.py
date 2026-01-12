@@ -274,9 +274,9 @@ class LowerTriangularFromBottomRightMask(AttentionBias):
     """
 
     def to(self, device: torch.device) -> "LowerTriangularFromBottomRightMask":
-        assert (
-            type(self) is LowerTriangularFromBottomRightMask
-        ), "Please implement in subclass"
+        assert type(self) is LowerTriangularFromBottomRightMask, (
+            "Please implement in subclass"
+        )
         return self
 
     def materialize(
@@ -326,9 +326,9 @@ class LowerTriangularFromBottomRightLocalAttentionMask(
     def to(
         self, device: torch.device
     ) -> "LowerTriangularFromBottomRightLocalAttentionMask":
-        assert (
-            type(self) is LowerTriangularFromBottomRightLocalAttentionMask
-        ), "Please implement in subclass"
+        assert type(self) is LowerTriangularFromBottomRightLocalAttentionMask, (
+            "Please implement in subclass"
+        )
         return self
 
     def __post_init__(self) -> None:
@@ -359,9 +359,9 @@ class LowerTriangularMaskWithTensorBias(LowerTriangularMask):
         self._bias = bias
 
     def to(self, device: torch.device) -> "LowerTriangularMaskWithTensorBias":
-        assert (
-            type(self) is LowerTriangularMaskWithTensorBias
-        ), "Please implement in subclass"
+        assert type(self) is LowerTriangularMaskWithTensorBias, (
+            "Please implement in subclass"
+        )
         return LowerTriangularMaskWithTensorBias(_to_device(self._bias, device))
 
     def materialize(
@@ -578,9 +578,9 @@ class _PaddedSeqLenInfo(_SeqLenInfo):
         seqstart = padding * torch.arange(batch_size)
         """
         assert not isinstance(seqlens, torch.Tensor)
-        assert all(
-            seqlen <= padding for seqlen in seqlens
-        ), f"Seqlens {seqlens} Padding {padding}"
+        assert all(seqlen <= padding for seqlen in seqlens), (
+            f"Seqlens {seqlens} Padding {padding}"
+        )
         device = _get_default_bias_device(device)
         seqstart_py = list(range(0, len(seqlens) * padding + 1, padding))
         seqlen = _to_device_tensor(seqlens, dtype=torch.int32, device=device)
@@ -602,9 +602,9 @@ class _PaddedSeqLenInfo(_SeqLenInfo):
         into CUDA graphs during the generation.
         """
         assert not isinstance(seqlens, torch.Tensor)
-        assert all(
-            seqlen <= self.padding for seqlen in seqlens
-        ), f"Seqlens {seqlens} Padding {self.padding}"
+        assert all(seqlen <= self.padding for seqlen in seqlens), (
+            f"Seqlens {seqlens} Padding {self.padding}"
+        )
         seqlen_tensor = torch.tensor(seqlens, dtype=torch.int32)
 
         assert len(self.seqlen_py) == len(seqlens), (
@@ -1028,9 +1028,9 @@ class BlockDiagonalCausalFromBottomRightMask(BlockDiagonalMask):
     """
 
     def to(self, device) -> "BlockDiagonalCausalFromBottomRightMask":
-        assert (
-            type(self) is BlockDiagonalCausalFromBottomRightMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalFromBottomRightMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalFromBottomRightMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1213,9 +1213,9 @@ class BlockDiagonalCausalWithOffsetPaddedKeysMask(BlockDiagonalPaddedKeysMask):
     causal_diagonal: Any = None  # unused. Exists for BC only.
 
     def to(self, device) -> "BlockDiagonalCausalWithOffsetPaddedKeysMask":
-        assert (
-            type(self) is BlockDiagonalCausalWithOffsetPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalWithOffsetPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalWithOffsetPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1287,9 +1287,9 @@ class BlockDiagonalLocalAttentionPaddedKeysMask(BlockDiagonalPaddedKeysMask):
     window_right: int
 
     def to(self, device) -> "BlockDiagonalLocalAttentionPaddedKeysMask":
-        assert (
-            type(self) is BlockDiagonalLocalAttentionPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalLocalAttentionPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalLocalAttentionPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1347,9 +1347,9 @@ class BlockDiagonalCausalLocalAttentionPaddedKeysMask(BlockDiagonalPaddedKeysMas
     _window_size: int
 
     def to(self, device) -> "BlockDiagonalCausalLocalAttentionPaddedKeysMask":
-        assert (
-            type(self) is BlockDiagonalCausalLocalAttentionPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalLocalAttentionPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalLocalAttentionPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1430,9 +1430,9 @@ class PagedBlockDiagonalPaddedKeysMask(AttentionBias):
     )
 
     def to(self, device: torch.device) -> "PagedBlockDiagonalPaddedKeysMask":
-        assert (
-            type(self) is PagedBlockDiagonalPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is PagedBlockDiagonalPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return PagedBlockDiagonalPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1533,9 +1533,9 @@ class PagedBlockDiagonalCausalWithOffsetPaddedKeysMask(
     def to(
         self, device: torch.device
     ) -> "PagedBlockDiagonalCausalWithOffsetPaddedKeysMask":
-        assert (
-            type(self) is PagedBlockDiagonalCausalWithOffsetPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is PagedBlockDiagonalCausalWithOffsetPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return PagedBlockDiagonalCausalWithOffsetPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1560,9 +1560,9 @@ class PagedBlockDiagonalCausalLocalPaddedKeysMask(PagedBlockDiagonalPaddedKeysMa
     )
 
     def to(self, device: torch.device) -> "PagedBlockDiagonalCausalLocalPaddedKeysMask":
-        assert (
-            type(self) is PagedBlockDiagonalCausalLocalPaddedKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is PagedBlockDiagonalCausalLocalPaddedKeysMask, (
+            "Please implement in subclass"
+        )
         return PagedBlockDiagonalCausalLocalPaddedKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1739,9 +1739,9 @@ class BlockDiagonalGappyKeysMask(AttentionBias):
             for i, start in enumerate(self.k_seqinfo.seqstart_py[:-1])
         ]
         new_seqstarts_py.append(-1)
-        assert all(
-            0 <= i < max_row_len for i in new_seqstarts_py[:-1]
-        ), f"{max_row_len=} {new_seqstarts_py=}"
+        assert all(0 <= i < max_row_len for i in new_seqstarts_py[:-1]), (
+            f"{max_row_len=} {new_seqstarts_py=}"
+        )
 
         # Sequence info is duplicated on CPU and GPU,
         # but we process them independently to avoid GPU sync.
@@ -1797,9 +1797,9 @@ class BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask(
     window_right: int
 
     def to(self, device) -> "BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask":
-        assert (
-            type(self) is BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1871,9 +1871,9 @@ class BlockDiagonalCausalWithOffsetGappyKeysMask(BlockDiagonalGappyKeysMask):
     """
 
     def to(self, device: torch.device) -> "BlockDiagonalCausalWithOffsetGappyKeysMask":
-        assert (
-            type(self) is BlockDiagonalCausalWithOffsetGappyKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalWithOffsetGappyKeysMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalWithOffsetGappyKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -1897,7 +1897,9 @@ class BlockDiagonalCausalWithOffsetGappyKeysMask(BlockDiagonalGappyKeysMask):
             self.k_seqinfo.intervals(),
         ):
             mask[q_start:q_end, k_start:k_end] = (
-                LowerTriangularFromBottomRightMask().materialize(shape=(q_end - q_start, k_end - k_start), dtype=dtype, device=device)
+                LowerTriangularFromBottomRightMask().materialize(
+                    shape=(q_end - q_start, k_end - k_start), dtype=dtype, device=device
+                )
             )
 
         for _ in range(len(shape) - 2):
@@ -1924,9 +1926,9 @@ class PagedBlockDiagonalGappyKeysMask(AttentionBias):
     )
 
     def to(self, device: torch.device) -> "PagedBlockDiagonalGappyKeysMask":
-        assert (
-            type(self) is PagedBlockDiagonalGappyKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is PagedBlockDiagonalGappyKeysMask, (
+            "Please implement in subclass"
+        )
         return PagedBlockDiagonalGappyKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -2039,9 +2041,9 @@ class PagedBlockDiagonalCausalWithOffsetGappyKeysMask(PagedBlockDiagonalGappyKey
     def to(
         self, device: torch.device
     ) -> "PagedBlockDiagonalCausalWithOffsetGappyKeysMask":
-        assert (
-            type(self) is PagedBlockDiagonalCausalWithOffsetGappyKeysMask
-        ), "Please implement in subclass"
+        assert type(self) is PagedBlockDiagonalCausalWithOffsetGappyKeysMask, (
+            "Please implement in subclass"
+        )
         return PagedBlockDiagonalCausalWithOffsetGappyKeysMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -2064,9 +2066,9 @@ class BlockDiagonalCausalLocalAttentionMask(BlockDiagonalCausalMask):
     _window_size: int = 0  # forced due to inheritance and default arguments
 
     def to(self, device) -> "BlockDiagonalCausalLocalAttentionMask":
-        assert (
-            type(self) is BlockDiagonalCausalLocalAttentionMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalLocalAttentionMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalLocalAttentionMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),
@@ -2130,9 +2132,9 @@ class BlockDiagonalCausalLocalAttentionFromBottomRightMask(
     _window_size: int = 0  # forced due to inheritance and default arguments
 
     def to(self, device) -> "BlockDiagonalCausalLocalAttentionFromBottomRightMask":
-        assert (
-            type(self) is BlockDiagonalCausalLocalAttentionFromBottomRightMask
-        ), "Please implement in subclass"
+        assert type(self) is BlockDiagonalCausalLocalAttentionFromBottomRightMask, (
+            "Please implement in subclass"
+        )
         return BlockDiagonalCausalLocalAttentionFromBottomRightMask(
             q_seqinfo=self.q_seqinfo.to(device),
             k_seqinfo=self.k_seqinfo.to(device),

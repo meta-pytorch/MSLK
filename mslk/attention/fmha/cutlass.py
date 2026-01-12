@@ -35,7 +35,6 @@ from .common import (
     Inputs,
 )
 from .torch_attention_compat import is_pt_cutlass_compatible
-
 from .utils.op_common import get_operator, register_operator
 
 

@@ -288,7 +288,7 @@ def _kernel_quantize_mx4_unpack(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -1626,7 +1626,7 @@ def _kernel_nvfp4_quantize(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -1839,7 +1839,7 @@ def _kernel_nvfp4_quantize_silu(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -2201,7 +2201,7 @@ def _kernel_nvfp4_quantize_rms(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -2563,7 +2563,7 @@ def _kernel_nvfp4_quantize_stacked(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -3241,7 +3241,7 @@ def _kernel_nvfp4_quantize_stacked_silu(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -3534,7 +3534,7 @@ def _mega_fp4_quantize_kernel(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -3805,7 +3805,7 @@ def _mega_fp4_quantize_kernel_with_tensor_idx(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -4389,7 +4389,7 @@ def _kernel_nvfp4_quantize_stacked_rms(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -4731,7 +4731,7 @@ def _mega_fp4_pack_kernel(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -4943,7 +4943,7 @@ def _mega_fp4_pack_kernel_per_tensor(
 
             }
             """,
-            constraints="=r," "f, f, f, f, f, f, f, f",
+            constraints="=r,f, f, f, f, f, f, f, f",
             args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
             dtype=tl.int32,
             is_pure=True,
@@ -5320,9 +5320,9 @@ def mega_fp4_unpack(
     M, original_K = input.shape
     device = input.device
 
-    assert input.dtype in (
-        torch.uint8,
-    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+    assert input.dtype in (torch.uint8,), (
+        f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+    )
 
     # returns the size of the original k dimension before packing
     def decompose_K(k: int):

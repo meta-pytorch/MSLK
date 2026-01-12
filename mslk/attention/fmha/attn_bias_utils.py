@@ -329,9 +329,9 @@ def _rand_seqlens(
             keys_left = kv_len - sum(seqlens_k, 0)
             queries_left = q_len - sum(seqlens_q, 0)
 
-            assert (
-                keys_left >= queries_left - max_q_minus_k
-            ), f"{keys_left=} {queries_left=} {max_q_minus_k=} {kv_len=} {q_len=} {seqlens_k=} {seqlens_q=}"
+            assert keys_left >= queries_left - max_q_minus_k, (
+                f"{keys_left=} {queries_left=} {max_q_minus_k=} {kv_len=} {q_len=} {seqlens_k=} {seqlens_q=}"
+            )
             # Limit num_queries from above: if num_queries > keys_left + max_q_minus_k,
             # condition num_queries <= num_keys + max_q_minus_k can't be satisfied even if we take
             # all the remaining keys

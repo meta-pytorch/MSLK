@@ -13,7 +13,6 @@ from typing import Optional, Tuple
 import mslk.quantize  # noqa: F401
 import torch
 from hypothesis import given, settings, strategies as st
-
 from mslk.quantize.triton.fp4_quantize import (
     _from_blocked,
     _to_blocked,
@@ -30,7 +29,6 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_scale_nvfp4_quant_silu,
     triton_silu_quantize_mx4_unpack,
 )
-
 from torch.testing._internal.common_quantized import _f32_to_floatx_unpacked, pack_uint4
 
 # pyre-fixme [16]

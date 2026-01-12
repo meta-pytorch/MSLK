@@ -13,7 +13,6 @@ from typing import List, Optional, Sequence, Tuple, Type
 import torch
 
 from .. import fmha
-
 from . import (
     flash,
     flash3,
@@ -593,12 +592,12 @@ def tree_attention(
 
     assert H == H1 and D == D1 and G == G1
     assert cache_k.shape == cache_v.shape
-    assert (
-        tree_size_q1 == tree_size_q <= tree_size_kv
-    ), f"{tree_size_q1=} {tree_size_q=} {tree_size_kv=}"
-    assert (
-        q.shape[2:] == spec_k.shape[2:] == spec_v.shape[2:]
-    ), f"{q.shape=} {spec_k.shape=} {spec_v.shape=}"
+    assert tree_size_q1 == tree_size_q <= tree_size_kv, (
+        f"{tree_size_q1=} {tree_size_q=} {tree_size_kv=}"
+    )
+    assert q.shape[2:] == spec_k.shape[2:] == spec_v.shape[2:], (
+        f"{q.shape=} {spec_k.shape=} {spec_v.shape=}"
+    )
 
     spec_attn_bias = spec_attn_bias.expand(B, G, H, tree_size_q, tree_size_kv)
 

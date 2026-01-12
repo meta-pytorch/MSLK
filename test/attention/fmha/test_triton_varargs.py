@@ -13,7 +13,6 @@ import torch
 try:
     import triton
     import triton.language as tl
-
     from mslk.attention.fmha._triton.vararg_kernel import (
         _VisitorConditionalKernel,
         unroll_varargs,

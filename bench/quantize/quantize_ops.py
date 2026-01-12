@@ -10,9 +10,7 @@ import abc
 from typing import Any, TypeVar
 
 import torch
-
 from mslk.bench.common.utils import BenchOptions, do_bench
-
 from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,

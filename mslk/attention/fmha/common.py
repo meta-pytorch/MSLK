@@ -33,9 +33,7 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-
 from .utils.cpp_lib import _built_with_cuda
-
 from .utils.op_common import BaseOperator
 
 

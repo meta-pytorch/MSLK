@@ -11,7 +11,6 @@ from typing import List, Optional, Tuple, Type
 
 import pytest
 import torch
-
 from mslk.attention import fmha
 from mslk.attention.fmha.attn_bias import (
     BlockDiagonalPaddedKeysMask,
@@ -527,9 +526,9 @@ def test_tree_attention_metadata_arbitrary_tree(branching: List[int]) -> None:
         torch.tensor([0] * num_nodes_per_level[-1])
     )
     subtree_sizes_ref.append(len(tree_indices) + 1)
-    assert (
-        [0] + tree_indices == tree_attn_metadata.tree_indices.tolist()
-    ), f"{tree_indices=} {tree_attn_metadata.tree_indices.tolist()=}"
+    assert [0] + tree_indices == tree_attn_metadata.tree_indices.tolist(), (
+        f"{tree_indices=} {tree_attn_metadata.tree_indices.tolist()=}"
+    )
 
     num_children_per_node_ref.extend([0] * num_paths)
     num_children_per_node_ref_tensor = torch.tensor(num_children_per_node_ref)

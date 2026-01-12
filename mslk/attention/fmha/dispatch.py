@@ -60,7 +60,7 @@ def _ensure_op_supports_or_raise(exc_type, name: str, op, inp: Inputs) -> None:
         return
     raise exc_type(
         f"""Operator `{name}` does not support inputs:
-{textwrap.indent(_format_inputs_description(inp), '     ')}
+{textwrap.indent(_format_inputs_description(inp), "     ")}
 {_format_not_supported_reasons(op, reasons)}"""
     )
 
@@ -84,7 +84,7 @@ def _run_priority_list(
 
     # Let's write a nice message explaining what we tried and why it's not supported
     msg = f"""No operator found for `{name}` with inputs:
-{textwrap.indent(_format_inputs_description(inp), '     ')}"""
+{textwrap.indent(_format_inputs_description(inp), "     ")}"""
     for op, not_supported in zip(priority_list, not_supported_reasons):
         msg += "\n" + _format_not_supported_reasons(op, not_supported)
     if extra_op_reasons is not None:

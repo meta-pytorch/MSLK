@@ -11,14 +11,10 @@ from enum import auto, Enum
 
 import numpy as np
 import torch
-
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
-
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
-
 from mslk.quantize.shuffle import ck_preshuffle, quantize_int4_preshuffle
-
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -30,7 +26,6 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_scale_nvfp4_quant_rms,
     triton_scale_nvfp4_quant_silu,
 )
-
 from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
     quantize_fp8_group,
@@ -38,7 +33,6 @@ from mslk.quantize.triton.fp8_quantize import (
     scale_fp8_row,
     triton_quantize_fp8_row,
 )
-
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 try:
@@ -2087,9 +2081,9 @@ class F8I4ShuffledGroupedGemm(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(
-            w, list
-        ), "Only supported for grouped inputs."
+        assert isinstance(x, list) and isinstance(w, list), (
+            "Only supported for grouped inputs."
+        )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)
@@ -2150,9 +2144,9 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(
-            w, list
-        ), "Only supported for grouped inputs."
+        assert isinstance(x, list) and isinstance(w, list), (
+            "Only supported for grouped inputs."
+        )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)

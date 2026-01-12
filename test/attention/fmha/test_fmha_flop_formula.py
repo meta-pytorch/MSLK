@@ -11,7 +11,6 @@ from typing import Optional, Tuple, Type
 
 import pytest
 import torch
-
 from mslk.attention import fmha
 
 from .utils import disable_on_rocm, ref_attention_bmhk_for_test

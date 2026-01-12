@@ -70,9 +70,9 @@ def _batched_scaled_mm(
     # Handle MQA/GQA head repetition if needed
     if handle_mqa_gqa and (batch_heads_a != batch_heads_b):
         # Repeat k/v heads to match q heads (from fp8_matmul logic)
-        assert (
-            batch_heads_a % batch_heads_b == 0
-        ), f"q_heads ({batch_heads_a}) must be divisible by kv_heads ({batch_heads_b})"
+        assert batch_heads_a % batch_heads_b == 0, (
+            f"q_heads ({batch_heads_a}) must be divisible by kv_heads ({batch_heads_b})"
+        )
         repeat_factor = batch_heads_a // batch_heads_b
         # Repeat each kv head to match q heads
         b_batch = b_batch.repeat_interleave(repeat_factor, dim=0)

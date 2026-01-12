@@ -7,23 +7,18 @@
 import itertools
 import os
 import sys
-
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
 import click
-
 import matplotlib.pyplot as plt
 import numpy as np
-
 import pandas as pd
 import seaborn as sns
 import torch
-
 import triton  # @manual=//triton:triton
-
 from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from tabulate import tabulate
@@ -625,7 +620,7 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--shapes",
     default=None,
-    help=f"Specific model shapes to use, options: {", ".join(shape_registry.keys())}.",
+    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
 )
 @click.option(
     "--trace",
@@ -705,9 +700,9 @@ def invoke_main(
         M = [int(m_val) for m_val in m.strip().split(",")]
         N = [int(n_val) for n_val in n.strip().split(",")]
         K = [int(k_val) for k_val in k.strip().split(",")]
-        assert (
-            len(M) == len(N) == len(K)
-        ), "M, N, and K must be the same length in grouped mode."
+        assert len(M) == len(N) == len(K), (
+            "M, N, and K must be the same length in grouped mode."
+        )
 
         # Note this is a single grouped gemm.
         MNK = [[M, N, K]]
@@ -715,7 +710,7 @@ def invoke_main(
         if shapes:
             if shapes not in shape_registry:
                 print(
-                    f"Shape {shapes} not found in shape registry. Valid shapes: {", ".join(shape_registry.keys())}."
+                    f"Shape {shapes} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
                 )
                 sys.exit(1)
             MNK = shape_registry[shapes]()
