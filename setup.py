@@ -140,14 +140,20 @@ class MSLKBuild:
     def variant(self) -> str:
         return self.args.build_variant
 
+    def package_channel(self) -> str:
+        return self.args.package_channel
+
     def package_name(self) -> str:
         if self.target() == "default":
             pkg_name: str = "mslk"
         else:
-            pkg_name: str = f"mslk_{self.target()}"
+            pkg_name: str = f"mslk-{self.target()}"
 
         if self.nova_flag() is None:
-            pkg_name += f"-{self.variant()}-{self.args.package_channel}"
+            if self.package_channel() != "release":
+                pkg_name += f"-{self.variant()}-{self.package_channel()}"
+            else:
+                pkg_name += f"-{self.variant()}"
 
         return pkg_name
 
@@ -212,7 +218,7 @@ class MSLKBuild:
             f"[SETUP.PY] TAG: {gitversion.get_tag()}, BRANCH: {gitversion.get_branch()}, SHA: {gitversion.get_sha()}"
         )
 
-        if self.args.package_channel == "nightly":
+        if self.package_channel() == "nightly":
             # Use date stamp for nightly versions
             logging.debug(
                 "[SETUP.PY] Package is for NIGHTLY; using timestamp for the versioning"

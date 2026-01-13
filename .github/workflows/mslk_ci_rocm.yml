@@ -53,16 +53,21 @@ on:
   #
   workflow_dispatch:
     inputs:
-      pytorch_channel_version:
+      pytorch-channel-version:
         description: Package Channel + Version to Use for PyTorch Installation, in `<channel>[/<version>]` Format
         type: string
         required: false
         default: ""
-      publish_to_pypi:
+      publish-to-pypi:
         description: Publish Artifact to PyPI
         type: boolean
         required: false
         default: false
+      rocm-version-publish:
+        description: ROCm Target Version for Artifact Publishing
+        type: string
+        required: false
+        default: "7.0"
 
 concurrency:
   # Cancel previous runs in the PR if a new commit is pushed
@@ -138,7 +143,7 @@ jobs:
       run: . $PRELUDE; install_rocm_ubuntu $BUILD_ENV ${{ matrix.rocm-version }}
 
     - name: Install PyTorch-ROCm Nightly
-      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch_channel_version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
+      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
 
     - name: Collect PyTorch Environment Info
       if: ${{ success() || failure() }}
@@ -232,7 +237,7 @@ jobs:
       run: . $PRELUDE; install_rocm_amdsmi_ubuntu $BUILD_ENV
 
     - name: Install PyTorch-ROCm Nightly
-      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch_channel_version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
+      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
 
     - name: Collect PyTorch Environment Info
       if: ${{ success() || failure() }}
@@ -247,3 +252,18 @@ jobs:
     - name: Test with PyTest
       timeout-minutes: 90
       run: . $PRELUDE; test_all_mslk_modules $BUILD_ENV
+
+    - name: Push Wheel to PyPI
+      if: ${{ inputs.publish-to-pypi && matrix.rocm-version == inputs.rocm-version-publish }}
+      env:
+        PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+      run: |
+        . $PRELUDE;
+
+        if [[ -z "$PYPI_TOKEN" ]]; then
+          echo "PYPI_TOKEN is not set!" >&2
+          echo "NOTE that secrets will not be available if the workflow is triggered by a PR from a fork." >&2
+          exit 1
+        fi
+
+        publish_to_pypi $BUILD_ENV "$PYPI_TOKEN" *.whl
