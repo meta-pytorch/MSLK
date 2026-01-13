@@ -12,16 +12,20 @@ namespace mslk::gemm {
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
-at::Tensor f4f4bf16_256_256_2_2_1_t(
+at::Tensor f4f4bf16_128_192_4_2_1(
     at::Tensor XQ, // FP4
     at::Tensor WQ, // FP4
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale = std::nullopt) {
-  // Dispatch this kernel to the correct underlying implementation.
-  return _f4f4bf16<MXFP4, 256, 256, 2, 2, 1>(
-      XQ, WQ, x_scale, w_scale, output, global_scale);
+    std::optional<at::Tensor> global_scale) {
+  if (global_scale) {
+    return _f4f4bf16<NVFP4, 128, 192, 4, 2, 1>(
+        XQ, WQ, x_scale, w_scale, output, global_scale);
+  } else {
+    return _f4f4bf16<MXFP4, 128, 192, 4, 2, 1>(
+        XQ, WQ, x_scale, w_scale, output, global_scale);
+  }
 }
 
 #endif
