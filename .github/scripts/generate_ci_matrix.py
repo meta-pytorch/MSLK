@@ -265,13 +265,13 @@ class BuildConfigScheme:
 
     def python_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
-            return ["3.13"]
+            return ["3.14"]
         if self.repo_owner != REPO_OWNER_META_PYTORCH:
-            return ["3.13"]
+            return ["3.14"]
         if self.variant == VARIANT_ROCM:
             # Save on ROCm compute resources
-            return ["3.13"]
-        return ["3.10", "3.11", "3.12", "3.13"]
+            return ["3.14"]
+        return ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     def compilers(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
