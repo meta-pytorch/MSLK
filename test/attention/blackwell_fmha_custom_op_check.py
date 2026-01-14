@@ -219,11 +219,11 @@ def get_sample_inputs_for_backward():
 # expected test_utils to be subset of ('test_schema', 'test_autograd_registration', 'test_faketensor', 'test_aot_dispatch_static', 'test_aot_dispatch_dynamic')
 sample_inputs = get_sample_inputs()
 for i in range(len(sample_inputs)):
-    opcheck(torch.ops.blackwell_fmha.fmha_fwd.default, sample_inputs[i])
+    opcheck(torch.ops.mslk.cutlass_blackwell_fmha_fwd.default, sample_inputs[i])
 
 sample_inputs_bwd = get_sample_inputs_for_backward()
 for i in range(len(sample_inputs_bwd)):
     opcheck(
-        torch.ops.blackwell_fmha.fmha_bwd.default,
+        torch.ops.mslk.cutlass_blackwell_fmha_bwd.default,
         sample_inputs_bwd[i],
     )

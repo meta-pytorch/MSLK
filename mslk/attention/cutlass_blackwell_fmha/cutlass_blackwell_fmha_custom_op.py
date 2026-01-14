@@ -11,19 +11,19 @@ from torch.library import register_fake
 
 
 torch.library.define(
-    "blackwell_fmha::fmha_fwd",
+    "mslk::cutlass_blackwell_fmha_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, int? max_seq_len_q, int? max_seq_len_k, float? softmax_scale, bool? causal, Tensor? seqlen_kv, Tensor? page_table, int seqlen_k=-1, int window_size_left=-1, int window_size_right=-1, bool bottom_right=True) -> (Tensor, Tensor)",
     tags=torch.Tag.pt2_compliant_tag,
 )
 
 torch.library.define(
-    "blackwell_fmha::fmha_bwd",
+    "mslk::cutlass_blackwell_fmha_bwd",
     "(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out, Tensor softmax_lse, Tensor? cu_seqlens_q, Tensor? cu_seqlens_k, int? max_seq_len_q, int? max_seq_len_k, float? softmax_scale, bool? causal, int window_size_left=-1, int window_size_right=-1, bool bottom_right=True, bool deterministic=False) -> (Tensor, Tensor, Tensor)",
     tags=torch.Tag.pt2_compliant_tag,
 )
 
 
-@torch.library.impl("blackwell_fmha::fmha_fwd", "cuda")
+@torch.library.impl("mslk::cutlass_blackwell_fmha_fwd", "cuda")
 def custom_op_fmha(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -67,7 +67,7 @@ def custom_op_fmha(
     )
 
 
-@register_fake("blackwell_fmha::fmha_fwd")
+@register_fake("mslk::cutlass_blackwell_fmha_fwd")
 def fmha_fwd_meta(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -126,7 +126,7 @@ def fmha_fwd_meta(
     return out1, out2
 
 
-@torch.library.impl("blackwell_fmha::fmha_bwd", "cuda")
+@torch.library.impl("mslk::cutlass_blackwell_fmha_bwd", "cuda")
 def custom_op_fmha_bwd(
     dOutput: torch.Tensor,
     query: torch.Tensor,
@@ -165,7 +165,7 @@ def custom_op_fmha_bwd(
     )
 
 
-@register_fake("blackwell_fmha::fmha_bwd")
+@register_fake("mslk::cutlass_blackwell_fmha_bwd")
 def fmha_bwd_meta(
     dOutput: torch.Tensor,
     query: torch.Tensor,
@@ -218,7 +218,7 @@ def _backward(ctx, *grad):
     if not k.is_contiguous:
         k = k.contiguous()
 
-    dq, dk, dv = torch.ops.blackwell_fmha.fmha_bwd(
+    dq, dk, dv = torch.ops.mslk.cutlass_blackwell_fmha_bwd(
         grad0,
         q,
         k,
@@ -292,7 +292,7 @@ def _setup_context(ctx, inputs, output):
 # the backward formula for the operator and a `setup_context` function
 # to save values to be used in the backward.
 torch.library.register_autograd(
-    "blackwell_fmha::fmha_fwd", _backward, setup_context=_setup_context
+    "mslk::cutlass_blackwell_fmha_fwd", _backward, setup_context=_setup_context
 )
 
 
@@ -313,7 +313,7 @@ def cutlass_blackwell_fmha_custom_op(
     window_size_right: int | None = -1,
     bottom_right: bool | None = True,
 ):
-    return torch.ops.blackwell_fmha.fmha_fwd(
+    return torch.ops.mslk.cutlass_blackwell_fmha_fwd(
         q=q,
         k=k,
         v=v,
