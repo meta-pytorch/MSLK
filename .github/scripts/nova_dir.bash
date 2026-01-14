@@ -23,23 +23,17 @@ fi
 ## Overwrite existing ENV VAR in Nova
 if [[ "$CONDA_ENV" != "" ]]; then export CONDA_RUN="conda run --no-capture-output -p ${CONDA_ENV}" && echo "$CONDA_RUN"; fi
 
-if  [[ "$CU_VERSION" == "cu130" ]]; then
-    export TORCH_CUDA_ARCH_LIST="7.5;8.0;9.0a;10.0a;12.0a"
-    echo "[NOVA] Set TORCH_CUDA_ARCH_LIST to: ${TORCH_CUDA_ARCH_LIST}"
-
-elif [[ "$CU_VERSION" == "cu129" ]] ||
+if [[ "$CU_VERSION" == "cu130" ]] ||
+     [[ "$CU_VERSION" == "cu129" ]] ||
      [[ "$CU_VERSION" == "cu128" ]]; then
-    export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0a;10.0a;12.0a"
+    export TORCH_CUDA_ARCH_LIST="8.0;9.0a;10.0a;12.0a"
     echo "[NOVA] Set TORCH_CUDA_ARCH_LIST to: ${TORCH_CUDA_ARCH_LIST}"
 
 elif [[ "$CU_VERSION" == "cu126" ]] ||
      [[ "$CU_VERSION" == "cu124" ]] ||
-     [[ "$CU_VERSION" == "cu121" ]]; then
-    export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0a"
-    echo "[NOVA] Set TORCH_CUDA_ARCH_LIST to: ${TORCH_CUDA_ARCH_LIST}"
-
-elif [[ "$CU_VERSION" == "cu118" ]]; then
-    export TORCH_CUDA_ARCH_LIST="7.0;8.0;9.0"
+     [[ "$CU_VERSION" == "cu121" ]] ||
+     [[ "$CU_VERSION" == "cu118" ]]; then
+    export TORCH_CUDA_ARCH_LIST="8.0;9.0a"
     echo "[NOVA] Set TORCH_CUDA_ARCH_LIST to: ${TORCH_CUDA_ARCH_LIST}"
 
 elif [[ "$CU_VERSION" == "cu"* ]]; then
@@ -52,20 +46,12 @@ elif [[ "$CU_VERSION" == "cu"* ]]; then
 
 
 elif [[ "$CU_VERSION" == "rocm7.0"* ]]; then
-    export PYTORCH_ROCM_ARCH="gfx908,gfx90a,gfx942,gfx1201,gfx950"
+    export PYTORCH_ROCM_ARCH="gfx908,gfx90a,gfx942,gfx950"
     echo "[NOVA] Set PYTORCH_ROCM_ARCH to: ${PYTORCH_ROCM_ARCH}"
 
 elif [[ "$CU_VERSION" == "rocm6.4"* ]] ||
-     [[ "$CU_VERSION" == "rocm6.3"* ]]; then
-    export PYTORCH_ROCM_ARCH="gfx908,gfx90a,gfx942,gfx1201"
-    echo "[NOVA] Set PYTORCH_ROCM_ARCH to: ${PYTORCH_ROCM_ARCH}"
-
-elif [[ "$CU_VERSION" == "rocm6.4"* ]] ||
-     [[ "$CU_VERSION" == "rocm6.3"* ]]; then
-    export PYTORCH_ROCM_ARCH="gfx908,gfx90a,gfx942,gfx1201"
-    echo "[NOVA] Set PYTORCH_ROCM_ARCH to: ${PYTORCH_ROCM_ARCH}"
-
-elif [[ "$CU_VERSION" == "rocm6.2"* ]]; then
+     [[ "$CU_VERSION" == "rocm6.3"* ]] ||
+     [[ "$CU_VERSION" == "rocm6.2"* ]]; then
     export PYTORCH_ROCM_ARCH="gfx908,gfx90a,gfx942"
     echo "[NOVA] Set PYTORCH_ROCM_ARCH to: ${PYTORCH_ROCM_ARCH}"
 
