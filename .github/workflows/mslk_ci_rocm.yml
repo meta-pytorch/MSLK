@@ -63,11 +63,6 @@ on:
         type: boolean
         required: false
         default: false
-      rocm-version-publish:
-        description: ROCm Target Version for Artifact Publishing
-        type: string
-        required: false
-        default: "7.0"
 
 concurrency:
   # Cancel previous runs in the PR if a new commit is pushed
@@ -75,195 +70,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build on CPU hosts and upload to GHA
-  build_artifact:
+  generate-build-matrix:
     if: ${{ github.repository_owner == 'meta-pytorch' }}
-    runs-on: ${{ matrix.host-machine.instance }}
-    container:
-      image: ${{ matrix.container-image }}
-      options: --user root
-    defaults:
-      run:
-        shell: bash
-    env:
-      PRELUDE: ci/scripts/setup_env.bash
-      BUILD_ENV: build_binary
-      BUILD_TARGET: ${{ matrix.build-target }}
-      BUILD_VARIANT: rocm
-      BUILD_ROCM_VERSION: ${{ matrix.rocm-version }}
-    strategy:
-      fail-fast: false
-      matrix:
-        host-machine: [
-          { arch: x86, instance: "linux.24xlarge" },
-        ]
-        container-image: [ "ubuntu:22.04" ]
-        build-target: [ "default" ]
-        # NOTE: we test only a subset of Python versions to reduce CI expenses
-        python-version: [ "3.14" ]
-        # NOTE: PyTorch releases for ROCm include the ROCm patch version,
-        # unlike releases for CUDA
-        rocm-version: [ "7.0", "7.1" ]
-        compiler: [ "gcc", "clang" ]
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      targets: default
+      variant: rocm
+      jobtype: build
 
-    steps:
-    - name: Setup Build Container
-      run: |
-        apt update -y
-        apt install -y binutils git pciutils sudo wget
-        git config --global --add safe.directory '*'
+  build:
+    needs: generate-build-matrix
+    uses: ./.github/workflows/_mslk_rocm_build.yml
+    with:
+      matrix: ${{ needs.generate-build-matrix.outputs.matrix }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
 
-    - name: Checkout the Repository
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+  generate-test-matrix:
+    needs: build
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      targets: default
+      variant: rocm
+      jobtype: test
 
-    - name: Display System Info
-      run: . $PRELUDE; print_system_info
-
-    - name: Display GPU Info
-      run: . $PRELUDE; print_gpu_info
-
-    - name: Free Disk Space
-      run: . $PRELUDE; free_disk_space
-
-    - name: Setup Miniconda
-      run: . $PRELUDE; setup_miniconda $HOME/miniconda
-
-    - name: Create Conda Environment
-      run: . $PRELUDE; create_conda_environment $BUILD_ENV ${{ matrix.python-version }}
-
-    - name: Install C/C++ Compilers
-      run: . $PRELUDE; install_cxx_compiler $BUILD_ENV ${{ matrix.compiler }}
-
-    - name: Install Build Tools
-      run: . $PRELUDE; install_build_tools $BUILD_ENV
-
-    - name: Install ROCm
-      run: . $PRELUDE; install_rocm_ubuntu $BUILD_ENV ${{ matrix.rocm-version }}
-
-    - name: Install PyTorch-ROCm Nightly
-      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
-
-    - name: Collect PyTorch Environment Info
-      if: ${{ success() || failure() }}
-      run: if . $PRELUDE && which conda; then collect_pytorch_env_info $BUILD_ENV; fi
-
-    - name: Prepare MSLK Build
-      run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
-
-    - name: Build MSLK Wheel
-      run: . $PRELUDE; build_mslk_package $BUILD_ENV nightly ${{ matrix.build-target }}/rocm
-
-    - name: Upload Built Wheel as GHA Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mslk_${{ matrix.build-target }}_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_rocm${{ matrix.rocm-version }}.whl
-        path: dist/*.whl
-        if-no-files-found: error
-
-
-  # Download the built artifact from GHA, test on GPU, and push to PyPI
-  test_and_publish_artifact:
-    if: ${{ github.repository_owner == 'meta-pytorch' }}
-    runs-on: ${{ matrix.host-machine.instance }}
-    container:
-      image: "rocm/dev-ubuntu-22.04:${{ matrix.rocm-version }}-complete"
-      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
-    defaults:
-      run:
-        shell: bash
-    env:
-      PRELUDE: ci/scripts/setup_env.bash
-      BUILD_ENV: build_binary
-      BUILD_TARGET: ${{ matrix.build-target }}
-      BUILD_VARIANT: rocm
-      BUILD_ROCM_VERSION: ${{ matrix.rocm-version }}
-      ENFORCE_ROCM_DEVICE: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        host-machine: [
-          { arch: x86, instance: "linux.rocm.gpu.2" },
-        ]
-        build-target: [ "default" ]
-        # ROCm machines are limited, so we only test a subset of Python versions
-        python-version: [ "3.14" ]
-        rocm-version: [ "7.0", "7.1" ]
-        compiler: [ "gcc", "clang" ]
-    needs: build_artifact
-
-    steps:
-    - name: Setup Build Container
-      run: |
-        apt update -y
-        apt install -y git wget
-        git config --global --add safe.directory '*'
-
-    - name: Checkout the Repository
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
-
-    - name: Download Wheel Artifact from GHA
-      uses: actions/download-artifact@v4
-      with:
-        name: mslk_${{ matrix.build-target }}_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_rocm${{ matrix.rocm-version }}.whl
-
-    - name: Display System Info
-      run: . $PRELUDE; print_system_info
-
-    - name: Display GPU Info
-      run: . $PRELUDE; print_gpu_info
-
-    - name: Free Disk Space
-      run: . $PRELUDE; free_disk_space
-
-    - name: Setup Miniconda
-      run: . $PRELUDE; setup_miniconda $HOME/miniconda
-
-    - name: Create Conda Environment
-      run: . $PRELUDE; create_conda_environment $BUILD_ENV ${{ matrix.python-version }}
-
-    - name: Install C/C++ Compilers
-      # NOTE: Need to install compilers to set up libomp for the clang case
-      run: . $PRELUDE; install_cxx_compiler $BUILD_ENV ${{ matrix.compiler }}
-
-    - name: Install Build Tools
-      # NOTE: Need to install build tools to set up libtbb
-      run: . $PRELUDE; install_build_tools $BUILD_ENV
-
-    - name: Install ROCm AMD-SMI
-      run: . $PRELUDE; install_rocm_amdsmi_ubuntu $BUILD_ENV
-
-    - name: Install PyTorch-ROCm Nightly
-      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
-
-    - name: Collect PyTorch Environment Info
-      if: ${{ success() || failure() }}
-      run: if . $PRELUDE && which conda; then collect_pytorch_env_info $BUILD_ENV; fi
-
-    - name: Prepare MSLK Build
-      run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
-
-    - name: Install MSLK Wheel
-      run: . $PRELUDE; install_mslk_wheel $BUILD_ENV *.whl
-
-    - name: Test with PyTest
-      timeout-minutes: 90
-      run: . $PRELUDE; test_all_mslk_modules $BUILD_ENV
-
-    - name: Push Wheel to PyPI
-      if: ${{ inputs.publish-to-pypi && matrix.rocm-version == inputs.rocm-version-publish }}
-      env:
-        PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      run: |
-        . $PRELUDE;
-
-        if [[ -z "$PYPI_TOKEN" ]]; then
-          echo "PYPI_TOKEN is not set!" >&2
-          echo "NOTE that secrets will not be available if the workflow is triggered by a PR from a fork." >&2
-          exit 1
-        fi
-
-        publish_to_pypi $BUILD_ENV "$PYPI_TOKEN" *.whl
+  test:
+    needs: generate-test-matrix
+    uses: ./.github/workflows/_mslk_rocm_test.yml
+    with:
+      matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
+      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
+      publish-to-pypi: ${{ (github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true') }}
+      rocm-version-publish: 7.0
+    secrets:
+      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
