@@ -3,9 +3,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This callable workflow is used for testing MSLK CUDA wheels
+# This callable workflow is used for testing MSLK ROCm wheels
 # as well as optionally publish the wheels to PyPI after a successful test.
-name: MSLK CUDA Test
+name: MSLK ROCm Test
 
 on:
   workflow_call:
@@ -13,11 +13,6 @@ on:
       matrix:
         required: true
         type: string
-      container:
-        description: 'Container configuration for the job'
-        type: string
-        required: false
-        default: '{"image": null}'
       repo-ref:
         description: Repository ref/sha
         type: string
@@ -38,8 +33,8 @@ on:
         type: boolean
         required: false
         default: false
-      cuda-version-publish:
-        description: CUDA Target Version for Artifact Publishing
+      rocm-version-publish:
+        description: ROCm Target Version for Artifact Publishing
         type: string
         required: false
         default: ""
@@ -61,9 +56,10 @@ on:
 jobs:
   # Download the built artifact from GHA, test on GPU, and push to PyPI
   test_and_publish_artifact:
-    # Use available instance types - https://github.com/pytorch/test-infra/blob/main/.github/scale-config.yml
     runs-on: ${{ matrix.host-machine.instance }}
-    container: ${{ fromJson(inputs.container) }}
+    container:
+      image: "rocm/dev-ubuntu-22.04:${{ matrix.rocm-version }}-complete"
+      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     defaults:
       run:
         shell: bash
@@ -71,17 +67,19 @@ jobs:
       PRELUDE: ci/scripts/setup_env.bash
       BUILD_ENV: build_binary
       BUILD_TARGET: ${{ matrix.build-target }}
-      BUILD_VARIANT: cuda
-      BUILD_CUDA_VERSION: ${{ matrix.cuda-version }}
-      ENFORCE_CUDA_DEVICE: 1
+      BUILD_VARIANT: rocm
+      BUILD_ROCM_VERSION: ${{ matrix.rocm-version }}
+      ENFORCE_ROCM_DEVICE: 1
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(inputs.matrix) }}
 
     steps:
     - name: Setup Build Container
-      if: ${{ fromJson(inputs.container).image != null }}
-      run: yum update -y; yum install -y binutils findutils git jq pciutils sudo tar wget which xz
+      run: |
+        apt update -y
+        apt install -y git wget
+        git config --global --add safe.directory '*'
 
     - name: Merge Extra Environment Variables
       run: |
@@ -105,16 +103,10 @@ jobs:
         ref: ${{ inputs.repo-ref }}
 
     - name: Free Disk Space on Host
-      if: ${{ fromJson(inputs.container).image != null }}
       run: . $PRELUDE; free_disk_space_on_host
 
-    # Use PyTorch test infrastructure action - https://github.com/pytorch/test-infra/blob/main/.github/actions/setup-nvidia/action.yml
-    - name: Install NVIDIA Drivers and NVIDIA-Docker Runtime
-      if: ${{ fromJson(inputs.container).image == null }}
-      uses: pytorch/test-infra/.github/actions/setup-nvidia@main
-
     - name: Display System Info
-      run: . $PRELUDE; print_system_info; print_ec2_info
+      run: . $PRELUDE; print_system_info
 
     - name: Display GPU Info
       run: . $PRELUDE; print_gpu_info
@@ -125,22 +117,19 @@ jobs:
     - name: Create Conda Environment
       run: . $PRELUDE; create_conda_environment $BUILD_ENV ${{ matrix.python-version }}
 
-    - name: Install C/C++ Compilers for Updated LIBGCC
-      # NOTE: gcc is required for torch dynamo to work properly, as some of
-      # the compilation flags used by torch dynamo are gcc-specific:
-      #
-      #   clang-16: error: unknown argument: '-fno-tree-loop-vectorize'
-      run: . $PRELUDE; install_cxx_compiler $BUILD_ENV gcc
+    - name: Install C/C++ Compilers
+      # NOTE: Need to install compilers to set up libomp for the clang case
+      run: . $PRELUDE; install_cxx_compiler $BUILD_ENV ${{ matrix.compiler }}
 
     - name: Install Build Tools
+      # NOTE: Need to install build tools to set up libtbb
       run: . $PRELUDE; install_build_tools $BUILD_ENV
 
-    - name: Install CUDA
-      run: . $PRELUDE; install_cuda $BUILD_ENV ${{ matrix.cuda-version }}
+    - name: Install ROCm AMD-SMI
+      run: . $PRELUDE; install_rocm_amdsmi_ubuntu $BUILD_ENV
 
-    # Install via PIP to avoid defaulting to the CPU variant if the GPU variant of the day is not ready
     - name: Install PyTorch (${{ inputs.pytorch-channel-version }})
-      run: . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ inputs.pytorch-channel-version }} cuda/${{ matrix.cuda-version }}
+      run:  . $PRELUDE; install_pytorch_pip $BUILD_ENV ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }} rocm/${{ matrix.rocm-version }}
 
     - name: Collect PyTorch Environment Info
       if: ${{ success() || failure() }}
@@ -153,7 +142,7 @@ jobs:
       if: ${{ inputs.mslk-channel-version == '' }}
       uses: actions/download-artifact@v4
       with:
-        name: mslk_${{ matrix.build-target }}_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_cu${{ matrix.cuda-version }}.whl
+        name: mslk_${{ matrix.build-target }}_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_rocm${{ matrix.rocm-version }}.whl
 
     - name: Install MSLK (local wheel)
       if: ${{ inputs.mslk-channel-version == '' }}
@@ -161,7 +150,7 @@ jobs:
 
     - name: Install MSLK (pip)
       if: ${{ inputs.mslk-channel-version != '' }}
-      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk_channel_version || 'nightly' }} cuda/${{ matrix.cuda-version }}
+      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk_channel_version || 'nightly' }} rocm/${{ matrix.rocm-version }}
 
     - name: Test with PyTest
       if: ${{ inputs.run-target == 'test' }}
@@ -177,12 +166,12 @@ jobs:
       if: ${{ inputs.run-target == 'benchmark' }}
       uses: actions/upload-artifact@v4
       with:
-        name: mslk_traces_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_cu${{ matrix.cuda-version }}.zip
+        name: mslk_traces_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_rocm${{ matrix.rocm-version }}.zip
         path: mslk/bench/*.json
         if-no-files-found: error
 
     - name: Push Wheel to PyPI
-      if: ${{ inputs.publish-to-pypi && matrix.cuda-version == inputs.cuda-version-publish }}
+      if: ${{ inputs.publish-to-pypi && matrix.rocm-version == inputs.rocm-version-publish }}
       env:
         PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
       run: |

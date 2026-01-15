@@ -3,40 +3,39 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This workflow is used for MSLK CUDA CI as well as nightly builds of MSLK CUDA
-# against PyTorch-CUDA Nightly.
-name: MSLK CUDA CI
+# This workflow is used for building and publishing MSLK-CUDA release
+# builds against PyTorch-CUDA Release to public PyPI.
+name: MSLK-CUDA Release Build
 
 on:
   # PR Trigger (enabled for regression checks and debugging)
   #
   pull_request:
     branches:
-      - main
+      - v[0-9]+\.[0-9]+\.[0-9]+-release
 
   # Push Trigger (enable to catch errors coming out of multiple merges)
   #
   push:
     branches:
-      - main
-
-  # Cron Trigger (UTC)
-  #
-  # Based on the Conda page for PyTorch-nightly, the GPU nightly releases appear
-  # around 02:30 PST every day (roughly 2 hours after the CPU releases)
-  #
-  schedule:
-    - cron:  '45 12 * * *'
+      - v[0-9]+\.[0-9]+\.[0-9]+-release
 
   # Manual Trigger
   #
   workflow_dispatch:
     inputs:
-      pytorch-channel-version:
-        description: Package Channel + Version to Use for PyTorch Installation, in `<channel>[/<version>]` Format
-        type: string
+      pytorch-channel:
+        description: Package Channel to Use for PyTorch Installation
+        type: choice
         required: false
-        default: ""
+        options: [ "nightly", "test", "release" ]
+        default: "test"
+      cuda-version-publish:
+        description: CUDA Version to Use for Building Artifact
+        type: choice
+        required: false
+        options: [ "12.6.3", "12.8.1", "12.9.1", "13.0.2" ]
+        default: "12.8.1"
       publish-to-pypi:
         description: Publish Artifact to PyPI
         type: boolean
@@ -50,11 +49,11 @@ concurrency:
 
 jobs:
   generate-build-matrix:
-    if: ${{ github.repository_owner == 'meta-pytorch' }}
+    if: ${{ github.repository_owner == 'pytorch' }}
     uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
     with:
       repo-owner: ${{ github.repository_owner }}
-      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      repo-ref: ${{ github.ref }}
       targets: default
       variant: cuda
       jobtype: build
@@ -64,15 +63,15 @@ jobs:
     uses: ./.github/workflows/_mslk_cuda_build.yml
     with:
       matrix: ${{ needs.generate-build-matrix.outputs.matrix }}
-      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
-      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
+      repo-ref: ${{ github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel) || 'release' }}
 
   generate-test-matrix:
     needs: build
     uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
     with:
       repo-owner: ${{ github.repository_owner }}
-      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
+      repo-ref: ${{ github.ref }}
       targets: default
       variant: cuda
       jobtype: test
@@ -82,9 +81,9 @@ jobs:
     uses: ./.github/workflows/_mslk_cuda_test.yml
     with:
       matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
-      repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
-      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
-      publish-to-pypi: ${{ (github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true') }}
-      cuda-version-publish: 12.8.1
+      repo-ref: ${{ github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel) || 'release' }}
+      publish-to-pypi: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true' }}
+      cuda-version-publish: ${{ github.event.inputs.cuda-version-publish }}
     secrets:
       PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}

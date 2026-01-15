@@ -1,0 +1,89 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# This workflow is used for building and publishing MSLK-ROCm release
+# builds against PyTorch-ROCm Release to public PyPI.
+name: MSLK-ROCm Release Build
+
+on:
+  # PR Trigger (enabled for regression checks and debugging)
+  #
+  pull_request:
+    branches:
+      - ^v([0-9]+)\.([0-9]+)\.([0-9]+)-release
+
+  # Push Trigger (enable to catch errors coming out of multiple merges)
+  #
+  push:
+    branches:
+      - ^v([0-9]+)\.([0-9]+)\.([0-9]+)-release
+
+  # Manual Trigger
+  #
+  workflow_dispatch:
+    inputs:
+      pytorch-channel:
+        description: Package Channel to Use for PyTorch Installation
+        type: choice
+        required: false
+        options: [ "nightly", "test", "release" ]
+        default: "test"
+      rocm-version-publish:
+        description: ROCm Version to Use for Building Artifact
+        type: choice
+        required: false
+        options: [ "7.0", "7.1" ]
+        default: "7.0"
+      publish-to-pypi:
+        description: Publish Artifact to PyPI
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  # Cancel previous runs in the PR if a new commit is pushed
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate-build-matrix:
+    if: ${{ github.repository_owner == 'pytorch' }}
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ github.ref }}
+      targets: default
+      variant: rocm
+      jobtype: build
+
+  build:
+    needs: generate-build-matrix
+    uses: ./.github/workflows/_mslk_rocm_build.yml
+    with:
+      matrix: ${{ needs.generate-build-matrix.outputs.matrix }}
+      repo-ref: ${{ github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel) || 'release' }}
+
+  generate-test-matrix:
+    needs: build
+    uses: ./.github/workflows/_mslk_generate_ci_matrix.yml
+    with:
+      repo-owner: ${{ github.repository_owner }}
+      repo-ref: ${{ github.ref }}
+      targets: default
+      variant: rocm
+      jobtype: test
+
+  test:
+    needs: generate-test-matrix
+    uses: ./.github/workflows/_mslk_rocm_test.yml
+    with:
+      matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
+      repo-ref: ${{ github.ref }}
+      pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel) || 'release' }}
+      publish-to-pypi: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true' }}
+      rocm-version-publish: ${{ github.event.inputs.rocm-version-publish }}
+    secrets:
+      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
