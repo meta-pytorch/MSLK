@@ -284,13 +284,13 @@ class BuildConfigScheme:
     def cuda_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
             return ["12.8.1"]
-        return ["12.6.3", "12.8.1", "13.0.2"]
+        return ["12.6.3", "12.8.1", "12.9.1", "13.0.2"]
 
     def rocm_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
-            return ["6.4.2"]
+            return ["7.1"]
         else:
-            return ["6.3", "6.4.2"]
+            return ["7.0", "7.1"]
 
     def host_machines(self) -> List[Dict[str, str]]:
         # For the list of available instance types:
@@ -307,17 +307,15 @@ class BuildConfigScheme:
             # https://hud.pytorch.org/metrics
             # { arch: x86, instance: "linux.gcp.a100" },
             if self.jobtype == JOBTYPE_BUILD:
-                table = {
-                    TARGET_DEFAULT: [
-                        {"arch": "x86", "instance": "linux.24xlarge.memory"}
-                    ],
-                }
-                return table[self.target]
+                return [{"arch": "x86", "instance": "linux.24xlarge.memory"}]
             else:
                 return [{"arch": "x86", "instance": "linux.g5.4xlarge.nvidia.gpu"}]
 
         elif self.variant == VARIANT_ROCM:
-            return [{"arch": "x86", "instance": "linux.rocm.gpu.2"}]
+            if self.jobtype == JOBTYPE_BUILD:
+                return [{"arch": "x86", "instance": "linux.24xlarge.memory"}]
+            else:
+                return [{"arch": "x86", "instance": "linux.rocm.gpu.2"}]
 
         else:
             return []
