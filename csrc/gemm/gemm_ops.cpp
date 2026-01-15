@@ -19,7 +19,7 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "bf16bf16bf16_grouped_dynamic(Tensor X, Tensor W, Tensor zero_start_index_M) -> Tensor");
   m.def(
-      "bf16bf16bf16_grouped_stacked(Tensor X, Tensor W, Tensor M_sizes, Tensor? out=None) -> Tensor");
+      "bf16bf16bf16_grouped_stacked(Tensor X, Tensor W, Tensor M_sizes, Tensor? out=None, int? num_sms=None) -> Tensor");
   m.def(
       "f8f8bf16_blockwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, int block_m=128, int block_n=128, int block_k=128) -> Tensor");
   m.def(
@@ -471,7 +471,8 @@ at::Tensor bf16bf16bf16_grouped_stacked_meta(
     at::Tensor X,
     at::Tensor W,
     at::Tensor /* M_sizes */,
-    std::optional<at::Tensor> out) {
+    std::optional<at::Tensor> out,
+    std::optional<int64_t> /* num_sms */) {
   const at::SymInt total_M = X.sym_size(0);
   const at::SymInt N = W.sym_size(1);
 

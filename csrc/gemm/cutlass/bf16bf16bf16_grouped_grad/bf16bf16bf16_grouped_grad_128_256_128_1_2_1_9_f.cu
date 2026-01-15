@@ -10,13 +10,14 @@
 
 namespace mslk::gemm {
 
-at::Tensor bf16bf16bf16_grouped_grad_256_128_128_4_1_1_9_t(
+at::Tensor bf16bf16bf16_grouped_grad_128_256_128_1_2_1_9_f(
     at::Tensor X, // BF16
     at::Tensor W, // BF16
     at::Tensor output,
+    int sm_count,
     std::optional<at::Tensor> M_sizes) {
-  return bf16bf16bf16_grouped_grad_impl<256, 128, 128, 4, 1, 1, true>(
-      X, W, output, M_sizes);
+  return bf16bf16bf16_grouped_grad_dispatch<128, 256, 128, 1, 2, 1, false>(
+      X, W, output, sm_count, M_sizes);
 }
 
 } // namespace mslk::gemm

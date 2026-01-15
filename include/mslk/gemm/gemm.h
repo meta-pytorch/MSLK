@@ -95,7 +95,8 @@ at::Tensor bf16bf16bf16_grouped_stacked(
     at::Tensor X,
     at::Tensor W,
     at::Tensor M_sizes,
-    std::optional<at::Tensor> out = std::nullopt);
+    std::optional<at::Tensor> out = std::nullopt,
+    std::optional<int64_t> num_sms = std::nullopt);
 
 at::Tensor f8f8bf16_rowwise(
     at::Tensor XQ,
