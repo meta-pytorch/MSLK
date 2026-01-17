@@ -16,6 +16,7 @@ on:
       - main
     paths:
       # Workflow and CI scripts
+      - '.github/scripts/generate_ci_matrix.py'
       - '.github/workflows/mslk_ci_rocm.yml'
       - 'ci/scripts/utils_rocm.bash'
       # CMake ROCm/HIP configuration
