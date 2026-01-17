@@ -104,9 +104,13 @@ gpu_cpp_library(
 )
 
 ################################################################################
-# Install Shared Library
+# Install Shared Library and Python Files
 ################################################################################
 
 add_to_package(
   DESTINATION mslk
   TARGETS mslk)
+
+install(
+  DIRECTORY bench
+  DESTINATION mslk)
