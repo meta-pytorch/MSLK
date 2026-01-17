@@ -286,77 +286,67 @@ def _kernel_matmul_fp8_row(
     k_tiles = tl.cdiv(K, BLOCK_K)
     num_tiles = num_pid_m * num_pid_n
 
-    tiles_per_SM = num_tiles // NUM_SMS
-    if start_pid < num_tiles % NUM_SMS:
-        tiles_per_SM += 1
-
-    tile_id = start_pid - NUM_SMS
-    ki = -1
-
     offs_k_for_mask = tl.arange(0, BLOCK_K)
 
     num_pid_in_group = GROUP_M * num_pid_n
 
-    pid_m = 0
-    pid_n = 0
-    offs_am = tl.arange(0, BLOCK_M)
-    offs_bn = tl.arange(0, BLOCK_N)
     acc_dtype = tl.float32 if allow_tf32 else dot_out_dtype
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
 
-    for _ in range(0, k_tiles * tiles_per_SM):
-        ki = tl.where(ki == k_tiles - 1, 0, ki + 1)
-        if ki == 0:
-            tile_id += NUM_SMS
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-            pid_m = first_pid_m + (tile_id % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+    # Outer loop over tiles assigned to this SM
+    for tile_id in range(start_pid, num_tiles, NUM_SMS):
+        group_id = tile_id // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        # pyre-ignore[58]: `%` is not supported for operand types `int` and `tl.core.constexpr`.
+        pid_m = first_pid_m + (tile_id % group_size_m)
+        pid_n = (tile_id % num_pid_in_group) // group_size_m
 
-            start_m = pid_m * BLOCK_M
-            start_n = pid_n * BLOCK_N
-            offs_am = start_m + tl.arange(0, BLOCK_M)
-            offs_bn = start_n + tl.arange(0, BLOCK_N)
-            offs_am = tl.where(offs_am < M, offs_am, 0)
-            offs_bn = tl.where(offs_bn < N, offs_bn, 0)
-            offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_M), BLOCK_M)
-            offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
-        offs_k = ki * BLOCK_K + tl.arange(0, BLOCK_K)
-        A = A_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        B = B_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        start_m = pid_m * BLOCK_M
+        start_n = pid_n * BLOCK_N
+        offs_am = start_m + tl.arange(0, BLOCK_M)
+        offs_bn = start_n + tl.arange(0, BLOCK_N)
+        offs_am = tl.where(offs_am < M, offs_am, 0)
+        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_M), BLOCK_M)
+        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_N), BLOCK_N)
 
-        a = tl.load(A, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_K, other=0.0)
-        b = tl.load(B, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_K, other=0.0)
-        acc = tl.dot(a, b, acc, out_dtype=acc_dtype, allow_tf32=allow_tf32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
 
-        if ki == k_tiles - 1:
-            # rematerialize rm and rn to save registers
-            rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-            rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        # Inner loop over K dimension
+        for ki in range(0, k_tiles):
+            offs_k = ki * BLOCK_K + tl.arange(0, BLOCK_K)
+            A = A_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            B = B_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-            # Invert scaling.
-            b_scale = tl.load(B_scale + rn, mask=rn < N)
-            if skip_scaling_a:
-                acc *= b_scale[None, :]
-            else:
-                a_scale = tl.load(A_scale + rm, mask=rm < M)
-                # pyre-ignore[16]: Undefined attribute [16]: `float`
-                # has no attribute `__getitem__`.
-                scale = a_scale[:, None] * b_scale[None, :]
-                acc *= scale
+            a = tl.load(A, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_K, other=0.0)
+            b = tl.load(B, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_K, other=0.0)
+            acc = tl.dot(a, b, acc, out_dtype=acc_dtype, allow_tf32=allow_tf32)
 
-            # Load and add bias if specified.
-            if USE_BIAS:
-                bias = tl.load(Bias + rn, mask=rn < N)
-                acc += bias[None, :]
+        # rematerialize rm and rn to save registers
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-            acc = acc.to(C_ptr.dtype.element_ty)
-            C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
-            mask = (rm < M)[:, None] & (rn < N)[None, :]
-            # Handles write-back with reduction-splitting
-            tl.store(C, acc, mask=mask)
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_dtype)
+        # Invert scaling.
+        b_scale = tl.load(B_scale + rn, mask=rn < N)
+        if skip_scaling_a:
+            acc *= b_scale[None, :]
+        else:
+            a_scale = tl.load(A_scale + rm, mask=rm < M)
+            # pyre-ignore[16]: Undefined attribute [16]: `float`
+            # has no attribute `__getitem__`.
+            scale = a_scale[:, None] * b_scale[None, :]
+            acc *= scale
+
+        # Load and add bias if specified.
+        if USE_BIAS:
+            bias = tl.load(Bias + rn, mask=rn < N)
+            acc += bias[None, :]
+
+        acc = acc.to(C_ptr.dtype.element_ty)
+        C = C_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
+        mask = (rm < M)[:, None] & (rn < N)[None, :]
+        # Handles write-back with reduction-splitting
+        tl.store(C, acc, mask=mask)
 
 
 @triton.autotune(

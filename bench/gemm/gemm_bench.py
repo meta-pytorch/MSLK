@@ -115,6 +115,27 @@ def llama3_70b_shapes() -> list[tuple[int, int, int]]:
     return shapes
 
 
+@register_shapes("autotune")
+def autotune() -> list[tuple[int, int, int]]:
+    shapes = []
+    for M in [
+        1,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+    ]:
+        for N in range(1024, 16384 + 1, 1024):
+            for K in range(1024, 16384 + 1, 1024):
+                shapes.append((M, N, K))
+    return shapes
+
+
 @register_shapes("llama3_405b")
 def llama3_405b_shapes() -> list[tuple[int, int, int]]:
     shapes = []

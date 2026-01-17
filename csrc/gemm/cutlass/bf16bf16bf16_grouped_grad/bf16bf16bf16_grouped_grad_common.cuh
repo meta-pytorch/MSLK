@@ -104,6 +104,7 @@ __global__ void set_stacked_kernel_args_kernel(
 }
 
 template <
+    typename ElementType,
     int TB_M,
     int TB_N,
     int TB_K,
@@ -115,6 +116,7 @@ at::Tensor bf16bf16bf16_grouped_grad_impl(
     at::Tensor X,
     at::Tensor W,
     at::Tensor output,
+    int sm_count,
     std::optional<at::Tensor> M_sizes) {
   c10::cuda::CUDAGuard deviceGuard(X.device());
 
@@ -133,9 +135,9 @@ at::Tensor bf16bf16bf16_grouped_grad_impl(
   // Define gemm configuration.
   using ProblemShape =
       cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
-  using ElementA = cutlass::bfloat16_t;
-  using ElementB = cutlass::bfloat16_t;
-  using ElementC = cutlass::bfloat16_t;
+  using ElementA = ElementType;
+  using ElementB = ElementType;
+  using ElementC = ElementType;
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
@@ -291,21 +293,13 @@ at::Tensor bf16bf16bf16_grouped_grad_impl(
   // non-zero rows.
   kernel_groups = int(std::min(M, G));
 
-  cutlass::KernelHardwareInfo hw_info;
-  // Change device_id to another value if you are running on a machine with
-  // multiple GPUs and wish to use a GPU other than that with device ID 0.
-  hw_info.device_id = 0;
-  hw_info.sm_count =
-      min(cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-              hw_info.device_id),
-          2147483647); // INT_MAX
-
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {kernel_groups, problem_shape_ptr, nullptr},
       {x_ptr, stride_a_ptr, w_ptr, stride_b_ptr},
-      {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr},
-      hw_info};
+      {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr}};
+
+  arguments.hw_info.sm_count = sm_count;
 
   Gemm gemm;
 
@@ -341,8 +335,58 @@ at::Tensor bf16bf16bf16_grouped_grad_impl(
   return output;
 }
 
+template <
+    int TB_M,
+    int TB_N,
+    int TB_K,
+    int TBS_M,
+    int TBS_N,
+    int TBS_K,
+    bool PONG>
+at::Tensor bf16bf16bf16_grouped_grad_dispatch(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor output,
+    int sm_count,
+    std::optional<at::Tensor> M_sizes) {
+  // Dispatch to appropriately typed kernel.
+  at::ScalarType dtype = X.scalar_type();
+  // Check that dtypes are consistent.
+  TORCH_CHECK(dtype == W.scalar_type(), "X and W must have the same dtype.");
+  TORCH_CHECK(
+      dtype == output.scalar_type(), "X and output must have the same dtype.");
+  if (dtype == at::kBFloat16) {
+    return bf16bf16bf16_grouped_grad_impl<
+        cutlass::bfloat16_t,
+        TB_M,
+        TB_N,
+        TB_K,
+        TBS_M,
+        TBS_N,
+        TBS_K,
+        PONG>(X, W, output, sm_count, M_sizes);
+  } else if (dtype == at::kHalf) {
+    return bf16bf16bf16_grouped_grad_impl<
+        cutlass::half_t,
+        TB_M,
+        TB_N,
+        TB_K,
+        TBS_M,
+        TBS_N,
+        TBS_K,
+        PONG>(X, W, output, sm_count, M_sizes);
+  } else {
+    TORCH_CHECK(
+        false,
+        "Unsupported dtype: ",
+        dtype,
+        ". Only bf16 and fp16 are supported.");
+  }
+}
+
 #if CUDART_VERSION >= 12080
 template <
+    typename ElementType,
     int TB_M,
     int TB_N,
     int TB_K,
@@ -354,6 +398,7 @@ at::Tensor bf16bf16bf16_grouped_grad_sm100_impl(
     at::Tensor X,
     at::Tensor W,
     at::Tensor output,
+    int sm_count,
     std::optional<at::Tensor> M_sizes) {
   int64_t G;
   at::TensorOptions options;
@@ -370,9 +415,9 @@ at::Tensor bf16bf16bf16_grouped_grad_sm100_impl(
   // Define gemm configuration.
   using ProblemShape =
       cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
-  using ElementA = cutlass::bfloat16_t;
-  using ElementB = cutlass::bfloat16_t;
-  using ElementC = cutlass::bfloat16_t;
+  using ElementA = ElementType;
+  using ElementB = ElementType;
+  using ElementC = ElementType;
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
@@ -523,21 +568,13 @@ at::Tensor bf16bf16bf16_grouped_grad_sm100_impl(
   // non-zero rows.
   kernel_groups = int(std::min(M, G));
 
-  cutlass::KernelHardwareInfo hw_info;
-  // Change device_id to another value if you are running on a machine with
-  // multiple GPUs and wish to use a GPU other than that with device ID 0.
-  hw_info.device_id = 0;
-  hw_info.sm_count =
-      min(cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-              hw_info.device_id),
-          2147483647); // INT_MAX
-
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {kernel_groups, problem_shape_ptr, nullptr},
       {x_ptr, stride_a_ptr, w_ptr, stride_b_ptr},
-      {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr},
-      hw_info};
+      {{}, nullptr, stride_c_ptr, output_ptr, stride_c_ptr}};
+
+  arguments.hw_info.sm_count = sm_count;
 
   Gemm gemm;
 
@@ -573,9 +610,59 @@ at::Tensor bf16bf16bf16_grouped_grad_sm100_impl(
   return output;
 }
 
+template <
+    int TB_M,
+    int TB_N,
+    int TB_K,
+    int TBS_M,
+    int TBS_N,
+    int TBS_K,
+    bool PONG>
+at::Tensor bf16bf16bf16_grouped_grad_sm100_dispatch(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor output,
+    int sm_count,
+    std::optional<at::Tensor> M_sizes) {
+  // Dispatch to appropriately typed kernel.
+  at::ScalarType dtype = X.scalar_type();
+  // Check that dtypes are consistent.
+  TORCH_CHECK(dtype == W.scalar_type(), "X and W must have the same dtype.");
+  TORCH_CHECK(
+      dtype == output.scalar_type(), "X and output must have the same dtype.");
+  if (dtype == at::kBFloat16) {
+    return bf16bf16bf16_grouped_grad_sm100_impl<
+        cutlass::bfloat16_t,
+        TB_M,
+        TB_N,
+        TB_K,
+        TBS_M,
+        TBS_N,
+        TBS_K,
+        PONG>(X, W, output, sm_count, M_sizes);
+  } else if (dtype == at::kHalf) {
+    return bf16bf16bf16_grouped_grad_sm100_impl<
+        cutlass::half_t,
+        TB_M,
+        TB_N,
+        TB_K,
+        TBS_M,
+        TBS_N,
+        TBS_K,
+        PONG>(X, W, output, sm_count, M_sizes);
+  } else {
+    TORCH_CHECK(
+        false,
+        "Unsupported dtype: ",
+        dtype,
+        ". Only bf16 and fp16 are supported.");
+  }
+}
+
 #else
 
 template <
+    typename ElementType,
     int TB_M,
     int TB_N,
     int TB_K,
@@ -587,8 +674,28 @@ at::Tensor bf16bf16bf16_grouped_grad_sm100_impl(
     at::Tensor X,
     at::Tensor W,
     at::Tensor output,
+    int sm_count,
     std::optional<at::Tensor> M_sizes) {
-  return output;
+  throw std::runtime_error(
+      "CUDA version is older than 12.8"); // requires CUDA>=12.8
+}
+
+template <
+    int TB_M,
+    int TB_N,
+    int TB_K,
+    int TBS_M,
+    int TBS_N,
+    int TBS_K,
+    bool PONG>
+at::Tensor bf16bf16bf16_grouped_grad_sm100_dispatch(
+    at::Tensor X,
+    at::Tensor W,
+    at::Tensor output,
+    int sm_count,
+    std::optional<at::Tensor> M_sizes) {
+  throw std::runtime_error(
+      "CUDA version is older than 12.8"); // requires CUDA>=12.8
 }
 #endif
 

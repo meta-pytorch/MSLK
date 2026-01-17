@@ -8,12 +8,15 @@ primitives for GenAI training and inference.
 ## **Installation**
 
 ```bash
-# Full MSLK library
+# Install MSLK for CUDA
 pip install mslk-cuda==1.0.0
-pip install mslk==1.0.0 --index-url https://download.pytorch.org/whl/cu128
+# Install MSLK for ROCm
+pip install mslk-rocm==1.0.0
+# Install a nightly version
+pip3 install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
 ```
 
-### Releases Compatibility Table
+## Release Compatibility Table
 
 MSLK is released in accordance to the PyTorch release schedule, and each
 release has no guarantee to work in conjunction with PyTorch releases that are
@@ -21,7 +24,36 @@ older than the one that the MSLK release corresponds to.
 
 | MSLK Release | Corresponding PyTorch Release | Supported Python Versions | Supported CUDA Versions | Supported CUDA Architectures | Supported ROCm Versions | Supported ROCm Architectures |
 |---------|---------|---------|---------|----------|-------------|-------------|
-| 1.0.0 | 2.10.x | 3.10, 3.11, 3.12 3.13, 3.14 | 12.6, 12.8, 12.9, 13.0 | 8.0, 9.0a, 10.0a, 12.0a | 7.0, 7.1 | gfx908, gfx90a, gfx942, gfx950 |
+| 1.0.0 | 2.10.x | 3.10, 3.11, 3.12, 3.13, 3.14 | 12.6, 12.8, 12.9, 13.0 | 8.0, 9.0a, 10.0a, 12.0a | 7.0, 7.1 | gfx908, gfx90a, gfx942, gfx950 |
+
+## **Running Benchmarks**
+```bash
+python bench/gemm/gemm_bench.py
+python bench/quantize/quantize_bench.py
+```
+
+## **Running Tests**
+```bash
+python test/gemm/gemm_test.py
+python test/gemm/quantize_test.py
+```
+
+## **Build From Source**
+We only support building on Linux. See the release compatibility table above for supported versions of Python, CUDA, ROCm.
+```bash
+# Clone repo
+git clone https://github.com/meta-pytorch/MSLK
+cd MSLK
+git submodule sync
+git submodule update --init --recursive
+# Build and install
+# The script will create a conda environment and install the required dependencies.
+# The conda environment will look something like: build-py3.14-torchnightly-cuda12.9.1
+./ci/integration/mslk_oss_build.bash
+# After the initial environment setup, you can activate the environment and iterate faster:
+conda activate build-py3.14-torchnightly-cuda12.9.1
+python setup.py install
+```
 
 ## Join the MSLK community
 
