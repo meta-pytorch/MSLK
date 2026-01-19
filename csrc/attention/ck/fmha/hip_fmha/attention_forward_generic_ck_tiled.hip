@@ -23,6 +23,10 @@
 #include "ck_tiled_fmha_fwd_splitkv_selector.h"
 #include "ck_tiled_fmha_params.h"
 
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
 extern void batched_forward_fp16(
     BatchedForwardParams& param,
     hipStream_t stream);

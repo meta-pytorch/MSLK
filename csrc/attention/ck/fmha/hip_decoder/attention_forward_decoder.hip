@@ -13,6 +13,10 @@
 
 #include "ck_attention_forward_decoder.h"
 
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
 namespace {
 constexpr int32_t kThreadsPerWavefront = 64;
 constexpr int32_t kWavefrontsPerBlock = 16;
