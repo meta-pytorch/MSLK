@@ -60,7 +60,8 @@ class FP8CorrectnessTest(unittest.TestCase):
     """Check that FP8 ops produce correct results."""
 
     @unittest.skipIf(
-        torch.cuda.get_device_capability("cuda") < (9, 0), "Only support sm90+"
+        torch.version.cuda is None or torch.cuda.get_device_capability("cuda") < (9, 0),
+        "Only support sm90+",
     )
     @given(
         input_shape=st.sampled_from([[32, 32]]),
