@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+from mslk.quantize.triton.fp4_utils import dequantize_nvfp4, global_scale_nvfp4
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
@@ -19,10 +20,6 @@ from mslk.quantize.triton.fp8_quantize import (
     triton_quantize_fp8_group,
     triton_quantize_fp8_row,
     triton_quantize_fp8_tensor,
-)
-from mslk.test.quantize.triton.fp4_quantize_test import (
-    dequantize_nvfp4,
-    global_scale_nvfp4,
 )
 
 
