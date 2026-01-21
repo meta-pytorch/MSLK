@@ -12,8 +12,10 @@ primitives for GenAI training and inference.
 pip install mslk-cuda==1.0.0
 # Install MSLK for ROCm
 pip install mslk-rocm==1.0.0
-# Install a nightly version
-pip3 install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
+# Install a nightly CUDA version
+pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
+# Install a nightly ROCm version
+pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
 ```
 
 ## Release Compatibility Table
@@ -28,14 +30,16 @@ older than the one that the MSLK release corresponds to.
 
 ## **Running Benchmarks**
 ```bash
-python bench/gemm/gemm_bench.py
-python bench/quantize/quantize_bench.py
+python bench/gemm/gemm_bench.py --M 4096 --N 4096 --K 4096
+python bench/quantize/quantize_bench.py --M 4096 --K 4096
+python bench/conv/conv_bench.py
 ```
 
 ## **Running Tests**
 ```bash
-python test/gemm/gemm_test.py
-python test/gemm/quantize_test.py
+pytest test/gemm/gemm_test.py
+pytest test/quantize/fp8_quantize_correctness_test.py
+pytest test/conv/conv_test.py
 ```
 
 ## **Build From Source**
