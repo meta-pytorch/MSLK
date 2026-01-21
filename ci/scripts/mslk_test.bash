@@ -167,6 +167,7 @@ __configure_mslk_test_rocm () {
     ./gemm/triton/*.py
     ./moe/*.py
     ./quantize/fp8_quantize_test.py
+    ./quantize/fp8_quantize_export_test.py
     ./quantize/triton/fp8_quantize_test.py
   )
 }

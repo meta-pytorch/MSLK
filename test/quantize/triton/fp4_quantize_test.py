@@ -29,6 +29,11 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_scale_nvfp4_quant_silu,
     triton_silu_quantize_mx4_unpack,
 )
+from mslk.quantize.triton.fp4_utils import (
+    dequantize_nvfp4,
+    fp4_to_float,
+    global_scale_nvfp4,
+)
 from torch.testing._internal.common_quantized import _f32_to_floatx_unpacked, pack_uint4
 
 # pyre-fixme [16]
@@ -37,27 +42,6 @@ open_source: bool = getattr(mslk, "open_source", False)
 if not open_source:
     from gen_ai.llm_inference.fb.llm.kernel.rms_norm import rms_norm
     from gen_ai.llm_inference.fb.llm.kernel.silu_mul import silu_mul
-
-
-def fp4_to_float(x: torch.Tensor) -> torch.Tensor:
-    # Start by unpacking the FP4 values into separate integers.
-    low_mx4 = torch.bitwise_and(x, 0xF)
-    high_mx4 = torch.bitwise_and(x >> 4, 0xF)
-    comb_shape = x.shape[:-1] + (x.shape[-1] * 2,)
-    x_comb = (
-        torch.stack([low_mx4, high_mx4], dim=0)
-        .view(2, -1)
-        .t()
-        .contiguous()
-        .to(torch.int32)
-    )
-    # Map to float with a lookup table.
-    E2M1_LUT = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
-        dtype=torch.float32,
-        device=x.device,
-    )
-    return torch.index_select(E2M1_LUT, 0, x_comb.view(-1)).view(comb_shape)
 
 
 def scale_mx4(x: torch.Tensor, exp: torch.Tensor, group_size: int = 32) -> torch.Tensor:
@@ -74,34 +58,6 @@ def scale_mx4(x: torch.Tensor, exp: torch.Tensor, group_size: int = 32) -> torch
     return scaled_x.view(orig_shape)
 
 
-def global_scale_nvfp4(
-    x: torch.Tensor,
-) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
-    amax = torch.amax(torch.abs(x)).to(torch.float32)
-    global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax
-    return global_scale
-
-
-def scale_nvfp4(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor,
-    group_size: int = 16,
-) -> torch.Tensor:
-    # NVFP4 uses a trick where global scales are folded into the scales
-    # but not x itself. Those scales are normally removed in the epilogue.
-    # Here, we manually get the scaling for x by removing global components.
-    true_scale = scale.view(torch.float8_e4m3fn).to(torch.float) / global_scale
-    # Now we can reverse scaling of x.
-    num_groups = x.shape[-1] // group_size
-    scaled_x = (
-        x.view(-1, num_groups, group_size)
-        * true_scale.view(x.shape[0], -1)[:, :num_groups, None]
-    )
-    return scaled_x.view(x.shape)
-
-
 def sample_scales() -> st.SearchStrategy[Optional[torch.Tensor]]:
     return st.sampled_from(
         [
@@ -114,23 +70,6 @@ def sample_scales() -> st.SearchStrategy[Optional[torch.Tensor]]:
         ]
         if torch.cuda.is_available()
         else [None]
-    )
-
-
-def dequantize_nvfp4(
-    input_quantized: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor,
-    group_size: int = 16,
-) -> torch.Tensor:
-    M = input_quantized.shape[0]
-    # Two FP4 values are packed into one uint8.
-    N = input_quantized.shape[1] * 2
-    # Convert blocked scale format back to (M, num_groups) layout.
-    scale = _from_blocked(scale, (M, math.ceil(N / group_size)))
-    input_quantized_float = fp4_to_float(input_quantized)
-    return scale_nvfp4(input_quantized_float, scale, global_scale, group_size).to(
-        torch.bfloat16
     )
 
 

@@ -59,7 +59,10 @@ jobs:
     runs-on: ${{ matrix.host-machine.instance }}
     container:
       image: "rocm/dev-ubuntu-22.04:${{ matrix.rocm-version }}-complete"
-      options: --user root --device=/dev/kfd --device=/dev/dri --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      options: --user root --privileged --pid=host --device=/dev/kfd --device=/dev/dri --ipc=host --shm-size 16G --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+      volumes: [
+        "/var/run/docker.sock:/var/run/docker.sock"
+      ]
     defaults:
       run:
         shell: bash
@@ -78,7 +81,7 @@ jobs:
     - name: Setup Build Container
       run: |
         apt update -y
-        apt install -y git wget
+        apt install -y git jq wget
         git config --global --add safe.directory '*'
 
     - name: Merge Extra Environment Variables
@@ -101,9 +104,6 @@ jobs:
       with:
         submodules: true
         ref: ${{ inputs.repo-ref }}
-
-    - name: Free Disk Space on Host
-      run: . $PRELUDE; free_disk_space_on_host
 
     - name: Display System Info
       run: . $PRELUDE; print_system_info
