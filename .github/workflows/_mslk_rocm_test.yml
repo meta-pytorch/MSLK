@@ -150,7 +150,7 @@ jobs:
 
     - name: Install MSLK (pip)
       if: ${{ inputs.mslk-channel-version != '' }}
-      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk_channel_version || 'nightly' }} rocm/${{ matrix.rocm-version }}
+      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk-channel-version || 'nightly' }} rocm/${{ matrix.rocm-version }}
 
     - name: Test with PyTest
       if: ${{ inputs.run-target == 'test' }}

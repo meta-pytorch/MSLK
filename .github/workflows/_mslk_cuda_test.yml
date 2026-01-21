@@ -161,7 +161,7 @@ jobs:
 
     - name: Install MSLK (pip)
       if: ${{ inputs.mslk-channel-version != '' }}
-      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk_channel_version || 'nightly' }} cuda/${{ matrix.cuda-version }}
+      run: . $PRELUDE; install_mslk_pip $BUILD_ENV ${{ github.event.inputs.mslk-channel-version || 'nightly' }} cuda/${{ matrix.cuda-version }}
 
     - name: Test with PyTest
       if: ${{ inputs.run-target == 'test' }}
