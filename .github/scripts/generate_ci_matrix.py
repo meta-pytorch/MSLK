@@ -315,7 +315,7 @@ class BuildConfigScheme:
             if self.jobtype == JOBTYPE_BUILD:
                 return [{"arch": "x86", "instance": "linux.24xlarge.memory"}]
             else:
-                return [{"arch": "x86", "instance": "linux.rocm.gpu.2"}]
+                return [{"arch": "x86", "instance": "amd-mi350-runner"}]
 
         else:
             return []
