@@ -121,7 +121,7 @@ jobs:
       run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
 
     - name: Build MSLK Wheel
-      run: . $PRELUDE; build_mslk_package $BUILD_ENV nightly ${{ matrix.build-target }}/cuda
+      run: . $PRELUDE; build_mslk_package $BUILD_ENV ${{ inputs.pytorch-channel-version }} ${{ matrix.build-target }}/cuda
 
     - name: Upload Built Wheel as GHA Artifact
       uses: actions/upload-artifact@v4
