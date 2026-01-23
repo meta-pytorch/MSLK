@@ -34,6 +34,24 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
     -mllvm -greedy-reverse-local-assignment=1
     -fhip-new-launch-api)
 
+  # is this hipify v2?
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "from torch.utils.hipify import __version__; print(__version__)"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _tempvar
+    RESULT_VARIABLE _resvar
+    ERROR_VARIABLE _errvar)
+  if(NOT "${_resvar}" EQUAL "0")
+    message(WARNING "Failed to execute Python (${Python_EXECUTABLE})\n"
+      "Result: ${_resvar}\n"
+      "Error: ${_errvar}\n")
+  endif()
+  string(FIND "${_tempvar}" "2" found_pos)
+  if(found_pos GREATER_EQUAL 0)
+    list(APPEND HIP_HCC_FLAGS -DHIPIFY_V2)
+  endif()
+
   BLOCK_PRINT(
     "HIP found: ${HIP_FOUND}"
     "HIPCC compiler flags:"
