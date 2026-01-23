@@ -24,6 +24,10 @@
 #include "ck/host_utility/hip_check_error.hpp"
 #include "ck/utility/flush_icache.hpp"
 
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
 namespace mslk::quantize {
 
 void flush_icache_ck()

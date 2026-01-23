@@ -18,6 +18,10 @@
 
 #include "ck_tiled_rand_uniform_kernel.h"
 
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
 namespace {
 
 /**

@@ -17,6 +17,10 @@
 #include "ck_fmha_util.h"
 #include "ck_tiled_fmha_params.h"
 
+#ifdef HIPIFY_V2
+#define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
 extern void batched_backward_fp16(
     BatchedBackwardParams& param,
     hipStream_t stream);
