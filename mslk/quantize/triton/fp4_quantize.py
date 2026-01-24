@@ -785,10 +785,10 @@ def _kernel_silu_quantize_mx4_unpack(
         # Check for overflow and adjust exponent accordingly.
         overflow = mantissa > MANTISSA_OVERFLOW_THRESHOLD
         # Allow subnorms to overflow into normals, otherwise shift away overflow.
-        mantissa = tl.where(overflow and (not is_subnorm), mantissa >> 1, mantissa)
+        mantissa = tl.where(overflow & (not is_subnorm), mantissa >> 1, mantissa)
         # Special case where a value is subnormal and has a large mantissa, overflow it.
         new_biased_exp = tl.where(
-            (new_biased_exp <= 0) and (mantissa == 2), 1, new_biased_exp
+            (new_biased_exp <= 0) & (mantissa == 2), 1, new_biased_exp
         )
         # Remove implicit 1.
         mantissa = mantissa & IMPLICIT_1_MASK
@@ -1209,10 +1209,10 @@ def _kernel_rms_quantize_mx4_unpack(
         # Check for overflow and adjust exponent accordingly.
         overflow = mantissa > MANTISSA_OVERFLOW_THRESHOLD
         # Allow subnorms to overflow into normals, otherwise shift away overflow.
-        mantissa = tl.where(overflow and (not is_subnorm), mantissa >> 1, mantissa)
+        mantissa = tl.where(overflow & (not is_subnorm), mantissa >> 1, mantissa)
         # Special case where a value is subnormal and has a large mantissa, overflow it.
         new_biased_exp = tl.where(
-            (new_biased_exp <= 0) and (mantissa == 2), 1, new_biased_exp
+            (new_biased_exp <= 0) & (mantissa == 2), 1, new_biased_exp
         )
         # Remove implicit 1.
         mantissa = mantissa & IMPLICIT_1_MASK
