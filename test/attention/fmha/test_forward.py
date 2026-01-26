@@ -37,6 +37,7 @@ from .utils import (
     cuda_or_mtia_only,
     nanify_oob_seqlen,
     ref_attention_for_test,
+    UNSUPPORTED_OP_PASSES,
 )
 
 logger = logging.getLogger("xformers")
@@ -48,20 +49,63 @@ parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = pytest.mark.parametrize(
     "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
     **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS),
 )
-parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametrize(
-    "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS, max_shapes_per_op=1),
-)
-parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametrize(
-    "opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_BW_OPS, max_shapes_per_op=1),
-)
 
 
-@pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
-@pytest.mark.parametrize("packed", [False, True])
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs):
+def parametrize_test_forward():
+    values_ids = _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS)
+    out = []
+    out_ids = []
+    for value, id in zip(values_ids["argvalues"], values_ids["ids"]):
+        out.append(value + (False, "BMHK"))
+        out_ids.append(id + "--BMHK")
+        (
+            op,
+            device,
+            dtype,
+            bias_type,
+            batch_size,
+            q_len,
+            kv_len,
+            h,
+            k,
+            kv,
+        ) = value
+        do_BMK = bias_type in (
+            fmha.attn_bias.LowerTriangularMask,
+            torch.Tensor,
+            type(None),
+        )
+        # packed doesn't make sense with paged attention,
+        # since q has different shape than k/v.
+        # packed incompatible with `k != kv` or `q_len != kv_len`
+        do_packed = not issubclass(
+            bias_type,
+            (
+                fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
+                fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
+            ),
+        ) and (k == kv and q_len == kv_len)
+
+        if do_BMK:
+            out.append(value + (False, "BMK"))
+            out_ids.append(id + "--BMK")
+
+        if do_packed:
+            out.append(value + (True, "BMHK"))
+            out_ids.append(id + "-packed-BMHK")
+            if do_BMK:
+                out.append(value + (True, "BMK"))
+                out_ids.append(id + "-packed-BMK")
+    return {
+        "argvalues": out,
+        "ids": out_ids,
+    }
+
+
+@pytest.mark.parametrize(
+    "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt", **parametrize_test_forward()
+)
+def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt, **kwargs):
     (
         op,
         device,
@@ -73,23 +117,9 @@ def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs)
         h,
         k,
         kv,
-    ) = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-    if packed and issubclass(
-        bias_type,
-        (
-            fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask,
-            fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
-        ),
-    ):
-        pytest.skip(
-            "packed doesn't make sense with paged attention, since q has different shape than k/v"
-        )
-    if packed and not (k == kv and q_len == kv_len):
-        pytest.skip(
-            f"packed incompatible with `k ({k}) != kv ({kv})` or `q_len ({q_len}) != kv_len ({kv_len})`"
-        )
-    if fmt == "BMK" and not fmha.common._is_bias_type_supported_in_BMK(bias_type):
-        pytest.skip("BMK incompatible with this bias")
+        packed,
+        fmt,
+    ) = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt
 
     if op is fmha.ck.FwOp:
         if (k > 256 or kv > 256) and issubclass(
@@ -101,11 +131,19 @@ def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs)
         ):
             pytest.skip("ck.FwOp hdim-512 is not supported when Paged-KVCache is used!")
 
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK" if packed else fmt,
-        **kwargs,
-    )
+    try:
+        query, key, value, attn_bias = create_tensors(
+            *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt[:-2],
+            fmt="BMHK" if packed else fmt,
+            **kwargs,
+        )
+    except pytest.skip.Exception as e:
+        if UNSUPPORTED_OP_PASSES:
+            logger.warning(
+                f"Skipping {opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt}: {e}"
+            )
+            return
+        raise
     if attn_bias is not None:
         assert type(attn_bias.to(query.device)) is type(attn_bias)
 
@@ -161,27 +199,32 @@ def test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed, fmt, **kwargs)
     )
 
 
+def nqueries_for_test_forward_gqa(biasT):
+    if issubclass(
+        biasT,
+        (fmha.attn_bias.LowerTriangularMask, fmha.attn_bias.BlockDiagonalCausalMask),
+    ):
+        # avoid undefined upper left
+        return [512]
+    return [1, 512]
+
+
 @cuda_or_mtia_only
-@pytest.mark.parametrize("Mq", [1, 512])
 @pytest.mark.parametrize(
-    "opFW_biasT",
+    "opFW_biasT_Mq",
     [
-        (op, biasT)
+        (op, biasT, Mq)
         for op in ALL_FW_OPS
         for biasT in get_supported_attn_bias_types(op)
         if op.SUPPORTS_BMGHK
+        for Mq in nqueries_for_test_forward_gqa(biasT)
     ],
-    ids=lambda o: f"{o[0].NAME}-{o[1].__name__}" if isinstance(o, tuple) else "",
+    ids=lambda o: f"{o[0].NAME}-{o[1].__name__}-{o[2]}" if isinstance(o, tuple) else "",
 )
-def test_forward_gqa(opFW_biasT, Mq: int):
+def test_forward_gqa(opFW_biasT_Mq):
+    opFW, biasT, Mq = opFW_biasT_Mq
     device = torch._C._get_accelerator().type
 
-    opFW, biasT = opFW_biasT
-    if Mq < 512 and (
-        issubclass(biasT, fmha.attn_bias.LowerTriangularMask)
-        or issubclass(biasT, fmha.attn_bias.BlockDiagonalCausalMask)
-    ):
-        pytest.skip("undefined upper left")
     B_Mq_Mkv_H_K_Kv = (3, Mq, 512, 16, 128, 128)
     test_forward(
         (
@@ -190,9 +233,9 @@ def test_forward_gqa(opFW_biasT, Mq: int):
             torch.float16,
             biasT,
             *B_Mq_Mkv_H_K_Kv,
+            False,
+            "BMGHK",
         ),
-        packed=False,
-        fmt="BMGHK",
         g=2,
     )
 
@@ -233,7 +276,7 @@ def test_forward_splitk(
     packed=False,
     fmt="BMHK",
 ):
-    test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, packed=packed, fmt=fmt)
+    test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv + (packed, fmt))
 
 
 @cuda_only
@@ -256,7 +299,7 @@ def test_forward_triton_split_k_autotune():
             torch.bfloat16,
             biasT,
             *B_Mq_Mkv_H_K_Kv,
+            False,
+            "BMHK",
         ),
-        packed=False,
-        fmt="BMHK",
     )
