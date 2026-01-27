@@ -7,7 +7,7 @@
 import itertools
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
@@ -19,6 +19,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import triton  # @manual=//triton:triton
+from mslk.bench.common.telemetry import export_benchmark_to_scuba, is_scuba_available
 from mslk.bench.common.utils import BenchOptions, profiler
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from tabulate import tabulate
@@ -216,6 +217,8 @@ class Metrics:
     gbps: float = 0.0
     mem_bw_util: float = 0.0
     compute_util: float = 0.0
+    extra_tags: dict[str, str] = field(default_factory=dict)
+    extra_metrics: dict[str, float] = field(default_factory=dict)
 
     @staticmethod
     def header(shape_mode: ShapeMode = ShapeMode.REGULAR) -> str:
@@ -564,6 +567,12 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     help="Export results to a CSV file.",
 )
 @click.option(
+    "--export-scuba",
+    is_flag=True,
+    hidden=True,
+    help="Export results to a Scuba table (internal only).",
+)
+@click.option(
     "--plot",
     is_flag=True,
     help="Create a plot of the benchmark measurements.",
@@ -668,6 +677,7 @@ def invoke_main(
     output_dir: str,
     num_iters: int,
     export_csv: bool,
+    export_scuba: bool,
     plot: bool,
     enable_amd_env_vars: bool,
     bench_quantize: bool,
@@ -851,6 +861,27 @@ def invoke_main(
         df = pd.DataFrame(csv)
         df.to_csv(csv_file, na_rep="NaN", index=False)
         print(f"CSV saved to {csv_file}")
+    if export_scuba:
+        if not is_scuba_available():
+            print(
+                "Warning: --export-scuba requires FB-internal build. "
+                "Skipping Scuba export."
+            )
+        else:
+            # Determine kernel category based on benchmark mode
+            kernel_category = "Grouped GEMM Kernels" if grouped else "GEMM Kernels"
+            # Set shape_mode in extra_tags for each sample
+            for metric in benchmark_results:
+                metric.extra_tags["shape_mode"] = metric.shape_mode.value
+            export_benchmark_to_scuba(
+                samples=benchmark_results,
+                bench_type="gemm",
+                kernel_category=kernel_category,
+                mem_bw_roofline_gbps=mem_bw_gbps,
+                cuda_graph_enabled=not no_cuda_graph,
+                fast_accum_enabled=not disable_fast_accum,
+                torch_compile_enabled=torch_compile,
+            )
     if plot:
         plot_benchmark(benchmark_results, output_dir)
 
