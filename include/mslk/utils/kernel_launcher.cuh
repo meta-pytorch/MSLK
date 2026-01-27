@@ -462,28 +462,41 @@ struct KernelLauncher {
 //  - The macro expression is wrapped inside a parenthesis to avoid commas from
 //  interfering with preoprocessing when this macro is invoked inside another
 //  macro.
+//
+//  - __VA_OPT__(,) is used to handle the case when no kernel arguments are
+// passed (aside from TORCH_DSA_KERNEL_ARGS)
 ////////////////////////////////////////////////////////////////////////////////
 
-#define MSLK_LAUNCH_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)            \
-  ([&] {                                                                      \
-    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);                \
-    auto& _kernel_ = KERNEL;                                                  \
-                                                                              \
-    return mslk::utils::                                                      \
-        KernelLauncher<false, false, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(      \
-               _context_)                                                     \
-            .launch_kernel(_kernel_, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
+#define MSLK_LAUNCH_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)       \
+  ([&] {                                                                 \
+    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);           \
+    auto& _kernel_ = KERNEL;                                             \
+                                                                         \
+    return mslk::utils::                                                 \
+        KernelLauncher<false, false, _FKL_BLOCKING_, _FKL_TENSORCHECK_>( \
+               _context_)                                                \
+            .launch_kernel(                                              \
+                _kernel_,                                                \
+                GRID,                                                    \
+                BLOCK,                                                   \
+                SMEM,                                                    \
+                STREAM __VA_OPT__(, ) __VA_ARGS__);                      \
   }())
 
-#define MSLK_LAUNCH_DSA_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)        \
-  ([&] {                                                                      \
-    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);                \
-    auto& _kernel_ = KERNEL;                                                  \
-                                                                              \
-    return mslk::utils::                                                      \
-        KernelLauncher<false, true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(       \
-               _context_)                                                     \
-            .launch_kernel(_kernel_, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
+#define MSLK_LAUNCH_DSA_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...)  \
+  ([&] {                                                                \
+    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);          \
+    auto& _kernel_ = KERNEL;                                            \
+                                                                        \
+    return mslk::utils::                                                \
+        KernelLauncher<false, true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>( \
+               _context_)                                               \
+            .launch_kernel(                                             \
+                _kernel_,                                               \
+                GRID,                                                   \
+                BLOCK,                                                  \
+                SMEM,                                                   \
+                STREAM __VA_OPT__(, ) __VA_ARGS__);                     \
   }())
 
 #define MSLK_LAUNCH_COOPERATIVE_KERNEL(KERNEL, GRID, BLOCK, SMEM, STREAM, ...) \
@@ -494,17 +507,27 @@ struct KernelLauncher {
     return mslk::utils::                                                       \
         KernelLauncher<true, false, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(        \
                _context_)                                                      \
-            .launch_kernel(_kernel_, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__);  \
+            .launch_kernel(                                                    \
+                _kernel_,                                                      \
+                GRID,                                                          \
+                BLOCK,                                                         \
+                SMEM,                                                          \
+                STREAM __VA_OPT__(, ) __VA_ARGS__);                            \
   }())
 
-#define MSLK_LAUNCH_COOPERATIVE_DSA_KERNEL(                                   \
-    KERNEL, GRID, BLOCK, SMEM, STREAM, ...)                                   \
-  ([&] {                                                                      \
-    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);                \
-    auto& _kernel_ = KERNEL;                                                  \
-                                                                              \
-    return mslk::utils::                                                      \
-        KernelLauncher<true, true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>(        \
-               _context_)                                                     \
-            .launch_kernel(_kernel_, GRID, BLOCK, SMEM, STREAM, __VA_ARGS__); \
+#define MSLK_LAUNCH_COOPERATIVE_DSA_KERNEL(                            \
+    KERNEL, GRID, BLOCK, SMEM, STREAM, ...)                            \
+  ([&] {                                                               \
+    constexpr auto _context_ = SOURCE_CONTEXT_CURRENT(KERNEL);         \
+    auto& _kernel_ = KERNEL;                                           \
+                                                                       \
+    return mslk::utils::                                               \
+        KernelLauncher<true, true, _FKL_BLOCKING_, _FKL_TENSORCHECK_>( \
+               _context_)                                              \
+            .launch_kernel(                                            \
+                _kernel_,                                              \
+                GRID,                                                  \
+                BLOCK,                                                 \
+                SMEM,                                                  \
+                STREAM __VA_OPT__(, ) __VA_ARGS__);                    \
   }())
