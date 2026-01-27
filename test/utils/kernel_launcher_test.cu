@@ -41,6 +41,13 @@ constexpr auto TemplateSourceFileReference = "FOO/BAR/BAZ-123.cpp";
 // Test Kernels
 ////////////////////////////////////////////////////////////////////////////////
 
+__global__ void zero_args_kernel() {
+  return;
+}
+__global__ void zero_args_dsa_kernel(TORCH_DSA_KERNEL_ARGS) {
+  return;
+}
+
 template <typename T>
 __global__ void array_sum_kernel(T* C, const T* A, const T* B, size_t size) {
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -163,6 +170,16 @@ TEST(KernelLauncherTest, template_source_file) {
         launcher.context.description(),
         Not(HasSubstr(TemplateSourceFileReference)));
   }
+}
+
+TEST(KernelLauncherTest, zero_args_launch) {
+  MSLK_LAUNCH_KERNEL(
+      zero_args_kernel, 8, 1024, 0, at::cuda::getCurrentCUDAStream());
+}
+
+TEST(KernelLauncherTest, zero_args_dsa_launch) {
+  MSLK_LAUNCH_DSA_KERNEL(
+      zero_args_dsa_kernel, 8, 1024, 0, at::cuda::getCurrentCUDAStream());
 }
 
 TEST(KernelLauncherTest, array_kernel_launch) {
