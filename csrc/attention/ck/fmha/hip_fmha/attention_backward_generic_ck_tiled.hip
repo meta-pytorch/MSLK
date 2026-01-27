@@ -115,7 +115,7 @@ efficient_attention_backward_ck(
     TORCH_CHECK(max_seqlen_k_.has_value());
   }
 
-  hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+  hipStream_t stream = at::cuda::getCurrentHIPStream().stream();
 
   int64_t B = query.size(0);
   int64_t M = query.size(1);
