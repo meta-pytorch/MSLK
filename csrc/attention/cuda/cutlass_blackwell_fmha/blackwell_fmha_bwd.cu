@@ -1,5 +1,6 @@
 // @nolint
 #include "blackwell_fmha_bwd_template.cuh"
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
 struct KernelCoop {};
@@ -21,15 +22,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dispatch_fmha_bwd(
     int64_t window_size_right,
     bool bottom_right,
     bool deterministic) {
-  // This workaround initializes the CUDA context to prevent the 201 error
-  // (invalid context).  When this function is invoked through PyTorch
-  // autograd, it runs on a new thread that hasn't been associated with a CUDA
-  // context. To bind this thread to a CUDA context, we call a CUDA runtime API
-  // (e.g., cudaFree), which will automatically initialize the context.  This
-  // ensures that subsequent calls to driver APIs, which assume an initialized
-  // CUDA context, do not result in an invalid context error.
-  // TODO: initialize context properly
-  cudaFree(0);
+  if (C10_LIKELY(at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None)) {
+    // This workaround initializes the CUDA context to prevent the 201 error
+    // (invalid context).  When this function is invoked through PyTorch
+    // autograd, it runs on a new thread that hasn't been associated with a CUDA
+    // context. To bind this thread to a CUDA context, we call a CUDA runtime API
+    // (e.g., cudaFree), which will automatically initialize the context.  This
+    // ensures that subsequent calls to driver APIs, which assume an initialized
+    // CUDA context, do not result in an invalid context error.
+    // TODO: initialize context properly
+    cudaFree(0);
+  }
 
   // Handle local attention parameters
   bool local = (window_size_left >= 0 || window_size_right >= 0);
