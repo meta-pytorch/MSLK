@@ -120,7 +120,7 @@ efficient_attention_forward_ck(
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(key);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(value);
 
-  hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+  hipStream_t stream = at::cuda::getCurrentHIPStream().stream();
 
   int64_t B = query.size(0);
   int64_t M = query.size(1);
