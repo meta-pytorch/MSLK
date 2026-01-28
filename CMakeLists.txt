@@ -126,6 +126,7 @@ include(${CMAKEMODULES}/GpuCppLibrary.cmake)
 set(mslk_include_directories
   # MSLK
   ${MSLK}/include
+  ${MSLK}/csrc/attention/ck/fmha/hip_fmha
   # PyTorch
   ${TORCH_INCLUDE_DIRS}
   # Third-party

@@ -16,11 +16,15 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
   include(Hip)
   include(Hipify)
 
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium")
+  add_link_options(-fuse-ld=/opt/rocm/llvm/bin/ld.lld)
+
   # Configure compiler for HIP
   list(APPEND HIP_HCC_FLAGS
     " \"-Wno-#pragma-messages\" "
     " \"-Wno-#warnings\" "
     -fclang-abi-compat=17
+    -mcmodel=medium
     -Wno-cuda-compat
     -Wno-deprecated-declarations
     -Wno-format

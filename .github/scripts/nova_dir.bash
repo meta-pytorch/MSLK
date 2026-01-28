@@ -9,10 +9,13 @@
 MSLK_DIR="/__w/MSLK/MSLK"
 export MSLK_REPO="${MSLK_DIR}/${REPOSITORY}"
 working_dir=$(pwd)
-if [[ "$working_dir" == "$MSLK_REPO" ]]; then cd MSLK || echo "Failed to cd MSLK from $(pwd)"; fi
+if [[ "$working_dir" != "$MSLK_REPO" ]]; then
+    cd "${MSLK_REPO}" || echo "Failed to cd to ${MSLK_REPO} from $(pwd)"
+fi
 
-## Build clean/wheel will be done in pre-script. Set flag such that setup.py will skip these steps in Nova workflow
-export BUILD_FROM_NOVA=1
+## Build clean/wheel will be done in pre-script.
+## Set flag such that setup.py will skip these steps in Nova workflow
+export BUILD_FROM_NOVA=0
 
 if [[ "$CU_VERSION" == "cu"* ]]; then
     echo "Current TORCH_CUDA_ARCH_LIST value: ${TORCH_CUDA_ARCH_LIST}"
