@@ -28,6 +28,15 @@ from tabulate import tabulate
 logging.basicConfig(level=logging.INFO)
 
 
+def _detect_build_variant() -> str:
+    """Auto-detect the build variant based on the installed PyTorch."""
+    if torch.version.hip is not None:
+        return "rocm"
+    if torch.version.cuda is not None:
+        return "cuda"
+    return "cpu"
+
+
 @dataclass(frozen=True)
 class MSLKBuild:
     args: argparse.Namespace
@@ -66,7 +75,7 @@ class MSLKBuild:
             "--build-variant",
             type=str,
             choices=["cpu", "cuda", "rocm"],
-            default="cuda",
+            default=_detect_build_variant(),
             help="The MSLK build variant to build.",
         )
         parser.add_argument(
