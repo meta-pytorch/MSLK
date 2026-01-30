@@ -355,6 +355,7 @@ class FwOpDecode(AttentionFwOpBase):
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        BlockDiagonalLocalAttentionPaddedKeysMask,
     )
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -373,6 +374,13 @@ class FwOpDecode(AttentionFwOpBase):
         q_shape = d.query.shape
         if q_shape[-2] > 16:
             reasons.append(f"Max qHeads ({q_shape[-2]}) per KV head is > 16")
+        # Check for unsupported window_right > 0 in local attention masks
+        if isinstance(d.attn_bias, BlockDiagonalLocalAttentionPaddedKeysMask):
+            if d.attn_bias.window_right > 0:
+                reasons.append(
+                    f"BlockDiagonalLocalAttentionPaddedKeysMask with window_right > 0 "
+                    f"is not supported (got window_right={d.attn_bias.window_right})"
+                )
         return reasons
 
     @classmethod
@@ -416,17 +424,33 @@ class FwOpDecode(AttentionFwOpBase):
                 window_right=window_right,
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
             )
+
+            # Kernel returns: out [B, 1, H, num_splits, D], lse [B, num_splits, H, 1]
+            num_splits = out.shape[3]
+
+            if num_splits > 1:
+                # Split-K case: permute for merge_attentions
+                # out: [B, 1, H, num_splits, D] -> [num_splits, B, 1, H, D]
+                out = out.permute(3, 0, 1, 2, 4)
+                # lse: [B, num_splits, H, 1] -> [num_splits, B, H, 1]
+                lse = lse.permute(1, 0, 2, 3)
+
+                from . import merge_attentions
+
+                out, lse = merge_attentions(out, lse, write_lse=True)
+                # out: [B, 1, H, D], lse: [B, H, 1]
+            else:
+                # Non-split case: squeeze the num_splits dimension
+                # out: [B, 1, H, 1, D] -> [B, 1, H, D]
+                out = out.squeeze(3)
+                # lse: [B, 1, H, 1] -> [B, H, 1]
+                lse = lse.squeeze(1)
         else:
             out = torch.zeros_like(inp.query)
-            if cu_seqlens_q is None:
-                assert inp.query.ndim == 4
-                B, M, H, K = inp.query.shape
-                # lse_shape = [B, H, M]
-            else:
-                assert inp.query.ndim == 3
-                M, H, K = inp.query.shape
-                # lse_shape = [1, H, M]
-            # lse = torch.zeros(*lse_shape, dtype=torch.float, device=out.device)
+            assert inp.query.ndim == 4
+            B, M, H, _ = inp.query.shape
+            lse = torch.zeros(B, H, M, dtype=torch.float, device=out.device)
+        # Restore original shape (e.g., 5D BMGHK) after _convert_input_format folded it to 4D
         out = out.reshape(q_shape)
         assert not needs_gradient, "FwOpDecode does not support gradient computation"
         return out, None
