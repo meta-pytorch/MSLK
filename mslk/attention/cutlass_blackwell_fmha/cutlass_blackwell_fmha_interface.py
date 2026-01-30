@@ -371,7 +371,7 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
         window_left, window_right = window_size
         # Check if this is generation phase (sq = 1)
         sq = q.shape[1]
-        if q.dim() == 4 and sq == 1:
+        if q.dim() == 4 and sq == 1 and not page_table:
             # For gen case, we don't need to save tensors for backward
             ctx.is_gen = True
             out, _ = cutlass_blackwell_fmha_decode_forward(
