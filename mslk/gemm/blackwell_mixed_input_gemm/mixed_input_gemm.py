@@ -2384,6 +2384,383 @@ def compare(
     torch.testing.assert_close(kernel_result, ref_result, atol=tolerance, rtol=1e-05)
 
 
+# Global cache for compiled kernels to avoid recompilation
+_kernel_cache: dict = {}
+
+
+def _get_major_dim(tensor: torch.Tensor) -> int:
+    """
+    Get the major dimension (stride 1) of a tensor.
+
+    Returns:
+        The index of the dimension with stride 1, or -1 if none.
+    """
+    for i, stride in enumerate(tensor.stride()):
+        if stride == 1:
+            return i
+    return -1
+
+
+def _get_tensor_majorness(tensor: torch.Tensor, dim_names: tuple[str, str]) -> str:
+    """
+    Get the majorness string for a 2D tensor.
+
+    Args:
+        tensor: A 2D tensor.
+        dim_names: Tuple of dimension names, e.g., ("m", "k") for A tensor.
+
+    Returns:
+        The name of the major dimension (e.g., "m" or "k").
+
+    Raises:
+        ValueError: If no dimension has stride 1.
+    """
+    major_dim = _get_major_dim(tensor)
+    if major_dim == -1 or major_dim >= len(dim_names):
+        raise ValueError(
+            f"Cannot determine majorness: tensor with shape {tensor.shape} "
+            f"has strides {tensor.stride()}, expected one dimension with stride 1"
+        )
+    return dim_names[major_dim]
+
+
+def mixed_input_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: Optional[torch.Tensor] = None,
+    C: Optional[torch.Tensor] = None,
+    scale_granularity_m: int = 1,
+    scale_granularity_k: int = 128,
+    acc_dtype: Optional[type[cutlass.Numeric]] = None,
+    mma_tiler_mnk: tuple[int, int, int] = (128, 128, 128),
+    cluster_shape_mn: tuple[int, int] = (1, 1),
+    use_2cta_instrs: bool = False,
+    use_tma_store: bool = False,
+) -> torch.Tensor:
+    """
+    Perform mixed-input GEMM using CuteDSL kernel on Blackwell architecture.
+
+    This function takes torch tensors as input and performs a mixed-precision
+    GEMM operation where A is narrow precision (Int4/Int8) and B is wide
+    precision (BF16/FP16).
+
+    Computes: C = A @ B.T  (with optional scaling for A)
+
+    Args:
+        A: Input tensor A of shape (M, K) with narrow precision dtype (int8).
+            For Int4, should be stored as int8.
+        B: Input tensor B of shape (N, K) with wide precision dtype (bf16/fp16).
+        A_scale: Optional scale tensor for A. Required for Int4 inputs.
+            Shape should be (M, K // scale_granularity_k).
+        C: Optional output tensor of shape (M, N). If None, will be allocated.
+        scale_granularity_m: Number of elements sharing the same scale along M.
+        scale_granularity_k: Number of elements sharing the same scale along K.
+        acc_dtype: Accumulation dtype. Defaults to Float32.
+        mma_tiler_mnk: MMA tile shape (M, N, K).
+        cluster_shape_mn: Cluster dimensions (M, N).
+        use_2cta_instrs: Whether to use 2CTA MMA instructions.
+        use_tma_store: Whether to use TMA for storing results.
+
+    Returns:
+        Output tensor C of shape (M, N) with the same dtype as B.
+    """
+    if acc_dtype is None:
+        acc_dtype = cutlass.Float32
+
+    # Determine input dtypes
+    if A.dtype == torch.int8:
+        # Could be Int4 (packed) or Int8
+        if A_scale is not None:
+            a_dtype = cutlass.Int4
+        else:
+            a_dtype = cutlass.Int8
+    elif A.dtype == torch.uint8:
+        a_dtype = cutlass.Uint8
+    else:
+        raise ValueError(f"Unsupported A dtype: {A.dtype}. Expected int8 or uint8.")
+
+    if B.dtype == torch.bfloat16:
+        b_dtype = cutlass.BFloat16
+    elif B.dtype == torch.float16:
+        b_dtype = cutlass.Float16
+    else:
+        raise ValueError(f"Unsupported B dtype: {B.dtype}. Expected bfloat16 or float16.")
+
+    c_dtype = b_dtype  # Output dtype matches B
+
+    # Get dimensions - A is (M, K), B is (N, K)
+    m, k = A.shape
+    n = B.shape[0]
+    l = 1  # Batch size
+    # Assert correct contraction dim
+    assert (
+        k == B.shape[1]
+    ), f"Invalid input shapes. A.shape[1] must equal B.shape[1] but got {k} and {B.shape[1]}"
+
+    # Deduce major modes from tensor strides
+    # A has shape (M, K), so dim 0 is M, dim 1 is K
+    a_major = _get_tensor_majorness(A, ("m", "k"))
+    # B has shape (N, K), so dim 0 is N, dim 1 is K
+    b_major = _get_tensor_majorness(B, ("n", "k"))
+    # C has shape (M, N), so dim 0 is M, dim 1 is N
+    # For C, we deduce from the provided tensor or default to n-major if allocating
+    if C is not None:
+        c_major = _get_tensor_majorness(C, ("m", "n"))
+    else:
+        c_major = "n"  # Default to n-major when allocating
+
+    # Ensure tensors are on CUDA
+    assert A.is_cuda, "A must be on CUDA"
+    assert B.is_cuda, "B must be on CUDA"
+    assert A_scale is None or A_scale.is_cuda, "A_scale must be on CUDA"
+
+    # Validate configuration
+    mnkl = (m, n, k, l)
+    if not MixedInputGemmKernel.can_implement(
+        mnkl,
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        c_major,
+        scale_granularity_m,
+        scale_granularity_k,
+        mma_tiler_mnk,
+        cluster_shape_mn,
+        use_2cta_instrs,
+        use_tma_store,
+    ):
+        raise ValueError(
+            f"GEMM configuration not supported for shape {mnkl} with "
+            f"a_dtype={a_dtype}, b_dtype={b_dtype}, mma_tiler={mma_tiler_mnk}"
+        )
+
+    # Get current CUDA stream
+    torch_stream = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+    # Get divisibility for tensor alignment
+    a_divisibility = mixed_input_utils.get_divisibility(m)
+    b_divisibility = mixed_input_utils.get_divisibility(n)
+    c_divisibility = mixed_input_utils.get_divisibility(n)
+
+    # Reshape tensors to 3D format expected by kernel: (M, K, L) for A, (N, K, L) for B
+    A_3d = A.unsqueeze(-1)  # (M, K) -> (M, K, 1)
+    B_3d = B.unsqueeze(-1)  # (N, K) -> (N, K, 1)
+
+    # Create cute tensors using cutlass_torch utilities
+    # For A tensor
+    a_cute, _ = cutlass_torch.cute_tensor_like(
+        A_3d,
+        a_dtype,
+        is_dynamic_layout=True,
+        assumed_align=a_divisibility,
+    )
+
+    # For A_scale tensor
+    a_scale_cute = None
+    if A_scale is not None:
+        # Scale tensor shape: (M, num_scales, L) where num_scales = K // scale_granularity_k
+        assert _get_tensor_majorness(A_scale, ("m", "k")) == "m", "A_scale must be m-major"
+        A_scale_3d = A_scale.unsqueeze(-1)  # (M, num_scales) -> (M, num_scales, 1)
+        a_scale_cute = from_dlpack(A_scale_3d, assumed_align=a_divisibility)
+        # Find leading dimension
+        leading_dim = _get_major_dim(A_scale_3d)
+        assert leading_dim != -1
+        a_scale_cute = a_scale_cute.mark_layout_dynamic(leading_dim=leading_dim)
+
+    # For B tensor
+    b_cute, _ = cutlass_torch.cute_tensor_like(
+        B_3d,
+        b_dtype,
+        is_dynamic_layout=True,
+        assumed_align=b_divisibility,
+    )
+
+    # Allocate output if not provided
+    c_torch_dtype = torch.bfloat16 if c_dtype == cutlass.BFloat16 else torch.float16
+    if C is None:
+        C = torch.empty(m, n, dtype=c_torch_dtype, device="cuda")
+    C_3d = C.unsqueeze(-1)  # (M, N) -> (M, N, 1)
+
+    # For C tensor - use cute_tensor_like and mark_compact_shape_dynamic
+    c_cute, c_torch_gpu = cutlass_torch.cute_tensor_like(
+        C_3d,
+        c_dtype,
+        is_dynamic_layout=True,
+        assumed_align=c_divisibility,
+    )
+    # Set mode and stride_order based on c_major
+    # C_3d has shape (M, N, L) where L=1
+    # n-major: dim 1 (N) has stride 1 -> mode=1, stride_order=(2, 0, 1) meaning (L, M, N)
+    # m-major: dim 0 (M) has stride 1 -> mode=0, stride_order=(2, 1, 0) meaning (L, N, M)
+    if c_major == "n":
+        c_mode = 1
+        c_stride_order = (2, 0, 1)
+    else:  # c_major == "m"
+        c_mode = 0
+        c_stride_order = (2, 1, 0)
+    c_cute = c_cute.mark_compact_shape_dynamic(
+        mode=c_mode,
+        stride_order=c_stride_order,
+        divisibility=c_divisibility,
+    )
+
+    # Create cache key for kernel compilation
+    cache_key = (
+        m, n, k, l,
+        a_dtype, b_dtype, c_dtype,
+        a_major, b_major, c_major,
+        scale_granularity_m, scale_granularity_k,
+        acc_dtype,
+        use_2cta_instrs,
+        mma_tiler_mnk,
+        cluster_shape_mn,
+        use_tma_store,
+    )
+
+    # Check cache or compile kernel
+    if cache_key in _kernel_cache:
+        compiled_kernel = _kernel_cache[cache_key]
+    else:
+        # Create kernel instance
+        kernel = MixedInputGemmKernel(
+            scale_granularity_m,
+            scale_granularity_k,
+            acc_dtype,
+            use_2cta_instrs,
+            mma_tiler_mnk,
+            cluster_shape_mn,
+            use_tma_store,
+        )
+
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_shape_mn[0] * cluster_shape_mn[1],
+        )
+
+        compiled_kernel = cute.compile(
+            kernel,
+            a_cute,
+            a_scale_cute,
+            b_cute,
+            c_cute,
+            max_active_clusters,
+            current_stream,
+        )
+        _kernel_cache[cache_key] = compiled_kernel
+
+    # Execute kernel
+    compiled_kernel(
+        a_cute,
+        a_scale_cute,
+        b_cute,
+        c_cute,
+        current_stream,
+    )
+
+    # Return the 2D output (squeeze the batch dimension)
+    return c_torch_gpu.squeeze(-1)
+
+
+def int4bf16bf16_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    C: Optional[torch.Tensor] = None,
+    scale_granularity_m: int = 1,
+    scale_granularity_k: int = 128,
+    acc_dtype: Optional[type[cutlass.Numeric]] = None,
+    mma_tiler_mnk: tuple[int, int, int] = (128, 128, 128),
+    cluster_shape_mn: tuple[int, int] = (1, 1),
+    use_2cta_instrs: bool = False,
+    use_tma_store: bool = False,
+) -> torch.Tensor:
+    """
+    Perform Int4 x BF16 -> BF16 mixed-input GEMM.
+
+    This is a convenience wrapper around mixed_input_gemm for Int4 inputs with
+    BF16 weights. A_scale is required for Int4 quantized inputs.
+
+    Computes: C = A @ B.T  (with scaling for A)
+
+    Args:
+        A: Input tensor A of shape (M, K) with int8 dtype (Int4 packed).
+        B: Input tensor B of shape (N, K) with bfloat16 dtype.
+        A_scale: Scale tensor for A. Shape should be (M, K // scale_granularity_k).
+        C: Optional output tensor of shape (M, N). If None, will be allocated.
+        scale_granularity_m: Number of elements sharing the same scale along M.
+        scale_granularity_k: Number of elements sharing the same scale along K.
+        acc_dtype: Accumulation dtype. Defaults to Float32.
+        mma_tiler_mnk: MMA tile shape (M, N, K).
+        cluster_shape_mn: Cluster dimensions (M, N).
+        use_2cta_instrs: Whether to use 2CTA MMA instructions.
+        use_tma_store: Whether to use TMA for storing results.
+
+    Returns:
+        Output tensor C of shape (M, N) with bfloat16 dtype.
+    """
+    return mixed_input_gemm(
+        A=A,
+        B=B,
+        A_scale=A_scale,
+        C=C,
+        scale_granularity_m=scale_granularity_m,
+        scale_granularity_k=scale_granularity_k,
+        acc_dtype=acc_dtype,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mn=cluster_shape_mn,
+        use_2cta_instrs=use_2cta_instrs,
+        use_tma_store=use_tma_store,
+    )
+
+
+def int8bf16bf16_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[type[cutlass.Numeric]] = None,
+    mma_tiler_mnk: tuple[int, int, int] = (128, 128, 128),
+    cluster_shape_mn: tuple[int, int] = (1, 1),
+    use_2cta_instrs: bool = False,
+    use_tma_store: bool = False,
+) -> torch.Tensor:
+    """
+    Perform Int8 x BF16 -> BF16 mixed-input GEMM.
+
+    This is a convenience wrapper around mixed_input_gemm for Int8 inputs with
+    BF16 weights. No scale tensor is used for Int8 inputs.
+
+    Computes: C = A @ B.T
+
+    Args:
+        A: Input tensor A of shape (M, K) with int8 dtype.
+        B: Input tensor B of shape (N, K) with bfloat16 dtype.
+        C: Optional output tensor of shape (M, N). If None, will be allocated.
+        acc_dtype: Accumulation dtype. Defaults to Float32.
+        mma_tiler_mnk: MMA tile shape (M, N, K).
+        cluster_shape_mn: Cluster dimensions (M, N).
+        use_2cta_instrs: Whether to use 2CTA MMA instructions.
+        use_tma_store: Whether to use TMA for storing results.
+
+    Returns:
+        Output tensor C of shape (M, N) with bfloat16 dtype.
+    """
+    return mixed_input_gemm(
+        A=A,
+        B=B,
+        A_scale=None,
+        C=C,
+        scale_granularity_m=0,
+        scale_granularity_k=0,
+        acc_dtype=acc_dtype,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mn=cluster_shape_mn,
+        use_2cta_instrs=use_2cta_instrs,
+        use_tma_store=use_tma_store,
+    )
+
+
 def run(
     mnkl: tuple[int, int, int, int],
     scale_granularity_m: int,

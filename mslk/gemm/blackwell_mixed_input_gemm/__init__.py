@@ -5,6 +5,9 @@ __version__ = "0.1.0"
 
 from .mixed_input_gemm import (
     MixedInputGemmKernel,
+    mixed_input_gemm,
+    int4bf16bf16_gemm,
+    int8bf16bf16_gemm,
     run,
     create_tensors,
     compare,
@@ -12,6 +15,9 @@ from .mixed_input_gemm import (
 
 __all__ = [
     "MixedInputGemmKernel",
+    "mixed_input_gemm",
+    "int4bf16bf16_gemm",
+    "int8bf16bf16_gemm",
     "run",
     "create_tensors",
     "compare",
