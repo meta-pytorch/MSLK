@@ -24,6 +24,10 @@ template <
     ck_tile::index_t MaxK,
     ck_tile::index_t MaxSeqlenQ>
 struct grouped_forward_splitkv_mask_bias_dropout_dispatch {
+  template <typename FmhaTraits>
+  using AttentionVariant = ck_tile::ComposedAttention<
+      FmhaTraits::kHasLogitsSoftCap * ck_tile::LOGITS_SOFT_CAP,
+      CK_TILE_FMHA_FWD_FAST_EXP2>;
   template <
       typename FmhaFwdSplitKVTraits,
       typename FmhaMask,
@@ -42,7 +46,7 @@ struct grouped_forward_splitkv_mask_bias_dropout_dispatch {
           ODataType,
           typename FmhaFwdSplitKVShape<MaxK, MaxSeqlenQ>::Type,
           true, // kIsGroupMode
-          ck_tile::StandardAttention,
+          AttentionVariant<FmhaFwdSplitKVTraits>,
           FmhaMask,
           FmhaFwdSplitKVTraits>;
 
@@ -219,7 +223,7 @@ struct grouped_forward_splitkv_mask_bias_dropout_dispatch {
             false, // is_gappy
             param.scale,
             1.0f, // scale_p
-            0.0f, // logits_soft_cap
+            0.f, // logits_soft_cap
             param.q_strides[0], // q, k, v, bias, out_acc tensor seq-dim
                                 // stride
             param.k_strides[0],
@@ -264,7 +268,7 @@ struct grouped_forward_splitkv_mask_bias_dropout_dispatch {
             false, // is_gappy
             param.scale,
             1.0f, // scale_p
-            0.0f, // logits_soft_cap
+            0.f, // logits_soft_cap
             param.q_strides[0], // q, k, v, bias, out tensor seq-dim stride
             param.k_strides[0],
             param.v_strides[0],
