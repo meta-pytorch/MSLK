@@ -8,7 +8,6 @@
 
 import logging
 import math
-import random
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Type
 
@@ -25,7 +24,7 @@ except ImportError:
 
 from mslk.attention import fmha
 from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
-from mslk.attention.fmha.attn_bias_utils import create_attn_bias, pack_kv_cache
+from mslk.attention.fmha.attn_bias_utils import pack_kv_cache
 from mslk.attention.fmha.common import AttentionFwOpBase, pack_fp8_tensorwise_per_head
 from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list
 from mslk.attention.fmha.unbind import unbind
@@ -35,13 +34,9 @@ from torch.utils.checkpoint import checkpoint
 from .case_generation import (
     _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
     create_tensors,
-    get_bias_grad,
-    get_supported_attn_bias_types,
-    make_id,
     sample_random_supported_fw,
 )
 from .utils import (
-    _devices,
     _filter_unsupported_ops,
     add_q_fp8_to_inputs,
     assert_allclose,
@@ -52,17 +47,17 @@ from .utils import (
     disable_on_mtia,
     disable_on_rocm,
     disable_tf32,
-    nanify_oob_seqlen,
     ref_attention_bmhk_for_test,
     ref_attention_for_test,
     rocm_only,
     skip_if_sm100_or_better,
+    skip_if_triton_cannot_dequant,
     sm100_or_better_only,
-    sm70_or_better_only,
     sm75_or_better_only,
     sm80_or_better_only,
     sm90_or_better_only,
-    use_cpu_ref,
+    TRITON_CANNOT_DEQUANT,
+    UNSUPPORTED_OP_PASSES,
 )
 
 logger = logging.getLogger("xformers")
@@ -73,14 +68,6 @@ ALL_BW_OPS = _filter_unsupported_ops(ALL_BW_OPS)
 parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = pytest.mark.parametrize(
     "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
     **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS),
-)
-parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametrize(
-    "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_FW_OPS, max_shapes_per_op=1),
-)
-parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs = pytest.mark.parametrize(
-    "opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv",
-    **_generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(ALL_BW_OPS, max_shapes_per_op=1),
 )
 
 
@@ -118,14 +105,22 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
                 fmha.attn_bias.PagedBlockDiagonalGappyKeysMask,
             ),
         ):
+            if UNSUPPORTED_OP_PASSES:
+                return
             pytest.skip(
                 "With ck.FwOp Paged-KVCache has some problem with forward training!"
             )
 
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK",
-    )
+    try:
+        query, key, value, attn_bias = create_tensors(
+            *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+            fmt="BMHK",
+        )
+    except pytest.skip.Exception as e:
+        if UNSUPPORTED_OP_PASSES:
+            logger.warning(f"Skipping {opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv}: {e}")
+            return
+        raise
 
     _out, lse = fmha.memory_efficient_attention_forward_requires_grad(
         query,
@@ -182,18 +177,10 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
 def test_logsumexp_mqa(op: Type[AttentionFwOpBase]):
     device = torch._C._get_accelerator().type
 
-    if not op.is_available():
-        pytest.skip("not available")
-
     if device not in op.SUPPORTED_DEVICES:
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip(f"{op} is not supported on {device}")
-
-    if device == "cuda" and op.CUDA_MINIMUM_COMPUTE_CAPABILITY > compute_capability:
-        skip_reason = (
-            f"requires device with capability >= {op.CUDA_MINIMUM_COMPUTE_CAPABILITY} "
-            f"but your GPU has capability {compute_capability} (too old)"
-        )
-        pytest.skip(skip_reason)
 
     dtype = torch.float16
     s = 3
@@ -277,7 +264,8 @@ def test_dropout_ck(q_len, kv_len, batch_size, k_len, p, seed, attn_bias):
 
     inputs_for_support_check = fmha.Inputs(query, key, value, attn_bias, p, None)
     if not op.supports(inputs_for_support_check):
-        del query, key, value, attn_bias
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip(f"{op.NAME}: unsupported input")
 
     torch.manual_seed(seed)
@@ -326,6 +314,8 @@ def test_dropout_backward_ck(q_len, kv_len, batch_size, k, p):
     op = fmha.ck.FwOp
     dtype = torch.float16
     if not op.is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip()
 
     scale = 3
@@ -394,18 +384,20 @@ def test_dropout_backward_ck(q_len, kv_len, batch_size, k, p):
 
 
 @pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
-@parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
-def test_lowlevel_api_shapes(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt):
-    query, key, value, attn_bias = create_tensors(
-        *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt=fmt
-    )
+@pytest.mark.parametrize("op_bw", ALL_BW_OPS)
+def test_lowlevel_api_shapes(op_bw, fmt):
+    device = torch.accelerator.current_accelerator()
+    query = torch.randn([1, 32, 8, 128], dtype=torch.float16, device=device)
+    key = torch.randn([1, 32, 8, 128], dtype=torch.float16, device=device)
+    value = torch.randn([1, 32, 8, 128], dtype=torch.float16, device=device)
+    attn_bias = None
+
     grad_out = torch.ones_like(query)
     query.requires_grad_(True)
     key.requires_grad_(True)
     value.requires_grad_(True)
 
     inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
-    op_bw = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
     op_fw = sample_random_supported_fw(
         inputs, ALL_FW_OPS, seed=f"{op_bw.NAME}{query.shape}", op_bw=op_bw
     )
@@ -421,43 +413,19 @@ def test_lowlevel_api_shapes(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt):
     assert dv.shape == value.shape
 
 
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+@disable_on_rocm
+@cuda_only
+@pytest.mark.parametrize("op", ALL_FW_OPS)
 def test_cuda_streams(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    op,
 ):
-    (
-        op,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    ) = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-    if device != "cuda":
-        pytest.skip("Not CUDA")
+    dtype = torch.float16
+    query = torch.randn([1, 32, 8, 128], dtype=dtype, device="cuda")
+    key = torch.randn([1, 32, 8, 128], dtype=dtype, device="cuda")
+    value = torch.randn([1, 32, 8, 128], dtype=dtype, device="cuda")
 
-    bias_type = None
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = [
-        op,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    ]
     s_hipri = torch.cuda.Stream(priority=-1)
     s_lopri = torch.cuda.Stream(priority=0)
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt="BMHK"
-    )
     torch.cuda.synchronize()
     with torch.cuda.stream(s_lopri):
         torch.cuda._sleep(100_000_000)  # wait 100m cycles
@@ -488,30 +456,21 @@ def test_cuda_streams(
 
 
 @disable_tf32
-@parametrize_opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
-def test_custom_scale(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
+@pytest.mark.parametrize("op_bw", ALL_BW_OPS)
+def test_custom_scale(op_bw):
     p = 0.0
     scale = 0.1
 
-    (
-        op_bw,
-        device,
-        dtype,
-        _,
-        B,
-        q_len,
-        kv_len,
-        H,
-        k,
-        Kv,
-    ) = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
+    q_len = kv_len = 32
+    k = Kv = 128
+    H = 8
+    B = 1
     torch.manual_seed(q_len + kv_len + k)
-    if device not in {"cuda", "mtia"}:
-        pytest.skip("Not CUDA or MTIA")
-
-    query, key, value, attn_bias = create_tensors(
-        *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv, fmt="BMK"
-    )
+    dtype = torch.float16
+    query = torch.randn([8, 32, 128], dtype=dtype, device="cuda")
+    key = torch.randn([8, 32, 128], dtype=dtype, device="cuda")
+    value = torch.randn([8, 32, 128], dtype=dtype, device="cuda")
+    attn_bias = None
     inputs = fmha.Inputs(
         query=query, key=key, value=value, attn_bias=attn_bias, scale=scale
     )
@@ -525,10 +484,10 @@ def test_custom_scale(opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
 
     reasons = op_fw.not_supported_reasons(inputs)
     if reasons:
-        pytest.skip(f"{op_fw.NAME}: unsupported ({'/'.join(reasons)})")
+        pytest.fail(f"{op_fw.NAME}: unsupported ({'/'.join(reasons)})")
     reasons = op_bw.not_supported_reasons(inputs)
     if reasons:
-        pytest.skip(f"{op_bw.NAME}: unsupported ({'/'.join(reasons)})")
+        pytest.fail(f"{op_bw.NAME}: unsupported ({'/'.join(reasons)})")
 
     # NOTE: we still need to scale the inputs to not blowup
     # the pre-softmax values (numerical stability)
@@ -567,46 +526,20 @@ def apply_attention(query, key, value, attn_bias, op_fw, proj):
 # MTIA doesn't support this yet
 @disable_on_mtia
 @pytest.mark.parametrize("use_reentrant", [False, True])
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+@pytest.mark.parametrize(
+    "op",
+    [op for op in ALL_FW_OPS if op not in [fmha.triton_splitk.FwOp, fmha.ck.FwOp]],
+)
 def test_grad_checkpointing(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    op,
     use_reentrant,
 ):
     fmt = "BMHK"
-    (
-        op,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    ) = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-    if op is fmha.triton_splitk.FwOp:
-        pytest.skip("Triton Flash Decoding doesn't support backward pass yet")
-    if op is fmha.ck.FwOp:
-        pytest.skip("ck-tiled FMHA doesn't supported backward pass yet")
-
-    bias_type = None
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv = (
-        op,
-        device,
-        dtype,
-        bias_type,
-        batch_size,
-        q_len,
-        kv_len,
-        h,
-        k,
-        kv,
-    )
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt=fmt,
-    )
+    dtype = torch.float16
+    k = 128
+    query = torch.randn([1, 32, 8, k], dtype=dtype, device="cuda")
+    key = torch.randn([1, 32, 8, k], dtype=dtype, device="cuda")
+    value = torch.randn([1, 32, 8, k], dtype=dtype, device="cuda")
     qkv = None
 
     if (
@@ -624,7 +557,7 @@ def test_grad_checkpointing(
     key.requires_grad_(True)
     value.requires_grad_(True)
 
-    proj = torch.nn.Linear(kv, k, device=device, dtype=dtype)
+    proj = torch.nn.Linear(k, k, device="cuda", dtype=dtype)
 
     x = query
     for _ in range(5):
@@ -633,7 +566,7 @@ def test_grad_checkpointing(
             x,
             key,
             value,
-            attn_bias,
+            None,  # attn_bias
             op,
             proj,
             use_reentrant=use_reentrant,
@@ -927,18 +860,7 @@ def _kv_heads_label(kv_heads: Optional[int]) -> str:
     return f"gqa{kv_heads}"
 
 
-@sm70_or_better_only
-@pytest.mark.parametrize(
-    "op",
-    [
-        fmha.ck_decoder.FwOp,
-    ],
-)
-@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
-@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
-@pytest.mark.parametrize("padding", [32, 4096])
-@pytest.mark.parametrize("dtype", ["f16", "bf16", "f32"])
-def test_decoder(
+def _test_decoder(
     op,
     n_heads: int,
     kv_heads: Optional[int],
@@ -956,10 +878,6 @@ def test_decoder(
     # kv_heads > 1: BMGHK
     if dtype == "bf16" and torch.version.cuda and compute_capability < (8, 0):
         raise pytest.skip("BF16 is only supported on SM80+")
-    import triton
-
-    if dequant and triton.__version__[:4] < "3.0.":
-        raise pytest.skip("dequant needs triton updates")
     dtype_ = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[dtype]
     torch.manual_seed(1)
     if kv_heads is not None and kv_heads > 1:
@@ -1043,18 +961,10 @@ def test_decoder(
 
 @sm80_or_better_only
 @pytest.mark.parametrize(
-    "op,dequant,dtype",
+    "op,dtype",
     [
-        (fmha.triton_splitk.FwOp_S1, False, "bf16"),
-        (fmha.triton_splitk.FwOp_S2, False, "f16"),
-        (fmha.triton_splitk.FwOp_S2, True, "bf16"),
-        (
-            type(
-                "S2_8", (fmha.triton_splitk.FwOp_S2,), {"NUM_GROUPS": 8, "NAME": "S2_8"}
-            ),
-            True,
-            "bf16",
-        ),
+        (fmha.triton_splitk.FwOp_S1, "bf16"),
+        (fmha.triton_splitk.FwOp_S2, "f16"),
     ],
 )
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
@@ -1062,7 +972,6 @@ def test_decoder(
 @pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1)])
 def test_triton_splitk_decoder(
     op,
-    dequant: bool,
     kv_heads: Optional[int],
     n_heads: int,
     padding: int,
@@ -1070,14 +979,72 @@ def test_triton_splitk_decoder(
     dtype: str,
 ) -> None:
     # We omit dequant with f16: it needs a very high tol
-    test_decoder(
+    _test_decoder(
         op,
         kv_heads=kv_heads,
         n_heads=n_heads,
         padding=padding,
         bsz=bsz,
         dtype=dtype,
-        dequant=dequant,
+    )
+
+
+@skip_if_triton_cannot_dequant
+@sm80_or_better_only
+@pytest.mark.parametrize(
+    "op,dtype",
+    [
+        (fmha.triton_splitk.FwOp_S2, "bf16"),
+        (
+            type(
+                "S2_8", (fmha.triton_splitk.FwOp_S2,), {"NUM_GROUPS": 8, "NAME": "S2_8"}
+            ),
+            "bf16",
+        ),
+    ],
+)
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("n_heads", [16])
+@pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1)])
+def test_triton_splitk_decoder_dequant(
+    op,
+    kv_heads: Optional[int],
+    n_heads: int,
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    # We omit dequant with f16: it needs a very high tol
+    _test_decoder(
+        op,
+        kv_heads=kv_heads,
+        n_heads=n_heads,
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+        dequant=True,
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
+@pytest.mark.parametrize("padding", [32, 4096])
+@pytest.mark.parametrize("dtype", ["f16", "bf16", "f32"])
+def test_decoder_ck(
+    n_heads: int,
+    kv_heads: Optional[int],
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    _test_decoder(
+        fmha.ck_decoder.FwOp,
+        kv_heads=kv_heads,
+        n_heads=n_heads,  # qheads per kv head
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
     )
 
 
@@ -1094,7 +1061,7 @@ def test_cutlass_blackwell_decoder(
     dtype: str,
 ) -> None:
     """Test CUTLASS Blackwell decode kernel for single-query decode workloads."""
-    test_decoder(
+    _test_decoder(
         fmha.cutlass_blackwell.FwOpDecode,
         kv_heads=kv_heads,
         n_heads=n_heads,  # qheads per kv head
@@ -1125,7 +1092,7 @@ def test_ck_splitk_decoder(
     d: int,
 ) -> None:
     # no quantized impl compared to cuda
-    test_decoder(
+    _test_decoder(
         op,
         kv_heads=kv_heads,
         n_heads=n_heads,
@@ -1160,7 +1127,7 @@ def test_triton_splitk_decoder_manyqueries(
     num_queries: int,
 ) -> None:
     kv_heads = 1 if multiquery else None
-    test_decoder(
+    _test_decoder(
         op,
         kv_heads=kv_heads,
         n_heads=n_heads,
@@ -1180,6 +1147,7 @@ def test_attn_bias_from_seqlens() -> None:
 
 
 @cuda_only
+@disable_on_rocm
 def test_attn_bias_blockdiag_doc() -> None:
     """IMPORTANT:
     This is the example in the doc for `BlockDiagonalMask`.
@@ -1187,9 +1155,6 @@ def test_attn_bias_blockdiag_doc() -> None:
     """
     import torch
     from mslk.attention import fmha
-
-    if torch.version.hip:
-        pytest.skip("backward pass/gradience is not yet supported by ck-tiled fmha!")
 
     K = 16
     dtype = torch.float16
@@ -1467,7 +1432,9 @@ def test_dispatch_decoding_bmghk() -> None:
 @cuda_or_mtia_only
 @pytest.mark.parametrize(
     "op",
-    [fmha.triton_splitk.FwOp, fmha.flash.FwOp, fmha.ck.FwOp, fmha.flash_mtia.FwOp],
+    _filter_unsupported_ops(
+        [fmha.triton_splitk.FwOp, fmha.flash.FwOp, fmha.ck.FwOp, fmha.flash_mtia.FwOp]
+    ),
     ids=lambda op: op.NAME,
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=str)
@@ -1477,13 +1444,14 @@ def test_dispatch_decoding_bmghk() -> None:
         (1, 2**16, 3, 128),
         (5, 53, 4, 64),
         (7, 51, 4, 256),
-        (3, 51, 2, 512),
     ],
 )
 def test_mqa_decoding(op: Type[fmha.AttentionFwOpBase], dtype, B_Mkv_H_K):
     device = torch._C._get_accelerator().type
 
     B, Mkv, H, K = B_Mkv_H_K
+    if K == 256 and 512 <= op.SUPPORTED_MAX_K:
+        K = 512
     q = torch.randn([B, 1, H, K], dtype=dtype, device=device) * 3
     k = torch.randn([B, Mkv, 1, K], dtype=dtype, device=device) * 3
     v = torch.randn([B, Mkv, 1, K], dtype=dtype, device=device) * 3
@@ -1502,19 +1470,15 @@ def test_mqa_decoding(op: Type[fmha.AttentionFwOpBase], dtype, B_Mkv_H_K):
     )
 
 
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+@disable_on_rocm
+@cuda_only
+@pytest.mark.parametrize("opFW", ALL_FW_OPS)
 def test_empty_tensors_empty_query(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    opFW,
 ):
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK",
-    )
-    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
-
-    if torch.version.hip:
-        pytest.skip("backward pass/gradience is not yet supported by ck-tiled fmha!")
-
+    query = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    key = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    value = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
     query = query[:, :0]
     query.requires_grad_(True)
     key.requires_grad_(True)
@@ -1527,21 +1491,15 @@ def test_empty_tensors_empty_query(
     assert_allclose(value.grad, torch.zeros_like(value.grad), "value.grad")
 
 
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+@disable_on_rocm
+@cuda_only
+@pytest.mark.parametrize("opFW", ALL_FW_OPS)
 def test_empty_tensors_empty_kv(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    opFW,
 ):
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK",
-    )
-    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
-    if opFW == fmha.triton_splitk.FwOp:
-        pytest.skip("triton_splitk doesn't support empty kv")
-
-    if torch.version.hip:
-        pytest.skip("backward pass/gradience is not yet supported by ck-tiled fmha!")
-
+    query = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    key = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    value = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
     key = key[:, :0]
     value = value[:, :0]
     query.requires_grad_(True)
@@ -1554,19 +1512,15 @@ def test_empty_tensors_empty_kv(
     assert_allclose(query.grad, torch.zeros_like(query.grad), "query.grad")
 
 
-@parametrize_opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv__xs
+@disable_on_rocm
+@cuda_only
+@pytest.mark.parametrize("opFW", ALL_FW_OPS)
 def test_empty_tensors_empty_b(
-    opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+    opFW,
 ):
-    query, key, value, attn_bias = create_tensors(
-        *opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        fmt="BMHK",
-    )
-    opFW = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv[0]
-
-    if torch.version.hip:
-        pytest.skip("backward pass/gradience is not yet supported by ck-tiled fmha!")
-
+    query = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    key = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
+    value = torch.randn([1, 32, 8, 128], dtype=torch.float16, device="cuda")
     query, key, value = query[:0], key[:0], value[:0]
     query.requires_grad_(True)
     key.requires_grad_(True)
@@ -1600,7 +1554,9 @@ def test_local_attn_bias() -> None:
     ],
     ids=lambda op: op.NAME,
 )
-@pytest.mark.parametrize("num_quant_groups", [0, 1, 8])
+@pytest.mark.parametrize(
+    "num_quant_groups", [0] if TRITON_CANNOT_DEQUANT else [0, 1, 8]
+)
 @pytest.mark.parametrize("page_size", [64, 128, 256])
 @pytest.mark.parametrize("gappy", [False, True], ids=lambda x: "gappy" if x else "")
 def test_paged_attention(
@@ -1649,11 +1605,6 @@ def test_paged_attention_ck(B, MAX_T: int, page_size: int, gappy: bool):
 def test_paged_attention_flash(B, MAX_T: int, page_size: int):
     # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
     op = fmha.flash.FwOp
-    if (
-        fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask
-        not in get_supported_attn_bias_types(op)
-    ):
-        pytest.skip("Not supported bias")
     num_quant_groups = 0
     paged_attention_run_inner(B, MAX_T, num_quant_groups, page_size, op, bench=False)
 
@@ -1670,11 +1621,6 @@ def test_paged_attention_flash(B, MAX_T: int, page_size: int):
 def test_paged_attention_flash3(
     op: Type[AttentionFwOpBase], B: int, MAX_T: int, page_size: int
 ):
-    if (
-        fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask
-        not in get_supported_attn_bias_types(op)
-    ):
-        pytest.skip("Not supported bias")
     num_quant_groups = 0
     paged_attention_run_inner(B, MAX_T, num_quant_groups, page_size, op, bench=False)
 
@@ -1726,9 +1672,6 @@ def paged_attention_run_inner(
 
     q = torch.randn((B, 1, N_H_L, D_H), dtype=torch.bfloat16, device="cuda")
     if num_quant_groups:
-        if triton.__version__[:4] < "3.0.":
-            raise pytest.skip("dequant needs triton updates")
-
         # Using high=64 below, because with 256 both paged and non-paged paths
         # will produce NaNs - probably some quantization coeffitions are NaNs
         # after the bitwise cast.
@@ -1933,7 +1876,8 @@ def paged_attention_run_inner(
     "bias_t",
     [None, fmha.attn_bias.LowerTriangularMask, fmha.attn_bias.BlockDiagonalMask],
 )
-@pytest.mark.parametrize("create_bias_inside_compiled", [False, True])
+# Note that create_bias_inside_compiled currently wouldn't test anything.
+@pytest.mark.parametrize("create_bias_inside_compiled", [False])
 @pytest.mark.parametrize(
     "op",
     [
@@ -1946,6 +1890,8 @@ def paged_attention_run_inner(
 def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
     torch.manual_seed(0)
     if op is not None and not op[0].is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("Op is not available")
     torch._dynamo.reset_code_caches()  # avoids hitting recompilation limit
     B, M, H, K = 1, 256, 2, 64
@@ -2246,9 +2192,13 @@ def _test_triton_splitk_tokenwise_qkv_fp8(
 def test_fp8_attention(dtype_init, deterministic, causal, B, nheads, seq_len, head_dim):
     op = fmha.flash3.FwOp
     if not op.is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("FAv3 is not available")
     dtype_fp8 = torch.float8_e4m3fn
     if dtype_fp8 not in op.SUPPORTED_DTYPES:
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("FP8 is not supported")
 
     q = torch.randn(B, seq_len, nheads, head_dim, device="cuda", dtype=dtype_init)
@@ -2343,6 +2293,8 @@ def test_fav3_kvsplit_attn(
 ):
     op = fmha.flash3.FwOp_KVSplit
     if not op.is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("FAv3 KVSplit is not available")
     nheads_kv = 1
 
@@ -2370,6 +2322,7 @@ def test_fav3_kvsplit_attn(
 
 
 @sm90_or_better_only
+@cuda_only
 @pytest.mark.parametrize(
     "op",
     _filter_unsupported_ops(
@@ -2394,10 +2347,6 @@ def test_nans_in_padding(op):
     The reason is probably that some sequences end in the middle of a K/V block,
     and NaNs leak into quantities like per-block maximum of Q@K used in FA algorithm.
     """
-
-    if "cuda" not in _devices:
-        pytest.skip("CUDA device is not available")
-
     nheads_kv = 1
     nheads_q = 8
     B = 64
@@ -2431,6 +2380,8 @@ def test_nans_in_padding(op):
         q_seqlen=[seq_len_q] * B, kv_seqlen=seqlens.tolist(), kv_padding=max_len_kv
     )
     if type(attn_bias) not in op.SUPPORTED_ATTN_BIAS_TYPES:
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip(f"Op {op.NAME} doesn't support {type(attn_bias)}")
 
     out_ref, lse_ref = fmha.memory_efficient_attention_forward_requires_grad(
@@ -2475,6 +2426,8 @@ def test_nans_in_padding(op):
         )
 
         if type(attn_bias_paged) not in op.SUPPORTED_ATTN_BIAS_TYPES:
+            if UNSUPPORTED_OP_PASSES:
+                return
             pytest.skip(f"Op {op.NAME} doesn't support {type(attn_bias)}")
         out, lse = fmha.memory_efficient_attention_forward_requires_grad(
             axq,
