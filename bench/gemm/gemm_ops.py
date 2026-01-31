@@ -83,6 +83,16 @@ except ImportError:
     MACHETE_ENABLED = False
 
 
+# CuteDSL mixed-input GEMM for Blackwell.
+try:
+    import cutlass
+    from mslk.gemm.blackwell_mixed_input_gemm import int4bf16bf16_gemm
+
+    CUTEDSL_MIXED_INPUT_ENABLED = True
+except ImportError:
+    CUTEDSL_MIXED_INPUT_ENABLED = False
+
+
 class Accelerator(Enum):
     NVIDIA_SM90 = auto()
     NVIDIA_SM100 = auto()
@@ -3340,3 +3350,178 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
+
+
+@register_gemm_op
+class I4BF16CuteDSLGemm(GemmOpBase):
+    """
+    CuteDSL Mixed-Input GEMM for Blackwell (SM100+).
+    Supports Int4 (x) x BF16 (w) using convert-scale mode.
+
+    This implementation uses the mixed_input_gemm function which takes
+    torch tensors as input directly. Activation (x) is quantized to int4
+    and weight (w) is in BF16.
+    """
+
+    def __init__(self):
+        # Default configuration for Int4 x BF16
+        self._scale_granularity_m = 1
+        self._scale_granularity_k = 128
+        self._acc_dtype = cutlass.Float32 if CUTEDSL_MIXED_INPUT_ENABLED else None
+
+    def _int4_quantize(
+        self,
+        x: torch.Tensor,
+        group_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize tensor to int4 with per-group scaling.
+
+        Args:
+            x: Input tensor of shape (M, K) in bf16/fp16.
+            group_size: Number of elements per quantization group along K.
+
+        Returns:
+            x_quant: Quantized tensor of shape (M, K) in int8 (packed int4).
+            scales: Scale tensor of shape (M, K // group_size) in bf16.
+        """
+        m, k = x.shape
+        num_groups = k // group_size
+
+        # Reshape for group-wise quantization: (M, K) -> (M, num_groups, group_size)
+        x_reshaped = x.reshape(m, num_groups, group_size).float()
+
+        # Compute scales per group (M, num_groups, 1)
+        max_val = x_reshaped.abs().amax(dim=2, keepdim=True)
+        max_int4 = 7  # Max value for signed 4-bit integer (-8 to 7)
+        scales = max_val.clamp(min=1e-6) / max_int4
+
+        # Quantize: scale -> round -> clamp
+        x_quant = (x_reshaped / scales).round().clamp(-max_int4, max_int4)
+        x_quant = x_quant.to(torch.int8).reshape(m, k)
+
+        # Make scale m-major, and reshape scales: (M, num_groups, 1) -> (M, num_groups)
+        scales = scales.permute(2, 1, 0).contiguous().permute(2, 1, 0)
+        scales = scales.squeeze(-1).to(x.dtype)
+
+        return x_quant, scales
+
+    def preprocess(self, x, w):
+        """Preprocess inputs - just pass through for quantization step."""
+        return x, w
+
+    def quantize(self, x, w):
+        """Quantize activation (x) to Int4 format with scales.
+
+        Args:
+            x: Activation tensor of shape (M, K) in bf16.
+            w: Weight tensor of shape (N, K) in bf16.
+
+        Returns:
+            Tuple of (x_quant, x_scale, w, output_tensor, shape).
+        """
+        m, k = x.shape
+        n, _ = w.shape
+
+        # Quantize x to int4 with group-wise scales
+        x_quant, x_scale = self._int4_quantize(x, self._scale_granularity_k)
+
+        # Allocate output tensor
+        output = torch.empty(m, n, dtype=w.dtype, device=w.device)
+
+        return x_quant, x_scale, w, output, (m, n, k)
+
+    def compute(self, x_quant, x_scale, w, output, shape):
+        """Execute the mixed-input GEMM kernel.
+
+        Args:
+            x_quant: Quantized activation tensor (M, K) in int8.
+            x_scale: Scale tensor (M, K // group_size) in bf16.
+            w: Weight tensor (N, K) in bf16.
+            output: Output tensor (M, N) in bf16.
+            shape: Tuple of (M, N, K).
+
+        Returns:
+            Output tensor of shape (M, N) in bf16.
+        """
+        return int4bf16bf16_gemm(
+            A=x_quant,
+            B=w,
+            A_scale=x_scale,
+            C=output,
+            scale_granularity_m=self._scale_granularity_m,
+            scale_granularity_k=self._scale_granularity_k,
+            acc_dtype=self._acc_dtype,
+        )
+
+    def quantize_and_compute(self, x, w):
+        preprocessed = self.preprocess(x, w)
+        quantized = self.quantize(*preprocessed)
+        return self.compute(*quantized)
+
+    @property
+    def name(self) -> str:
+        return "int4bf16_cutedsl_gemm"
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
+    @property
+    def supported(self) -> bool:
+        """Check if the op is supported on current hardware and dependencies are available."""
+        if not CUTEDSL_MIXED_INPUT_ENABLED:
+            return False
+        accelerator = get_current_accelerator()
+        if accelerator not in self.supported_accelerators:
+            return False
+        return True
+
+
+@register_gemm_op
+class BF16I4CuteDSLGemm(I4BF16CuteDSLGemm):
+    """
+    CuteDSL Mixed-Input GEMM for Blackwell (SM100+).
+    Supports BF16 (x) x Int4 (w) using convert-scale mode.
+
+    This is the transpose variant of I4BF16CuteDSLGemm. Here the weight
+    (w) is quantized to Int4 and x (activation) is in BF16.
+    """
+
+    def preprocess(self, x, w):
+        """Preprocess inputs - keep original order for activation quantization."""
+        return w, x
+
+    def compute(self, w_quant, w_scale, x, output, shape):
+        """Execute the mixed-input GEMM kernel.
+
+        Args:
+            w_quant: Quantized activation tensor (N, K) in int8.
+            w_scale: Scale tensor (N, K // group_size) in bf16.
+            x: Weight tensor (M, K) in bf16.
+            output: Output tensor (M, N) in bf16.
+            shape: Tuple of (M, N, K).
+
+        Returns:
+            Output tensor of shape (M, N) in bf16.
+        """
+        return int4bf16bf16_gemm(
+            A=w_quant,
+            B=x,
+            A_scale=w_scale,
+            C=output,
+            scale_granularity_m=self._scale_granularity_m,
+            scale_granularity_k=self._scale_granularity_k,
+            acc_dtype=self._acc_dtype,
+        ).T
+
+    @property
+    def name(self) -> str:
+        return "bf16int4_cutedsl_gemm"
