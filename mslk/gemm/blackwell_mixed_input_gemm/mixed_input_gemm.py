@@ -2105,7 +2105,7 @@ class MixedInputGemmKernel:
         """
         Check if the kernel can be implemented for the given tensor shapes and data types.
         """
-        m, n, k, l = mnkl
+        m, n, k, _ = mnkl
 
         if not MixedInputGemmKernel.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler, cluster_shape_mn, use_2cta_instrs
@@ -2140,7 +2140,7 @@ class MixedInputGemmKernel:
         return True
 
 
-def create_i4_tensor_and_scale(
+def create_i4_tensor_and_scale(  # noqa: E741
     l: int,
     m: int,
     k: int,
@@ -2271,7 +2271,7 @@ def create_tensor_a(
 
 
 def create_tensors(
-    l: int,
+    l: int,  # noqa: E741
     m: int,
     n: int,
     k: int,
@@ -2491,7 +2491,7 @@ def mixed_input_gemm(
     # Get dimensions - A is (M, K), B is (N, K)
     m, k = A.shape
     n = B.shape[0]
-    l = 1  # Batch size
+    l = 1  # Batch size  # noqa: E741
     # Assert correct contraction dim
     assert (
         k == B.shape[1]
@@ -2790,7 +2790,7 @@ def run(
     optionally compares results with a reference implementation and reports
     kernel execution time.
     """
-    m, n, k, l = mnkl
+    m, n, k, l = mnkl  # noqa: E741
 
     if not torch.cuda.is_available():
         raise ValueError("CUDA is not available")

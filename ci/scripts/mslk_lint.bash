@@ -145,20 +145,26 @@ lint_mslk_copyright () {
 
   local ignored_paths=(
     mslk/attention/flash_attn
+    mslk/gemm/blackwell_mixed_input_gemm/__init__.py
+    mslk/gemm/blackwell_mixed_input_gemm/mixed_input_gemm.py
     test/attention/test_flash_attn.py
     test/attention/test_flash_attn_varlen.py
+    test/gemm/test_blackwell_mixed_input_gemm.py
   )
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
+  local fail_count=0
 
   for p in "${lint_paths[@]}"; do
     # shellcheck disable=SC2086
     (print_exec conda run ${env_prefix} python test/lint/check_meta_header.py \
       --path="${p}" \
       --ignore="$(IFS=','; echo "${ignored_paths[*]}")" \
-      --fixit=False) || return 1
+      --fixit=False) || ((fail_count++))
   done
+
+  ((fail_count == 0)) || return 1
 
   echo "[TEST] Finished running Meta Copyright Header checks"
 }

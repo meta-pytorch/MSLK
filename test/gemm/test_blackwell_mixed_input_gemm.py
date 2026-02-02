@@ -43,7 +43,7 @@ class TestMixedInputGemmNumeric:
         import cutlass.utils as utils
         import cuda.bindings.driver as cuda_bindings
 
-        m, n, k, l = mnkl
+        m, n, k, l = mnkl  # noqa: E741
 
         if not MixedInputGemmKernel.can_implement(
             mnkl,
