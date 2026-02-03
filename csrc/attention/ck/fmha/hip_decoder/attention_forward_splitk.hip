@@ -143,7 +143,7 @@ at::Tensor& efficient_attention_forward_decoder_splitk_ck_out_impl(
       WavefrontsPerBlock; // 4 * threadsPerBlock * sizeof(float) ==
                           // sizeof(O[b][0][h][:])
   const size_t attn_lds_bytes = max(smem_softmax, smem_output);
-  auto stream = at::hip::getCurrentHIPStream().stream();
+  auto stream = at::cuda::getCurrentHIPStream().stream();
 
   AT_DISPATCH_SWITCH_3(
       at::ScalarType::Half,
