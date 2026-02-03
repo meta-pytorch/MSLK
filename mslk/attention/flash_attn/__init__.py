@@ -7,16 +7,6 @@ import cutlass.cute as cute
 
 from .interface import (
     flash_attn_func,
-    flash_attn_varlen_func,
+    # TODO: enable this
+    # flash_attn_varlen_func,
 )
-
-from mslk.attention.flash_attn.cute_dsl_utils import cute_compile_patched
-
-# Patch cute.compile to optionally dump SASS
-cute.compile = cute_compile_patched
-
-
-__all__ = [
-    "flash_attn_func",
-    "flash_attn_varlen_func",
-]
