@@ -1786,7 +1786,7 @@ def _kernel_matmul_fp8_block_fastacc(
             )
             scale = a_scale * b_scale
             if k + 1 == tl.cdiv(K, BLOCK_K * SPLIT_K):
-                scale_next_inv_scale = scale
+                scale_next_inv_scale = scale.to(tl.float32)
             else:
                 a_scale_next = tl.load(
                     A_scale + scale_m * stride_scale_am + scale_k_next * stride_scale_ak
@@ -1795,7 +1795,7 @@ def _kernel_matmul_fp8_block_fastacc(
                     B_scale + scale_n * stride_scale_bn + scale_k_next * stride_scale_bk
                 )
                 scale_next = a_scale_next * b_scale_next
-                scale_next_inv_scale = scale / scale_next
+                scale_next_inv_scale = (scale / scale_next).to(tl.float32)
             acc *= scale_next_inv_scale
 
     # rematerialize rm and rn to save registers
