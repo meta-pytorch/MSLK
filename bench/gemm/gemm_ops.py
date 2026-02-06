@@ -4,12 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Keep a registry of all quantize operators.
 import abc
 import functools
 from enum import auto, Enum
 
-import numpy as np
 import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
@@ -23,8 +21,6 @@ from mslk.quantize.triton.fp4_quantize import (
     mega_fp4_unpack,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
-    triton_scale_nvfp4_quant_rms,
-    triton_scale_nvfp4_quant_silu,
 )
 from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
@@ -35,12 +31,6 @@ from mslk.quantize.triton.fp8_quantize import (
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
-try:
-    from gen_ai.llm_inference.fb.llm.kernel.rms_norm import rms_norm
-    from gen_ai.llm_inference.fb.llm.kernel.silu_mul import silu_mul
-except ImportError:
-    # Above is used for some experiments, but the quantize is not relying on them. Okay to just skip.
-    pass
 
 try:
     from tinygemm.utils import group_quantize_tensor
@@ -175,10 +165,10 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         )
         return t
 
-    @abc.abstractproperty
+    @property
     def name(self) -> str:
         """Name of the operator."""
-        pass
+        return self.__class__.__name__
 
     @abc.abstractproperty
     def supported_accelerators(self) -> set[Accelerator]:
@@ -212,7 +202,7 @@ def get_gemm_ops() -> list[GemmOpBase]:
 
 
 @register_gemm_op
-class FP32Baseline(GemmOpBase):
+class TorchFP32(GemmOpBase):
     """
     FP32 matmul baseline.
     """
@@ -227,7 +217,7 @@ class FP32Baseline(GemmOpBase):
         return x, w
 
     def compute(self, x, w):
-        # Handle both grouped and standard gemm.
+        # Handle both grouped and standard Gemm.
         if isinstance(x, list):
             output = []
             for i in range(len(x)):
@@ -237,10 +227,6 @@ class FP32Baseline(GemmOpBase):
 
     def quantize_and_compute(self, x, w):
         return self.compute(*self.quantize(x, w))
-
-    @property
-    def name(self) -> str:
-        return "fp32_baseline"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -256,7 +242,7 @@ class FP32Baseline(GemmOpBase):
 
 
 @register_gemm_op
-class TF32Baseline(GemmOpBase):
+class TorchTF32(GemmOpBase):
     """
     TF32 matmul baseline.
     """
@@ -271,7 +257,7 @@ class TF32Baseline(GemmOpBase):
         return x, w
 
     def compute(self, x, w):
-        # Handle both grouped and standard gemm.
+        # Handle both grouped and standard Gemm.
         original_precision = torch.get_float32_matmul_precision()
         torch.set_float32_matmul_precision("high")
         if isinstance(x, list):
@@ -287,10 +273,6 @@ class TF32Baseline(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "tf32_baseline"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -304,7 +286,7 @@ class TF32Baseline(GemmOpBase):
 
 
 @register_gemm_op
-class BF16Baseline(GemmOpBase):
+class TorchBF16(GemmOpBase):
     """
     Baseline BF16 matmul.
     """
@@ -331,10 +313,6 @@ class BF16Baseline(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "bf16_baseline"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -348,7 +326,7 @@ class BF16Baseline(GemmOpBase):
 
 
 @register_gemm_op
-class ScaledMMBaseline(GemmOpBase):
+class TorchFP8Tensorwise(GemmOpBase):
     """
     Reference FP8 matmul implemented in native torch with cublas or hipblas.
     """
@@ -414,10 +392,6 @@ class ScaledMMBaseline(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "scaled_mm"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -431,7 +405,7 @@ class ScaledMMBaseline(GemmOpBase):
 
 
 @register_gemm_op
-class BF16X9Baseline(GemmOpBase):
+class CublasBF16X9(GemmOpBase):
     """
     FP32 matmul implemented with BF16X9 emulation.
     """
@@ -458,10 +432,6 @@ class BF16X9Baseline(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "bf16x9_gemm"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -479,7 +449,7 @@ class BF16X9Baseline(GemmOpBase):
 
 
 @register_gemm_op
-class ScaledMMRowwise(GemmOpBase):
+class TorchFP8Rowwise(GemmOpBase):
     def __init__(self):
         self.fast_accum = True
         self.torch_compile = False
@@ -516,10 +486,6 @@ class ScaledMMRowwise(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "scaled_mm_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -533,7 +499,7 @@ class ScaledMMRowwise(GemmOpBase):
 
 
 @register_gemm_op
-class ScaledMMMXFP8(GemmOpBase):
+class TorchMXFP8Groupwise(GemmOpBase):
     def __init__(self):
         self.torch_compile = False
 
@@ -569,10 +535,6 @@ class ScaledMMMXFP8(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "scaled_mm_mxfp8"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -586,7 +548,7 @@ class ScaledMMMXFP8(GemmOpBase):
 
 
 @register_gemm_op
-class ScaledMMNVFP4(GemmOpBase):
+class TorchNVFP4Groupwise(GemmOpBase):
     def __init__(self):
         self.torch_compile = False
 
@@ -629,10 +591,6 @@ class ScaledMMNVFP4(GemmOpBase):
         return self.compute(*self.quantize(x, w))
 
     @property
-    def name(self) -> str:
-        return "scaled_mm_nvfp4"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -646,7 +604,7 @@ class ScaledMMNVFP4(GemmOpBase):
 
 
 @register_gemm_op
-class FP8TensorwiseGemm(GemmOpBase):
+class CutlassFP8Tensorwise(GemmOpBase):
     """
     FP8 matmul with tensorwise scaling.
     """
@@ -665,10 +623,6 @@ class FP8TensorwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "cutlass_tensorwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -682,7 +636,7 @@ class FP8TensorwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8CublasRowwiseGemm(GemmOpBase):
+class CublasFP8Rowwise(GemmOpBase):
     """
     FP8 cublas matmul with rowwise scaling.
     """
@@ -703,10 +657,6 @@ class FP8CublasRowwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "cublas_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -724,7 +674,7 @@ class FP8CublasRowwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8CublasTensorwiseGemm(GemmOpBase):
+class CublasFP8Tensorwise(GemmOpBase):
     """
     FP8 cublas matmul with tensorwise scaling.
     """
@@ -743,10 +693,6 @@ class FP8CublasTensorwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale * w_scale)
 
     @property
-    def name(self) -> str:
-        return "cublas_tensorwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -764,10 +710,15 @@ class FP8CublasTensorwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8RowwiseGemm(GemmOpBase):
+class FP8Rowwise(GemmOpBase):
     """
     FP8 matmul with rowwise scaling.
     """
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if torch.version.cuda else "CK"
+        return f"{prefix}{self.__class__.__name__}"
 
     def __init__(self):
         self.fast_accum = True
@@ -828,13 +779,6 @@ class FP8RowwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_rowwise"
-        else:
-            return "ck_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -853,7 +797,7 @@ class FP8RowwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
+class FP8RowwisePreshuffle(FP8Rowwise):
     """
     FP8 matmul with rowwise scaling and preshuffling of input B.
     """
@@ -866,10 +810,6 @@ class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
     def preprocess(self, x, w):
         x, wq, w_scale = super().preprocess(x, w)
         return x, ck_preshuffle(wq, 16), w_scale
-
-    @property
-    def name(self) -> str:
-        return "ck_rowwise_preshuffle"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -885,109 +825,9 @@ class FP8RowwisePreshuffleGemm(FP8RowwiseGemm):
 
 
 @register_gemm_op
-class FP8RowwiseGroupedGemm(GemmOpBase):
+class TritonBF16Grouped(GemmOpBase):
     """
-    FP8 grouped matmul with rowwise scaling.
-    """
-
-    def preprocess(self, x, w):
-        # Apply sparsity to inputs if appropriate.
-        # First check if N and K are fixed.
-        m_values = [i.shape[0] for i in x]
-        n_values = [i.shape[0] for i in w]
-        k_values = [i.shape[1] for i in w]
-        # If so, do specialized version of initialization.
-        if len(np.unique(n_values)) == 1 and len(np.unique(k_values)) == 1:
-            m_values = [i.shape[0] for i in x]
-            # Inputs for fixed nk mode must be contiguous, however in the benchmark
-            # script they typically are not. Do a little special processing to make them
-            # work. In practice this wont be needed.
-            # Start by padding along m dimension with zeros.
-            max_m = max(m_values)
-            x = [
-                torch.nn.functional.pad(i, (0, 0, 0, max_m - i.shape[0]), value=0)
-                for i in x
-            ]
-            # Stack inputs into groups.
-            x = torch.stack(x).contiguous()
-            w = torch.stack(w).contiguous()
-
-            # Preapply weight quantization.
-            wq, w_scale = quantize_fp8_row(w)
-            # Return processed tensors.
-            return (
-                x,
-                wq,
-                w_scale,
-                torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device),
-            )
-        # Otherwise run without sparsity.
-        wq, w_scale = zip(*[quantize_fp8_row(i) for i in w])
-        return x, wq, w_scale, None
-
-    def quantize(self, x, wq, w_scale, m_values=None):
-        # Handle case where inputs are explicitly grouped and non-sparse.
-        if isinstance(x, (tuple, list)):
-            xq, x_scale = zip(*[triton_quantize_fp8_row(i) for i in x])
-            return xq, wq, x_scale, w_scale, m_values
-        # Otherwise inputs are unified tensors and sparse.
-        else:
-            B = x.shape[0]
-            xq, x_scale = triton_quantize_fp8_row(x, zero_start_index_M=m_values)
-            x_scale = x_scale.view(B, -1)
-            return xq, wq, x_scale, w_scale, m_values
-
-    def compute(self, xq, wq, x_scale, w_scale, m_values):
-        if m_values is None:
-            return torch.ops.mslk.f8f8bf16_rowwise_grouped(
-                xq,
-                wq,
-                x_scale,
-                w_scale,
-            )
-        else:
-            # Break tensor into groups, simulates what is done e2e.
-            return torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
-                xq,
-                wq,
-                x_scale,
-                w_scale,
-                zero_start_index_M=m_values,
-            )
-
-    def quantize_and_compute(self, x, wq, w_scale, m_values=None):
-        xq, wq, x_scale, w_scale, m_values = self.quantize(x, wq, w_scale, m_values)
-        return self.compute(xq, wq, x_scale, w_scale, m_values)
-
-    @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_rowwise_grouped"
-        else:
-            return "ck_rowwise_grouped"
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {
-            Accelerator.NVIDIA_SM90,
-            Accelerator.NVIDIA_SM100,
-            Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
-        }
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.GROUPED}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP8
-
-
-@register_gemm_op
-class BF16TritonStackedGroupedGemm(GemmOpBase):
-    """
-    BF16 grouped matmul with stacked inputs implemented with triton.
+    BF16 grouped matmul implemented with triton.
     """
 
     def preprocess(self, x, w):
@@ -1011,10 +851,6 @@ class BF16TritonStackedGroupedGemm(GemmOpBase):
         return self.compute(x, w, m_sizes)
 
     @property
-    def name(self) -> str:
-        return "triton_bf16_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -1028,9 +864,9 @@ class BF16TritonStackedGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16TritonStackedGroupedGemmFuseScatterAdd(BF16TritonStackedGroupedGemm):
+class TritonBF16GroupedFuseScatterAdd(TritonBF16Grouped):
     """
-    BF16 grouped matmul with stacked inputs implemented with triton. Fused with ScatterAdd.
+    BF16 grouped matmul implemented with triton. Fused with ScatterAdd.
     """
 
     def preprocess(self, x, w):
@@ -1058,15 +894,11 @@ class BF16TritonStackedGroupedGemmFuseScatterAdd(BF16TritonStackedGroupedGemm):
         x, w, m_sizes, *ret = self.quantize(x, w, m_sizes, *args)
         return self.compute(x, w, m_sizes, *ret)
 
-    @property
-    def name(self) -> str:
-        return "triton_bf16_grouped_stacked_fuse_scatter_add"
-
 
 @register_gemm_op
-class FP8TritonStackedGroupedGemm(GemmOpBase):
+class TritonFP8RowwiseGrouped(GemmOpBase):
     """
-    FP8 grouped matmul with rowwise scaling and stacked inputs implemented with triton.
+    FP8 grouped matmul with rowwise scaling implemented with triton.
     """
 
     def preprocess(self, x, w):
@@ -1099,10 +931,6 @@ class FP8TritonStackedGroupedGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, m_sizes)
 
     @property
-    def name(self) -> str:
-        return "triton_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -1116,9 +944,9 @@ class FP8TritonStackedGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8TritonStackedGroupedGemmFuseScatterAdd(FP8TritonStackedGroupedGemm):
+class TritonFP8RowwiseGroupedFuseScatterAdd(TritonFP8RowwiseGrouped):
     """
-    FP8 grouped matmul with stacked inputs implemented with triton. Fused with ScatterAdd.
+    FP8 grouped matmul implemented with triton. Fused with ScatterAdd.
     """
 
     def preprocess(self, x, w):
@@ -1150,15 +978,11 @@ class FP8TritonStackedGroupedGemmFuseScatterAdd(FP8TritonStackedGroupedGemm):
         )
         return self.compute(xq, wq, x_scale, w_scale, m_sizes, *ret)
 
-    @property
-    def name(self) -> str:
-        return "triton_grouped_stacked_fuse_scatter_add"
-
 
 @register_gemm_op
-class DeepGemmStacked(GemmOpBase):
+class DeepGemmFP8GroupwiseGrouped(GemmOpBase):
     """
-    FP8 grouped matmul with blockwise scaling implemented with DeepGemm.
+    FP8 grouped matmul with groupwise scaling implemented with DeepGemm.
     """
 
     def preprocess(self, x, w):
@@ -1199,10 +1023,6 @@ class DeepGemmStacked(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, m_indices)
 
     @property
-    def name(self) -> str:
-        return "deepgemm_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         if DEEPGEMM_ENABLED:
             return {Accelerator.NVIDIA_SM90}
@@ -1218,7 +1038,7 @@ class DeepGemmStacked(GemmOpBase):
 
 
 @register_gemm_op
-class DeepGemmMaskedStacked(DeepGemmStacked):
+class DeepGemmFP8GroupwiseGroupedMasked(DeepGemmFP8GroupwiseGrouped):
     def preprocess(self, x, w):
         # Quantize weights.
         wq, w_scale = zip(*[quantize_fp8_block(i, block_k=128, block_m=128) for i in w])
@@ -1278,15 +1098,11 @@ class DeepGemmMaskedStacked(DeepGemmStacked):
         )
         return self.compute(xq, wq, x_scale, w_scale, masked_m, expected_m, m_values)
 
-    @property
-    def name(self) -> str:
-        return "deepgemm_masked_stacked"
-
 
 @register_gemm_op
-class DeepGemmBlockwise(GemmOpBase):
+class DeepGemmFP8Groupwise(GemmOpBase):
     """
-    FP8 matmul with blockwise scaling implemented with DeepGemm.
+    FP8 matmul with groupwise scaling implemented with DeepGemm.
     """
 
     def preprocess(self, x, w):
@@ -1312,10 +1128,6 @@ class DeepGemmBlockwise(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, out)
 
     @property
-    def name(self) -> str:
-        return "deepgemm_blockwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         if DEEPGEMM_ENABLED:
             return {Accelerator.NVIDIA_SM90}
@@ -1331,7 +1143,7 @@ class DeepGemmBlockwise(GemmOpBase):
 
 
 @register_gemm_op
-class DeepGemmRowwise(GemmOpBase):
+class DeepGemmFP8Rowwise(GemmOpBase):
     """
     FP8 matmul with rowwise scaling implemented with DeepGemm.
     """
@@ -1361,10 +1173,6 @@ class DeepGemmRowwise(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, out)
 
     @property
-    def name(self) -> str:
-        return "deepgemm_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         if DEEPGEMM_ENABLED:
             return {Accelerator.NVIDIA_SM90}
@@ -1380,10 +1188,15 @@ class DeepGemmRowwise(GemmOpBase):
 
 
 @register_gemm_op
-class FP8StackedGroupedGemm(GemmOpBase):
+class FP8RowwiseGrouped(GemmOpBase):
     """
-    FP8 grouped matmul with rowwise scaling and stacked inputs.
+    FP8 grouped matmul with rowwise scaling.
     """
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if torch.version.cuda else "CK"
+        return f"{prefix}{self.__class__.__name__}"
 
     def preprocess(self, x, w):
         m_values = [i.shape[0] for i in x]
@@ -1414,13 +1227,6 @@ class FP8StackedGroupedGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, m_sizes)
 
     @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_grouped_stacked"
-        else:
-            return "ck_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -1439,7 +1245,7 @@ class FP8StackedGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
+class FP8RowwiseGrouped2D3D(FP8RowwiseGrouped):
     def quantize(self, x, wq, w_scale, m_sizes):
         xq, wq, x_scale, w_scale, m_sizes = super().quantize(x, wq, w_scale, m_sizes)
         offsets = torch.cumsum(m_sizes, dim=0, dtype=torch.int32)
@@ -1459,10 +1265,6 @@ class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
         return self.compute(xq, wq, x_scale, w_scale, offsets, out)
 
     @property
-    def name(self) -> str:
-        return "ck_grouped_stacked_torch_2d3d"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.AMD_MI300X}
 
@@ -1476,7 +1278,7 @@ class FP8StackedGroupedGemmTorch(FP8StackedGroupedGemm):
 
 
 @register_gemm_op
-class ScaledGroupedMMRowwise(FP8StackedGroupedGemmTorch):
+class TorchFP8RowwiseGrouped(FP8RowwiseGrouped2D3D):
     def __init__(self):
         self.fast_accum = True
         self.torch_compile = False
@@ -1505,10 +1307,6 @@ class ScaledGroupedMMRowwise(FP8StackedGroupedGemmTorch):
         )
 
     @property
-    def name(self) -> str:
-        return "scaled_grouped_mm_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -1525,9 +1323,9 @@ class ScaledGroupedMMRowwise(FP8StackedGroupedGemmTorch):
 
 
 @register_gemm_op
-class FP8StackedGroupwiseGroupedGemm(GemmOpBase):
+class CutlassFP8GroupwiseGrouped(GemmOpBase):
     """
-    FP8 grouped matmul with groupwise scaling and stacked inputs.
+    FP8 grouped matmul with groupwise scaling.
     """
 
     def preprocess(self, x, w):
@@ -1559,10 +1357,6 @@ class FP8StackedGroupwiseGroupedGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, m_sizes)
 
     @property
-    def name(self) -> str:
-        return "cutlass_groupwise_grouped"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -1576,82 +1370,15 @@ class FP8StackedGroupwiseGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16GroupedGemm(GemmOpBase):
-    """
-    BF16 grouped matmul implemented with CK or Cutlass.
-    """
-
-    def preprocess(self, x, w):
-        # Apply sparsity to inputs if appropriate.
-        # First check if N and K are fixed.
-        m_values = [i.shape[0] for i in x]
-        n_values = [i.shape[0] for i in w]
-        k_values = [i.shape[1] for i in w]
-        # If so, do specialized version of initialization.
-        if len(np.unique(n_values)) == 1 and len(np.unique(k_values)) == 1:
-            m_values = [i.shape[0] for i in x]
-            # Inputs for fixed nk mode must be contiguous, however in the benchmark
-            # script they typically are not. Do a little special processing to make them
-            # work. In practice this wont be needed.
-            # Start by padding along m dimension with zeros.
-            max_m = max(m_values)
-            x = [
-                torch.nn.functional.pad(i, (0, 0, 0, max_m - i.shape[0]), value=0)
-                for i in x
-            ]
-            # Stack inputs into groups.
-            x = torch.stack(x).contiguous()
-            w = torch.stack(w).contiguous()
-            return (
-                x,
-                w,
-                torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device),
-            )
-        return x, w, None
-
-    def quantize(self, x, w, m_values=None):
-        # No action required.
-        return x, w, m_values
-
-    def compute(self, x, w, m_values):
-        if m_values is None:
-            return torch.ops.mslk.bf16bf16bf16_grouped(x, w)
-        else:
-            return torch.ops.mslk.bf16bf16bf16_grouped_dynamic(x, w, m_values)
-
-    def quantize_and_compute(self, x, w, m_values):
-        return self.compute(x, w, m_values)
-
-    @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_bf16_grouped"
-        else:
-            return "ck_bf16_grouped"
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {
-            Accelerator.NVIDIA_SM90,
-            Accelerator.NVIDIA_SM100,
-            Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
-        }
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.GROUPED}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.BF16
-
-
-@register_gemm_op
-class FP8RowwiseBatchedGemm(GemmOpBase):
+class FP8RowwiseBatched(GemmOpBase):
     """
     FP8 batched matmul with rowwise scaling.
     """
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if torch.version.cuda else "CK"
+        return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
         assert isinstance(x, list) and isinstance(w, list)
@@ -1668,13 +1395,6 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
     def quantize_and_compute(self, x, w):
         xq, wq, x_scale, w_scale = self.quantize(x, w)
         return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_rowwise_batched"
-        else:
-            return "ck_rowwise_batched"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1696,7 +1416,7 @@ class FP8RowwiseBatchedGemm(GemmOpBase):
 
 # This kernel is broken and causes GPU to lock up, needs some investigation
 # @register_gemm_op
-class TritonFP8RowwiseGemm(GemmOpBase):
+class TritonFP8Rowwise(GemmOpBase):
     """
     FP8 matmul with rowwise scaling implemented with Triton.
     """
@@ -1727,10 +1447,6 @@ class TritonFP8RowwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "triton_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -1744,7 +1460,7 @@ class TritonFP8RowwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8TritonBlockwiseGemm(GemmOpBase):
+class TritonFP8Blockwise(GemmOpBase):
     """
     FP8 matmul with block scaling.
     """
@@ -1763,10 +1479,6 @@ class FP8TritonBlockwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "triton_blockwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -1780,10 +1492,15 @@ class FP8TritonBlockwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8CutlassBlockwiseGemm(GemmOpBase):
+class FP8Blockwise(GemmOpBase):
     """
     FP8 matmul with block scaling.
     """
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if torch.version.cuda else "CK"
+        return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
         # Quantize both input tensors.
@@ -1799,13 +1516,6 @@ class FP8CutlassBlockwiseGemm(GemmOpBase):
     def quantize_and_compute(self, x, w):
         xq, wq, x_scale, w_scale = self.quantize(x, w)
         return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_blockwise"
-        else:
-            return "ck_blockwise"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1824,9 +1534,9 @@ class FP8CutlassBlockwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class FP8CutlassGroupwiseGemm(GemmOpBase):
+class CutlassFP8Groupwise(GemmOpBase):
     """
-    FP8 matmul with group / block scaling.
+    FP8 matmul with groupwise scaling.
     """
 
     def preprocess(self, x, w):
@@ -1850,10 +1560,6 @@ class FP8CutlassGroupwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "cutlass_groupwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -1867,7 +1573,7 @@ class FP8CutlassGroupwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class F8I4RowwiseGemm(GemmOpBase):
+class CutlassFP8Int4Rowwise(GemmOpBase):
     """
     Mixed Precision FP8 Activations with Int4 Weights.
     """
@@ -1929,10 +1635,6 @@ class F8I4RowwiseGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, w_zp)
 
     @property
-    def name(self) -> str:
-        return "cutlass_f8i4_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -1946,7 +1648,7 @@ class F8I4RowwiseGemm(GemmOpBase):
 
 
 @register_gemm_op
-class F8I4ShuffledGemm(GemmOpBase):
+class CutlassFP8Int4RowwisePreshuffle(GemmOpBase):
     def preprocess(self, x, w):
         # Prequantize and pack weights.
         wq, (group_scale, row_scale) = quantize_int4_preshuffle(w)
@@ -1978,10 +1680,6 @@ class F8I4ShuffledGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, row_scale, group_scale)
 
     @property
-    def name(self) -> str:
-        return "cutlass_f8i4_preshuffle"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -1995,7 +1693,7 @@ class F8I4ShuffledGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16I4ShuffledGemm(GemmOpBase):
+class CutlassBF16Int4GroupwisePreshuffle(GemmOpBase):
     def preprocess(self, x, w):
         # Prequantize and pack weights.
         wq, (group_scale, group_zero) = quantize_int4_preshuffle(w, dtype="bf16")
@@ -2016,16 +1714,12 @@ class BF16I4ShuffledGemm(GemmOpBase):
                     x[i], wq[i], group_scale[i], group_zero[i]
                 )
             return y
-        # Otherwise run gemm normally.
+        # Otherwise run Gemm normally.
         return torch.ops.mslk.bf16i4bf16_shuffled(x, wq, group_scale, group_zero)
 
     def quantize_and_compute(self, x, wq, group_scale, group_zero):
         x, wq, group_scale, group_zero = self.quantize(x, wq, group_scale, group_zero)
         return self.compute(x, wq, group_scale, group_zero)
-
-    @property
-    def name(self) -> str:
-        return "cutlass_bf16i4_preshuffle"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2041,7 +1735,7 @@ class BF16I4ShuffledGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16I4ShuffledBatchedGemm(GemmOpBase):
+class CutlassBF16Int4GroupwiseBatchedPreshuffle(GemmOpBase):
     """
     BF16 x INT4 mixed dtype batched gemm with preshuffling.
     """
@@ -2068,10 +1762,6 @@ class BF16I4ShuffledBatchedGemm(GemmOpBase):
         return self.compute(x, wq, group_scale, group_zero)
 
     @property
-    def name(self) -> str:
-        return "cutlass_bf16i4_preshuffle_batched"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -2085,7 +1775,7 @@ class BF16I4ShuffledBatchedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class F8I4ShuffledGroupedGemm(GemmOpBase):
+class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
     FP8 x Int4 mixed dtype grouped gemm with preshuffling.
     """
@@ -2128,13 +1818,6 @@ class F8I4ShuffledGroupedGemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, row_scale, group_scale, m_sizes)
 
     @property
-    def name(self) -> str:
-        if torch.version.cuda:
-            return "cutlass_f8i4_grouped_preshuffle"
-        else:
-            return "ck_f8i4_grouped_preshuffle"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -2148,7 +1831,7 @@ class F8I4ShuffledGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16I4ShuffledGroupedGemm(GemmOpBase):
+class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
     BF16 x Int4 mixed dtype grouped gemm with preshuffling.
     """
@@ -2178,7 +1861,7 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
         return x, wq, group_scale, group_zero, m_sizes
 
     def compute(self, x, wq, group_scale, group_zero, m_sizes):
-        # TODO Zero points arent currently supported in grouped gemm.
+        # TODO Zero points arent currently supported in grouped Gemm.
         # We leave them as inputs for future compatibility but they are ignored.
         return torch.ops.mslk.bf16i4bf16_shuffled_grouped(
             x, wq, group_scale, group_zero, m_sizes
@@ -2189,10 +1872,6 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
             x, wq, group_scale, group_zero, m_sizes
         )
         return self.compute(x, wq, group_scale, group_zero, m_sizes)
-
-    @property
-    def name(self) -> str:
-        return "cutlass_bf16i4_grouped_preshuffle"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2208,7 +1887,7 @@ class BF16I4ShuffledGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class BF16GroupedGrad(GemmOpBase):
+class CutlassBF16DGrad(GemmOpBase):
     """
     BF16 grouped matmul with dgrad inputs in pretraining backed by cutlass
     """
@@ -2240,10 +1919,6 @@ class BF16GroupedGrad(GemmOpBase):
         return self.compute(x, w, m_sizes)
 
     @property
-    def name(self) -> str:
-        return "bf16_grouped_grad"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -2261,7 +1936,7 @@ class BF16GroupedGrad(GemmOpBase):
 
 
 @register_gemm_op
-class BF16GroupedWGrad(GemmOpBase):
+class CutlassBF16WGrad(GemmOpBase):
     """
     BF16 grouped matmul with wgrad inputs in pretraining backed by cutlass
     """
@@ -2294,10 +1969,6 @@ class BF16GroupedWGrad(GemmOpBase):
         return self.compute(x, w, k_sizes)
 
     @property
-    def name(self) -> str:
-        return "bf16_grouped_wgrad"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -2315,10 +1986,15 @@ class BF16GroupedWGrad(GemmOpBase):
 
 
 @register_gemm_op
-class BF16GroupedStacked(GemmOpBase):
+class BF16Grouped(GemmOpBase):
     """
-    BF16 grouped matmul with stacked inputs backed by cutlass or ck.
+    BF16 grouped matmul backed by cutlass or ck.
     """
+
+    @property
+    def name(self) -> str:
+        prefix = "Cutlass" if torch.version.cuda else "CK"
+        return f"{prefix}{self.__class__.__name__}"
 
     def preprocess(self, x, w):
         m_values = [i.shape[0] for i in x]
@@ -2342,10 +2018,6 @@ class BF16GroupedStacked(GemmOpBase):
         return self.compute(x, w, m_sizes)
 
     @property
-    def name(self) -> str:
-        return "bf16_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
@@ -2364,7 +2036,7 @@ class BF16GroupedStacked(GemmOpBase):
 
 
 @register_gemm_op
-class BF16I4RowwiseGemm(F8I4RowwiseGemm):
+class CutlassBF16Int4Rowwise(CutlassFP8Int4Rowwise):
     """
     Mixed Precision BF16 Activations with Int4 Weights.
     """
@@ -2389,10 +2061,6 @@ class BF16I4RowwiseGemm(F8I4RowwiseGemm):
         return self.compute(x, wq, w_scale, w_zp)
 
     @property
-    def name(self) -> str:
-        return "cutlass_bf16i4_rowwise"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
 
@@ -2406,7 +2074,7 @@ class BF16I4RowwiseGemm(F8I4RowwiseGemm):
 
 
 @register_gemm_op
-class TinyGemmBF16I4(GemmOpBase):
+class TinyGemmBF16Int4Groupwise(GemmOpBase):
     """
     Mixed Precision BF16 Activations with Int4 Weights using tinygemm.
     """
@@ -2429,10 +2097,6 @@ class TinyGemmBF16I4(GemmOpBase):
         return self.compute(x, wq, scale)
 
     @property
-    def name(self) -> str:
-        return "tinygemm_bf16i4"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         if TINYGEMM_ENABLED:
             return {Accelerator.NVIDIA_SM90}
@@ -2448,7 +2112,7 @@ class TinyGemmBF16I4(GemmOpBase):
 
 
 @register_gemm_op
-class MarlinBF16I4(GemmOpBase):
+class MarlinBF16Int4Groupwise(GemmOpBase):
     """
     Mixed Precision BF16 Activations with Int4 Weights using Marlin.
     """
@@ -2464,10 +2128,6 @@ class MarlinBF16I4(GemmOpBase):
     def quantize_and_compute(self, x, w):
         x, wq, scale = self.quantize(x, w)
         return self.compute(x, wq, scale)
-
-    @property
-    def name(self) -> str:
-        return "marlin_bf16i4"
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2489,7 +2149,7 @@ class MarlinBF16I4(GemmOpBase):
 
 
 @register_gemm_op
-class MacheteBF16I4(GemmOpBase):
+class MacheteBF16Int4Groupwise(GemmOpBase):
     """
     Mixed Precision BF16 Activations with Int4 Weights using Machete.
     """
@@ -2509,10 +2169,6 @@ class MacheteBF16I4(GemmOpBase):
         return self.compute(x, wq, scale)
 
     @property
-    def name(self) -> str:
-        return "machete_bf16i4"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         if MACHETE_ENABLED:
             return {Accelerator.NVIDIA_SM90}
@@ -2528,9 +2184,9 @@ class MacheteBF16I4(GemmOpBase):
 
 
 @register_gemm_op
-class NVFP4Gemm(GemmOpBase):
+class CutlassNVFP4Groupwise(GemmOpBase):
     """
-    NVFP4 matmul with block-wise scaling.
+    NVFP4 matmul with groupwise scaling.
     """
 
     def quantize(self, x, w):
@@ -2557,10 +2213,6 @@ class NVFP4Gemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale, global_scale=global_scale)
 
     @property
-    def name(self) -> str:
-        return "cutlass_nv_f4f4bf16"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -2574,97 +2226,9 @@ class NVFP4Gemm(GemmOpBase):
 
 
 @register_gemm_op
-class NVFP4Quantize(GemmOpBase):
+class CutlassMXFP4Groupwise(GemmOpBase):
     """
-    NVFP4 quantization with block-wise scaling.
-    """
-
-    def quantize_rms(self, x, w):
-        M, N = w.shape
-        group_size = 16
-        w = torch.randn(group_size, dtype=torch.bfloat16, device=w.device)
-        x_global_scale = torch.tensor([448.0 * 6.0]).to(
-            device=x.device, dtype=torch.float32
-        ) / torch.amax(torch.abs(x.flatten()), dim=-1).to(torch.float32)
-        xq_ref, x_scale_ref = triton_scale_nvfp4_quant_rms(
-            x,
-            w.repeat(M * N // group_size),
-            x_global_scale,
-            group_size=group_size,
-            EPS=1e-5,
-        )
-
-        intermediate = rms_norm(x.reshape(-1, 16), w, eps=1e-5)
-        intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-        xq, x_scale = triton_quantize_nvfp4(
-            intermediate,
-            x_global_scale,
-            group_size=group_size,
-        )
-
-    def quantize_silu(self, x, w):
-        M, N = x.shape
-        group_size = 16
-        x_global_scale = torch.tensor([448.0 * 6.0]).to(
-            device=x.device, dtype=torch.float32
-        ) / torch.amax(torch.abs(x.flatten()), dim=-1).to(torch.float32)
-        xq_ref, x_scale_ref = triton_scale_nvfp4_quant_silu(
-            x,
-            w,
-            x_global_scale,
-            group_size=group_size,
-        )
-
-        intermediate = silu_mul(x.reshape(-1, 16), w.reshape(-1, 16))
-        intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-        xq, x_scale = triton_quantize_nvfp4(
-            intermediate,
-            x_global_scale,
-            group_size=group_size,
-        )
-
-    def quantize(self, x, w):
-        x_global_scale = (448.0 * 6.0) / torch.amax(torch.abs(x.flatten()), dim=-1).to(
-            torch.float32
-        )
-        w_global_scale = (448.0 * 6.0) / torch.amax(torch.abs(w.flatten()), dim=-1).to(
-            torch.float32
-        )
-        global_scale = 1 / (x_global_scale * w_global_scale)
-
-        xq, x_scale = triton_quantize_nvfp4(x, x_global_scale)
-        wq, w_scale = triton_quantize_nvfp4(w, w_global_scale)
-        return xq, wq, x_scale, w_scale, global_scale
-
-    def compute(self, xq, wq, x_scale, w_scale, global_scale):
-        return torch.ops.mslk.f4f4bf16(
-            xq, wq, x_scale, w_scale, global_scale=global_scale
-        )
-
-    def quantize_and_compute(self, x, w):
-        return self.quantize(x, w)
-
-    @property
-    def name(self) -> str:
-        return "nvfp4_quantize"
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP4
-
-
-@register_gemm_op
-class MXFP4Gemm(GemmOpBase):
-    """
-    MXFP4 matmul with block-wise scaling.
+    MXFP4 matmul with groupwise scaling.
     """
 
     def quantize(self, x, w):
@@ -2680,10 +2244,6 @@ class MXFP4Gemm(GemmOpBase):
         return self.compute(xq, wq, x_scale, w_scale)
 
     @property
-    def name(self) -> str:
-        return "cutlass_f4f4bf16"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -2697,9 +2257,9 @@ class MXFP4Gemm(GemmOpBase):
 
 
 @register_gemm_op
-class MXFP4StackedGroupedGemm(GemmOpBase):
+class CutlassMXFP4GroupwiseGrouped(GemmOpBase):
     """
-    MXFP4 grouped matmul with blockwise scaling and stacked inputs.
+    MXFP4 grouped matmul with groupwise scaling.
     """
 
     def preprocess(self, x, w):
@@ -2760,10 +2320,6 @@ class MXFP4StackedGroupedGemm(GemmOpBase):
         )
 
     @property
-    def name(self) -> str:
-        return "cutlass_f4f4bf16_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -2777,9 +2333,9 @@ class MXFP4StackedGroupedGemm(GemmOpBase):
 
 
 @register_gemm_op
-class NVFP4StackedGroupedGemm(GemmOpBase):
+class CutlassNVFP4GroupwiseGrouped(GemmOpBase):
     """
-    NVFP4 grouped matmul with blockwise scaling and stacked inputs.
+    NVFP4 grouped matmul with groupwise scaling.
     """
 
     def preprocess(self, x, w):
@@ -2908,10 +2464,6 @@ class NVFP4StackedGroupedGemm(GemmOpBase):
         )
 
     @property
-    def name(self) -> str:
-        return "cutlass_nv_f4f4bf16_grouped_stacked"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -2926,9 +2478,9 @@ class NVFP4StackedGroupedGemm(GemmOpBase):
 
 # Broken with cuda graph
 # @register_gemm_op
-class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
+class CutlassNVFP4GroupwiseStackedGroupedPackUnpack(GemmOpBase):
     """
-    NVFP4 grouped matmul with blockwise scaling and stacked inputs.
+    NVFP4 grouped matmul with groupwise scaling and stacked inputs.
     """
 
     def preprocess(self, x, w):
@@ -3081,10 +2633,6 @@ class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
         )
 
     @property
-    def name(self) -> str:
-        return "cutlass_nv_f4f4bf16_grouped_stacked_pack_unpack"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -3098,9 +2646,9 @@ class NVFP4StackedGroupedGemmPackUnpack(GemmOpBase):
 
 
 @register_gemm_op
-class BF16GroupedGemm2d3d(GemmOpBase):
+class TorchBF16Grouped(GemmOpBase):
     """
-    Torch BF16 grouped GEMM with 2D inputs and 3D weights.
+    Torch BF16 grouped gemm with 2D inputs and 3D weights.
     """
 
     def preprocess(self, x, w):
@@ -3129,10 +2677,6 @@ class BF16GroupedGemm2d3d(GemmOpBase):
         return self.compute(x, w, offs)
 
     @property
-    def name(self) -> str:
-        return "bf16_baseline_grouped_2d_3d"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
 
@@ -3146,9 +2690,9 @@ class BF16GroupedGemm2d3d(GemmOpBase):
 
 
 @register_gemm_op
-class MXFP8GroupedGemm2d3d(GemmOpBase):
+class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
     """
-    MXFP8 grouped GEMM with 2D inputs and 3D weights.
+    MXFP8 grouped Gemm with 2D inputs and 3D weights.
     """
 
     def preprocess(self, x, w):
@@ -3219,10 +2763,6 @@ class MXFP8GroupedGemm2d3d(GemmOpBase):
         )
 
     @property
-    def name(self) -> str:
-        return "cutlass_mx8mx8bf16_grouped_mm_2d_3d"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -3236,9 +2776,9 @@ class MXFP8GroupedGemm2d3d(GemmOpBase):
 
 
 @register_gemm_op
-class MXFP8GroupedGemm2d2d(GemmOpBase):
+class CutlassMXFP8GroupwiseGrouped2D2D(GemmOpBase):
     """
-    MXFP8 grouped GEMM with 2D inputs and 3D weights.
+    MXFP8 grouped GEMM with 2D inputs and 2D weights.
     """
 
     def preprocess(self, x, w):
@@ -3336,10 +2876,6 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
         )
 
     @property
-    def name(self) -> str:
-        return "cutlass_mx8mx8bf16_grouped_mm_2d_2d"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -3353,7 +2889,7 @@ class MXFP8GroupedGemm2d2d(GemmOpBase):
 
 
 @register_gemm_op
-class I4BF16CuteDSLGemm(GemmOpBase):
+class CuteDSLInt4BF16Groupwise(GemmOpBase):
     """
     CuteDSL Mixed-Input GEMM for Blackwell (SM100+).
     Supports Int4 (x) x BF16 (w) using convert-scale mode.
@@ -3431,7 +2967,7 @@ class I4BF16CuteDSLGemm(GemmOpBase):
         return x_quant, x_scale, w, output, (m, n, k)
 
     def compute(self, x_quant, x_scale, w, output, shape):
-        """Execute the mixed-input GEMM kernel.
+        """Execute the mixed-input gemm kernel.
 
         Args:
             x_quant: Quantized activation tensor (M, K) in int8.
@@ -3459,10 +2995,6 @@ class I4BF16CuteDSLGemm(GemmOpBase):
         return self.compute(*quantized)
 
     @property
-    def name(self) -> str:
-        return "int4bf16_cutedsl_gemm"
-
-    @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
@@ -3476,22 +3008,18 @@ class I4BF16CuteDSLGemm(GemmOpBase):
 
     @property
     def supported(self) -> bool:
-        """Check if the op is supported on current hardware and dependencies are available."""
         if not CUTEDSL_MIXED_INPUT_ENABLED:
             return False
-        accelerator = get_current_accelerator()
-        if accelerator not in self.supported_accelerators:
-            return False
-        return True
+        return super().supported
 
 
 @register_gemm_op
-class BF16I4CuteDSLGemm(I4BF16CuteDSLGemm):
+class CuteDSLBF16Int4Groupwise(CuteDSLInt4BF16Groupwise):
     """
     CuteDSL Mixed-Input GEMM for Blackwell (SM100+).
     Supports BF16 (x) x Int4 (w) using convert-scale mode.
 
-    This is the transpose variant of I4BF16CuteDSLGemm. Here the weight
+    This is the transpose variant of CuteDSLInt4BF16Groupwise. Here the weight
     (w) is quantized to Int4 and x (activation) is in BF16.
     """
 
@@ -3521,7 +3049,3 @@ class BF16I4CuteDSLGemm(I4BF16CuteDSLGemm):
             scale_granularity_k=self._scale_granularity_k,
             acc_dtype=self._acc_dtype,
         ).T
-
-    @property
-    def name(self) -> str:
-        return "bf16int4_cutedsl_gemm"
