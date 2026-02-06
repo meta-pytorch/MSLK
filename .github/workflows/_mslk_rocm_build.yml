@@ -123,7 +123,14 @@ jobs:
       run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
 
     - name: Build MSLK Wheel
-      run: . $PRELUDE; build_mslk_package $BUILD_ENV nightly ${{ matrix.build-target }}/rocm
+      run: |
+        . $PRELUDE
+
+        # Extract channel from channel/version string
+        PYTORCH_CHANNEL_VERSION="${{ inputs.pytorch-channel-version }}"
+        PYTORCH_CHANNEL_ONLY="${PYTORCH_CHANNEL_VERSION%%/*}"
+
+        build_mslk_package $BUILD_ENV "$PYTORCH_CHANNEL_ONLY" ${{ matrix.build-target }}/rocm
 
     - name: Upload Built Wheel as GHA Artifact
       uses: actions/upload-artifact@v4
