@@ -433,9 +433,10 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
         return out
 
     @staticmethod
+    # pyre-ignore[14]: Signature matches PyTorch autograd convention
     def backward(
-        ctx, dout: torch.Tensor, *args: Any
-    ) -> tuple[  # type: ignore
+        ctx: Any, *grad_outputs: Any
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -452,6 +453,7 @@ class CutlassBlackwellFmhaFunc(torch.autograd.Function):
         None,
         None,
     ]:
+        dout: torch.Tensor = grad_outputs[0]
         if ctx.is_gen:
             # For gen case, no backward pass is needed (generation is inference only)
             raise RuntimeError(
