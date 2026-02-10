@@ -307,7 +307,15 @@ __determine_test_directories () {
   echo ""
 }
 
-__test_mslk_common_pre_steps () {
+mslk_testing_setup () {
+  env_name="$1"
+  if [ "$env_name" == "" ]; then
+    echo "Usage: ${FUNCNAME[0]} ENV_NAME"
+    echo "Example(s):"
+    echo "    ${FUNCNAME[0]} build_env        # Run test setup for FBGEMM_GPU"
+    return 1
+  fi
+
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
@@ -369,7 +377,7 @@ test_all_mslk_modules () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
-  __test_mslk_common_pre_steps                  || return 1
+  mslk_testing_setup "$env_name"                || return 1
 
   # Go to the repo root directory
   print_exec pushd "${repo}"                    || return 1
@@ -414,7 +422,7 @@ test_single_mslk_module () {
     repo=$(pwd)
   fi
 
-  __test_mslk_common_pre_steps                  || return 1
+  mslk_testing_setup "$env_name"                || return 1
 
   # Go to the repo root directory
   print_exec pushd "${repo}"                    || return 1

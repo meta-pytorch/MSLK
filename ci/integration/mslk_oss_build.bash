@@ -28,7 +28,7 @@ else
   echo "[MSLK CI] Invalid build variant: $BUILD_VARIANT"
   exit 1
 fi
-BUILD_ENV=${BUILD_ENV:-"build-py${PYTHON_VERSION}-torch${PYTORCH_VERSION}-${BUILD_VARIANT}${BUILD_VARIANT_VERSION}"}
+BUILD_ENV=${BUILD_ENV:-"build-py${PYTHON_VERSION}-torch${PYTORCH_VERSION//\//-}-${BUILD_VARIANT}${BUILD_VARIANT_VERSION}"}
 
 echo "################################################################################"
 echo "# MSLK OSS Build and Install"
@@ -75,8 +75,18 @@ integration_setup_conda_environment "$BUILD_ENV" gcc "$PYTHON_VERSION" "$PYTORCH
 echo "[MSLK CI] Building the package ..."
 integration_mslk_build_and_install "$BUILD_ENV" "$BUILD_TARGET/$BUILD_VARIANT" "$REPO_ROOT" || exit 1
 
+# Run checks and update the Conda environment to support MSLK testing
+echo "[MSLK CI] Updating the conda environment to support testing ..."
+mslk_testing_setup "$BUILD_ENV" || exit 1
+
 echo "[MSLK CI] Exporting the build environment name ..."
 export CURRENT_MSLK_BUILD_ENV="$BUILD_ENV"
 
-echo ""
 echo "[MSLK CI] Package is now installed into $BUILD_ENV"
+echo ""
+echo ""
+echo "################################################################################"
+echo "#"
+echo "# MSLK package build and install has successfully completed!"
+echo "#"
+echo "################################################################################"
