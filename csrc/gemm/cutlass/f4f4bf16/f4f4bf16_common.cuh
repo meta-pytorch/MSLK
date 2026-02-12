@@ -28,6 +28,8 @@ namespace cutlass = cutlass_mslk;
 
 using MXFP4 = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
 using NVFP4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+// MXFP4 with 1x16 block size
+using MXFP4_16 = cutlass::mx_float4_16_t<cutlass::float_e2m1_t>;
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 

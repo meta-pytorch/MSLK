@@ -18,7 +18,8 @@ at::Tensor f4f4bf16_128_128_1_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_128_1_2_1(
     at::Tensor XQ, // FP4
@@ -26,7 +27,8 @@ at::Tensor f4f4bf16_128_128_1_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_128_1_4_1(
     at::Tensor XQ, // FP4
@@ -34,7 +36,8 @@ at::Tensor f4f4bf16_128_128_1_4_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_128_2_2_1(
     at::Tensor XQ, // FP4
@@ -42,7 +45,8 @@ at::Tensor f4f4bf16_128_128_2_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_128_4_1_1(
     at::Tensor XQ, // FP4
@@ -50,7 +54,8 @@ at::Tensor f4f4bf16_128_128_4_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_128_4_2_1(
     at::Tensor XQ, // FP4
@@ -58,7 +63,8 @@ at::Tensor f4f4bf16_128_128_4_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_192_2_1_1(
     at::Tensor XQ, // FP4
@@ -66,7 +72,8 @@ at::Tensor f4f4bf16_128_192_2_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_192_2_2_1(
     at::Tensor XQ, // FP4
@@ -74,7 +81,8 @@ at::Tensor f4f4bf16_128_192_2_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_192_4_2_1(
     at::Tensor XQ, // FP4
@@ -82,7 +90,8 @@ at::Tensor f4f4bf16_128_192_4_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_128_256_2_1_1(
     at::Tensor XQ, // FP4
@@ -90,7 +99,8 @@ at::Tensor f4f4bf16_128_256_2_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_128_2_1_1(
     at::Tensor XQ, // FP4
@@ -98,7 +108,8 @@ at::Tensor f4f4bf16_256_128_2_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_128_2_2_1(
     at::Tensor XQ, // FP4
@@ -106,7 +117,8 @@ at::Tensor f4f4bf16_256_128_2_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_128_2_4_1(
     at::Tensor XQ, // FP4
@@ -114,7 +126,8 @@ at::Tensor f4f4bf16_256_128_2_4_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_128_4_1_1(
     at::Tensor XQ, // FP4
@@ -122,7 +135,8 @@ at::Tensor f4f4bf16_256_128_4_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_192_2_1_1(
     at::Tensor XQ, // FP4
@@ -130,7 +144,8 @@ at::Tensor f4f4bf16_256_192_2_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_192_2_2_1(
     at::Tensor XQ, // FP4
@@ -138,7 +153,8 @@ at::Tensor f4f4bf16_256_192_2_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_192_2_4_1(
     at::Tensor XQ, // FP4
@@ -146,7 +162,8 @@ at::Tensor f4f4bf16_256_192_2_4_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_192_4_1_1(
     at::Tensor XQ, // FP4
@@ -154,7 +171,8 @@ at::Tensor f4f4bf16_256_192_4_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_256_2_1_1(
     at::Tensor XQ, // FP4
@@ -162,7 +180,8 @@ at::Tensor f4f4bf16_256_256_2_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_256_2_2_1(
     at::Tensor XQ, // FP4
@@ -170,7 +189,8 @@ at::Tensor f4f4bf16_256_256_2_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_256_2_4_1(
     at::Tensor XQ, // FP4
@@ -178,7 +198,8 @@ at::Tensor f4f4bf16_256_256_2_4_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
 at::Tensor f4f4bf16_256_256_4_1_1(
     at::Tensor XQ, // FP4
@@ -186,15 +207,20 @@ at::Tensor f4f4bf16_256_256_4_1_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale);
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size);
 
+// Kernel function pointer type
+// mxfp4_block_size: 32 for standard MXFP4 (1x32 block), 16 for MXFP4_16 (1x16
+// block)
 using Kernel_f4f4bf16 = at::Tensor (*)(
     at::Tensor,
     at::Tensor,
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    std::optional<at::Tensor>);
+    std::optional<at::Tensor>,
+    int64_t);
 
 #endif
 } // namespace mslk::gemm

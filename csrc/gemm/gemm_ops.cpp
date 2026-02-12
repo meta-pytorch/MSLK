@@ -52,7 +52,7 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #else
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
-      "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, Tensor? global_scale=None) -> Tensor");
+      "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, Tensor? global_scale=None, int mxfp4_block_size=32) -> Tensor");
   m.def(
       "f4f4bf16_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes, Tensor? global_scale=None, Tensor? starting_row_after_padding=None, bool use_mx=True) -> Tensor");
   m.def(
@@ -198,7 +198,8 @@ at::Tensor f4f4bf16_meta(
     at::Tensor /* x_scale */,
     at::Tensor /* w_scale */,
     std::optional<at::Tensor> /* output = std::nullopt */,
-    std::optional<at::Tensor> /* global_scale = std::nullopt */) {
+    std::optional<at::Tensor> /* global_scale = std::nullopt */,
+    int64_t /* mxfp4_block_size = 32 */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
   auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
