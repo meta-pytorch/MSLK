@@ -189,6 +189,50 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         """The dtype used by tensor cores for the compute."""
         pass
 
+    @property
+    def input_bytes_per_element(self) -> float:
+        """Bytes per input activation element after quantization.
+
+        Default is derived from compute_dtype:
+        - FP32/TF32: 4 bytes
+        - BF16: 2 bytes
+        - FP8: 1 byte
+        - FP4: 0.5 bytes
+
+        Override in subclasses for mixed-precision ops where input precision
+        differs from compute_dtype (e.g., BF16 input with Int4 weights).
+        """
+        return _COMPUTE_DTYPE_TO_BYTES.get(self.compute_dtype, 2.0)
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        """Bytes per weight element after quantization.
+
+        Default matches input_bytes_per_element (same precision for both).
+        Override in subclasses for mixed-precision ops (e.g., FP8xInt4).
+        """
+        return self.input_bytes_per_element
+
+    @property
+    def output_bytes_per_element(self) -> float:
+        """Bytes per output element.
+
+        Default is 2 bytes (bf16) for sub-fp32 ops, 4 bytes for FP32/TF32.
+        """
+        if self.compute_dtype in (ComputeDtype.FP32, ComputeDtype.TF32):
+            return 4.0
+        return 2.0  # bf16 output
+
+
+# Default bytes per element for each compute dtype
+_COMPUTE_DTYPE_TO_BYTES: dict[ComputeDtype, float] = {
+    ComputeDtype.FP32: 4.0,
+    ComputeDtype.TF32: 4.0,
+    ComputeDtype.BF16: 2.0,
+    ComputeDtype.FP8: 1.0,
+    ComputeDtype.FP4: 0.5,
+}
+
 
 def register_gemm_op(op):
     """Decorator function for assembling all quantize ops."""
@@ -1646,6 +1690,10 @@ class CutlassFP8Int4Rowwise(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class CutlassFP8Int4RowwisePreshuffle(GemmOpBase):
@@ -1691,6 +1739,10 @@ class CutlassFP8Int4RowwisePreshuffle(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class CutlassBF16Int4GroupwisePreshuffle(GemmOpBase):
@@ -1733,6 +1785,10 @@ class CutlassBF16Int4GroupwisePreshuffle(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class CutlassBF16Int4GroupwiseBatchedPreshuffle(GemmOpBase):
@@ -1772,6 +1828,10 @@ class CutlassBF16Int4GroupwiseBatchedPreshuffle(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
 
 
 @register_gemm_op
@@ -1829,6 +1889,10 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
@@ -1884,6 +1948,10 @@ class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
 
 
 @register_gemm_op
@@ -2072,6 +2140,14 @@ class CutlassBF16Int4Rowwise(CutlassFP8Int4Rowwise):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
 
+    @property
+    def input_bytes_per_element(self) -> float:
+        return 2.0  # BF16 input (overrides FP8 from parent)
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class TinyGemmBF16Int4Groupwise(GemmOpBase):
@@ -2110,6 +2186,10 @@ class TinyGemmBF16Int4Groupwise(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class MarlinBF16Int4Groupwise(GemmOpBase):
@@ -2147,6 +2227,10 @@ class MarlinBF16Int4Groupwise(GemmOpBase):
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
 
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
+
 
 @register_gemm_op
 class MacheteBF16Int4Groupwise(GemmOpBase):
@@ -2181,6 +2265,10 @@ class MacheteBF16Int4Groupwise(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.BF16
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weights
 
 
 @register_gemm_op
@@ -3007,6 +3095,14 @@ class CuteDSLInt4BF16Groupwise(GemmOpBase):
         return ComputeDtype.BF16
 
     @property
+    def input_bytes_per_element(self) -> float:
+        return 0.5  # Int4 input
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 2.0  # BF16 weight
+
+    @property
     def supported(self) -> bool:
         if not CUTEDSL_MIXED_INPUT_ENABLED:
             return False
@@ -3049,3 +3145,11 @@ class CuteDSLBF16Int4Groupwise(CuteDSLInt4BF16Groupwise):
             scale_granularity_k=self._scale_granularity_k,
             acc_dtype=self._acc_dtype,
         ).T
+
+    @property
+    def input_bytes_per_element(self) -> float:
+        return 2.0  # BF16 input
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5  # Int4 weight
