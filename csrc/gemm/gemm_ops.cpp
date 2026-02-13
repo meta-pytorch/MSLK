@@ -535,6 +535,7 @@ TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched_meta);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise_meta);
   m.impl("bf16i4bf16_rowwise", bf16i4bf16_rowwise_meta);
+  m.impl("bf116i4bf16_shuffled", bf16i4bf16_rowwise_meta);
   m.impl("bf16i4bf16_shuffled_batched", bf16i4bf16_shuffled_batched_meta);
   m.impl("bf16i4bf16_rowwise_batched", bf16i4bf16_rowwise_batched_meta);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled_meta);
