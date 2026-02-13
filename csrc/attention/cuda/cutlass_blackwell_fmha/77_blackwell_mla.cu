@@ -1,6 +1,6 @@
 // @nolint
 /***************************************************************************************************
- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -76,7 +76,11 @@ struct Options {
   int split_kv = -1; // number of split along k dim.
   bool is_var_split_kv = false;
   int max_split_kv = 16;
+#ifdef CPASYNC
+  int page = 1;
+#else
   int page = -1;
+#endif
   float spread = 0.2f;
   int iterations = 3;
   bool verify = false;
@@ -261,7 +265,7 @@ struct ExampleResult {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#if (defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED))
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -752,7 +756,7 @@ void run_mla(Options const & options, cutlass::KernelHardwareInfo const& hw_info
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -767,13 +771,18 @@ int main_single(int argc, char const **args) {
     return -1;
   }
 
-  if (__CUDACC_VER_MAJOR__ < 12 || props.major != 10) {
-    std::cout
-      << "This example requires a GPU of NVIDIA's Blackwell Architecture "
-      << "(compute capability major 10) and CUDA 12.8 or greater.\n";
+  if (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8)) {
+    std::cerr << "This example requires CUDA 12.8 or newer." << std::endl;
+    // Returning zero so this test passes on older Toolkits. Its actions are no-op.
     return 0;
   }
 
+  if (props.major != 10) {
+    std::cerr
+      << "This example requires a GPU of NVIDIA's Blackwell Architecture "
+      << "(compute capability 100a)." << std::endl;
+    return 0;
+  }
   //
   // Parse options
   //
@@ -792,7 +801,7 @@ int main_single(int argc, char const **args) {
     return -1;
   }
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#if (defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM103_SUPPORTED))
 
   //
   // Run examples
