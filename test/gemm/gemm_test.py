@@ -2332,5 +2332,198 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
 
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+class MXFP4BlockSize16Tests(unittest.TestCase):
+    """
+    Tests for MXFP4_16 format: MXFP4 with 1x16 block size
+    (16 elements per scale factor).
+    This is a hybrid format using MXFP4's E8M0 scale factors with NVFP4's block size.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 250]),
+        N=st.sampled_from([256, 1024]),
+        K=st.sampled_from([2048, 3584]),
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Use group_size=16 for MXFP4_16 (1x16 block size)
+        aq, a_scale = triton_quantize_mx4_unpack(A, group_size=16)
+        bq, b_scale = triton_quantize_mx4_unpack(B, group_size=16)
+
+        # Call f4f4bf16 with mxfp4_block_size=16 for MXFP4_16 format
+        out_mxfp4_16 = torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale, None, None, 16)
+        out_bf16 = A @ B.t()
+
+        torch.testing.assert_close(out_mxfp4_16, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    def test_mxfp4_16_vs_mxfp4_32_block_size(self) -> None:
+        """
+        Test that MXFP4_16 has better accuracy than MXFP4_32 for data with
+        fine-grained scale variations within 32-element blocks.
+
+        This test uses values perfectly representable by MXFP4 format:
+        - FP4 (E2M1) values: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+        - E8M0 scales: powers of 2
+
+        Perfectly representable values = FP4_value × E8M0_scale:
+        - High value: 6 × 1024 = 6144
+        - Low value: 6 × 128 = 768
+
+        With 16-element blocks (MXFP4_16):
+        - Each group can use its own scale, so both values are exact.
+
+        With 32-element blocks (MXFP4_32):
+        - A single scale must cover both values, causing quantization error.
+        """
+        M, N, K = 1, 256, 512
+
+        # Values perfectly representable by MXFP4: FP4_max(6) × E8M0_scale
+        high_val = 6.0 * 1024  # 6144, needs scale=1024
+        low_val = 6.0 * 128  # 768, needs scale=128
+
+        # Create A matrix with alternating high/low magnitude 16-element groups
+        A = torch.zeros((M, K), dtype=torch.bfloat16, device=self.device)
+        for i in range(K // 32):
+            A[:, i * 32 : i * 32 + 16] = high_val
+            A[:, i * 32 + 16 : i * 32 + 32] = low_val
+
+        # Create B matrix with inverse pattern
+        B = torch.zeros((N, K), dtype=torch.bfloat16, device=self.device)
+        for i in range(K // 32):
+            B[:, i * 32 : i * 32 + 16] = low_val
+            B[:, i * 32 + 16 : i * 32 + 32] = high_val
+
+        # Compute bf16 reference
+        out_bf16 = A @ B.t()
+
+        # --- MXFP4_32 (block_size=32) ---
+        # Single scale for 32 elements cannot represent both 6144 and 768 exactly
+        aq_32, a_scale_32 = triton_quantize_mx4_unpack(A, group_size=32)
+        bq_32, b_scale_32 = triton_quantize_mx4_unpack(B, group_size=32)
+        out_mxfp4_32 = torch.ops.mslk.f4f4bf16(
+            aq_32, bq_32, a_scale_32, b_scale_32, None, None, 32
+        )
+
+        # --- MXFP4_16 (block_size=16) ---
+        # Each 16-element group uses its own scale, so values are exact
+        aq_16, a_scale_16 = triton_quantize_mx4_unpack(A, group_size=16)
+        bq_16, b_scale_16 = triton_quantize_mx4_unpack(B, group_size=16)
+        out_mxfp4_16 = torch.ops.mslk.f4f4bf16(
+            aq_16, bq_16, a_scale_16, b_scale_16, None, None, 16
+        )
+
+        # Calculate errors
+        error_mxfp4_32 = (out_mxfp4_32 - out_bf16).abs().mean().item()
+        error_mxfp4_16 = (out_mxfp4_16 - out_bf16).abs().mean().item()
+
+        # MXFP4_16 should produce EXACT results (values are perfectly representable)
+        self.assertTrue(
+            torch.equal(out_mxfp4_16, out_bf16),
+            "MXFP4_16 output should be exactly equal to bf16 baseline "
+            "when using perfectly representable values",
+        )
+
+        # MXFP4_16 should have better accuracy (lower error) than MXFP4_32
+        # MXFP4_32 should have significant error due to block size mismatch
+        self.assertLess(
+            error_mxfp4_16,
+            error_mxfp4_32,
+            f"MXFP4_16 error ({error_mxfp4_16:.6f}) should be less than "
+            f"MXFP4_32 error ({error_mxfp4_32:.6f}) for data with "
+            f"fine-grained scale variations within 32-element blocks",
+        )
+
+        # Verify outputs are finite
+        self.assertTrue(
+            out_mxfp4_32.isfinite().all(), "MXFP4_32 output contains non-finite values"
+        )
+        self.assertTrue(
+            out_mxfp4_16.isfinite().all(), "MXFP4_16 output contains non-finite values"
+        )
+
+    def test_mxfp4_16_vs_nvfp4_scale_range(self) -> None:
+        """
+        Test that MXFP4_16 has better accuracy than NVFP4 (with global_scale=1.0)
+        for data requiring scales beyond E4M3 range.
+
+        This test uses values perfectly representable by MXFP4:
+        - Value: 6 × 2048 = 12288 (FP4_max × E8M0_scale)
+
+        NVFP4 max with global_scale=1.0:
+        - Max = FP4_max × E4M3_max = 6 × 448 = 2688
+        - Value 12288 > 2688, so NVFP4 will clip and lose precision.
+
+        MXFP4_16 can represent 12288 exactly (scale=2048, FP4=6).
+        """
+        from mslk.quantize.triton.fp4_quantize import triton_quantize_nvfp4
+
+        M, N, K = 1, 256, 512
+
+        # Value perfectly representable by MXFP4: 6 × 2048 = 12288
+        # This exceeds NVFP4 max of 6 × 448 = 2688
+        val = 6.0 * 2048  # 12288
+
+        A = torch.full((M, K), val, dtype=torch.bfloat16, device=self.device)
+        B = torch.full((N, K), val, dtype=torch.bfloat16, device=self.device)
+
+        # Compute bf16 reference
+        out_bf16 = A @ B.t()
+
+        # --- NVFP4 with global_scale=1.0 ---
+        # Max representable = 6 × 448 × 1.0 = 2688
+        # Value 12288 exceeds this, causing clipping/precision loss
+        global_scale = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        aq_nvfp4, a_scale_nvfp4 = triton_quantize_nvfp4(A, global_scale)
+        bq_nvfp4, b_scale_nvfp4 = triton_quantize_nvfp4(B, global_scale)
+        out_nvfp4 = torch.ops.mslk.f4f4bf16(
+            aq_nvfp4, bq_nvfp4, a_scale_nvfp4, b_scale_nvfp4, None, global_scale
+        )
+
+        # --- MXFP4_16 (block_size=16) ---
+        # E8M0 scale=2048, FP4=6 → value=12288 exactly
+        aq_16, a_scale_16 = triton_quantize_mx4_unpack(A, group_size=16)
+        bq_16, b_scale_16 = triton_quantize_mx4_unpack(B, group_size=16)
+        out_mxfp4_16 = torch.ops.mslk.f4f4bf16(
+            aq_16, bq_16, a_scale_16, b_scale_16, None, None, 16
+        )
+
+        # Calculate errors
+        error_nvfp4 = (out_nvfp4 - out_bf16).abs().mean().item()
+        error_mxfp4_16 = (out_mxfp4_16 - out_bf16).abs().mean().item()
+
+        # MXFP4_16 should produce EXACT results (values are perfectly representable)
+        self.assertTrue(
+            torch.equal(out_mxfp4_16, out_bf16),
+            "MXFP4_16 output should be exactly equal to bf16 baseline "
+            "when using perfectly representable values",
+        )
+
+        # MXFP4_16 should have better accuracy (lower error) than NVFP4
+        # NVFP4 should have significant error due to clipping at 2688
+        self.assertLess(
+            error_mxfp4_16,
+            error_nvfp4,
+            f"MXFP4_16 error ({error_mxfp4_16:.6f}) should be less than "
+            f"NVFP4 error ({error_nvfp4:.6f}) for value 12288 exceeding "
+            f"NVFP4 max (6 × 448 = 2688) with global_scale=1.0",
+        )
+
+        # Verify outputs are finite
+        self.assertTrue(
+            out_nvfp4.isfinite().all(), "NVFP4 output contains non-finite values"
+        )
+        self.assertTrue(
+            out_mxfp4_16.isfinite().all(), "MXFP4_16 output contains non-finite values"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

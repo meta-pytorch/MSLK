@@ -18,11 +18,18 @@ at::Tensor f4f4bf16_128_128_4_2_1(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale) {
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size) {
   if (global_scale) {
+    // NVFP4: uses global_scale, block_size parameter ignored
     return _f4f4bf16<NVFP4, 128, 128, 4, 2, 1>(
         XQ, WQ, x_scale, w_scale, output, global_scale);
+  } else if (mxfp4_block_size == 16) {
+    // MXFP4_16: 1x16 block size with E8M0 scales
+    return _f4f4bf16<MXFP4_16, 128, 128, 4, 2, 1>(
+        XQ, WQ, x_scale, w_scale, output, global_scale);
   } else {
+    // MXFP4: standard 1x32 block size (default)
     return _f4f4bf16<MXFP4, 128, 128, 4, 2, 1>(
         XQ, WQ, x_scale, w_scale, output, global_scale);
   }
