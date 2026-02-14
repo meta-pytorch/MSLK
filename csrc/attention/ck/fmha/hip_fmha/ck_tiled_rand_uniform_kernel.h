@@ -151,7 +151,7 @@ struct FmhaRandUniformKernel {
       ck_tile::index_t seqlen_k_) {
     (void)seqlen_k_; // not used at present
 
-    // at present, seqlen_k is not split by thread-groups
+    // at present, seqlen_k is not splitted by thread-groups
     return dim3(
         ck_tile::integer_divide_ceil(seqlen_q_, kMPerBlock),
         nhead_,
