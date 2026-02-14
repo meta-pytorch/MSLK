@@ -5576,6 +5576,8 @@ def triton_quantize_nvfp4_kernel(
     USE_E8M0_SCALE: tl.constexpr,
 ):
     E4M3_EPS = 1.5258789e-05
+    FP4_E2M1_MAX = 6.0
+    FP8_E4M3_MAX = 448.0
 
     NUM_ELEM_PER_LAYOUT = 128 * 4
     NUM_N_BLOCKS = tl.cdiv(N, 64)

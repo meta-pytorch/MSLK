@@ -1274,7 +1274,8 @@ Kernel_f4f4bf16 get_kernel_via_tuning(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor output,
-    std::optional<at::Tensor> global_scale = std::nullopt) {
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size) {
   static TuningCache cache("f4f4bf16");
 
   M = nextPowerOf2OrRoundUp(M, 1024, 1024);
@@ -1287,7 +1288,15 @@ Kernel_f4f4bf16 get_kernel_via_tuning(
   const auto& kernels = get_f4f4bf16_kernels();
 
   auto kernel = cache.findBestKernelMaybeAutotune(
-      shape_key, kernels, XQ, WQ, x_scale, w_scale, output, global_scale);
+      shape_key,
+      kernels,
+      XQ,
+      WQ,
+      x_scale,
+      w_scale,
+      output,
+      global_scale,
+      mxfp4_block_size);
   return kernel;
 }
 
@@ -1299,7 +1308,12 @@ at::Tensor f4f4bf16(
     at::Tensor x_scale,
     at::Tensor w_scale,
     std::optional<at::Tensor> output,
-    std::optional<at::Tensor> global_scale) {
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size) {
+  TORCH_CHECK(
+      mxfp4_block_size == 32 || mxfp4_block_size == 16,
+      "mxfp4_block_size must be 32 or 16, got ",
+      mxfp4_block_size);
   TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
   TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
   TORCH_CHECK(x_scale.is_cuda() && x_scale.is_contiguous());
@@ -1325,11 +1339,20 @@ at::Tensor f4f4bf16(
   auto kernel = [&]() {
     if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
       return get_kernel_via_tuning(
-          M, N, K, XQ, WQ, x_scale, w_scale, out, global_scale);
+          M,
+          N,
+          K,
+          XQ,
+          WQ,
+          x_scale,
+          w_scale,
+          out,
+          global_scale,
+          mxfp4_block_size);
     }
     return get_kernel_via_heuristics(M, N, K);
   }();
-  return kernel(XQ, WQ, x_scale, w_scale, out, global_scale);
+  return kernel(XQ, WQ, x_scale, w_scale, out, global_scale, mxfp4_block_size);
 }
 
 #else
@@ -1340,7 +1363,8 @@ at::Tensor f4f4bf16(
     at::Tensor x_scale,
     at::Tensor w_scale,
     std::optional<at::Tensor> output,
-    std::optional<at::Tensor> global_scale) {
+    std::optional<at::Tensor> global_scale,
+    int64_t mxfp4_block_size) {
   throw std::runtime_error(
       "CUDA version is older than 12.8"); // requires CUDA>=12.8
 }

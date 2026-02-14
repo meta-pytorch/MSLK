@@ -44,13 +44,23 @@ at::Tensor f4f4bf16_grouped_mm(
     std::optional<at::Tensor> output = std::nullopt,
     std::optional<at::Tensor> global_scale = std::nullopt);
 
+// FP4 GEMM supporting NVFP4, MXFP4 (1x32 block), and MXFP4_16 (1x16 block)
+//
+// Format selection:
+// - NVFP4: Provide global_scale (mxfp4_block_size is ignored)
+// - MXFP4 (1x32): No global_scale, mxfp4_block_size = 32 (default)
+// - MXFP4_16 (1x16): No global_scale, mxfp4_block_size = 16
+//
+// MXFP4_16 is a hybrid format that uses MXFP4's E8M0 scale factors with
+// NVFP4's 16-element block size, enabling finer-grained quantization.
 at::Tensor f4f4bf16(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
     std::optional<at::Tensor> output = std::nullopt,
-    std::optional<at::Tensor> global_scale = std::nullopt);
+    std::optional<at::Tensor> global_scale = std::nullopt,
+    int64_t mxfp4_block_size = 32);
 
 #endif
 
