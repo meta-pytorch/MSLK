@@ -37,6 +37,7 @@ from .utils import (
     disable_tf32,
     ref_attention_bmhk_for_test,
     ref_attention_for_test,
+    UNSUPPORTED_OP_PASSES,
     use_cpu_ref,
 )
 
@@ -83,11 +84,17 @@ def test_backward(  # noqa: C901
     attn_bias_requires_grad = (
         random.Random(q_len + kv_len * batch_size).randint(0, 1) > 0
     )
-    query, key, value, attn_bias = create_tensors(
-        *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
-        attn_bias_requires_grad=attn_bias_requires_grad,
-        fmt=fmt,
-    )
+    try:
+        query, key, value, attn_bias = create_tensors(
+            *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
+            attn_bias_requires_grad=attn_bias_requires_grad,
+            fmt=fmt,
+        )
+    except pytest.skip.Exception as e:
+        if UNSUPPORTED_OP_PASSES:
+            logger.warning(f"Skipping {opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv}: {e}")
+            return
+        raise
 
     # To understand why we do this, check the comment on the
     # `AttentionBwOpBase` class
@@ -138,6 +145,8 @@ def test_backward(  # noqa: C901
     value.requires_grad_(True)
 
     if not op_bw.supports(fmha.Inputs(query, key, value, attn_bias)):
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("inputs not supported")
 
     out = fmha.memory_efficient_attention(
@@ -270,11 +279,17 @@ def test_backward_gqa(opBW):
     H = 8
     B_Mq_Mkv_H_K_Kv = (3, 512, 512, H, 128, 128)
     dtype = torch.float16
-    query, key, value, attn_bias = create_tensors(
-        *(opBW, device, dtype, type(None), *B_Mq_Mkv_H_K_Kv),
-        attn_bias_requires_grad=False,
-        fmt="BMHK",
-    )
+    try:
+        query, key, value, attn_bias = create_tensors(
+            *(opBW, device, dtype, type(None), *B_Mq_Mkv_H_K_Kv),
+            attn_bias_requires_grad=False,
+            fmt="BMHK",
+        )
+    except pytest.skip.Exception as e:
+        if UNSUPPORTED_OP_PASSES:
+            logger.warning(f"Skipping {opBW}: {e}")
+            return
+        raise
     op = (fmha.ck.FwOp if torch.version.hip else fmha.cutlass.FwOp, opBW)
     key = key[:, :, :1].expand(-1, -1, H, -1)
     value = value[:, :, :1].expand(-1, -1, H, -1)
