@@ -36,7 +36,13 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
+from .common import (
+    AttentionFwOpBase,
+    check_lastdim_alignment_stride1,
+    Context,
+    Inputs,
+    InputsFp8,
+)
 from .utils.op_common import register_operator
 
 
@@ -88,41 +94,6 @@ def _is_supported_paged_bias(attn_bias: Any) -> bool:
             PagedBlockDiagonalPaddedKeysMask,
         ),
     )
-
-
-@dataclass
-class InputsFp8(Inputs):
-    """
-    Each of k/v_fp8_scales is an int32 tensor of shape (1, B * Mkv, Hq),
-    or (1, page_size * max_pages_per_lane, Hq) in the paged case.
-    Each int32 element contains two packed fp16 number
-    - scales and shifts for row-wise FP8 quantization.
-    """
-
-    k_fp8_scale_shift: Optional[torch.Tensor] = None
-    v_fp8_scale_shift: Optional[torch.Tensor] = None
-    q_fp8_scale_shift: Optional[torch.Tensor] = None
-    quantize_pv_to_fp8: bool = False
-    quantize_qk_to_fp8: bool = False
-
-    @property
-    def nbytes(self) -> int:
-        """
-        Number of bytes in the input, not counting the attention bias.
-        """
-        return (
-            super(InputsFp8, self).nbytes
-            + (
-                self.k_fp8_scale_shift.untyped_storage().nbytes()
-                if self.k_fp8_scale_shift is not None
-                else 0
-            )
-            + (
-                self.v_fp8_scale_shift.untyped_storage().nbytes()
-                if self.v_fp8_scale_shift is not None
-                else 0
-            )
-        )
 
 
 if TYPE_CHECKING or is_triton_available():
