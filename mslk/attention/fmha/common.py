@@ -144,6 +144,48 @@ def pack_fp8_tensorwise_per_head(
     )
 
 
+def bmghk2bmhk(
+    x: torch.Tensor,
+    x_scale: Optional[torch.Tensor] = None,
+    handle_rep_heads: bool = False,
+):
+    if handle_rep_heads and x.stride(3) == 0:
+        return x[:, :, :, 0], x_scale[:, :, :, 0] if x_scale is not None else None
+
+    return x.reshape(
+        [
+            x.shape[0],
+            x.shape[1],
+            -1,
+            x.shape[4],
+        ]
+    ), x_scale.reshape(
+        [
+            x_scale.shape[0],
+            x_scale.shape[1],
+            -1,
+        ]
+    ) if x_scale is not None else None
+
+
+def bmhk2bhk(
+    x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, handle_mqa: bool = True
+):
+    assert x.shape[0] == 1
+    x = x.squeeze(0)
+    if x_scale is not None:
+        assert x_scale.shape[0] == 1
+        x_scale = x_scale.squeeze(0)
+
+    assert x.ndim == 3
+    if handle_mqa and x.stride(1) == 0:
+        # BMHK for MQA with kv_head = 1
+        if x_scale is not None:
+            return x[:, 0, :].unsqueeze(1), x_scale[:, 0, :].unsqueeze(1)
+        return x[:, 0, :].unsqueeze(1), None
+    return x, x_scale
+
+
 @dataclass
 class Inputs:
     """
@@ -158,9 +200,11 @@ class Inputs:
     scale: Optional[float] = None
     output_dtype: Optional[torch.dtype] = None
     is_partial: bool = False
+    deterministic: bool = False
     quantize_pv_to_fp8: bool = False
     quantize_qk_to_fp8: bool = False
     use_fp32_scales: bool = False
+    num_splits: int = 0
 
     @property
     def device(self) -> torch.device:
@@ -344,6 +388,41 @@ class Inputs:
         """
         return sum(
             x.untyped_storage().nbytes() for x in [self.query, self.key, self.value]
+        )
+
+
+@dataclass
+class InputsFp8(Inputs):
+    """
+    Each of k/v_fp8_scales is an int32 tensor of shape (1, B * Mkv, Hq),
+    or (1, page_size * max_pages_per_lane, Hq) in the paged case.
+    Each int32 element contains two packed fp16 number
+    - scales and shifts for row-wise FP8 quantization.
+    """
+
+    k_fp8_scale_shift: Optional[torch.Tensor] = None
+    v_fp8_scale_shift: Optional[torch.Tensor] = None
+    q_fp8_scale_shift: Optional[torch.Tensor] = None
+    quantize_pv_to_fp8: bool = False
+    quantize_qk_to_fp8: bool = False
+
+    @property
+    def nbytes(self) -> int:
+        """
+        Number of bytes in the input, not counting the attention bias.
+        """
+        return (
+            super(InputsFp8, self).nbytes
+            + (
+                self.k_fp8_scale_shift.untyped_storage().nbytes()
+                if self.k_fp8_scale_shift is not None
+                else 0
+            )
+            + (
+                self.v_fp8_scale_shift.untyped_storage().nbytes()
+                if self.v_fp8_scale_shift is not None
+                else 0
+            )
         )
 
 
