@@ -2,11 +2,6 @@
 from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
-from mslk.attention.flash_attn.interface import (
-    _flash_attn_bwd as mslk_flash_attn_bwd,
-    _flash_attn_decode as mslk_flash_attn_decode,
-    _flash_attn_fwd as mslk_flash_attn_fwd,
-)
 
 from .attn_bias import (
     AttentionBias,
@@ -43,14 +38,29 @@ from .common import (
 )
 
 
+def _get_operator(name: str):
+    def no_such_operator(*args, **kwargs):
+        raise RuntimeError(
+            f"No such operator mslk.attention.flash_attn.interface.{name}"
+        )
+
+    try:
+        # type: ignore  # pyre-ignore
+        import mslk.attention.flash_attn.interface as flash_attn
+
+        return getattr(flash_attn, name)  # type: ignore  # pyre-ignore
+    except (RuntimeError, ModuleNotFoundError):
+        return no_such_operator
+
+
 def _convert_input_format(
     inp: Inputs,
 ) -> Tuple[
     Inputs,
     Optional[torch.Tensor],
-    int,
+    Optional[int],
     Optional[torch.Tensor],
-    int,
+    Optional[int],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
 ]:
@@ -104,8 +114,12 @@ def _convert_input_format(
         max_seqlen_q = None
         max_seqlen_k = None
 
-    key_scale = inp.k_fp8_scale_shift if hasattr(inp, "k_fp8_scale_shift") else None
-    value_scale = inp.v_fp8_scale_shift if hasattr(inp, "v_fp8_scale_shift") else None
+    key_scale = (
+        inp.k_fp8_scale_shift if hasattr(inp, "k_fp8_scale_shift") else None
+    )  # pyre-fixme[16]
+    value_scale = (
+        inp.v_fp8_scale_shift if hasattr(inp, "v_fp8_scale_shift") else None
+    )  # pyre-fixme[16]
 
     if query.ndim == 5:  # GQA
         query, _ = bmghk2bmhk(query, None, handle_rep_heads=True)
@@ -179,10 +193,12 @@ def _is_seqlen_q_le_seqlen_k(
     cu_seqlens_k = torch.as_tensor(cu_seqlens_k_py, dtype=torch.int, device="cpu")
     seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    return torch.all(seqlens_k >= seqlens_q).item()
+    return torch.all(seqlens_k >= seqlens_q).item()  # pyre-fixme[7]
 
 
-def _get_paged_block_tables(attn_bias: AttentionBias) -> bool:
+def _get_paged_block_tables(
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
+) -> Optional[torch.Tensor]:
     if isinstance(
         attn_bias,
         (
@@ -197,7 +213,7 @@ def _get_paged_block_tables(attn_bias: AttentionBias) -> bool:
     return None
 
 
-def _is_causal(attn_bias: AttentionBias) -> bool:
+def _is_causal(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
     return isinstance(
         attn_bias,
         (
@@ -218,7 +234,7 @@ def _is_causal(attn_bias: AttentionBias) -> bool:
     )
 
 
-def _is_bottom_right(attn_bias: AttentionBias) -> bool:
+def _is_bottom_right(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
     return isinstance(
         attn_bias,
         (
@@ -263,7 +279,7 @@ def _window_size(
 
 
 class FwOp(AttentionFwOpBase):
-    OPERATOR = mslk_flash_attn_fwd
+    OPERATOR = _get_operator("_flash_attn_fwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
     SUPPORTED_MAX_K = 128
@@ -311,8 +327,8 @@ class FwOp(AttentionFwOpBase):
                 _,
             ) = _convert_input_format(d)
             if not _is_seqlen_q_le_seqlen_k(
-                d.attn_bias.q_seqinfo.seqstart_py,
-                d.attn_bias.k_seqinfo.seqstart_py,
+                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
+                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
             ):
                 reasons.append("seqlens_k must be >= seqlens_q")
 
@@ -392,7 +408,7 @@ class FwOpDecode(AttentionFwOpBase):
     where query length is 1.
     """
 
-    OPERATOR = mslk_flash_attn_decode
+    OPERATOR = _get_operator("_flash_attn_decode")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
     SUPPORTED_MAX_K = 128
@@ -431,11 +447,12 @@ class FwOpDecode(AttentionFwOpBase):
         if (
             d.attn_bias is not None
             and hasattr(d.attn_bias, "q_seqinfo")
-            and d.attn_bias.q_seqinfo.max_seqlen is not None
-            and d.attn_bias.q_seqinfo.max_seqlen != 1
+            and d.attn_bias.q_seqinfo.max_seqlen is not None  # pyre-fixme[16]
+            and d.attn_bias.q_seqinfo.max_seqlen != 1  # pyre-fixme[16]
         ):
             reasons.append(
-                f"Max Q seq length ({d.attn_bias.q_seqinfo.max_seqlen}) must be 1 for decode kernel"
+                f"Max Q seq length ({d.attn_bias.q_seqinfo.max_seqlen}) must be "
+                "1 for decode kernel"
             )
         return reasons
 
@@ -468,18 +485,23 @@ class FwOpDecode(AttentionFwOpBase):
         is_fp8 = isinstance(inp, InputsFp8)
         if is_fp8:
             assert (
-                inp.k_fp8_scale_shift is not None and inp.v_fp8_scale_shift is not None
+                inp.k_fp8_scale_shift is not None
+                and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
             ), (
                 "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
             )
 
         if inp.query.numel() > 0 and inp.key.numel() > 0:
-            out, lse = cls.OPERATOR(
+            out, _ = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
-                k_scale_shift=inp.k_fp8_scale_shift if is_fp8 else None,
-                v_scale_shift=inp.v_fp8_scale_shift if is_fp8 else None,
+                k_scale_shift=inp.k_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
+                v_scale_shift=inp.v_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
                 cu_seqlens_q=cu_seqlens_q,  # not used
                 cu_seqlens_k=cu_seqlens_k,  # not used
                 seqlen_kv=seqused_k,
@@ -499,12 +521,9 @@ class FwOpDecode(AttentionFwOpBase):
             if cu_seqlens_q is None:
                 assert inp.query.ndim == 4
                 B, M, H, K = inp.query.shape
-                lse_shape = [B, H, M]
             else:
                 assert inp.query.ndim == 3
                 M, H, K = inp.query.shape
-                lse_shape = [1, H, M]
-            lse = torch.zeros(*lse_shape, dtype=torch.float, device=out.device)
         out = out.reshape(q_shape)
         assert not needs_gradient, "FwOpDecode does not support gradient computation"
         return out, None
@@ -513,8 +532,7 @@ class FwOpDecode(AttentionFwOpBase):
 class BwOp(AttentionBwOpBase):
     __doc__ = FwOp.__doc__
 
-    OPERATOR = mslk_flash_attn_bwd
-
+    OPERATOR = _get_operator("_flash_attn_bwd")
     SUPPORTED_DEVICES = FwOp.SUPPORTED_DEVICES
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
@@ -565,8 +583,8 @@ class BwOp(AttentionBwOpBase):
 
         if isinstance(d.attn_bias, BlockDiagonalCausalMask):
             if not _is_seqlen_q_le_seqlen_k(
-                d.attn_bias.q_seqinfo.seqstart_py,
-                d.attn_bias.k_seqinfo.seqstart_py,
+                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
+                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
             ):
                 reasons.append("seqlens_k must be >= seqlens_q")
 
