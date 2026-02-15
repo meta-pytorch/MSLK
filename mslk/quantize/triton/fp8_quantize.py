@@ -53,16 +53,16 @@ def _kernel_quantize_fp8_row(
     B,
     M,
     N,
-    K,
-    K_fp8,  # used when padding
+    K: tl.constexpr,
+    K_fp8: tl.constexpr,  # used when padding
     stride_ab,
     stride_am,
     stride_an,
-    stride_ak,
+    stride_ak: tl.constexpr,
     stride_ob,
     stride_om,
     stride_on,
-    stride_ok,
+    stride_ok: tl.constexpr,
     stride_zb,
     stride_zm,
     TL_FP8_DTYPE: tl.constexpr,
@@ -116,19 +116,11 @@ def _kernel_quantize_fp8_row(
     # needed to avoid index overflows.
     if USE_INT64:
         pid = pid.to(tl.int64)
-    n_offset = tl.arange(0, BLOCK_SIZE)
-    a_offset_base = (
-        pid // (M * N) * stride_ab
-        + (pid % (M * N)) // N * stride_am
-        + (pid % (M * N)) % N * stride_an
-    )
-    a_fp8_offset_base = (
-        pid // (M * N) * stride_ob
-        + (pid % (M * N)) // N * stride_om
-        + (pid % (M * N)) % N * stride_on
-    )
 
-    K_in = K
+    # Compile-time dead-code elimination (CLAMP_MAX / JAGGED)
+    ub_ptr = None
+    if CLAMP_MAX:
+        ub_ptr = scale_ub  # only a placeholder, never accessed at runtime
 
     if JAGGED:
         z_offset_base = pid // (M * N) * stride_zb + (pid % (M * N)) // N * stride_zm
@@ -137,12 +129,63 @@ def _kernel_quantize_fp8_row(
         # If this row is empty, dont process any of it.
         if current_row >= group_rows:
             K_in = 0
+        else:
+            K_in = K
+    else:
+        K_in = K
 
-    # Calculate max.
+    # Fast-path for rows that completely fit into one BLOCK_SIZE
+    fast = K_in <= BLOCK_SIZE
+    if fast:
+        n_offset = tl.arange(0, BLOCK_SIZE)
+
+        # Load the whole row (masked)
+        a = tl.load(
+            A
+            + pid // (M * N) * stride_ab
+            + (pid % (M * N)) // N * stride_am
+            + (pid % (M * N)) % N * stride_an
+            + n_offset * stride_ak,
+            mask=n_offset < K_in,
+            other=0.0,
+        )
+
+        # Single reduction → per-row maximum
+        cur_max = tl.max(tl.abs(a))
+        if CLAMP_MAX:
+            ub = tl.load(ub_ptr)
+            cur_max = tl.clamp(cur_max, EPS, ub)
+        else:
+            cur_max = tl.maximum(cur_max, EPS)
+
+        a_scale = MAX_FP8 / cur_max
+        tl.store(A_scale + pid, 1.0 / a_scale)
+
+        # Quantise & store in the same iteration
+        a_fp8 = tl.clamp(a * a_scale, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
+        tl.store(
+            A_fp8
+            + pid // (M * N) * stride_ob
+            + (pid % (M * N)) // N * stride_om
+            + (pid % (M * N)) % N * stride_on
+            + n_offset * stride_ok,
+            a_fp8,
+            mask=n_offset < K_fp8,
+        )
+        return  # fast-path completed
+
+    # Generic implementation (unchanged – correctness for large K)
+    n_offset = tl.arange(0, BLOCK_SIZE)
+
+    # ---- Pass 1: row-wise max reduction --------------------------------
     cur_max = 0.0
     for _k in range(0, tl.cdiv(K_in, BLOCK_SIZE)):
         a = tl.load(
-            A + a_offset_base + n_offset * stride_ak,
+            A
+            + pid // (M * N) * stride_ab
+            + (pid % (M * N)) // N * stride_am
+            + (pid % (M * N)) % N * stride_an
+            + n_offset * stride_ak,
             mask=n_offset < K_in,
             other=0.0,
         )
@@ -159,13 +202,17 @@ def _kernel_quantize_fp8_row(
     # Scale and quantize.
     a_scale = MAX_FP8 / cur_max
     tl.store(A_scale + pid, 1.0 / a_scale)
-    n_offset = tl.arange(0, BLOCK_SIZE)
 
     # Write quantized values for the first K elements (from A), and pad the rest with zeros up to K_fp8
+    n_offset = tl.arange(0, BLOCK_SIZE)
     for _k in range(0, tl.cdiv(K_fp8, BLOCK_SIZE)):
         # Load from A if in range, else 0 (we're going all the way to K_fp8)
         a = tl.load(
-            A + a_offset_base + n_offset * stride_ak,
+            A
+            + pid // (M * N) * stride_ab
+            + (pid % (M * N)) // N * stride_am
+            + (pid % (M * N)) % N * stride_an
+            + n_offset * stride_ak,
             mask=n_offset < K_in,
             other=0.0,
         )
@@ -178,7 +225,11 @@ def _kernel_quantize_fp8_row(
 
         # Store the full new row in its place (for elements >= K, a_fp8 is already 0)
         tl.store(
-            A_fp8 + a_fp8_offset_base + n_offset * stride_ok,
+            A_fp8
+            + pid // (M * N) * stride_ob
+            + (pid % (M * N)) // N * stride_om
+            + (pid % (M * N)) % N * stride_on
+            + n_offset * stride_ok,
             a_fp8,
             mask=n_offset < K_fp8,
         )
