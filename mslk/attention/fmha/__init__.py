@@ -14,6 +14,7 @@ from . import (
     ck,
     ck_decoder,
     ck_splitk,
+    cute_blackwell,
     cutlass,
     cutlass_blackwell,
     flash,
@@ -119,6 +120,7 @@ class _fMHA(torch.autograd.Function):
         )
         ctx.rng_state = op_ctx.rng_state
         ctx.attn_bias_tensor = attn_bias_tensor
+        ctx.deterministic = inp.deterministic
         if op_ctx.op_bw is not None:
             if op_bw is not None and op_bw is not op_ctx.op_bw:
                 raise ValueError(
@@ -185,6 +187,7 @@ class _fMHA(torch.autograd.Function):
             attn_bias=_deserialize_bias(ctx.attn_bias_ctx, attn_bias_tensor),
             p=ctx.p,
             scale=ctx.scale,
+            deterministic=ctx.deterministic,
         )
         op_ctx = Context(
             lse=lse,
@@ -214,6 +217,7 @@ def memory_efficient_attention(
     *,
     op: Optional[AttentionOp] = None,
     output_dtype: Optional[torch.dtype] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """Implements the memory-efficient attention mechanism following
     `"Self-Attention Does Not Need O(n^2) Memory" <http://arxiv.org/abs/2112.05682>`_.
@@ -325,6 +329,7 @@ def memory_efficient_attention(
             attn_bias=attn_bias,
             scale=scale,
             output_dtype=output_dtype,
+            deterministic=deterministic,
         ),
         op=op,
     )
@@ -332,7 +337,8 @@ def memory_efficient_attention(
 
 torch.library.define(
     "mslk::memory_efficient_attention_forward",
-    "(Tensor q, Tensor k, Tensor v, Tensor? b = None, float? p = 0.0, float? scale = None) -> Tensor",
+    "(Tensor q, Tensor k, Tensor v, Tensor? b = None, float? p = 0.0, "
+    "float? scale = None, bool deterministic = False) -> Tensor",
 )
 
 
@@ -343,6 +349,7 @@ def _memory_efficient_attention_forward_torch_wrapper_meta(
     attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
+    deterministic: bool = False,
 ):
     return torch.empty_like(query)
 
@@ -363,6 +370,7 @@ def _memory_efficient_attention_forward_torch_wrapper(
     attn_bias: Optional[Union[torch.Tensor, AttentionBias]] = None,
     p: float = 0.0,
     scale: Optional[float] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     This provides a torch-compilable wrapper op to
@@ -381,6 +389,7 @@ def _memory_efficient_attention_forward_torch_wrapper(
         attn_bias,
         p,
         scale,
+        deterministic=deterministic,
     )
 
 
@@ -393,7 +402,8 @@ torch.library.impl(
 
 torch.library.define(
     "mslk::memory_efficient_attention_forward_with_bias",
-    "(Tensor q, Tensor k, Tensor v, Tensor b, float? p = 0.0, float? scale = None) -> Tensor",
+    "(Tensor q, Tensor k, Tensor v, Tensor b, float? p = 0.0, "
+    "float? scale = None, bool deterministic = False) -> Tensor",
 )
 
 
@@ -404,6 +414,7 @@ def _memory_efficient_attention_forward_torch_wrapper_with_bias_meta(
     attn_bias: Union[torch.Tensor, AttentionBias],
     p: float = 0.0,
     scale: Optional[float] = None,
+    deterministic: bool = False,
 ):
     return torch.empty_like(query)
 
@@ -426,6 +437,7 @@ def _memory_efficient_attention_forward_torch_wrapper_with_bias(
     attn_bias: Union[torch.Tensor, AttentionBias],
     p: float = 0.0,
     scale: Optional[float] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     This provides a torch-compilable wrapper op to
@@ -444,6 +456,7 @@ def _memory_efficient_attention_forward_torch_wrapper_with_bias(
         attn_bias,
         p,
         scale,
+        deterministic=deterministic,
     )
 
 
@@ -464,6 +477,7 @@ def memory_efficient_attention_forward(
     *,
     op: Optional[Type[AttentionFwOpBase]] = None,
     output_dtype: Optional[torch.dtype] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     Calculates the forward pass of :attr:`xformers.ops.memory_efficient_attention`.
@@ -477,6 +491,7 @@ def memory_efficient_attention_forward(
             attn_bias=attn_bias,
             scale=scale,
             output_dtype=output_dtype,
+            deterministic=deterministic,
         ),
         op=op,
     )
@@ -492,6 +507,7 @@ def memory_efficient_attention_forward_requires_grad(
     *,
     op: Optional[Type[AttentionFwOpBase]] = None,
     output_dtype: Optional[torch.dtype] = None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns a tuple (output, lse), where `lse` can be used to compute the backward pass later.
@@ -512,6 +528,7 @@ def memory_efficient_attention_forward_requires_grad(
             attn_bias=attn_bias,
             scale=scale,
             output_dtype=output_dtype,
+            deterministic=deterministic,
         ),
         op=op,
     )
@@ -530,6 +547,7 @@ def memory_efficient_attention_backward(
     scale: Optional[float] = None,
     *,
     op: Optional[Type[AttentionBwOpBase]] = None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Computes the gradient of the attention.
@@ -546,7 +564,13 @@ def memory_efficient_attention_backward(
     gradients = _memory_efficient_attention_backward(
         Context(out=output, lse=lse),
         Inputs(
-            query=query, key=key, value=value, p=p, attn_bias=attn_bias, scale=scale
+            query=query,
+            key=key,
+            value=value,
+            p=p,
+            attn_bias=attn_bias,
+            scale=scale,
+            deterministic=deterministic,
         ),
         grad,
         op=op,
@@ -568,7 +592,17 @@ def _memory_efficient_attention(
     op_fw = _serialize_op(op[0] if op is not None else None)
     op_bw = _serialize_op(op[1] if op is not None else None)
     return _fMHA.apply(
-        op_fw, op_bw, inp.query, inp.key, inp.value, inp.attn_bias, inp.p, inp.scale
+        op_fw,
+        op_bw,
+        inp.query,
+        inp.key,
+        inp.value,
+        inp.attn_bias,
+        inp.p,
+        inp.scale,
+        inp.output_dtype,
+        inp.is_partial,
+        inp.deterministic,
     )[0].reshape(output_shape)
 
 
@@ -695,6 +729,7 @@ def memory_efficient_attention_partial(
     op: Optional[Union[AttentionOp, Type[AttentionFwOpBase]]] = None,
     output_dtype: Optional[torch.dtype] = None,
     _allow_backward: bool = False,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns a tuple (output, lse), where `output` is the attention in the style of
@@ -722,6 +757,7 @@ def memory_efficient_attention_partial(
         scale=scale,
         output_dtype=output_dtype,
         is_partial=True,
+        deterministic=deterministic,
     )
     is_grad = (
         _allow_backward
@@ -757,6 +793,7 @@ def memory_efficient_attention_partial(
         inp.scale,
         inp.output_dtype,
         inp.is_partial,
+        inp.deterministic,
     )
 
 
