@@ -499,12 +499,9 @@ class FwOpDecode(AttentionFwOpBase):
             if cu_seqlens_q is None:
                 assert inp.query.ndim == 4
                 B, M, H, K = inp.query.shape
-                lse_shape = [B, H, M]
             else:
                 assert inp.query.ndim == 3
                 M, H, K = inp.query.shape
-                lse_shape = [1, H, M]
-            lse = torch.zeros(*lse_shape, dtype=torch.float, device=out.device)
         out = out.reshape(q_shape)
         assert not needs_gradient, "FwOpDecode does not support gradient computation"
         return out, None
