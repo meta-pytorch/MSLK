@@ -1,5 +1,5 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-from typing import Any, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
 
@@ -36,6 +36,26 @@ from .common import (
     Inputs,
     InputsFp8,
 )
+
+_ERROR_ATOL: Mapping[torch.dtype, float] = {
+    torch.float: 3e-4,
+    # (FIXME: Temporary Solution) Decided to use the tolerance same as FA4's
+    # varlen test
+    # (https://github.com/Dao-AILab/flash-attention/blob/main/tests/cute/test_flash_attn_varlen.py#L70-L71)
+    # temporarily.
+    torch.half: 3e-2,
+    torch.bfloat16: 3e-2,
+}
+
+_ERROR_RTOL: Mapping[torch.dtype, float] = {
+    torch.float: 2e-5,
+    # (FIXME: Temporary Solution) Decided to use the tolerance same as FA4's
+    # varlen test
+    # (https://github.com/Dao-AILab/flash-attention/blob/main/tests/cute/test_flash_attn_varlen.py#L70-L71)
+    # temporarily.
+    torch.half: 3e-2,
+    torch.bfloat16: 3e-2,
+}
 
 
 def _get_operator(name: str):
@@ -313,6 +333,9 @@ class FwOp(AttentionFwOpBase):
 
     _TEST_K: List[int] = [64, 128]
 
+    ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
+    ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
+
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(FwOp, cls).not_supported_reasons(d)
@@ -438,6 +461,9 @@ class FwOpDecode(AttentionFwOpBase):
 
     _TEST_K: List[int] = [64, 128]
 
+    ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
+    ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
+
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(FwOpDecode, cls).not_supported_reasons(d)
@@ -558,6 +584,9 @@ class BwOp(AttentionBwOpBase):
     SUPPORTS_PARTIAL = False
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (10, 0)
     NAME = "cuteDSLB-blackwell"
+
+    ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
+    ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
