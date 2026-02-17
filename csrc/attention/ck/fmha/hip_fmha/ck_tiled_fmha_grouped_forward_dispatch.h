@@ -24,6 +24,11 @@ template <
     ck_tile::index_t MaxK,
     ck_tile::index_t MTile>
 struct grouped_forward_mask_bias_dropout_dispatch {
+  template <typename FmhaTraits>
+  using AttentionVariant = ck_tile::ComposedAttention<
+      FmhaTraits::kHasLogitsSoftCap * ck_tile::LOGITS_SOFT_CAP,
+      CK_TILE_FMHA_FWD_FAST_EXP2>;
+
   template <typename FmhaTraits, typename FmhaMask>
   using FmhaPipelineProblemTemp = ck_tile::BlockFmhaPipelineProblem<
       typename FmhaFwdTypeConfig<ScalarType>::QDataType,
@@ -39,7 +44,7 @@ struct grouped_forward_mask_bias_dropout_dispatch {
       typename FmhaFwdTypeConfig<ScalarType>::ODataType,
       typename FmhaFwdShape<MaxK, MTile>::Type,
       true, // kIsGroupMode
-      ck_tile::StandardAttention,
+      AttentionVariant<FmhaTraits>,
       FmhaMask,
       FmhaTraits>;
 
@@ -140,9 +145,10 @@ struct grouped_forward_mask_bias_dropout_dispatch {
                                   : -1, // window_left_size
           (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
           param.custom_mask_type,
+          0, // min_seqlen_q, most recently added kernel argument
           param.dropout_prob,
           false, // is_store_randval
-          std::make_tuple(param.philox_seed, param.philox_offset));
+          std::make_pair(param.philox_seed, param.philox_offset));
     }();
 
     dim3 kGridSize = FmhaFwdKernel::GridSize(
