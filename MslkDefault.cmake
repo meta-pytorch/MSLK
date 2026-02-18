@@ -16,7 +16,8 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/gemm/*.cpp
   csrc/kv_cache/*.cpp
   csrc/moe/*.cpp
-  csrc/quantize/*.cpp)
+  csrc/quantize/*.cpp
+  csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
   csrc/attention/cuda/gqa_attn_splitk/*.cu
@@ -79,7 +80,8 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip
   csrc/quantize/ck/*.hip
-  csrc/quantize/ck/**/*.hip)
+  csrc/quantize/ck/**/*.hip
+  csrc/attention/ck/fmha/**/*.hip)
 
 ################################################################################
 # Build Shared Library
