@@ -8,7 +8,6 @@
 
 import logging
 import math
-import random
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Type
 
@@ -1668,6 +1667,31 @@ def test_paged_attention_flash(B, MAX_T: int, page_size: int):
 @pytest.mark.parametrize("MAX_T", [64, 128, 2048, 4096, 8192])
 @pytest.mark.parametrize("page_size", [256])
 def test_paged_attention_flash3(
+    op: Type[AttentionFwOpBase], B: int, MAX_T: int, page_size: int
+):
+    if (
+        fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask
+        not in get_supported_attn_bias_types(op)
+    ):
+        pytest.skip("Not supported bias")
+    num_quant_groups = 0
+    paged_attention_run_inner(B, MAX_T, num_quant_groups, page_size, op, bench=False)
+
+
+@sm100_or_better_only
+@disable_on_rocm
+@pytest.mark.parametrize(
+    "op",
+    _filter_unsupported_ops(
+        [
+            fmha.cutlass_blackwell.FwOp,
+        ]
+    ),
+)
+@pytest.mark.parametrize("B", [1, 5, 128])
+@pytest.mark.parametrize("MAX_T", [64, 128, 2048, 4096, 8192])
+@pytest.mark.parametrize("page_size", [128])
+def test_paged_attention_cutlass_blackwell(
     op: Type[AttentionFwOpBase], B: int, MAX_T: int, page_size: int
 ):
     if (

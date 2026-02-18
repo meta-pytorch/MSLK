@@ -25,6 +25,9 @@ from .attn_bias import (
     LowerTriangularFromBottomRightLocalAttentionMask,
     LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
+    PagedBlockDiagonalCausalLocalPaddedKeysMask,
+    PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+    PagedBlockDiagonalPaddedKeysMask,
 )
 from .common import AttentionBwOpBase, AttentionFwOpBase, Context, Gradients, Inputs
 from .utils.op_common import register_operator
@@ -79,6 +82,9 @@ def _convert_input_format(
             BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalLocalAttentionPaddedKeysMask,
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+            PagedBlockDiagonalPaddedKeysMask,
         ),
     ):
         assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
@@ -132,6 +138,12 @@ def _convert_input_format(
         key = fold(key)
         value = fold(value)
 
+        # Reshape KV to 4D for paged attention
+        if isinstance(attn_bias, PagedBlockDiagonalPaddedKeysMask):
+            num_pages = value.shape[0] // attn_bias.page_size
+            key = key.view(num_pages, attn_bias.page_size, *key.shape[1:])
+            value = value.view(num_pages, attn_bias.page_size, *value.shape[1:])
+
     new_inp = Inputs(
         query=query,
         key=key,
@@ -172,6 +184,8 @@ def _is_causal(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
             BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
         ),
     )
 
@@ -188,6 +202,8 @@ def _is_bottom_right(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) ->
             BlockDiagonalLocalAttentionPaddedKeysMask,
             BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
         ),
     )
 
@@ -202,8 +218,9 @@ def _window_size(
         (
             BlockDiagonalCausalLocalAttentionMask,
             BlockDiagonalCausalLocalAttentionFromBottomRightMask,
-            LowerTriangularFromBottomRightLocalAttentionMask,
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            LowerTriangularFromBottomRightLocalAttentionMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
         ),
     ):
         win_left = attn_bias._window_size - 1
@@ -243,6 +260,9 @@ class FwOp(AttentionFwOpBase):
         LowerTriangularFromBottomRightLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+        PagedBlockDiagonalPaddedKeysMask,
+        PagedBlockDiagonalCausalLocalPaddedKeysMask,
+        PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
     )
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -307,6 +327,11 @@ class FwOp(AttentionFwOpBase):
         window_left, window_right = _window_size(inp.attn_bias)
 
         if inp.query.numel() > 0 and inp.key.numel() > 0:
+            block_table = (
+                inp.attn_bias.block_tables
+                if isinstance(inp.attn_bias, PagedBlockDiagonalPaddedKeysMask)
+                else None
+            )
             out, lse = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
@@ -321,6 +346,7 @@ class FwOp(AttentionFwOpBase):
                 window_left=window_left,
                 window_right=window_right,
                 bottom_right=_is_bottom_right(inp.attn_bias),
+                page_table=block_table,
             )
         else:
             out = torch.zeros_like(inp.query)
