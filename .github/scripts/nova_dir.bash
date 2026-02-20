@@ -14,6 +14,9 @@ if [[ "$working_dir" == "$MSLK_REPO" ]]; then cd MSLK || echo "Failed to cd MSLK
 ## Build clean/wheel will be done in pre-script. Set flag such that setup.py will skip these steps in Nova workflow
 export BUILD_FROM_NOVA=1
 
+# Disable HIP FMHA build in the manywheel CI (the runner is too small)
+export MSLK_BUILD_HIP_FMHA=0
+
 if [[ "$CU_VERSION" == "cu"* ]]; then
     echo "Current TORCH_CUDA_ARCH_LIST value: ${TORCH_CUDA_ARCH_LIST}"
 elif [[ "$CU_VERSION" == "rocm"* ]]; then
