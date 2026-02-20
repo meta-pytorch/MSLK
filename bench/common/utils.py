@@ -100,9 +100,8 @@ def do_bench(
     # We benchmark on a different stream, so a sync is required.
     torch.cuda.synchronize()
 
-    def rotating_buffer_fn() -> None:
-        for a in args_list:
-            fn(*a)
+    def rotating_buffer_fn() -> list[Any]:
+        return [fn(*args) for args in args_list]
 
     return _do_bench(rotating_buffer_fn, opts) / len(args_list)
 
