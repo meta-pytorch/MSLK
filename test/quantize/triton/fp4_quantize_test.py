@@ -300,8 +300,8 @@ class TestNVFp4Quantize:
         x_scales_ref = _to_blocked(x_scales_ref).view(x_scales.shape)
 
         torch.testing.assert_close(x_global_scale, x_global_scale_ref.reciprocal())
-        torch.testing.assert_close(x_scales, x_scales_ref)
-        torch.testing.assert_close(x_fp4, x_fp4_ref)
+        assert torch.equal(x_scales, x_scales_ref)
+        assert torch.equal(x_fp4, x_fp4_ref)
 
     @pytest.mark.parametrize(
         "test_case",
