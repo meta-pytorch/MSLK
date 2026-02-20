@@ -5495,6 +5495,7 @@ def triton_quantize_nvfp4(
     x: torch.Tensor,
     global_scale: torch.Tensor,
     use_e8m0_scale: bool = False,
+    use_precise_math: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor to NVFP4 format.
 
@@ -5502,6 +5503,9 @@ def triton_quantize_nvfp4(
         x (torch.Tensor): Input tensor to be quantized.
         global_scale (torch.Tensor): Per-tensor scale for two-level quantization.
         use_e8m0_scale (bool): Whether to use E8M0 for quantization. If True will mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale.
+        use_precise_math (bool): Whether to use precise math for quantization.
+            If disabled the kernel would multiply by the reciprocal instead of dividing when computing scales.
+            In practice this is **often** bitwise accurate as the scales are converted to FP8 right after.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Quantized tensor and scales tensor in swizzled layout.
@@ -5552,6 +5556,8 @@ def triton_quantize_nvfp4(
         USE_MASK=USE_MASK,
         # pyre-ignore[6]
         USE_E8M0_SCALE=use_e8m0_scale,
+        # pyre-ignore[6]
+        USE_PRECISE_MATH=use_precise_math,
     )
 
     # reshape back to original shape
@@ -5574,10 +5580,12 @@ def triton_quantize_nvfp4_kernel(
     M_PER_BLOCK: tl.constexpr,
     USE_MASK: tl.constexpr,
     USE_E8M0_SCALE: tl.constexpr,
+    USE_PRECISE_MATH: tl.constexpr,
 ):
     E4M3_EPS = 1.5258789e-05
-    FP4_E2M1_MAX = 6.0
     FP8_E4M3_MAX = 448.0
+    FP4_E2M1_MAX = 6.0
+    INV_FP4_E2M1_MAX = 1.0 / 6.0
 
     NUM_ELEM_PER_LAYOUT = 128 * 4
     NUM_N_BLOCKS = tl.cdiv(N, 64)
@@ -5621,11 +5629,21 @@ def triton_quantize_nvfp4_kernel(
     # Block-wise max
     block_amax = tl.max(tl.abs(x_blocks), axis=2)  # [M_PER_BLOCK, 4]
 
+    # To avoid expensive per-element tl.div_rn we can multiply by the reciprocal.
+    # This could introduce ~1ULP differnce. However as the scales are casted
+    # from FP32 to FP4 right after, for most FP32 values this is equivalent still.
+    # We gate this to USE_PRECISE_MATH=False.
     if USE_E8M0_SCALE:
-        scales = tl.div_rn(block_amax, 4.0) * global_scale
+        if USE_PRECISE_MATH:
+            scales = tl.div_rn(block_amax, 4.0) * global_scale
+        else:
+            scales = block_amax * 0.25 * global_scale
         scales = _fp32_to_e8m0(scales, mbits=1, scale_round_mode="even")
     else:
-        scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * global_scale
+        if USE_PRECISE_MATH:
+            scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * global_scale
+        else:
+            scales = block_amax * INV_FP4_E2M1_MAX * global_scale
         scales = tl.clamp(scales, E4M3_EPS, FP8_E4M3_MAX)
 
     scales = scales.to(tl.float8e4nv)  # [M_PER_BLOCK, 4]
