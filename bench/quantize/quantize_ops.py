@@ -96,6 +96,28 @@ def get_ops() -> list[QuantizeOpBase]:
 
 
 @register_op
+class Copy(QuantizeOpBase):
+    """Copies input to output.
+
+    Useful for measuring achievable DRAM bandwidth.
+    """
+
+    def quantize(self, input: torch.Tensor) -> Any:
+        return (input.clone(),)
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        return args[0]
+
+    @property
+    def hip(self) -> bool:
+        return True
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
 class TritonFP8Rowwise(QuantizeOpBase):
     def quantize(self, input: torch.Tensor) -> Any:
         return triton_quantize_fp8_row(input)
