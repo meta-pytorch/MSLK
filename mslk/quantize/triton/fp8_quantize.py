@@ -138,51 +138,83 @@ def _kernel_quantize_fp8_row(
         if current_row >= group_rows:
             K_in = 0
 
-    # Calculate max.
-    cur_max = 0.0
-    for _k in range(0, tl.cdiv(K_in, BLOCK_SIZE)):
+    # Single-pass: when entire row fits in one block, load once and reuse
+    # for quantization, eliminating the second read from global memory.
+    if K_fp8 <= BLOCK_SIZE:
         a = tl.load(
             A + a_offset_base + n_offset * stride_ak,
             mask=n_offset < K_in,
             other=0.0,
         )
-        tile_max = tl.max(tl.abs(a))
-        cur_max = tl.maximum(tile_max, cur_max)
-        n_offset += BLOCK_SIZE
+        cur_max = tl.max(tl.abs(a))
 
-    # Clamp max value appropriately.
-    if CLAMP_MAX:
-        ub = tl.load(scale_ub)
-        cur_max = tl.clamp(cur_max, EPS, ub)
-    else:
-        cur_max = tl.maximum(cur_max, EPS)
-    # Scale and quantize.
-    a_scale = MAX_FP8 / cur_max
-    tl.store(A_scale + pid, 1.0 / a_scale)
-    n_offset = tl.arange(0, BLOCK_SIZE)
+        # Clamp max value appropriately.
+        if CLAMP_MAX:
+            ub = tl.load(scale_ub)
+            cur_max = tl.clamp(cur_max, EPS, ub)
+        else:
+            cur_max = tl.maximum(cur_max, EPS)
 
-    # Write quantized values for the first K elements (from A), and pad the rest with zeros up to K_fp8
-    for _k in range(0, tl.cdiv(K_fp8, BLOCK_SIZE)):
-        # Load from A if in range, else 0 (we're going all the way to K_fp8)
-        a = tl.load(
-            A + a_offset_base + n_offset * stride_ak,
-            mask=n_offset < K_in,
-            other=0.0,
-        )
-        # For elements >= K, a will be 0
+        # Scale and quantize.
+        a_scale = MAX_FP8 / cur_max
+        tl.store(A_scale + pid, 1.0 / a_scale)
+
         a_fp8 = a * a_scale
-        # Clamp A to fp8 range to make sure there's no overflow.
-        # This is required for AMD. Nvidia's default saturation
-        # handles it, but it's nice to have anyway.
         a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
-
-        # Store the full new row in its place (for elements >= K, a_fp8 is already 0)
         tl.store(
             A_fp8 + a_fp8_offset_base + n_offset * stride_ok,
             a_fp8,
             mask=n_offset < K_fp8,
         )
-        n_offset += BLOCK_SIZE
+    else:
+        # Multi-pass: two separate passes through the data
+
+        # Calculate max.
+        cur_max = 0.0
+        for _k in range(0, tl.cdiv(K_in, BLOCK_SIZE)):
+            a = tl.load(
+                A + a_offset_base + n_offset * stride_ak,
+                mask=n_offset < K_in,
+                other=0.0,
+            )
+            tile_max = tl.max(tl.abs(a))
+            cur_max = tl.maximum(tile_max, cur_max)
+            n_offset += BLOCK_SIZE
+
+        # Clamp max value appropriately.
+        if CLAMP_MAX:
+            ub = tl.load(scale_ub)
+            cur_max = tl.clamp(cur_max, EPS, ub)
+        else:
+            cur_max = tl.maximum(cur_max, EPS)
+
+        # Scale and quantize.
+        a_scale = MAX_FP8 / cur_max
+        tl.store(A_scale + pid, 1.0 / a_scale)
+
+        # Write quantized values for the first K elements (from A), and pad the rest with zeros up to K_fp8
+        n_offset = tl.arange(0, BLOCK_SIZE)
+        for _k in range(0, tl.cdiv(K_fp8, BLOCK_SIZE)):
+            # Load from A if in range, else 0 (we're going all the way to K_fp8)
+            a = tl.load(
+                A + a_offset_base + n_offset * stride_ak,
+                mask=n_offset < K_in,
+                other=0.0,
+            )
+            # For elements >= K, a will be 0
+            a_fp8 = a * a_scale
+            # Clamp A to fp8 range to make sure there's no overflow.
+            # This is required for AMD. Nvidia's default saturation
+            # handles it, but it's nice to have anyway.
+            a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
+
+            # Store the full new row in its place (for elements >= K, a_fp8 is already 0)
+            tl.store(
+                A_fp8 + a_fp8_offset_base + n_offset * stride_ok,
+                a_fp8,
+                mask=n_offset < K_fp8,
+            )
+            n_offset += BLOCK_SIZE
 
 
 def triton_quantize_fp8_row(
