@@ -45,13 +45,15 @@ if(BUILD_FB_CODE
       "[FBPKG] MSLK_FBPKG_BUILD is NOT set,"
       "certain FB-internal sources will be excluded from the build.")
 
-    # NOTE: Some FB-internal code explicitly require an FB-internal
-    # environment to build, such as code that depends on NCCLX
+    # To allow a directory, add it to the regex group below, e.g.:
+    #   set(FB_ONLY_ALLOW_REGEX "fb/csrc/(my_kernel_1|my_kernel_2)")
+    set(FB_ONLY_ALLOW_REGEX "^$")
+
     list(FILTER fb_only_sources_cpu
-      EXCLUDE REGEX "fb/csrc/tensor_parallel(/.*)*\\.cpp$")
+      INCLUDE REGEX "${FB_ONLY_ALLOW_REGEX}")
 
     list(FILTER fb_only_sources_gpu
-      EXCLUDE REGEX "fb/csrc/tensor_parallel(/.*)*\\.cu$")
+      INCLUDE REGEX "${FB_ONLY_ALLOW_REGEX}")
   endif()
 
   list(APPEND mslk_cpp_source_files_cpu ${fb_only_sources_cpu})
