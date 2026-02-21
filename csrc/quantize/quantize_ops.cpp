@@ -39,9 +39,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def("per_tensor_dynamic_quantize_i8(Tensor X) -> (Tensor, Tensor)");
 #ifndef USE_ROCM
   m.def(
-      "scaled_fp4_quant(Tensor! output, Tensor input, Tensor! output_scale, Tensor input_scale) -> ()");
-
-  m.def(
       "fake_quantize_nvfp4_per_tensor(Tensor input, Tensor? static_scales=None, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor[]");
 #else
   m.def("flush_icache_hip() -> ()");
@@ -62,7 +59,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
       quantize_fp8_per_tensor_fixed_scale);
 
 #ifndef USE_ROCM
-  DISPATCH_TO_CUDA("scaled_fp4_quant", scaled_fp4_quant);
   DISPATCH_TO_CUDA(
       "fake_quantize_nvfp4_per_tensor", fake_quantize_nvfp4_per_tensor);
 #else

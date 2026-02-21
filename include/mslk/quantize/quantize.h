@@ -50,12 +50,6 @@ at::Tensor get_fp8_per_tensor_scale(
     std::optional<at::Tensor> bs,
     std::optional<at::Tensor> scale_ub); // scale upperbound
 
-void scaled_fp4_quant(
-    at::Tensor const& output,
-    at::Tensor const& input,
-    at::Tensor const& output_sf,
-    at::Tensor const& input_sf);
-
 std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
     at::Tensor input,
     std::optional<at::Tensor> static_scales,
