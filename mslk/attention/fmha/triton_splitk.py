@@ -6,7 +6,6 @@
 # pyre-unsafe
 import functools
 import sys
-from dataclasses import dataclass
 from typing import (
     Any,
     cast,
