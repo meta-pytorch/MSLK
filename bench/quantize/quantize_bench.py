@@ -17,7 +17,7 @@ import click
 import pandas as pd
 import torch
 import triton  # @manual=//triton:triton
-from mslk.bench.common.utils import BenchOptions, profiler
+from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
 from mslk.bench.quantize.quantize_ops import get_ops, QuantizeOpBase
 from tabulate import tabulate
 
@@ -207,27 +207,7 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
 
 
 @click.command()
-@click.option(
-    "--output-dir",
-    default="/tmp",
-    help="Directory to save plots and csvs to",
-)
-@click.option(
-    "--num-iters",
-    default=1,
-    type=int,
-    help="Number of iterations to repeat each benchmark.",
-)
-@click.option(
-    "--export-csv",
-    is_flag=True,
-    help="Export results to a CSV file.",
-)
-@click.option(
-    "--kernels",
-    default=None,
-    help="Comma separated list of kernels to benchmark. Defaults to all kernels.",
-)
+@common_bench_options(shape_registry)
 @click.option(
     "--M",
     default=None,
@@ -243,26 +223,6 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
     is_flag=True,
     help="If set, instead of benchmarking cartesian product of M * K, benchmark consecutive MK pairs together.",
 )
-@click.option(
-    "--no-cuda-graph",
-    is_flag=True,
-    help="If set, do not use cuda graph for benchmarking.",
-)
-@click.option(
-    "--no-rotating-buffer",
-    is_flag=True,
-    help="If set, do not use rotating buffer for benchmarking.",
-)
-@click.option(
-    "--shapes",
-    default=None,
-    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
-)
-@click.option(
-    "--trace",
-    is_flag=True,
-    help="If set, produce a performance trace of the benchmark.",
-)
 def invoke_main(
     output_dir: str,
     num_iters: int,
@@ -271,10 +231,11 @@ def invoke_main(
     m: Optional[str],
     k: Optional[str],
     pair_mk: bool,
-    no_cuda_graph: bool,
-    no_rotating_buffer: bool,
+    cuda_graph: bool,
+    rotating_buffer: bool,
     shapes: Optional[str],
     trace: bool,
+    rep_ms: int,
 ) -> None:
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
     all_kernels = kernels.strip().split(",") if kernels else None
@@ -294,8 +255,9 @@ def invoke_main(
 
     opts = BenchOptions(
         num_iters=num_iters,
-        cuda_graph=not no_cuda_graph,
-        rotating_buffer=not no_rotating_buffer,
+        cuda_graph=cuda_graph,
+        rotating_buffer=rotating_buffer,
+        rep_ms=rep_ms,
         trace=trace,
     )
 
