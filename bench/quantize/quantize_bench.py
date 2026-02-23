@@ -149,6 +149,7 @@ def benchmark(
     k: int,
     mem_bw_roofline_gbps: float,
     opts: BenchOptions,
+    num_groups: int = 1,
 ) -> list[Metrics]:
     # Create input tensors.
     input = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -158,7 +159,7 @@ def benchmark(
     # Benchmark each operator.
     for quantize_op in quantize_ops:
         metrics = Metrics(op=quantize_op.name, M=m, K=k)
-        args = quantize_op.preprocess(input)
+        args = quantize_op.preprocess(input, num_groups=num_groups)
         quantized = quantize_op.quantize(input, *args)
         dequantized = quantize_op.dequantize(*quantized)
         metrics.sim = torch.mean(torch.pow(dequantized - input, 2)).item()
@@ -263,6 +264,12 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
     is_flag=True,
     help="If set, produce a performance trace of the benchmark.",
 )
+@click.option(
+    "--num-groups",
+    default=1,
+    type=int,
+    help="Number of groups (experts) to split M across for grouped/MoE quantize ops.",
+)
 def invoke_main(
     output_dir: str,
     num_iters: int,
@@ -275,6 +282,7 @@ def invoke_main(
     no_rotating_buffer: bool,
     shapes: Optional[str],
     trace: bool,
+    num_groups: int,
 ) -> None:
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
     all_kernels = kernels.strip().split(",") if kernels else None
@@ -309,6 +317,7 @@ def invoke_main(
             K,
             mem_bw_roofline_gbps,
             opts,
+            num_groups=num_groups,
         )
         benchmark_results.extend(quantize_measurements)
         csv_row = {}

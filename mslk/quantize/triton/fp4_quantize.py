@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import triton  # @manual
-from triton import language as tl
+from triton import Config, language as tl  # @manual
 
 try:
     from triton.language.extra.libdevice import rsqrt as tl_rsqrt
@@ -2175,390 +2175,210 @@ def triton_scale_nvfp4_quant_rms(
     return out.view(list(orig_shape[:-1]) + [-1]).view(torch.uint8), scale
 
 
+# Optionally include tuning, for now we skip for warmup efficiency.
+# @triton.autotune(
+#     configs=[
+#         Config({"M_PER_BLOCK": 32}, num_warps=2),
+#         Config({"M_PER_BLOCK": 64}, num_warps=4),
+#         Config({"M_PER_BLOCK": 128}, num_warps=4),
+#         Config({"M_PER_BLOCK": 128}, num_warps=8),
+#     ],
+#     key=["M", "N"],
+# )
 @triton.jit
-def _kernel_nvfp4_quantize_stacked(
-    A,
-    input_global_scale_tensor,
-    out,
-    scale,
-    belong_indices,
-    starting_row_after_padding,
-    row_within_tensor,
-    rand_bits,
+def _nvfp4_quantize_stacked_kernel(
+    x_ptr,
+    global_scale_ptr,
+    q_ptr,
+    s_ptr,
+    m_sizes_ptr,
+    stride_xm,
+    stride_xn,
     M,
-    K,
-    GROUPS_PER_ROW,
-    GROUPS_PER_THREAD,
-    ROW_PADDING,
-    EPS: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    EBITS: tl.constexpr,
-    MBITS: tl.constexpr,
-    ROUNDING_MODE: tl.constexpr,
-    STOCHASTIC_CASTING: tl.constexpr,
-    FP4_EXP_BIAS: tl.constexpr,
-    GROUP_LOAD: tl.constexpr,
-    USE_INT64: tl.constexpr,
-    SCALE_K: tl.constexpr,
-) -> None:
-    """Quantize a 1D float tensor into a packed MX4 tensor.
+    N,
+    NUM_SEGMENTS: tl.constexpr,
+    PREFIX_NUM: tl.constexpr,
+    M_PER_BLOCK: tl.constexpr = 64,
+):
+    """Quantize concatenated MoE activations to NVFP4 with per-expert global scales.
+
+    Uses a 2D tiled grid (cdiv(N, 64), cdiv(M, M_PER_BLOCK)). Each block
+    processes an [M_PER_BLOCK, 64] tile. Per-expert global scales are loaded
+    from a [num_segments] tensor. Cumsums and binary search are computed
+    redundantly in every thread block to eliminate host-side GPU operations.
 
     Args:
-        A (Tensor): [M] float tensor to be quantized.
-        out (Tensor): [M / 2] output containing packed mx4 values.
-        scale (Tensor): [M / GROUP_SIZE] containing mx4 shared exponents.
-        rand_bits (Optional Tensor): [M, K / 2] random integers used for stochastic rounding.
-        M (int): Number of input rows.
-        K (int): Number of input columns.
-        GROUPS_PER_ROW (int): Number of groups in each row of the input.
-        GROUPS_PER_THREAD (int): Number of groups to process per thread.
-        ROW_PADDING (int): Number of elements of padding to insert into each row.
-        GROUP_SIZE (int): Size of chunks that use the same shared exponent.
-        EBITS (int): Number of exponent bits in target mx4 format.
-        MBITS (int): Number of mantissa bits in target mx4 format.
-        ROUNDING_MODE (int): Which rounding method to use when calculating shared exponent.
-        STOCHASTIC_CASTING (bool): Whether to use stochastic rounding when downcasting.
-        FP4_EXP_BIAS (int): Exponent bias of target mx4 format.
-        GROUP_LOAD (int): Number of groups to process simultaneously.
-        USE_INT64 (bool): Whether to use int64 for indexing. This is needed for large tensors.
+        x_ptr: Input tensor pointer [M, N] (bf16/fp16).
+        global_scale_ptr: Per-expert global scales [num_segments] (fp32).
+        q_ptr: Output quantized data [M, N//2] (uint8).
+        s_ptr: Output scale buffer [padded_total_M, N//16] (uint8).
+        m_sizes_ptr: Rows per expert segment [num_segments] (int64).
+        stride_xm: Row stride of input.
+        stride_xn: Column stride of input.
+        M: Total number of rows.
+        N: Number of columns.
+        NUM_SEGMENTS: Number of expert segments.
+        PREFIX_NUM: next_power_of_2(NUM_SEGMENTS) for tl.cumsum.
+        M_PER_BLOCK: Rows per block (constexpr, power of 2, <= 128, autotuned).
     """
-    # Define Constant Expressions.
-    BF16_MIN_NORMAL: tl.constexpr = 2 ** (-126)  # type: ignore[Incompatible variable type]
+    E4M3_EPS: tl.constexpr = 1.5258789e-05
 
-    # Get the current thread number.
-    pid = tl.program_id(0)
-    # For very large inputs, we need to use int64 indexes. This is slower but necessary.
-    if USE_INT64:
-        pid = pid.to(tl.int64)
-        M = tl.cast(M, tl.int64)
-        K = tl.cast(K, tl.int64)
-        GROUPS_PER_THREAD = tl.cast(GROUPS_PER_THREAD, tl.int64)
+    NUM_ELEM_PER_LAYOUT: tl.constexpr = 128 * 4
+    NUM_N_BLOCKS = tl.cdiv(N, 64)
 
-    # Boundaries for writing to output tensor.
-    NUM_GROUPS = M * GROUPS_PER_ROW
-    OUTPUT_CHUNK_SIZE = (GROUPS_PER_THREAD * GROUP_SIZE) // 8
-    SCALE_CHUNK_SIZE = GROUPS_PER_THREAD
-    OUTPUT_SIZE = (GROUP_SIZE * NUM_GROUPS) // 8
-    SCALE_SIZE = NUM_GROUPS
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(0)
 
-    # load scaling factor
-    input_global_scale = tl.load(input_global_scale_tensor)
+    # ---- Step 1: Compute cumsums and binary search for segment ownership ----
+    seg_offs = tl.arange(0, PREFIX_NUM)
+    seg_mask = seg_offs < NUM_SEGMENTS
+    m_vals = tl.load(m_sizes_ptr + seg_offs, mask=seg_mask, other=0)
+    cumsum_inc = tl.cumsum(m_vals, axis=0)
+    padded_vals = ((m_vals + 127) // 128) * 128
+    padded_cumsum_inc = tl.cumsum(padded_vals, axis=0)
+    # Exclusive cumsums: [0, m_0, m_0+m_1, ...]
+    cumsum_exc = cumsum_inc - m_vals
+    padded_cumsum_exc = padded_cumsum_inc - padded_vals
 
-    # Find starting offsets for this thread. These are calculated before adjusting for padding.
-    input_start = pid * (GROUPS_PER_THREAD * GROUP_SIZE)
-    output_start = pid * OUTPUT_CHUNK_SIZE
-    exp_start = pid * SCALE_CHUNK_SIZE
-    # Initiate offset ranges used in kernel.
-    input_offset = tl.arange(0, GROUP_LOAD * GROUP_SIZE) + input_start
-    output_offset = tl.arange(0, GROUP_LOAD * (GROUP_SIZE // 8)) + output_start
+    rows = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)  # [M_PER_BLOCK]
 
-    # We need to shift output offsets to make space for shared exponent storage.
-    # Now create offsets for writing the shared exponent.
-    # make sure to add offset from padding
-    exp_offset = tl.arange(0, GROUP_LOAD) + exp_start
+    # Binary search: find largest seg_idx such that cumsum_exc[seg_idx] <= row
+    lo = tl.zeros([M_PER_BLOCK], dtype=tl.int32)
+    hi = tl.full([M_PER_BLOCK], NUM_SEGMENTS - 1, dtype=tl.int32)
+    for _ in range(10):  # log2(1024) = 10 iterations
+        mid = (lo + hi + 1) // 2
+        mid_val = tl.gather(cumsum_exc, mid, 0)
+        lo = tl.where(mid_val <= rows, mid, lo)
+        hi = tl.where(mid_val <= rows, hi, mid - 1)
+    seg_idx = lo  # [M_PER_BLOCK]
 
-    row_idx = exp_offset // GROUPS_PER_ROW
-    tensor_idx = tl.load(
-        belong_indices + row_idx,
-        mask=(row_idx < M),
-    )
-    tensor_offset = (
-        tl.load(starting_row_after_padding + tensor_idx, mask=(row_idx < M))
-        * GROUPS_PER_ROW
-    )
-    inner_idx = (
-        tl.load(
-            row_within_tensor + row_idx,
-            mask=(row_idx < M),
-        )
-        * GROUPS_PER_ROW
-    )
-    actual_scale_offset = tensor_offset + inner_idx + exp_offset % GROUPS_PER_ROW
+    # ---- Step 2: Load per-expert global scale for each row ----
+    global_scales = tl.load(global_scale_ptr + seg_offs, mask=seg_mask, other=1.0)
+    row_scale = tl.gather(global_scales, seg_idx, 0)  # [M_PER_BLOCK]
 
-    # Load and process blocks of values for this chunk.
-    for _k in range(0, tl.cdiv(GROUPS_PER_THREAD, GROUP_LOAD)):
-        # We need to make some adjustments to allow for padding.
-        pad_mask = (input_offset % (GROUPS_PER_ROW * GROUP_SIZE)) < K
-        if ROW_PADDING != 0:
-            # Shift the input to account for padding.
-            padded_input_offset = (
-                input_offset
-                - (input_offset // (GROUPS_PER_ROW * GROUP_SIZE)) * ROW_PADDING
-            )
-        # When there's no padding we can simplify indexing.
-        else:
-            padded_input_offset = input_offset
+    # ---- Step 3: Load tile [M_PER_BLOCK, 64] ----
+    offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
+    mask = (offs_m < M) & (offs_n < N)
 
-        # Load a block of values.
-        a = tl.load(
-            A + padded_input_offset,
-            # Mask values out of range for both the main array and this chunk. Also pad if needed.
-            mask=(padded_input_offset < (M * K))
-            & (padded_input_offset < ((pid + 1) * GROUPS_PER_THREAD * GROUP_SIZE))
-            & pad_mask,
-            other=0,
-        )
+    x = tl.load(
+        x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=0.0
+    )  # [M_PER_BLOCK, 64]
 
-        # View the block in terms of groups.
-        a_groups = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE])
-        # Compute the shared exponent of each group.
-        group_max = tl.max(tl.abs(a_groups), axis=1).to(tl.float32)
+    # ---- Step 4: Quantize ----
+    x_blocks = x.to(tl.float32).reshape(M_PER_BLOCK, 4, 16)  # [M_PER_BLOCK, 4, 16]
 
-        # Next we scale A in preparation for quantization.
-        scale_ = (group_max / 6.0 * input_global_scale).to(tl.float8e4nv)
-        # Prevent infinite values in log.
-        group_max = tl.where(group_max == 0, BF16_MIN_NORMAL, group_max)
+    # Block-wise max
+    block_amax = tl.max(tl.abs(x_blocks), axis=2)  # [M_PER_BLOCK, 4]
 
-        # Apply scale_ to input. We do this by broadcasting scale.
-        # scaled_a = a * global_scale (fp32) / local_scale (fp8)
-        scaled_a = tl.reshape(a, [GROUP_LOAD, GROUP_SIZE]) * tl.reshape(
-            input_global_scale / scale_, [GROUP_LOAD, 1]
-        )
-        # Reshape back to a flat array.
-        scaled_a = tl.reshape(scaled_a, [GROUP_LOAD * GROUP_SIZE])
-        # split them into 8 arrays with in a round robin fashion
-        # element 0 -> array 0, element 1 -> array 1, element 2 -> array 2 and so on
-        temp_l, temp_r = tl.split(
-            tl.reshape(scaled_a, [(GROUP_LOAD * GROUP_SIZE) // 2, 2])
-        )  # 0, 2, 4, 6, 8 || 1, 3, 5, 7, 9
-        t_one, t_two = tl.split(
-            tl.reshape(temp_l, [(GROUP_LOAD * GROUP_SIZE) // 4, 2])
-        )  # 0 4 8 || 2, 6, 10
-        t_three, t_four = tl.split(
-            tl.reshape(temp_r, [(GROUP_LOAD * GROUP_SIZE) // 4, 2])
-        )  # 1, 5, 9 || 3, 7, 11
+    scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * row_scale[:, None]
+    scales = tl.clamp(scales, E4M3_EPS, FP8_E4M3_MAX)
+    scales = scales.to(tl.float8e4nv)  # [M_PER_BLOCK, 4]
 
-        f_one, f_two = tl.split(
-            tl.reshape(t_one, [(GROUP_LOAD * GROUP_SIZE) // 8, 2])
-        )  # 0, 8 || 4, 12
-        f_three, f_four = tl.split(
-            tl.reshape(t_two, [(GROUP_LOAD * GROUP_SIZE) // 8, 2])
-        )  # 2, 10 || 6, 14
-        f_five, f_six = tl.split(
-            tl.reshape(t_three, [(GROUP_LOAD * GROUP_SIZE) // 8, 2])
-        )  # 1, 9 || 5, 13
-        f_seven, f_eight = tl.split(
-            tl.reshape(t_four, [(GROUP_LOAD * GROUP_SIZE) // 8, 2])
-        )  # 3, 11 || 7, 15
-        packed_result = tl.inline_asm_elementwise(
-            asm="""
-            {
-                .reg .b8 byte0;
-                .reg .b8 byte1;
-                .reg .b8 byte2;
-                .reg .b8 byte3;
-                cvt.rn.satfinite.e2m1x2.f32  byte0, $2, $1;
-                cvt.rn.satfinite.e2m1x2.f32  byte1, $4, $3;
-                cvt.rn.satfinite.e2m1x2.f32  byte2, $6, $5;
-                cvt.rn.satfinite.e2m1x2.f32  byte3, $8, $7;
-                mov.b32 $0, {byte0, byte1, byte2, byte3};
+    # Apply combined scale to data
+    total_scale = tl.div_rn(
+        row_scale[:, None, None], scales.to(tl.float32)[:, :, None]
+    )  # [M_PER_BLOCK, 4, 1]
+    x_blocks = x_blocks * total_scale  # [M_PER_BLOCK, 4, 16]
 
-            }
-            """,
-            constraints="=r,f, f, f, f, f, f, f, f",
-            args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
-            dtype=tl.int32,
-            is_pure=True,
-            pack=1,
-        )
+    scale_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
+    scale_mask = (offs_m < M) & (scale_offs_n < (N // 16))
+    scales = tl.where(scale_mask, scales, 0.0)
 
-        n_col_blocks = SCALE_K // 4
-        first_dim = actual_scale_offset // (512 * n_col_blocks)
-        second_dim = (actual_scale_offset % (512 * n_col_blocks)) // (
-            128 * n_col_blocks
-        )
-        third_dim = (actual_scale_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
-        fourth_dim = (actual_scale_offset % (4 * n_col_blocks)) // 4
-        fifth_dim = actual_scale_offset % 4
-        actual_scale_offset_permute = (
-            first_dim * (512 * n_col_blocks)
-            + fourth_dim * (512)
-            + third_dim * (16)
-            + second_dim * (4)
-            + fifth_dim
-        )
+    # ---- Step 5: Write FP4 data (flat, no segment awareness) ----
+    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    fp4_offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
+    fp4_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
+    fp4_mask = (fp4_offs_m < M) & (fp4_offs_n < N // 2)
+    tl.store(q_ptr + fp4_offs_m * (N // 2) + fp4_offs_n, x_fp4x2, mask=fp4_mask)
 
-        tl.store(
-            scale + actual_scale_offset_permute,
-            scale_.to(tl.uint8, bitcast=True),
-            # Prevent writing outside this chunk or the main array.
-            mask=(row_idx < M)
-            & (exp_offset < (SCALE_CHUNK_SIZE * (pid + 1)))
-            & (exp_offset < SCALE_SIZE),
-        )
-        # Write out packed values to output tensor.
-        tl.store(
-            out + output_offset,
-            packed_result,
-            # Prevent writing outside this chunk or the main array.
-            mask=(output_offset < OUTPUT_SIZE)
-            & (output_offset < (OUTPUT_CHUNK_SIZE * (pid + 1))),
-        )
+    # ---- Step 6: Compute padded row ----
+    seg_cumsum = tl.gather(cumsum_exc, seg_idx, 0)
+    seg_padded_cumsum = tl.gather(padded_cumsum_exc, seg_idx, 0)
+    padded_r = seg_padded_cumsum + (rows.to(tl.int64) - seg_cumsum)  # [M_PER_BLOCK]
 
-        # Update offsets so we work on the next block.
-        input_offset += GROUP_LOAD * GROUP_SIZE
+    # ---- Step 7: Write scales to padded+swizzled layout ----
+    padded_r_2d = padded_r[:, None]  # [M_PER_BLOCK, 1]
+    layout_off = (
+        padded_r_2d // 128
+    ) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
+    offs_m_in_layout = (padded_r_2d % 128).to(tl.int32)
+    scale_offs = layout_off + nvfp4_scale_swizzle(offs_m_in_layout)
 
-        # since next group might go across the tensor boundary into a new tensor, recalculate offset
-        exp_offset += GROUP_LOAD
-        row_idx = exp_offset // GROUPS_PER_ROW
-        tensor_idx = tl.load(
-            belong_indices + row_idx,
-            mask=(row_idx < M),
-        )
-        tensor_offset = (
-            tl.load(starting_row_after_padding + tensor_idx, mask=(row_idx < M))
-            * GROUPS_PER_ROW
-        )
-        inner_idx = (
-            tl.load(
-                row_within_tensor + row_idx,
-                mask=(row_idx < M),
-            )
-            * GROUPS_PER_ROW
-        )
-        actual_scale_offset = tensor_offset + inner_idx + exp_offset % GROUPS_PER_ROW
-
-        output_offset += GROUP_LOAD * GROUP_SIZE // 8
+    # Mask out rows beyond M and scale columns beyond N//16
+    scale_store_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
+    store_mask = (rows[:, None] < M) & (scale_store_offs_n < (N // 16))
+    tl.store(s_ptr + scale_offs, scales.to(tl.uint8, bitcast=True), mask=store_mask)
 
 
-def triton_nvfp4_quant_stacked(
+def nvfp4_quantize_stacked(
+    m_sizes: torch.Tensor,
     input: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    belong_indices: torch.Tensor,
-    starting_row_after_padding: torch.Tensor,
-    row_within_tensor: torch.Tensor,
-    group_size: int = 16,
-    ebits: int = 2,
-    mbits: int = 1,
-    rounding_mode: Union[RoundingMode, int] = RoundingMode.ceil,
-    stochastic_casting: bool = False,
-    EPS: float = 1e-5,
+    global_scale: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to nvfp4 format using efficient triton kernels.
+    """Quantize concatenated MoE activations to NVFP4 with per-expert global scales.
+
+    Uses per-expert global scales for quantization math, with per-segment
+    padded scales for the downstream GEMM. Cumsums are computed inside the
+    Triton kernel to avoid GPU launch overhead.
 
     Args:
-        a (Tensor): [M] higher precision input tensor.
-        group_size (int): Size of chunks that will use the same shared exponent.
-        ebits (int): Number of bits to use for exponent in target nvfp4 format.
-        mbits (int): Number of bits to use for mantissa in target nvfp4 format.
-        rounding_mode (Union[RoundingMode, int]): Which type of rounding to use
-        when calculating shared exponent. Defaults to pre-rounding to nearest even int.
-        stochastic_casting (bool): Whether to use stochastic casting.
+        m_sizes: [num_segments] int64 tensor of rows per expert.
+        input: [M, K] concatenated activation tensor (bf16/fp16).
+        global_scale: [num_segments] fp32 per-expert global scales
+            (e.g. from calculate_group_max).
 
     Returns:
-        torch.Tensor: [M / 2] nvfp4 scaled tensor packed into int8
-        torch.Tensor: [M / group_size] nvfp4 shared exponents into int8
-
-        eg.
-        Input with shape [1, 8192] will be quantized to [1, 4096 + 512] as
-        each value contain two elements packed into an int8 and
-        there are 32 elements per group.
+        Tuple of (xq, scale):
+            xq: [M, K//2] uint8 packed FP4 data.
+            scale: Flattened uint8 scale buffer (padded+swizzled).
     """
-
-    orig_shape = input.shape
     assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
-    other_dims = 1 if input.ndim == 1 else -1
-    input = input.reshape(other_dims, input.shape[-1])
+    input = input.reshape(-1, input.shape[-1])
     M, K = input.shape
-    block_size = group_size
+    num_segments = m_sizes.shape[0]
     device = input.device
 
-    assert K % block_size == 0, f"last dim has to be multiple of 16, but got {K}."
+    assert K % 16 == 0, f"K must be divisible by 16, but got {K}."
     assert input.dtype in (
         torch.float16,
         torch.bfloat16,
     ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
 
-    # Two fp4 values will be packed into an uint8.
-    out = torch.empty((M, K // 8), device=device, dtype=torch.uint32)
+    # Upper-bound on padded total rows avoids GPU->host sync (.item()) so
+    # this function is safe to use inside CUDA-graph capture.  Each of the
+    # num_segments segments can add at most 127 padding rows.
+    padded_total_M_ub = M + num_segments * 127
 
-    # We use the rounded values to store the swizzled values. Due to the
-    # requirement of the Tensor Core, the minimum tile is 128x4 for the scales.
-    # So, we first pad the scales to multiples of 128 and 4. Then, the scales
-    # (in float8_e4m3fn) int8. More:
-    # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x
-    def round_up(x: int, y: int) -> int:
-        return (x + y - 1) // y * y
+    # Allocate outputs
+    xq = torch.empty((M, K // 2), device=device, dtype=torch.uint8)
 
-    rounded_M = round_up(M + (starting_row_after_padding.numel() - 1) * 128, 128)
-    scale_K = K // block_size
-    rounded_K = round_up(scale_K, 4)
-    scale = torch.empty((rounded_M, rounded_K), device=device, dtype=torch.uint8)
-
-    # In this kernel, we want each row to be divisible by group_size.
-    # If the rows are not, then we will pad them. Find the number of
-    # groups per row after padding.
-    groups_per_row = math.ceil(K / group_size)
-    num_groups = M * groups_per_row
-    # Find how many groups each thread should process. We do this
-    # by assuming that it is good to distribute work evenly over threads.
-    num_threads = math.ceil(math.sqrt(input.numel()))
-    # Data is loaded in chunks of GROUP_LOAD elements, so theres no reason
-    # to ever fewer groups per thread than it.
-    GROUP_LOAD = 128
-    groups_per_thread = max(math.ceil(num_groups / num_threads), GROUP_LOAD)
-    # Determine how much padding, if any is needed for each row.
-    if K % group_size != 0:
-        padding = group_size - (K % group_size)
-    else:
-        padding = 0
-    # If using stochastic rounding, create random noise for each group.
-    # We use the same random bits as seeds when doing stochastic downcasting.
-    if rounding_mode == RoundingMode.stochastic or stochastic_casting:
-        # Each group will need a seed.
-        rand_bits = torch.randint(
-            low=0,
-            high=2**31 - 1,
-            size=(num_groups,),
-            dtype=torch.int32,
-            device=input.device,
-        )
-    else:
-        rand_bits = None
-
-    # Check if we need to use int64 for indexing.
-    use_int64 = num_threads * groups_per_thread * group_size > 2**31 - 1
-    # Invoke triton quantization kernel over rows.
-
-    grid = (num_threads,)
-    _kernel_nvfp4_quantize_stacked[grid](
-        input,
-        input_global_scale,
-        out,
-        scale,
-        belong_indices,
-        starting_row_after_padding,
-        row_within_tensor,
-        rand_bits=rand_bits,
-        M=M,
-        K=K,
-        GROUPS_PER_ROW=groups_per_row,
-        GROUPS_PER_THREAD=groups_per_thread,
-        ROW_PADDING=padding,
-        # pyre-ignore[6]
-        EPS=EPS,
-        # pyre-ignore[6]
-        GROUP_SIZE=group_size,
-        # pyre-ignore[6]
-        EBITS=ebits,
-        # pyre-ignore[6]
-        MBITS=mbits,
-        # pyre-ignore[6]
-        ROUNDING_MODE=rounding_mode,
-        # pyre-ignore[6]
-        STOCHASTIC_CASTING=stochastic_casting,
-        FP4_EXP_BIAS=get_mx4_exp_bias(ebits),
-        # pyre-ignore[6]
-        GROUP_LOAD=GROUP_LOAD,
-        # pyre-ignore[6]
-        USE_INT64=use_int64,
-        # pyre-ignore[6]
-        SCALE_K=rounded_K,
+    num_scales_per_row = K // 16
+    n_col_blocks = triton.cdiv(num_scales_per_row, 4)
+    padded_cols = n_col_blocks * 4
+    scale = torch.empty(
+        (padded_total_M_ub, padded_cols), device=device, dtype=torch.uint8
     )
 
-    scale = scale.flatten()
-    return out.view(list(orig_shape[:-1]) + [-1]).view(torch.uint8), scale
+    grid = lambda META: (triton.cdiv(K, 64), triton.cdiv(M, META["M_PER_BLOCK"]))
+
+    _nvfp4_quantize_stacked_kernel[grid](
+        input,
+        global_scale,
+        xq,
+        scale,
+        m_sizes,
+        input.stride(0),
+        input.stride(1),
+        M,
+        K,
+        # pyre-ignore[6]
+        NUM_SEGMENTS=num_segments,
+        # pyre-ignore[6]
+        PREFIX_NUM=triton.next_power_of_2(num_segments),
+    )
+
+    return xq.view(torch.float4_e2m1fn_x2), scale.view(torch.float8_e4m3fn)
 
 
 @triton.jit

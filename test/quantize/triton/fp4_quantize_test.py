@@ -16,10 +16,12 @@ from mslk.quantize.triton.fp4_quantize import (
     _from_blocked,
     _to_blocked,
     cal_global_scale_mx4_as_nvfp4,
+    calculate_group_max,
     FP4_E2M1_MAX,
     FP4_EBITS,
     FP4_MBITS,
     FP8_E4M3_MAX,
+    nvfp4_quantize_stacked,
     RoundingMode,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
@@ -430,3 +432,166 @@ def _float32_to_float4_e2m1fn_x2(x):
     x = pack_uint4(x)
     x = x.view(torch.float4_e2m1fn_x2)
     return x
+
+
+# MoE shapes: (num_experts, m_sizes_list, K)
+MOE_SHAPES = [
+    # Equal experts, rows aligned to 128
+    (4, [128, 128, 128, 128], 1024),
+    # Unequal experts, rows not aligned to 128
+    (4, [64, 128, 256, 64], 512),
+    # 8 experts with varying sizes
+    (8, [32, 64, 128, 32, 64, 128, 32, 64], 1024),
+    # Small experts requiring heavy padding
+    (2, [1, 3], 128),
+    # Large hidden dim
+    (4, [256, 256, 256, 256], 7168),
+]
+
+
+@pytest.mark.skipif(
+    not SUPPORTS_NVFP4,
+    reason="Skip if TestNVFP4QuantizeStacked is not supported on this device.",
+)
+class TestNVFP4QuantizeStacked:
+    device: torch.device | None = None
+
+    @pytest.fixture(autouse=True)
+    def setup(self) -> None:
+        torch.manual_seed(0)
+        self.device = torch.accelerator.current_accelerator()
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", MOE_SHAPES)
+    def test_calculate_group_max(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify per-expert global scales match naive per-expert computation."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+
+        global_scales, tensor_idx = calculate_group_max(x, m_sizes)
+
+        cumsum = [0] + [sum(m_sizes_list[: i + 1]) for i in range(num_experts)]
+        for i in range(num_experts):
+            start, end = cumsum[i], cumsum[i + 1]
+            expert_data = x[start:end]
+            ref_scale = global_scale_nvfp4(expert_data)
+            torch.testing.assert_close(
+                global_scales[i],
+                ref_scale,
+                atol=1e-3,
+                rtol=1e-3,
+            )
+
+        # Verify tensor_idx maps each row to the correct expert.
+        for i in range(num_experts):
+            start, end = cumsum[i], cumsum[i + 1]
+            assert (tensor_idx[start:end] == i).all(), (
+                f"tensor_idx mismatch for expert {i}"
+            )
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", MOE_SHAPES)
+    def test_xq_matches_individual(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify stacked xq data matches per-expert triton_quantize_nvfp4."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+
+        global_scales, _ = calculate_group_max(x, m_sizes)
+        xq_stacked, _ = nvfp4_quantize_stacked(m_sizes, x, global_scales)
+        xq_stacked = xq_stacked.view(torch.uint8)
+
+        cumsum = [0] + [sum(m_sizes_list[: i + 1]) for i in range(num_experts)]
+        for i in range(num_experts):
+            start, end = cumsum[i], cumsum[i + 1]
+            expert_data = x[start:end]
+            xq_ref, _ = triton_quantize_nvfp4(expert_data, global_scales[i])
+            xq_ref = xq_ref.view(torch.uint8)
+            torch.testing.assert_close(xq_stacked[start:end], xq_ref)
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", MOE_SHAPES)
+    def test_scale_matches_individual(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify stacked per-expert scales match individual triton_quantize_nvfp4."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+
+        global_scales, _ = calculate_group_max(x, m_sizes)
+        _, scale_stacked = nvfp4_quantize_stacked(m_sizes, x, global_scales)
+        scale_stacked_u8 = scale_stacked.view(torch.uint8)
+
+        # Compute padded cumsum to locate per-expert scales in stacked output.
+        padded_sizes = [((m + 127) // 128) * 128 for m in m_sizes_list]
+        padded_cumsum = [0]
+        for ps in padded_sizes:
+            padded_cumsum.append(padded_cumsum[-1] + ps)
+
+        num_scales_per_row = K // 16
+        padded_cols = ((num_scales_per_row + 3) // 4) * 4
+
+        cumsum = [0] + [sum(m_sizes_list[: i + 1]) for i in range(num_experts)]
+        for i in range(num_experts):
+            start, end = cumsum[i], cumsum[i + 1]
+            expert_data = x[start:end]
+            _, scale_ref = triton_quantize_nvfp4(expert_data, global_scales[i])
+            scale_ref_u8 = scale_ref.view(torch.uint8)
+
+            ps = padded_cumsum[i]
+            pe = padded_cumsum[i + 1]
+            scale_expert = scale_stacked_u8[ps:pe, :padded_cols]
+            torch.testing.assert_close(scale_expert, scale_ref_u8)
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", MOE_SHAPES)
+    def test_dequant_roundtrip(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify quantize-then-dequantize roundtrip quality per expert."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+
+        global_scales, _ = calculate_group_max(x, m_sizes)
+        xq_stacked, scale_stacked = nvfp4_quantize_stacked(m_sizes, x, global_scales)
+        xq_stacked_u8 = xq_stacked.view(torch.uint8)
+
+        # Compute padded cumsum for scale extraction.
+        padded_sizes = [((m + 127) // 128) * 128 for m in m_sizes_list]
+        padded_cumsum = [0]
+        for ps in padded_sizes:
+            padded_cumsum.append(padded_cumsum[-1] + ps)
+
+        num_scales_per_row = K // 16
+        padded_cols = ((num_scales_per_row + 3) // 4) * 4
+
+        cumsum = [0] + [sum(m_sizes_list[: i + 1]) for i in range(num_experts)]
+        for i in range(num_experts):
+            start, end = cumsum[i], cumsum[i + 1]
+            expert_xq = xq_stacked_u8[start:end]
+
+            ps = padded_cumsum[i]
+            pe = padded_cumsum[i + 1]
+            expert_scale = scale_stacked[ps:pe, :padded_cols]
+
+            expert_dequant = dequantize_nvfp4(
+                expert_xq, expert_scale, global_scales[i]
+            )
+            torch.testing.assert_close(
+                expert_dequant, x[start:end], atol=1, rtol=1
+            )
