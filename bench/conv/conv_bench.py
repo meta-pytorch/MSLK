@@ -17,7 +17,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 import triton  # @manual=//triton:triton
-from mslk.bench.common.utils import BenchOptions, profiler
+from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
 from mslk.bench.conv.conv_ops import ConvOpBase, get_conv_ops
 from tabulate import tabulate
 
@@ -304,22 +304,7 @@ def print_kernels(kernels: Optional[list[str]]) -> list[ConvOpBase]:
 
 
 @click.command()
-@click.option(
-    "--output-dir",
-    default="/tmp",
-    help="Directory to save plots and csvs to",
-)
-@click.option(
-    "--num-iters",
-    default=1,
-    type=int,
-    help="Number of iterations to repeat each benchmark.",
-)
-@click.option(
-    "--export-csv",
-    is_flag=True,
-    help="Export results to a CSV file.",
-)
+@common_bench_options(shape_registry)
 @click.option(
     "--plot",
     is_flag=True,
@@ -329,11 +314,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[ConvOpBase]:
     "--bench-quantize",
     is_flag=True,
     help="If set, include quantization cost in benchmark.",
-)
-@click.option(
-    "--kernels",
-    default=None,
-    help="Comma separated list of kernels to benchmark. Defaults to all kernels.",
 )
 @click.option(
     "--N",
@@ -396,21 +376,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[ConvOpBase]:
     help="Comma separated list of dilation values to benchmark.",
 )
 @click.option(
-    "--no-cuda-graph",
-    is_flag=True,
-    help="If set, do not use cuda graph for benchmarking.",
-)
-@click.option(
-    "--shapes",
-    default=None,
-    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
-)
-@click.option(
-    "--trace",
-    is_flag=True,
-    help="If set, produce a performance trace of the benchmark.",
-)
-@click.option(
     "--torch-compile",
     is_flag=True,
     help="If set, torch.compile will be used for aten backed ops.",
@@ -434,9 +399,11 @@ def invoke_main(
     pad: Optional[str],
     stride: Optional[str],
     dilation: Optional[str],
-    no_cuda_graph: bool,
+    cuda_graph: bool,
+    rotating_buffer: bool,
     shapes: Optional[str],
     trace: bool,
+    rep_ms: int,
     torch_compile: bool,
 ):
     # If kernel filter is provided, parse it. Else, benchmark all kernels.
@@ -489,7 +456,9 @@ def invoke_main(
     csv = []
     opts = BenchOptions(
         num_iters=num_iters,
-        cuda_graph=not no_cuda_graph,
+        cuda_graph=cuda_graph,
+        rotating_buffer=rotating_buffer,
+        rep_ms=rep_ms,
         trace=trace,
         torch_compile=torch_compile,
     )

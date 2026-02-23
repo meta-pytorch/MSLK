@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import click
 import torch
 import triton  # @manual=//triton:triton
 from torch.profiler import profile, ProfilerActivity  # pyre-ignore
@@ -145,3 +146,70 @@ def profiler(
         if enabled
         else contextlib.nullcontext()
     )
+
+
+def common_bench_options(shape_registry):
+    """Apply the common Click options shared across bench scripts.
+
+    Args:
+        shape_registry: Dict mapping shape name to shape function.
+    """
+
+    def decorator(func):
+        options = [
+            click.option(
+                "--output-dir",
+                default="/tmp",
+                help="Directory to save plots and csvs to",
+            ),
+            click.option(
+                "--num-iters",
+                default=1,
+                type=int,
+                help="Number of iterations to repeat each benchmark.",
+            ),
+            click.option(
+                "--export-csv",
+                is_flag=True,
+                help="Export results to a CSV file.",
+            ),
+            click.option(
+                "--kernels",
+                default=None,
+                help=(
+                    "Comma separated list of kernels to benchmark."
+                    " Defaults to all kernels."
+                ),
+            ),
+            click.option(
+                "--cuda-graph/--no-cuda-graph",
+                default=True,
+                help="Use cuda graph for benchmarking.",
+            ),
+            click.option(
+                "--rotating-buffer/--no-rotating-buffer",
+                default=True,
+                help="Use rotating buffer for benchmarking.",
+            ),
+            click.option(
+                "--shapes",
+                default=None,
+                help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
+            ),
+            click.option(
+                "--trace",
+                is_flag=True,
+                help="If set, produce a performance trace of the benchmark.",
+            ),
+            click.option(
+                "--rep-ms",
+                default=200,
+                type=int,
+                help="Repetition time in ms for triton.testing.do_bench.",
+            ),
+        ]
+        for option in reversed(options):
+            func = option(func)
+        return func
+
+    return decorator
