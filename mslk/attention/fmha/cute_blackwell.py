@@ -1,8 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
@@ -178,7 +174,6 @@ def _convert_input_format(
             scale=inp.scale,
             output_dtype=inp.output_dtype,
             is_partial=inp.is_partial,
-            deterministic=inp.deterministic,
             # We want k_fp8_scale_shift and v_fp8_scale_shift to be in the same shape as key and value[:-1]
             k_fp8_scale_shift=key_scale.view(key.shape[:-1]),
             v_fp8_scale_shift=value_scale.view(value.shape[:-1]),
@@ -194,7 +189,6 @@ def _convert_input_format(
             scale=inp.scale,
             output_dtype=inp.output_dtype,
             is_partial=inp.is_partial,
-            deterministic=inp.deterministic,
         )
     return (
         new_inp,
@@ -409,7 +403,8 @@ class FwOp(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                deterministic=inp.deterministic,
+                # Set to True until we create a sub-class for deterministic
+                deterministic=True,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -544,7 +539,8 @@ class FwOpDecode(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                deterministic=inp.deterministic,
+                # Set to True until we create a sub-class for deterministic
+                deterministic=True,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -681,7 +677,8 @@ class BwOp(AttentionBwOpBase):
                     window_left=window_left,
                     window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
-                    deterministic=inp.deterministic,
+                    # Set to True until we create a sub-class for deterministic
+                    deterministic=True,
                 )
             )
         else:

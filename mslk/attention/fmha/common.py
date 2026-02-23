@@ -200,7 +200,6 @@ class Inputs:
     scale: Optional[float] = None
     output_dtype: Optional[torch.dtype] = None
     is_partial: bool = False
-    deterministic: bool = False
     quantize_pv_to_fp8: bool = False
     quantize_qk_to_fp8: bool = False
     use_fp32_scales: bool = False
