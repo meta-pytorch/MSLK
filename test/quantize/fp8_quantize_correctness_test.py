@@ -27,10 +27,6 @@ def undo_rowwise_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float) * scale.unsqueeze(1)
 
 
-def undo_colwise_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x.to(torch.float) * scale.unsqueeze(0)
-
-
 def undo_blockwise_quant(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -86,7 +82,6 @@ TRITON_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
 
 MSLK_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
     (torch.ops.mslk.quantize_fp8_per_row, undo_rowwise_quant),
-    (torch.ops.mslk.quantize_fp8_per_col, undo_colwise_quant),
     (torch.ops.mslk.quantize_fp8_per_tensor, undo_tensorwise_quant),
 ]
 

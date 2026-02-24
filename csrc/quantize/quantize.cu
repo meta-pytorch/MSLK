@@ -54,10 +54,6 @@
 #include <hip/hip_fp16.h>
 #endif
 
-#ifndef USE_ROCM
-#include <mma.h>
-#endif
-
 #include <torch/torch.h>
 
 #if CUDART_VERSION >= 12000
@@ -75,20 +71,6 @@
 #include <cuda_runtime.h>
 #include <math.h>
 namespace mslk::quantize {
-
-// Each block handles a single batch and head
-
-// Each warp handles separate D dimension.
-
-// Load Q into registers in all warps.
-// Split T across warps in a block
-// Compute S[MAX_T] = for i in range(T): S[t] = sum(Q[d] * K[t, d])
-// Use shared reduction to compute max and compute softmax on shared memory.
-
-// Split T across warps in a block
-
-// each warp compute sum(t_subset) P[t] * V[t_subset, d]
-// outputs are of size float[D]
 
 #if (defined(USE_ROCM) && ROCM_VERSION >= 60200)
 #if HIP_FP8_TYPE_OCP && !HIP_FP8_TYPE_FNUZ
@@ -228,96 +210,6 @@ std::tuple<at::Tensor, at::Tensor> per_tensor_dynamic_quantize_i8(
       scale.data_ptr<at::BFloat16>(),
       0.0);
   return {XQ, scale};
-}
-
-DEVICE_INLINE float __sigmoid(float a) {
-  return 1.0 / (1.0 + __expf(-a));
-}
-
-__global__ void silu_mul_quantize_i8_kernel(
-    at::PackedTensorAccessor64<at::BFloat16, 2, at::RestrictPtrTraits>
-        X1, // [B][MAX_T][N_KVH][D_H]
-    at::PackedTensorAccessor64<at::BFloat16, 2, at::RestrictPtrTraits>
-        X2, // [B][MAX_T][N_KVH][D_H]
-    at::PackedTensorAccessor64<int8_t, 2, at::RestrictPtrTraits>
-        Y, // [B][MAX_T][N_KVH][D_H]
-    float inv_scale) {
-  auto b = blockIdx.x;
-  auto N = X1.size(1);
-  for (auto i = threadIdx.x * 8; i < N; i += 8 * blockDim.x) {
-    bf16x8 src1;
-    *reinterpret_cast<uint4*>(&src1) = *reinterpret_cast<uint4*>(&X1[b][i]);
-    bf16x8 src2;
-    *reinterpret_cast<uint4*>(&src2) = *reinterpret_cast<uint4*>(&X2[b][i]);
-
-    auto x1_0 = __bfloat162float(src1.vals[0].x);
-    auto x1_1 = __bfloat162float(src1.vals[0].y);
-    auto x1_2 = __bfloat162float(src1.vals[1].x);
-    auto x1_3 = __bfloat162float(src1.vals[1].y);
-    auto x1_4 = __bfloat162float(src1.vals[2].x);
-    auto x1_5 = __bfloat162float(src1.vals[2].y);
-    auto x1_6 = __bfloat162float(src1.vals[3].x);
-    auto x1_7 = __bfloat162float(src1.vals[3].y);
-
-    auto x2_0 = __bfloat162float(src2.vals[0].x);
-    auto x2_1 = __bfloat162float(src2.vals[0].y);
-    auto x2_2 = __bfloat162float(src2.vals[1].x);
-    auto x2_3 = __bfloat162float(src2.vals[1].y);
-    auto x2_4 = __bfloat162float(src2.vals[2].x);
-    auto x2_5 = __bfloat162float(src2.vals[2].y);
-    auto x2_6 = __bfloat162float(src2.vals[3].x);
-    auto x2_7 = __bfloat162float(src2.vals[3].y);
-
-    auto y_0 = x1_0 * __sigmoid(x1_0) * x2_0 * inv_scale;
-    auto y_1 = x1_1 * __sigmoid(x1_1) * x2_1 * inv_scale;
-    auto y_2 = x1_2 * __sigmoid(x1_2) * x2_2 * inv_scale;
-    auto y_3 = x1_3 * __sigmoid(x1_3) * x2_3 * inv_scale;
-    auto y_4 = x1_4 * __sigmoid(x1_4) * x2_4 * inv_scale;
-    auto y_5 = x1_5 * __sigmoid(x1_5) * x2_5 * inv_scale;
-    auto y_6 = x1_6 * __sigmoid(x1_6) * x2_6 * inv_scale;
-    auto y_7 = x1_7 * __sigmoid(x1_7) * x2_7 * inv_scale;
-
-    y_0 = fmaxf(-128.0, fminf(y_0, 127));
-    y_1 = fmaxf(-128.0, fminf(y_1, 127));
-    y_2 = fmaxf(-128.0, fminf(y_2, 127));
-    y_3 = fmaxf(-128.0, fminf(y_3, 127));
-    y_4 = fmaxf(-128.0, fminf(y_4, 127));
-    y_5 = fmaxf(-128.0, fminf(y_5, 127));
-    y_6 = fmaxf(-128.0, fminf(y_6, 127));
-    y_7 = fmaxf(-128.0, fminf(y_7, 127));
-
-    i8x8 dst;
-    dst.vals[0] = __float2int_rn(y_0);
-    dst.vals[1] = __float2int_rn(y_1);
-    dst.vals[2] = __float2int_rn(y_2);
-    dst.vals[3] = __float2int_rn(y_3);
-    dst.vals[4] = __float2int_rn(y_4);
-    dst.vals[5] = __float2int_rn(y_5);
-    dst.vals[6] = __float2int_rn(y_6);
-    dst.vals[7] = __float2int_rn(y_7);
-
-    *reinterpret_cast<uint2*>(&Y[b][i]) = *reinterpret_cast<uint2*>(&dst);
-  }
-}
-
-at::Tensor silu_mul_quantize_i8(at::Tensor X1, at::Tensor X2, double scale) {
-  float inv_scale = 1.0 / (scale + 1.0e-8);
-  auto Y = at::empty(X1.sizes(), X1.options().dtype(at::kChar));
-  TORCH_CHECK(X1.size(1) % 8 == 0);
-  constexpr int32_t kThreadsPerBlock = 1024;
-  dim3 threads = std::min<int32_t>(kThreadsPerBlock, X1.size(1) / 8);
-  dim3 blocks = X1.size(0);
-  MSLK_LAUNCH_KERNEL(
-      (silu_mul_quantize_i8_kernel),
-      blocks,
-      threads,
-      0,
-      at::cuda::getCurrentCUDAStream(),
-      X1.packed_accessor64<at::BFloat16, 2, at::RestrictPtrTraits>(),
-      X2.packed_accessor64<at::BFloat16, 2, at::RestrictPtrTraits>(),
-      Y.packed_accessor64<int8_t, 2, at::RestrictPtrTraits>(),
-      inv_scale);
-  return Y;
 }
 
 #if (defined(USE_ROCM) && ROCM_VERSION >= 60200) || \
@@ -492,22 +384,6 @@ __global__ void scaleMatrixRowwise1(
   }
 }
 
-template <bool QUANTIZE, typename T_OUT, typename T_S, typename T_IN>
-__global__ void scaleMatrixColwise(
-    T_OUT* const output,
-    T_S const* const input_scale,
-    T_IN const* const input,
-    const int64_t numel,
-    const int64_t lda) {
-  for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel;
-       i += (size_t)blockDim.x * gridDim.x) {
-    output[i] = T_OUT(
-        scale<QUANTIZE>(
-            static_cast<float>(input[i]),
-            static_cast<float>(input_scale[i % lda])));
-  }
-}
-
 template <typename T_OUT, typename T_S, typename T_IN>
 void invokeQuantizeMatrix(
     T_OUT* const output,
@@ -598,29 +474,6 @@ void invokeQuantizeMatrixRowwise(
   }
 }
 
-template <typename T_OUT, typename T_S, typename T_IN>
-void invokeQuantizeMatrixColwise(
-    T_OUT* const output,
-    T_S const* const input_scale,
-    T_IN const* const input,
-    const int64_t numel,
-    const int64_t lda,
-    const c10::cuda::CUDAStream stream) {
-  constexpr dim3 grid(1024);
-  const dim3 block(CTA_SIZE);
-  MSLK_LAUNCH_KERNEL(
-      (scaleMatrixColwise<true, T_OUT, T_S, T_IN>),
-      grid,
-      block,
-      0,
-      stream,
-      output,
-      input_scale,
-      input,
-      numel,
-      lda);
-}
-
 template <typename T>
 __inline__ __device__ T blockReduceMax(T val) {
   static __shared__ T shared[32];
@@ -677,39 +530,6 @@ __global__ void computeFP8QuantizeScale(
     const auto scale =
         (T_S)std::max(bounded_max / FP8_E4M3_MAX::value, min_scaling_factor);
     atomicMaxExtd(quant_ptr, scale);
-  }
-}
-
-template <typename T_S, typename T_W>
-__global__ void computeFP8QuantizeScaleColwise(
-    T_S* quant_ptr,
-    const T_W* weights,
-    const int64_t size,
-    const int64_t n) {
-  constexpr float min_scaling_factor = 1.0f / (FP8_E4M3_MAX::value * 512.f);
-
-  for (int64_t col = threadIdx.x; col < n; col += blockDim.x) {
-    float max = 0.f;
-    for (int64_t i = col + n * blockIdx.x; i < size; i += gridDim.x * n) {
-      auto val = fabs(static_cast<float>(weights[i]));
-      max = max > val ? max : val;
-    }
-    auto const scale =
-        (T_S)std::max(max / FP8_E4M3_MAX::value, min_scaling_factor);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    if constexpr (std::is_same_v<T_S, float>) {
-      atomicMaxExtd(quant_ptr + col, scale);
-    } else {
-      auto const address_u64 = reinterpret_cast<uint64_t>(quant_ptr + col);
-      if ((col == 0 && address_u64 % 4 != 0) ||
-          (col == n - 1 && address_u64 % 4 == 0))
-        atomicMaxExtd(quant_ptr + col, scale);
-      else
-        atomicMaxExtdV2(quant_ptr + col, scale);
-    }
-#else // Vector atomics require __CUDA_ARCH__ >= 900
-    atomicMaxExtd(quant_ptr + col, scale);
-#endif
   }
 }
 
@@ -1155,31 +975,6 @@ void invokeComputeScalesAndQuantizeMatrix(
   }
 }
 
-template <typename T_OUT, typename T_S, typename T_IN>
-void invokeComputeScalesAndQuantizeMatrixCol(
-    T_OUT* output,
-    T_S* quant_ptr,
-    const T_IN* input,
-    const int64_t numel,
-    const int64_t lda,
-    c10::cuda::CUDAStream stream) {
-  dim3 block(CTA_SIZE);
-  dim3 grid((lda + CTA_SIZE - 1) / CTA_SIZE);
-  C10_CUDA_CHECK(cudaMemsetAsync(quant_ptr, 0, lda * sizeof(T_S), stream));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  MSLK_LAUNCH_KERNEL(
-      (computeFP8QuantizeScaleColwise<T_S, T_IN>),
-      grid,
-      block,
-      0,
-      stream,
-      quant_ptr,
-      input,
-      numel,
-      lda);
-  invokeQuantizeMatrixColwise(output, quant_ptr, input, numel, lda, stream);
-}
-
 std::vector<at::Tensor> quantize_fp8_per_row(
     at::Tensor input,
     std::optional<at::Tensor> bs, // batch size
@@ -1265,53 +1060,6 @@ std::vector<at::Tensor> quantize_fp8_per_row(
 
     return std::vector<at::Tensor>{quantized_input, scales};
   }
-}
-
-std::vector<at::Tensor> quantize_fp8_per_col(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub) // scale upperbound)
-{
-  CUDA_DEVICE_GUARD(input);
-  TORCH_CHECK(
-      input.dim() >= 2,
-      "Invalid dim. The dim of input should be greater than or equal to 2");
-  auto _st = input.scalar_type();
-  TORCH_CHECK(_st == torch::kBFloat16, "Invalid datatype. input must be BF16");
-  std::vector<long int> quantized_input_shape;
-  for (int i = 0; i < input.dim(); i++)
-    quantized_input_shape.push_back(input.size(i));
-  std::vector<int64_t> scale_shape;
-  for (int i = 1; i < input.dim(); i++)
-    scale_shape.push_back(input.size(i));
-
-  input = input.cuda();
-  at::Tensor quantized_input = torch::empty(
-      quantized_input_shape,
-      torch::dtype(torch_fp8_e4m3)
-          .device(torch::kCUDA, at::cuda::current_device())
-          .requires_grad(false));
-  at::Tensor scales = torch::empty(
-      scale_shape,
-      torch::dtype(torch::kFloat32)
-          .device(torch::kCUDA, at::cuda::current_device())
-          .requires_grad(false));
-  // When input is empty, return empty tensors.
-  if (input.numel() == 0) {
-    return std::vector<at::Tensor>{quantized_input, scales};
-  }
-  auto* const quantized_input_ptr =
-      reinterpret_cast<__nv_fp8_e4m3*>(quantized_input.data_ptr());
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  invokeComputeScalesAndQuantizeMatrixCol(
-      quantized_input_ptr,
-      reinterpret_cast<float*>(scales.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-      input.numel(),
-      input.size(-1),
-      stream);
-
-  return std::vector<at::Tensor>{quantized_input, scales};
 }
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
@@ -1747,14 +1495,6 @@ at::Tensor quantize_fp8_per_tensor_fixed_scale(
 }
 
 at::Tensor get_fp8_per_tensor_scale(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub) { // scale upperbound
-  throw std::runtime_error(
-      "CUDA version is older than 12.0"); // requires CUDA>=12
-}
-
-std::vector<at::Tensor> quantize_fp8_per_col(
     at::Tensor input,
     std::optional<at::Tensor> bs, // batch size
     std::optional<at::Tensor> scale_ub) { // scale upperbound

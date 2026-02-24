@@ -56,7 +56,6 @@ class Fp8QuantizeExportTest(unittest.TestCase):
                 quantize_fp8_block,
                 quantize_fp8_tensor,
                 torch.ops.mslk.quantize_fp8_per_row,
-                torch.ops.mslk.quantize_fp8_per_col,
                 torch.ops.mslk.quantize_fp8_per_tensor,
             ]
         ),
