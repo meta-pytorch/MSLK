@@ -15,8 +15,6 @@ namespace mslk::quantize {
 void flush_icache_ck();
 #endif
 
-at::Tensor silu_mul_quantize_i8(at::Tensor X1, at::Tensor X2, double scale);
-
 at::Tensor per_tensor_quantize_i8(at::Tensor X, double scale);
 
 std::tuple<at::Tensor, at::Tensor> per_tensor_dynamic_quantize_i8(at::Tensor X);
@@ -33,11 +31,6 @@ std::vector<at::Tensor> quantize_fp8_per_row(
     std::optional<at::Tensor> scale_ub, // scale upperbound
     std::optional<c10::ScalarType> output_dtype, // output dtype
     bool stochastic_rounding); // whether apply stochastic rounding
-
-std::vector<at::Tensor> quantize_fp8_per_col(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub); // scale upperbound
 
 at::Tensor quantize_fp8_per_tensor_fixed_scale(
     at::Tensor input,
