@@ -20,7 +20,7 @@ import seaborn as sns
 import torch
 import triton  # @manual=//triton:triton
 from mslk.bench.common.telemetry import export_benchmark_to_scuba, is_scuba_available
-from mslk.bench.common.utils import BenchOptions, profiler
+from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from tabulate import tabulate
 
@@ -550,22 +550,7 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 
 
 @click.command()
-@click.option(
-    "--output-dir",
-    default="/tmp",
-    help="Directory to save plots and csvs to",
-)
-@click.option(
-    "--num-iters",
-    default=1,
-    type=int,
-    help="Number of iterations to repeat each benchmark.",
-)
-@click.option(
-    "--export-csv",
-    is_flag=True,
-    help="Export results to a CSV file.",
-)
+@common_bench_options(shape_registry)
 @click.option(
     "--export-scuba",
     is_flag=True,
@@ -586,11 +571,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     "--bench-quantize",
     is_flag=True,
     help="If set, include quantization cost in benchmark.",
-)
-@click.option(
-    "--kernels",
-    default=None,
-    help="Comma separated list of kernels to benchmark. Defaults to all kernels.",
 )
 @click.option(
     "--M",
@@ -638,26 +618,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     "Comma separated list of total-M values to benchmark.",
 )
 @click.option(
-    "--no-cuda-graph",
-    is_flag=True,
-    help="If set, do not use cuda graph for benchmarking.",
-)
-@click.option(
-    "--use-rotating-buffer-bench",
-    is_flag=True,
-    help="If set, use rotating buffer to benchmark.",
-)
-@click.option(
-    "--shapes",
-    default=None,
-    help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
-)
-@click.option(
-    "--trace",
-    is_flag=True,
-    help="If set, produce a performance trace of the benchmark.",
-)
-@click.option(
     "--disable-fast-accum",
     is_flag=True,
     help="If set, disable fast accumulation for FP8 implementations.",
@@ -666,12 +626,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     "--torch-compile",
     is_flag=True,
     help="If set, torch.compile will be used for scaled_mm backed ops.",
-)
-@click.option(
-    "--rep",
-    default=200,
-    type=int,
-    help="Repetition time in ms (int) for triton.testing.do_bench",
 )
 def invoke_main(
     output_dir: str,
@@ -690,13 +644,13 @@ def invoke_main(
     groups: Optional[str],
     total_k: Optional[str],
     total_m: Optional[str],
-    no_cuda_graph: bool,
-    use_rotating_buffer_bench: bool,
+    cuda_graph: bool,
+    rotating_buffer: bool,
     shapes: Optional[str],
     trace: bool,
     disable_fast_accum: bool,
     torch_compile: bool,
-    rep: int,
+    rep_ms: int,
 ):
     if enable_amd_env_vars:
         set_amd_env_vars()
@@ -811,9 +765,9 @@ def invoke_main(
 
     opts = BenchOptions(
         num_iters=num_iters,
-        cuda_graph=not no_cuda_graph,
-        rotating_buffer=use_rotating_buffer_bench,
-        rep_ms=rep,
+        cuda_graph=cuda_graph,
+        rotating_buffer=rotating_buffer,
+        rep_ms=rep_ms,
         trace=trace,
         fast_accum=not disable_fast_accum,
         torch_compile=torch_compile,
@@ -847,8 +801,8 @@ def invoke_main(
 
     print("")
     print("Benchmark Settings:")
-    print(f"    CUDA graph: {not no_cuda_graph}")
-    print(f"    Buffer rotation: {use_rotating_buffer_bench}")
+    print(f"    CUDA graph: {cuda_graph}")
+    print(f"    Buffer rotation: {rotating_buffer}")
     print(f"    Fast accumulation: {not disable_fast_accum}")
     print(f"    Torch compile: {torch_compile}")
 
@@ -878,7 +832,7 @@ def invoke_main(
                 bench_type="gemm",
                 kernel_category=kernel_category,
                 mem_bw_roofline_gbps=mem_bw_gbps,
-                cuda_graph_enabled=not no_cuda_graph,
+                cuda_graph_enabled=cuda_graph,
                 fast_accum_enabled=not disable_fast_accum,
                 torch_compile_enabled=torch_compile,
             )
