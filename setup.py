@@ -28,6 +28,15 @@ from tabulate import tabulate
 logging.basicConfig(level=logging.INFO)
 
 
+def _detect_build_variant() -> str:
+    """Auto-detect the build variant based on the installed PyTorch."""
+    if torch.version.hip is not None:
+        return "rocm"
+    if torch.version.cuda is not None:
+        return "cuda"
+    return "cpu"
+
+
 @dataclass(frozen=True)
 class MSLKBuild:
     args: argparse.Namespace
@@ -66,7 +75,7 @@ class MSLKBuild:
             "--build-variant",
             type=str,
             choices=["cpu", "cuda", "rocm"],
-            default="cuda",
+            default=_detect_build_variant(),
             help="The MSLK build variant to build.",
         )
         parser.add_argument(
@@ -387,11 +396,16 @@ class RocmUtils:
     def version_int(cls) -> int:
         version_string = os.environ.get("BUILD_ROCM_VERSION")
         if not version_string:
-            raise ValueError("BUILD_ROCM_VERSION is not set in the environment!")
+            version_string = torch.version.hip
+        if not version_string:
+            raise ValueError(
+                "BUILD_ROCM_VERSION is not set in the environment and "
+                "torch.version.hip is not available!"
+            )
 
         version_arr = version_string.split(".")
         if len(version_arr) < 2:
-            raise ValueError("BUILD_ROCM_VERSION is not in X.Y format!")
+            raise ValueError(f"ROCm version '{version_string}' is not in X.Y format!")
 
         return int(f"{version_arr[0]:<02}{version_arr[1]:<03}")
 
