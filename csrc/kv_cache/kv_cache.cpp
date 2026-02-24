@@ -7,7 +7,6 @@
  */
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAEvent.h>
 #include <mslk/kv_cache/kv_cache.h>
 #include <torch/library.h>
 
