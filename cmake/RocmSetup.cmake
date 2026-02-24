@@ -16,6 +16,14 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
   include(Hip)
   include(Hipify)
 
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_link_options(-fuse-ld=/opt/rocm/llvm/bin/ld.lld)
+  else()
+    # GCC doesn't support -fuse-ld= with full paths. Use -B to add the
+    # ROCm LLVM directory to GCC's tool search path.
+    add_link_options(-B/opt/rocm/llvm/bin/ -fuse-ld=lld)
+  endif()
+
   # Configure compiler for HIP
   list(APPEND HIP_HCC_FLAGS
     " \"-Wno-#pragma-messages\" "
