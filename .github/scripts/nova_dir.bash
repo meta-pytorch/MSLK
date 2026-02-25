@@ -5,14 +5,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-## Workaround for Nova Workflow to look for setup.py in MSLK rather than root repo
+## Set MSLK_REPO path for other scripts to use
 MSLK_DIR="/__w/MSLK/MSLK"
 export MSLK_REPO="${MSLK_DIR}/${REPOSITORY}"
-working_dir=$(pwd)
-if [[ "$working_dir" == "$MSLK_REPO" ]]; then cd MSLK || echo "Failed to cd MSLK from $(pwd)"; fi
 
-## Build clean/wheel will be done in pre-script. Set flag such that setup.py will skip these steps in Nova workflow
-export BUILD_FROM_NOVA=1
+export BUILD_FROM_NOVA=0
 
 # Disable HIP FMHA build in the manywheel CI (the runner is too small)
 export MSLK_BUILD_HIP_FMHA=0
