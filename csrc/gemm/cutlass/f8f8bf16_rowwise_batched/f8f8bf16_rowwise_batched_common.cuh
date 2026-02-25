@@ -192,9 +192,9 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementComputeEpilogue,
-          ElementOutput,
-          LayoutOutput,
-          AlignmentOutput,
+          void, // No C input - we are doing C = A @ B, not C = A @ B + beta*C
+          void,
+          0,
           ElementOutput,
           LayoutOutput,
           AlignmentOutput,
