@@ -16,7 +16,8 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/gemm/*.cpp
   csrc/kv_cache/*.cpp
   csrc/moe/*.cpp
-  csrc/quantize/*.cpp)
+  csrc/quantize/*.cpp
+  csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
   csrc/attention/cuda/gqa_attn_splitk/*.cu
@@ -83,6 +84,59 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/quantize/ck/*.hip
   csrc/quantize/ck/**/*.hip)
 
+# HIP FMHA sources - built separately for only the latest GPU architecture
+# to reduce build time and binary size
+file(GLOB_RECURSE mslk_hip_fmha_sources
+  csrc/attention/ck/fmha/hip_fmha/**/*.cpp)
+
+################################################################################
+# Build FMHA Static Library (gfx942 only, ROCm 7.x+)
+################################################################################
+
+set(mslk_fmha_deps)
+if(NOT DEFINED ENV{MSLK_BUILD_HIP_FMHA} OR NOT "$ENV{MSLK_BUILD_HIP_FMHA}" STREQUAL "0")
+  if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM
+      AND mslk_hip_fmha_sources
+      AND HIP_VERSION VERSION_GREATER_EQUAL "7.0")
+    # Build HIP flags for FMHA targeting only gfx942
+    set(HIP_HCC_FLAGS_FMHA ${HIP_HCC_FLAGS})
+    list(FILTER HIP_HCC_FLAGS_FMHA EXCLUDE REGEX "--offload-arch=")
+    list(APPEND HIP_HCC_FLAGS_FMHA
+      --offload-arch=gfx942
+      -DFMHA_LIMIT_MAX_HEADDIM_TO_256=1)
+
+    message("Building FMHA for arch: gfx942 (HIP_VERSION=${HIP_VERSION})")
+
+    # Mark sources for HIPCC compilation
+    set_source_files_properties(${mslk_hip_fmha_sources} PROPERTIES
+      HIP_SOURCE_PROPERTY_FORMAT 1)
+
+    hip_include_directories("${mslk_include_directories}")
+
+    hip_add_library(mslk_hip_fmha STATIC
+      ${mslk_hip_fmha_sources}
+      ${MSLK_HIP_HCC_LIBRARIES}
+      HIPCC_OPTIONS ${HIP_HCC_FLAGS_FMHA})
+
+    target_include_directories(mslk_hip_fmha PUBLIC
+      ${MSLK_HIP_INCLUDE}
+      ${ROCRAND_INCLUDE}
+      ${ROCM_SMI_INCLUDE}
+      ${mslk_include_directories})
+
+    target_include_directories(mslk_hip_fmha PRIVATE
+      ${TORCH_INCLUDE_DIRS}
+      ${NCCL_INCLUDE_DIRS})
+
+    set_target_properties(mslk_hip_fmha PROPERTIES
+      POSITION_INDEPENDENT_CODE ON)
+
+    set(mslk_fmha_deps mslk_hip_fmha)
+  endif()
+else()
+  message("Skipping HIP FMHA build (MSLK_BUILD_HIP_FMHA=0)")
+endif()
+
 ################################################################################
 # Build Shared Library
 ################################################################################
@@ -103,6 +157,8 @@ gpu_cpp_library(
     ${mslk_cpp_source_files_cuda}
   HIP_SPECIFIC_SRCS
     ${mslk_cpp_source_files_hip}
+  DEPS
+    ${mslk_fmha_deps}
 )
 
 ################################################################################

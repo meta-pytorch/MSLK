@@ -106,9 +106,9 @@ at::Tensor _f4f4bf16(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          ElementOutput,
-          LayoutOutputTag_Transpose,
-          AlignmentOutput,
+          void, // No C input - we are doing C = A @ B, not C = A @ B + beta*C
+          void,
+          0,
           ElementOutput,
           LayoutOutputTag_Transpose,
           AlignmentOutput,
