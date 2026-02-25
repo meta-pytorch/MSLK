@@ -1,3 +1,5 @@
+![MSLK Logo](./assets/logo_small.png)
+
 # MSLK Library
 
 
