@@ -56,7 +56,7 @@ __global__ void set_kernel_args(
     int64_t N,
     int64_t K,
     int64_t num_scale_groups,
-    int32_t* M_sizes,
+    int64_t* M_sizes,
     ProblemShape* problem_shape_ptr,
     ElementA* xq,
     const ElementA** xq_ptr,
@@ -394,7 +394,7 @@ void _f8i4bf16_shuffled_grouped(
       N,
       K,
       num_scale_groups,
-      reinterpret_cast<int32_t*>(M_sizes.data_ptr()),
+      reinterpret_cast<int64_t*>(M_sizes.data_ptr()),
       problem_shape_ptr,
       reinterpret_cast<ElementA*>(XQ.data_ptr()),
       xq_ptr,
@@ -490,10 +490,14 @@ at::Tensor f8i4bf16_shuffled_grouped(
   int64_t total_M = XQ.size(0);
   int64_t K = XQ.size(1);
   int64_t N = WQ.size(1);
-  int64_t group_count = M_sizes.size(0);
   TORCH_CHECK(
-      M_sizes.device() == XQ.device() && M_sizes.dtype() == at::kInt,
-      "M_sizes must be int32 and on the same device as inputs.");
+      M_sizes.device() == XQ.device(),
+      "M_sizes must be on the same device as inputs.");
+  TORCH_CHECK(
+      M_sizes.dtype() == at::kLong || M_sizes.dtype() == at::kInt,
+      "M_sizes must be int32 or int64.");
+  M_sizes = M_sizes.to(at::kLong);
+  int64_t group_count = M_sizes.size(0);
   TORCH_CHECK(
       WQ.dim() == 3 && WQ.size(0) == group_count && WQ.size(2) == K / 2,
       "Weights should be shape [G, N, K / 2]");
