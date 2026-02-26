@@ -8,10 +8,12 @@
 
 """Cutedsl GEMM kernel entrypoints."""
 
+from .bf16_grouped_gemm import bf16_grouped_gemm
 from .blockscale_gemm import mxfp8_gemm
 from .mixed_input_gemm import int4bf16bf16_gemm
 
 __all__ = [
+    "bf16_grouped_gemm",
     "mxfp8_gemm",
     "int4bf16bf16_gemm",
 ]

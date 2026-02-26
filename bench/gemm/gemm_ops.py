@@ -899,6 +899,44 @@ class TritonBF16Grouped(GemmOpBase):
 
 
 @register_gemm_op
+class CuteDSLBF16Grouped(GemmOpBase):
+    """
+    BF16 grouped matmul implemented with CuteDSL (Blackwell).
+    """
+
+    def preprocess(self, x, w):
+        m_values = [i.shape[0] for i in x]
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)
+        w_stacked = torch.stack(w, dim=0).contiguous()  # [G, N, K]
+        x_cat = torch.concat(x, dim=0).contiguous()  # [GM, K]
+        return x_cat, w_stacked, m_sizes
+
+    def quantize(self, x, w, m_sizes):
+        return x, w, m_sizes
+
+    def compute(self, x, w, m_sizes):
+        from mslk.gemm.cutedsl import bf16_grouped_gemm
+
+        return bf16_grouped_gemm(x, w, m_sizes)
+
+    def quantize_and_compute(self, x, w, m_sizes):
+        x, w, m_sizes = self.quantize(x, w, m_sizes)
+        return self.compute(x, w, m_sizes)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
+
+@register_gemm_op
 class TritonBF16GroupedFuseScatterAdd(TritonBF16Grouped):
     """
     BF16 grouped matmul implemented with triton. Fused with ScatterAdd.
