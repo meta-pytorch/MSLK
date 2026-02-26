@@ -1172,7 +1172,9 @@ def matmul_fp8_row(
     if torch.version.cuda:
         assert a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     elif torch.version.hip:
-        if torch.cuda.get_device_capability() < (9, 5):
+        # gfx942 (MI300) reports (9, 4), gfx950 (MI350) reports (9, 5)
+        # Both use fnuz format
+        if torch.cuda.get_device_capability() >= (9, 4):
             assert a.dtype in (
                 torch.float8_e4m3fnuz,
                 torch.float8_e5m2fnuz,
