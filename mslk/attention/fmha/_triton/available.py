@@ -11,7 +11,7 @@ import os
 import torch
 
 
-logger = logging.getLogger("xformers")
+logger = logging.getLogger("__file__")
 
 
 def compute_once(func):

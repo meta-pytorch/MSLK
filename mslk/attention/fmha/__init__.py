@@ -140,8 +140,7 @@ class _fMHA(torch.autograd.Function):
         ):
             raise ValueError(
                 f"Specified op_bw={op_bw.NAME} is not compatible with the "
-                f"op_fw={op_fw.NAME}, because they use different format of logsumexp. "
-                f"NOTE: This is new with xFormers 0.0.28"
+                f"op_fw={op_fw.NAME}, because they use different format of logsumexp."
             )
         if op_bw is None and (
             inp.query.requires_grad or inp.key.requires_grad or inp.value.requires_grad
@@ -228,7 +227,8 @@ def memory_efficient_attention(
     - Input tensors must be in format ``[B, M, H, K]``, where B is the batch size, M \
         the sequence length, H the number of heads, and K the embeding size per head
 
-    - If inputs have dimension 3, it is assumed that the dimensions are ``[B, M, K]`` and ``H=1``
+    - If inputs have dimension 3, it is assumed that the dimensions are ``[B, M, K]``
+        and ``H=1``
 
     - Inputs can also be of dimension 5 with GQA - see note below
 
@@ -256,47 +256,48 @@ def memory_efficient_attention(
 
     .. code-block:: python
 
-        import xformers.ops as xops
+        import mslk.attention.fmha as fmha
 
         # Compute regular attention
-        y = xops.memory_efficient_attention(q, k, v)
+        y = fmha.memory_efficient_attention(q, k, v)
 
         # With a dropout of 0.2
-        y = xops.memory_efficient_attention(q, k, v, p=0.2)
+        y = fmha.memory_efficient_attention(q, k, v, p=0.2)
 
         # Causal attention
-        y = xops.memory_efficient_attention(
+        y = fmha.memory_efficient_attention(
             q, k, v,
-            attn_bias=xops.LowerTriangularMask()
+            attn_bias=fmha.LowerTriangularMask()
         )
 
     :Supported hardware:
 
-        NVIDIA GPUs with compute capability above 6.0 (P100+), datatype ``f16``, ``bf16`` and ``f32``.
+        NVIDIA GPUs with compute capability above 6.0 (P100+), datatype ``f16``,
+        ``bf16`` and ``f32``.
 
-    :EXPERIMENTAL: Using with Multi Query Attention (MQA) and Grouped Query Attention (GQA):
+    :EXPERIMENTAL: Multi Query Attention (MQA) and Grouped Query Attention (GQA):
 
         MQA/GQA is an experimental feature supported only for the forward pass.
         If you have 16 heads in query, and 2 in key/value, you can provide 5-dim tensors
-        in the ``[B, M, G, H, K]`` format, where ``G`` is the number of head groups (here 2), and
-        ``H`` is the number of heads per group (8 in the example).
+        in the ``[B, M, G, H, K]`` format, where ``G`` is the number of head groups
+        (here 2), and ``H`` is the number of heads per group (8 in the example).
 
-        Please note that xFormers will not automatically broadcast the inputs, so you will need
-        to broadcast it manually before calling `memory_efficient_attention`.
+        Please note that the library will not automatically broadcast the inputs, so you
+        will need to broadcast it manually before calling `memory_efficient_attention`.
 
     :GQA/MQA example:
 
     .. code-block:: python
 
         import torch
-        import xformers.ops as xops
+        import mslk.attention.fmha as fmha
 
         B, M, K = 3, 32, 128
         kwargs = dict(device="cuda", dtype=torch.float16)
         q = torch.randn([B, M, 8, K], **kwargs)
         k = torch.randn([B, M, 2, K], **kwargs)
         v = torch.randn([B, M, 2, K], **kwargs)
-        out_gqa = xops.memory_efficient_attention(
+        out_gqa = fmha.memory_efficient_attention(
             q.reshape([B, M, 2, 4, K]),
             k.reshape([B, M, 2, 1, K]).expand([B, M, 2, 4, K]),
             v.reshape([B, M, 2, 1, K]).expand([B, M, 2, 4, K]),
@@ -310,13 +311,13 @@ def memory_efficient_attention(
     :parameter key: Tensor of shape ``[B, Mkv, H, K]``
     :parameter value: Tensor of shape ``[B, Mkv, H, Kv]``
     :parameter attn_bias: Bias to apply to the attention matrix - defaults to no masking. \
-        For common biases implemented efficiently in xFormers, see :attr:`xformers.ops.fmha.attn_bias.AttentionBias`. \
-        This can also be a :attr:`torch.Tensor` for an arbitrary mask (slower).
+        For common biases implemented efficiently, see `AttentionBias`. \
+        This can also be a `torch.Tensor` for an arbitrary mask (slower).
     :parameter p: Dropout probability. Disabled if set to ``0.0``
-    :parameter scale: Scaling factor for ``Q @ K.transpose()``. If set to ``None``, the default \
-        scale (q.shape[-1]**-0.5) will be used.
-    :parameter op: The operators to use - see :attr:`xformers.ops.AttentionOpBase`. \
-        If set to ``None`` (recommended), xFormers \
+    :parameter scale: Scaling factor for ``Q @ K.transpose()``. If set to ``None``,
+        the default scale (q.shape[-1]**-0.5) will be used.
+    :parameter op: The operators to use - see AttentionOpBase. \
+        If set to ``None`` (recommended), it \
         will dispatch to the best available operator, depending on the inputs \
         and options.
     :return: multi-head attention Tensor with shape ``[B, Mq, H, Kv]``
@@ -473,7 +474,7 @@ def memory_efficient_attention_forward(
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """
-    Calculates the forward pass of :attr:`xformers.ops.memory_efficient_attention`.
+    Calculates the forward pass of memory_efficient_attention.
     """
     return _memory_efficient_attention_forward(
         Inputs(
@@ -502,8 +503,8 @@ def memory_efficient_attention_forward_requires_grad(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns a tuple (output, lse), where `lse` can be used to compute the backward pass later.
-    See :attr:`xformers.ops.memory_efficient_attention` for an explanation of the arguments
-    See :attr:`xformers.ops.memory_efficient_attention_backward` for running the backward pass
+    See memory_efficient_attention for an explanation of the arguments
+    See memory_efficient_attention_backward for running the backward pass
     """
     if p != 0.0:
         raise NotImplementedError(
@@ -541,9 +542,9 @@ def memory_efficient_attention_backward(
     """
     Computes the gradient of the attention.
     Returns a tuple (dq, dk, dv)
-    See :attr:`xformers.ops.memory_efficient_attention` for an explanation of the arguments.
+    See memory_efficient_attention for an explanation of the arguments.
     `lse` is the tensor returned by
-    :attr:`xformers.ops.memory_efficient_attention_forward_requires_grad`
+    memory_efficient_attention_forward_requires_grad .
     """
     if p != 0.0:
         raise NotImplementedError(

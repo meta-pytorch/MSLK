@@ -276,7 +276,7 @@ def cutlass_blackwell_fmha_decode_forward(
     This is a wrapper to use the gen kernel which is optimized
     for decode (query length = 1).
 
-    This function is called externally by xformers ops.
+    This function is called externally by fmha ops.
 
     Accepts inputs in two formats:
     - Varlen format: [total_queries, num_heads, head_dim] (3D)

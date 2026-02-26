@@ -35,7 +35,7 @@ def _get_operator(name: str):
         raise RuntimeError(
             "No such operator "
             f"mslk.attention.cutlass_blackwell_fmha.{name} "
-            "- did you forget to build xformers with `python setup.py develop`?"
+            "- did you forget to build the library?"
         )
 
     try:

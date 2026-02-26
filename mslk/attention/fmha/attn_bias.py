@@ -6,7 +6,7 @@
 # pyre-unsafe
 """
 This file contains biases that can be used as the `attn_bias` argument in
-:attr:`xformers.ops.memory_efficient_attention`.
+`memory_efficient_attention`.
 Essentially, a bias is a Tensor which will be added to the ``Q @ K.t`` before
 computing the ``softmax``.
 
@@ -56,8 +56,7 @@ def _to_device_tensor(seq: Sequence[int], dtype: torch.dtype, device: torch.devi
 
 class AttentionBias:
     """Base class for a custom bias that can be applied \
-        as the attn_bias argument in
-    :attr:`xformers.ops.memory_efficient_attention`.
+        as the attn_bias argument in memory_efficient_attention.
 
     That function has the ability to add a tensor, the
     attention bias, to the QK^T matrix before it is used
@@ -73,19 +72,9 @@ class AttentionBias:
     be used as the attn_bias input to define an attention bias which
     forms such a mask, for some common cases.
 
-    When using an :attr:`xformers.ops.AttentionBias`
-    instead of a :attr:`torch.Tensor`, the mask matrix does
+    When using an AttentionBias torch.Tensor, the mask matrix does
     not need to be materialized, and can be
     hardcoded into some kernels for better performance.
-
-    See:
-
-    - :attr:`xformers.ops.fmha.attn_bias.LowerTriangularMask`
-    - :attr:`xformers.ops.fmha.attn_bias.LowerTriangularFromBottomRightMask`
-    - :attr:`xformers.ops.fmha.attn_bias.LowerTriangularMaskWithTensorBias`
-    - :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalMask`
-    - :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`
-
     """
 
     def materialize(
@@ -186,7 +175,7 @@ class LocalAttentionFromBottomRightMask(AttentionBias):
     .. code-block:: python
 
         import torch
-        from xformers.ops import fmha
+        from mslk.attention import fmha
 
         bias = fmha.attn_bias.LocalAttentionFromBottomRightMask(window_left=1, window_right=2)
         print(bias.materialize(shape=(4, 4)).exp())
@@ -748,7 +737,7 @@ class _GappySeqInfo(_SeqLenInfo):
 class BlockDiagonalMask(AttentionBias):
     """
     A block-diagonal mask that can be passed as ``attn_bias``
-    argument to :attr:`xformers.ops.memory_efficient_attention`.
+    argument to memory_efficient_attention.
 
     Queries and Keys are each divided into the same number of blocks.
     Queries in block i only attend to keys in block i.
@@ -763,7 +752,7 @@ class BlockDiagonalMask(AttentionBias):
     .. code-block:: python
 
         import torch
-        from xformers.ops import fmha
+        from mslk.attention import fmha
 
         K = 16
         dtype = torch.float16
@@ -984,7 +973,7 @@ class BlockDiagonalMask(AttentionBias):
 @dataclass
 class BlockDiagonalCausalMask(BlockDiagonalMask):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalMask`, except that each block is causal.
+    Same as BlockDiagonalMask, except that each block is causal.
 
     Queries and Keys are each divided into the same number of blocks.
     A query Q in block i cannot attend to a key which is not in block i,
@@ -1016,7 +1005,7 @@ class BlockDiagonalCausalMask(BlockDiagonalMask):
 @dataclass
 class BlockDiagonalCausalFromBottomRightMask(BlockDiagonalMask):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalMask`, except that each block is causal.
+    Same as BlockDiagonalMask, except that each block is causal.
     This mask allows for a non-causal prefix
     NOTE: Each block should have `num_keys >= num_queries` otherwise the forward pass is not
     defined (softmax of vector of `-inf` in the attention)
@@ -1066,7 +1055,7 @@ class BlockDiagonalCausalFromBottomRightMask(BlockDiagonalMask):
 @dataclass
 class BlockDiagonalPaddedKeysMask(AttentionBias):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalMask`,
+    Same as BlockDiagonalMask,
     except we support padding for k/v
 
     The keys and values are divided into blocks which are padded out to
@@ -1193,7 +1182,7 @@ class BlockDiagonalPaddedKeysMask(AttentionBias):
 @dataclass
 class BlockDiagonalCausalWithOffsetPaddedKeysMask(BlockDiagonalPaddedKeysMask):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`,
+    Same as BlockDiagonalCausalMask,
     except an offset on causality is allowed for each block and we support padding for k/v
 
     The keys and values are divided into blocks which are padded out to
@@ -1267,7 +1256,7 @@ class BlockDiagonalCausalWithOffsetPaddedKeysMask(BlockDiagonalPaddedKeysMask):
 @dataclass
 class BlockDiagonalLocalAttentionPaddedKeysMask(BlockDiagonalPaddedKeysMask):
     """
-    Like :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalLocalAttentionPaddedKeysMask`,
+    Like BlockDiagonalCausalLocalAttentionPaddedKeysMask,
     except that this is non-causal.
 
     A query Q in block i cannot attend to a key which is not in block i,
@@ -1333,8 +1322,7 @@ class BlockDiagonalLocalAttentionPaddedKeysMask(BlockDiagonalPaddedKeysMask):
 @dataclass
 class BlockDiagonalCausalLocalAttentionPaddedKeysMask(BlockDiagonalPaddedKeysMask):
     """
-    Like :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask`,
-    except with a window size.
+    Like BlockDiagonalCausalWithOffsetPaddedKeysMask except with a window size.
 
     A query Q in block i cannot attend to a key which is not in block i,
     nor one which is not in use (i.e. in the padded area),
@@ -1656,8 +1644,7 @@ class PagedBlockDiagonalCausalLocalPaddedKeysMask(PagedBlockDiagonalPaddedKeysMa
 @dataclass
 class BlockDiagonalGappyKeysMask(AttentionBias):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalMask`,
-    except k/v is gappy.
+    Same as BlockDiagonalMask, except k/v is gappy.
 
     A query Q in block i only attends to a key which is in block i.
     """
@@ -1781,8 +1768,7 @@ class BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask(
     BlockDiagonalGappyKeysMask
 ):
     """
-    Like :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalGappyKeysMask`,
-    except that this has local attention.
+    Like BlockDiagonalGappyKeysMask except that this has local attention.
 
     A query Q in block i cannot attend to a key which is not in block i,
     nor one which is not in use (i.e. in the padded area),
@@ -1862,7 +1848,7 @@ class BlockDiagonalLocalAttentionFromBottomRightGappyKeysMask(
 @dataclass
 class BlockDiagonalCausalWithOffsetGappyKeysMask(BlockDiagonalGappyKeysMask):
     """
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`,
+    Same as BlockDiagonalCausalMask,
     except k/v is gappy.
 
     A query Q in block i cannot attend to a key which is not in block i,
@@ -2056,7 +2042,7 @@ class PagedBlockDiagonalCausalWithOffsetGappyKeysMask(PagedBlockDiagonalGappyKey
 class BlockDiagonalCausalLocalAttentionMask(BlockDiagonalCausalMask):
     """
     (Experimental feature)
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`.
+    Same as BlockDiagonalCausalMask.
     This makes the mask "local" and the attention pattern banded.
 
     The ith query in a block only attends to keys in its block with index
@@ -2121,7 +2107,7 @@ class BlockDiagonalCausalLocalAttentionFromBottomRightMask(
 ):
     """
     (Experimental feature)
-    Same as :attr:`xformers.ops.fmha.attn_bias.BlockDiagonalCausalMask`.
+    Same as BlockDiagonalCausalMask.
     This makes the mask "local" and the attention pattern banded.
 
     A query with distance j from the last query in its block only attends to

@@ -158,7 +158,7 @@ def _custom_mask_type(bias: Optional[Union[torch.Tensor, AttentionBias]]) -> int
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """xFormers' MHA kernel based on CUTLASS.
+    """MHA kernel based on CUTLASS.
     Supports a large number of settings (including without TensorCores, f32 ...)
     and GPUs as old as P100 (Sm60)
     """

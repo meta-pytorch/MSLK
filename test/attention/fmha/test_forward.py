@@ -40,7 +40,7 @@ from .utils import (
     UNSUPPORTED_OP_PASSES,
 )
 
-logger = logging.getLogger("xformers")
+logger = logging.getLogger(__file__)
 
 ALL_FW_OPS = _filter_unsupported_ops(ALL_FW_OPS)
 ALL_BW_OPS = _filter_unsupported_ops(ALL_BW_OPS)
