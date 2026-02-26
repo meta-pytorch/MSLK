@@ -1,9 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
@@ -352,11 +347,6 @@ class FwOp(AttentionFwOpBase):
                 _,
                 _,
             ) = _convert_input_format(d)
-            if not _is_seqlen_q_le_seqlen_k(
-                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
-                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
-            ):
-                reasons.append("seqlens_k must be >= seqlens_q")
 
         if d.query.ndim < 4 or d.key.ndim < 4 or d.value.ndim < 4:
             reasons.append("Only supports BMHK or BMGHK")
@@ -370,8 +360,6 @@ class FwOp(AttentionFwOpBase):
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
         if K not in [64, 128] or Kv not in [64, 128]:
             reasons.append(f"Embed dim {K} not supported")
-        elif Mkv != 0 and Mq > Mkv:
-            reasons.append(f"Only support Mq ({Mq}) <= Mk ({Mkv})")
         return reasons
 
     @classmethod
@@ -408,7 +396,6 @@ class FwOp(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
                 deterministic=True,
             )
         else:
@@ -544,7 +531,6 @@ class FwOpDecode(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
                 deterministic=True,
             )
         else:
@@ -682,7 +668,6 @@ class BwOp(AttentionBwOpBase):
                     window_left=window_left,
                     window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
-                    # Set to True until we create a sub-class for deterministic
                     deterministic=True,
                 )
             )
