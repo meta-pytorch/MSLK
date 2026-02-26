@@ -160,16 +160,14 @@ def get_supported_attn_bias_types(op: Type[fmha.AttentionOpBase]) -> Iterable[An
 
 
 def _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(  # noqa: C901
-    ops_list: Sequence[Type[fmha.AttentionOpBase]], max_shapes_per_op: int = 65000
+    ops_list: Sequence[Type[fmha.AttentionOpBase]],
 ):
     r = random.Random(0)
     combination = []
     for op in ops_list:
-        op_count = 0
         # Sort list of masks, so it's deterministic across runs
         LIST_MASKS = sorted(get_supported_attn_bias_types(op), key=str)
         for shape in generate_test_shapes_B_Mq_Mkv_H_K_Kv(op):
-            has_one = False
             for device in _devices:
                 if device not in op.SUPPORTED_DEVICES:
                     continue
@@ -206,11 +204,6 @@ def _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(  # noqa: C901
                             Mq, Mkv = min(Mkv, Mq), max(Mkv, Mq)
                     new_shape = (B, Mq, Mkv, H, K, Kv)
                     combination.append((op, device, dtype, bias_type, *new_shape))
-                    has_one = True
-            if has_one:
-                op_count += 1
-            if op_count > max_shapes_per_op:
-                break
         # Some specific shapes for which we want to run without any mask
         bias_type = type(None)
         for shape in (
@@ -325,7 +318,10 @@ def create_tensors(  # noqa: C901
         key = key.expand((B, kv_len_paged, g, h, k))
         value = value.expand((B, kv_len_paged, g, h, k))
 
-    if fmt == "BMK" and not fmha.common._is_bias_type_supported_in_BMK(attn_bias_type):
+    if fmt == "BMK" and attn_bias_type not in (
+        fmha.attn_bias.LowerTriangularMask,
+        torch.Tensor,
+    ):
         attn_bias_type = None
     attn_bias = None
     if attn_bias_type is not None:

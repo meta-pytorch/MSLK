@@ -20,14 +20,11 @@ from mslk.attention.fmha.merge_training import (
     Partial,
 )
 
-from .utils import assert_allclose, disable_on_rocm
-
-compute_capability = (0, 0)
-if torch.cuda.is_available():
-    compute_capability = torch.cuda.get_device_capability("cuda")
-sm80_or_better_only = pytest.mark.skipif(
-    torch.version.cuda is not None and compute_capability < (8, 0),
-    reason="requires sm80+",
+from .utils import (
+    assert_allclose,
+    disable_on_rocm,
+    sm80_or_better_only,
+    UNSUPPORTED_OP_PASSES,
 )
 
 
@@ -66,9 +63,9 @@ def get_supported_attn_bias_types(op):
     [
         fmha.triton_splitk.FwOp,
         fmha.flash.FwOp,
-        fmha.flash3.FwOp,
         None,
-    ],
+    ]
+    + ([fmha.flash3.FwOp] if fmha.flash3.FwOp.is_available() else []),
     ids=lambda op: "None" if op is None else op.NAME,
 )
 @pytest.mark.parametrize("G,H", [(1, 11), (7, 1), (1, 1), (7, 11), (None, 11)])
@@ -89,8 +86,6 @@ def test_merge_attentions_nobias(
     Merging the same attention twice shouldn't change anything.
     This also tests the shape of the lse output of each permitted op.
     """
-    if op is fmha.flash3.FwOp and not op.is_available():
-        pytest.skip("Flash3 not available")
     B, Mq, K = 13, 3, 192
     if op is fmha.triton_splitk.FwOp:
         K = 128
@@ -101,9 +96,7 @@ def test_merge_attentions_nobias(
     if op is None or torch.bfloat16 in op.SUPPORTED_DTYPES:
         dtype = torch.bfloat16
     else:
-        dtype = next(iter(op.SUPPORTED_DTYPES))
-    if dtype == torch.float8_e4m3fn:
-        pytest.skip("float8 not supported")
+        dtype = [i for i in op.SUPPORTED_DTYPES if i != torch.float8_e4m3fn][0]
     if G is None:
         q = 3 * torch.rand(B, Mq, H, K, dtype=dtype, device="cuda")
         k = (3 * torch.rand(B, M, 1, K, dtype=dtype, device="cuda")).expand(B, M, H, K)
@@ -178,16 +171,15 @@ def test_partial_paged(
         k = k[:, :, 0]
         v = v[:, :, 0]
 
-    attn_bias = (
-        fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-            q_seqlen=[num_queries] * B,
-            kv_seqlen=[1] + ([100] * (B - 1)),
-            page_size=page_size,
-            block_tables=block_tables,
-        )
+    bias_type = fmha.attn_bias.PagedBlockDiagonalCausalWithOffsetPaddedKeysMask
+    attn_bias = bias_type.from_seqlens(
+        q_seqlen=[num_queries] * B,
+        kv_seqlen=[1] + ([100] * (B - 1)),
+        page_size=page_size,
+        block_tables=block_tables,
     )
 
-    if attn_bias not in get_supported_attn_bias_types(op):
+    if bias_type not in get_supported_attn_bias_types(op):
         pytest.skip("Not supported bias")
 
     attn_chunk, lse_chunk = fmha.memory_efficient_attention_partial(
@@ -544,6 +536,8 @@ def _merge_attentions_ref(attn_split, lse_split):
 def test_merge_attention_with_compile() -> None:
     op = fmha.flash3.FwOp
     if not op.is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
         pytest.skip("Op is not available")
     dtype = torch.bfloat16
     B, M, H, K = 1, 256, 2, 128
