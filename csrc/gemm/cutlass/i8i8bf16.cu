@@ -219,9 +219,9 @@ at::Tensor i8i8bf16sm90a_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementComputeEpilogue,
-          ElementOutput,
-          LayoutOutput,
-          AlignmentOutput,
+          void, // No C input - we are doing C = A @ B, not C = A @ B + beta*C
+          void,
+          0,
           ElementOutput,
           LayoutOutput,
           AlignmentOutput,
