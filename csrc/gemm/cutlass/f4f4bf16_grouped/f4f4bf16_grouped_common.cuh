@@ -234,6 +234,20 @@ at::Tensor f4f4bf16_grouped_impl(
       cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
       cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>;
 
+  // For NVFP4, we need to keep ElementC as the C input type because the
+  // epilogue uses alpha_ptr_array for per-group scaling, and the void C type
+  // changes the epilogue stride configuration in ways that break the
+  // alpha_ptr_array indexing. This is a fundamental limitation of CUTLASS's
+  // Sm90ScalarBroadcastPtrArray: it requires non-void C type to maintain proper
+  // stride layout for pointer-array access. For MXFP4, we can safely use void C
+  // type since it doesn't use alpha_ptr_array.
+  using EpilogueElementC = cute::conditional_t<is_nvfp4, ElementC, void>;
+  using EpilogueLayoutC = cute::conditional_t<
+      is_nvfp4,
+      typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
+      void>;
+  static constexpr int EpilogueAlignmentC = is_nvfp4 ? AlignmentC : 0;
+
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           ArchTag,
@@ -243,9 +257,9 @@ at::Tensor f4f4bf16_grouped_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          ElementC,
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
-          AlignmentC,
+          EpilogueElementC,
+          EpilogueLayoutC,
+          EpilogueAlignmentC,
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           AlignmentC,

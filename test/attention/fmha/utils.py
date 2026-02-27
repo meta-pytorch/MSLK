@@ -6,6 +6,7 @@
 # pyre-unsafe
 
 import math
+import os
 from functools import wraps
 from typing import List, Optional, Sequence, Tuple, Type, TypeVar
 
@@ -25,18 +26,40 @@ from mslk.attention.fmha.attn_bias_utils import (
 )
 from mslk.attention.fmha.triton_splitk import InputsFp8
 
-cuda_or_mtia_only = pytest.mark.skipif(
+IN_RE_WORKER: bool = os.environ.get("INSIDE_RE_WORKER") is not None
+
+# Whether a test with an unsupported op should pass or skip.
+UNSUPPORTED_OP_PASSES = IN_RE_WORKER
+
+# Whether a test with unsupported hardware should be expunged or skipped.
+UNSUPPORTED_HARDWARE_EXPUNGE = IN_RE_WORKER
+if UNSUPPORTED_HARDWARE_EXPUNGE:
+
+    def wrong_hardware(condition, reason):
+        if condition:
+
+            def decorator(func):
+                return None
+        else:
+
+            def decorator(func):
+                return func
+
+        return decorator
+else:
+    wrong_hardware = pytest.mark.skipif  # type: ignore  # pyre-ignore
+cuda_or_mtia_only = wrong_hardware(
     not torch.cuda.is_available() and not torch.mtia.is_available(),
     reason="requires CUDA or MTIA",
 )
-cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-rocm_only = pytest.mark.skipif(
+cuda_only = wrong_hardware(not torch.cuda.is_available(), reason="requires CUDA")
+rocm_only = wrong_hardware(
     not torch.cuda.is_available() or not torch.version.hip, reason="requires ROCM"
 )
-disable_on_rocm = pytest.mark.skipif(
+disable_on_rocm = wrong_hardware(
     not not torch.version.hip, reason="could not be done on ROCM"
 )
-disable_on_mtia = pytest.mark.skipif(
+disable_on_mtia = wrong_hardware(
     torch.mtia.is_available(), reason="Not supported yet on MTIA"
 )
 
@@ -455,31 +478,40 @@ def add_q_fp8_to_inputs(
 compute_capability = (0, 0)
 if torch.cuda.is_available():
     compute_capability = torch.cuda.get_device_capability("cuda")
-sm70_or_better_only = pytest.mark.skipif(
+sm70_or_better_only = wrong_hardware(
     torch.version.cuda is not None and compute_capability < (7, 0),
     reason="requires sm70+",
 )
-sm75_or_better_only = pytest.mark.skipif(
+sm75_or_better_only = wrong_hardware(
     torch.version.cuda is not None and compute_capability < (7, 5),
     reason="requires sm75+",
 )
-sm80_or_better_only = pytest.mark.skipif(
+sm80_or_better_only = wrong_hardware(
     torch.version.cuda is not None and compute_capability < (8, 0),
     reason="requires sm80+",
 )
-sm90_or_better_only = pytest.mark.skipif(
+sm90_or_better_only = wrong_hardware(
     compute_capability < (9, 0),
     reason="requires sm90+",
 )
-sm100_or_better_only = pytest.mark.skipif(
+sm100_or_better_only = wrong_hardware(
     compute_capability < (10, 0), reason="requires sm100+"
 )
-skip_if_sm100_or_better = pytest.mark.skipif(
+skip_if_sm100_or_better = wrong_hardware(
     compute_capability >= (10, 0), reason="not supported on Blackwell"
 )
 
-skip_if_rocm = pytest.mark.skipif(
+skip_if_rocm = wrong_hardware(
     torch.version.hip is not None, reason="not supported on ROCm"
+)
+try:
+    import triton
+
+    TRITON_CANNOT_DEQUANT = triton.__version__[:4] < "3.0."
+except ImportError:
+    TRITON_CANNOT_DEQUANT = True
+skip_if_triton_cannot_dequant = wrong_hardware(
+    TRITON_CANNOT_DEQUANT, reason="Triton cannot dequantize"
 )
 _devices = ["cpu"]
 _devices += ["cuda"] if torch.cuda.is_available() else []
