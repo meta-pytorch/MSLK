@@ -11,9 +11,8 @@
 #include <ATen/ScalarOps.h>
 #include <ATen/Tensor.h>
 #include <ATen/TensorOperators.h>
-#include <c10/hip/HIPStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
-#include <ATen/cuda/PhiloxUtils.cuh>
 
 #include "ck_fmha_util.h"
 #include "ck_tiled_fmha_params.h"
@@ -43,26 +42,26 @@ efficient_attention_backward_ck(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
-    const c10::optional<at::Tensor>& bias, // additive attention bias
+    const std::optional<at::Tensor>& bias, // additive attention bias
     // (Mode 1MHK only) [b+1]: cu_seqlens_q[b] contains the
     // position of the first query token for batch $b
-    const c10::optional<at::Tensor>& seqstart_q,
+    const std::optional<at::Tensor>& seqstart_q,
     // (Mode 1MHK only) [b+1]: cu_seqlens_k[b] contains the
     // position of the first key token for batch $b
-    const c10::optional<at::Tensor>& seqstart_k,
+    const std::optional<at::Tensor>& seqstart_k,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_q_,
+    const std::optional<int64_t> max_seqlen_q_,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_k_,
-    const c10::optional<at::Tensor>& seqlen_k,
+    const std::optional<int64_t> max_seqlen_k_,
+    const std::optional<at::Tensor>& seqlen_k,
     const at::Tensor& logsumexp,
     const at::Tensor& out,
     double dropout_p, // dropout probability
     int64_t rng_seed, // seed using for generating random numbers for dropout
     int64_t rng_offset, // offset into random number sequence
     int64_t custom_mask_type,
-    const c10::optional<double> scale,
-    const c10::optional<int64_t> window_size) {
+    const std::optional<double> scale,
+    const std::optional<int64_t> window_size) {
   // ndim
   TORCH_CHECK(query.dim() == grad_out.dim());
   TORCH_CHECK(query.dim() == key.dim());
@@ -116,7 +115,7 @@ efficient_attention_backward_ck(
     TORCH_CHECK(max_seqlen_k_.has_value());
   }
 
-  hipStream_t stream = c10::cuda::getCurrentHIPStream().stream();
+  hipStream_t stream = at::cuda::getCurrentHIPStream().stream();
 
   int64_t B = query.size(0);
   int64_t M = query.size(1);
@@ -555,26 +554,26 @@ efficient_attention_backward_ck_meta(
     const at::Tensor& query,
     const at::Tensor& key,
     const at::Tensor& value,
-    const c10::optional<at::Tensor>& bias, // additive attention bias
+    const std::optional<at::Tensor>& bias, // additive attention bias
     // (Mode 1MHK only) [b+1]: cu_seqlens_q[b] contains the
     // position of the first query token for batch $b
-    const c10::optional<at::Tensor>& seqstart_q,
+    const std::optional<at::Tensor>& seqstart_q,
     // (Mode 1MHK only) [b+1]: cu_seqlens_k[b] contains the
     // position of the first key token for batch $b
-    const c10::optional<at::Tensor>& seqstart_k,
+    const std::optional<at::Tensor>& seqstart_k,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_q_,
+    const std::optional<int64_t> max_seqlen_q_,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_k_,
-    const c10::optional<at::Tensor>& seqlen_k,
+    const std::optional<int64_t> max_seqlen_k_,
+    const std::optional<at::Tensor>& seqlen_k,
     const at::Tensor& logsumexp,
     const at::Tensor& out,
     double dropout_p, // dropout probability
     int64_t rng_seed, // seed using for generating random numbers for dropout
     int64_t rng_offset, // offset into random number sequence
     int64_t custom_mask_type,
-    const c10::optional<double> scale,
-    const c10::optional<int64_t> window_size) {
+    const std::optional<double> scale,
+    const std::optional<int64_t> window_size) {
   int64_t B = query.size(0);
   int64_t M = query.size(1);
   int64_t N = key.size(1);
