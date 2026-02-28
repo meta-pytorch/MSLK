@@ -305,40 +305,6 @@ void gather_or_scatter_along_first_dim(
 
 } // namespace
 
-at::Tensor gather_along_first_dim(at::Tensor data, at::Tensor index) {
-  if (data.is_contiguous() && data.dim() == 2 && index.is_contiguous() &&
-      index.dim() == 1) {
-    using T = cutlass::bfloat16_t;
-
-    const int M = data.size(0);
-    const int K = data.size(1);
-    const int N = index.size(0);
-    // TODO(shikaili): Make it supports more configurations.
-    if (data.dtype() == at::kBFloat16 &&
-        (K * sizeof(T) % kTmaGmemAlignment == 0) && (K % kL == 0)) {
-      at::Tensor output = at::empty(
-          {N, K},
-          at::TensorOptions().dtype(at::kBFloat16).device(data.device()));
-      if (index.dtype() == at::kInt) {
-        gather_or_scatter_along_first_dim<
-            true,
-            T,
-            int32_t,
-            cute::SM90_TMA_STORE>(data, index, output);
-        return output;
-      } else if (index.dtype() == at::kLong) {
-        gather_or_scatter_along_first_dim<
-            true,
-            T,
-            int64_t,
-            cute::SM90_TMA_STORE>(data, index, output);
-        return output;
-      }
-    }
-  }
-  return at::index_select(data, 0, index);
-}
-
 void scatter_add_along_first_dim(
     at::Tensor dst,
     at::Tensor src,
