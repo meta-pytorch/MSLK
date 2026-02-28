@@ -18,8 +18,6 @@ from mslk.attention.fmha.common import AttentionOpBase
 
 from .utils import _devices
 
-logger = logging.getLogger("xformers")
-
 
 def sample_random_supported_fw(
     inp: fmha.Inputs,

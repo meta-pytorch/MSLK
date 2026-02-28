@@ -458,17 +458,7 @@ class Gradients:
 
 
 class AttentionOpBase(BaseOperator):
-    """Base class for any attention operator in xFormers
-
-    See:
-
-    - :attr:`xformers.ops.fmha.cutlass.FwOp`
-    - :attr:`xformers.ops.fmha.cutlass.BwOp`
-    - :attr:`xformers.ops.fmha.flash.FwOp`
-    - :attr:`xformers.ops.fmha.flash.BwOp`
-    - :attr:`xformers.ops.fmha.triton.FwOp`
-    - :attr:`xformers.ops.fmha.triton.BwOp`
-    """
+    """Base class for any attention operator"""
 
     OPERATOR: Any  # pyre-ignore[13]
     SUPPORTED_DEVICES: Set[str]  # pyre-ignore[13]
@@ -539,7 +529,7 @@ class AttentionOpBase(BaseOperator):
             and not _built_with_cuda
             and (torch.version.hip is None)
         ):
-            reasons.append("xFormers wasn't build with CUDA support")
+            reasons.append("Library not built with CUDA support")
         if device_type == "cuda" and (torch.version.hip is None):
             device_capability = torch.cuda.get_device_capability(d.device)
             if device_capability < cls.CUDA_MINIMUM_COMPUTE_CAPABILITY:

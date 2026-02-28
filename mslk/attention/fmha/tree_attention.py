@@ -507,7 +507,7 @@ def select_prefix_op(
     elif use_triton_splitk_for_prefix(B, G, tree_size):
         return triton_splitk_op
     else:
-        # use default heuristics from xformers
+        # use default heuristics
         return None
 
 
@@ -693,8 +693,7 @@ def construct_full_tree_choices(
     Construct a full tree of a given depth where each node (except for leaves) has a given number of children.
     The format is compatible with that used by Medusa and EAGLE:
     https://github.com/FasterDecoding/Medusa/blob/5e98053/medusa/model/medusa_choices.py
-    For detailed description, see docstring of
-    xformers.ops.tree_attention.TreeAttnMetadata.from_tree_choices .
+    For detailed description, see docstring of TreeAttnMetadata.from_tree_choices .
     """
     return construct_tree_choices(branching=[branching] * tree_depth)
 

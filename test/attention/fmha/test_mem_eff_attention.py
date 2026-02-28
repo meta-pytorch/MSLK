@@ -60,7 +60,7 @@ from .utils import (
     UNSUPPORTED_OP_PASSES,
 )
 
-logger = logging.getLogger("xformers")
+logger = logging.getLogger(__file__)
 
 ALL_FW_OPS = _filter_unsupported_ops(ALL_FW_OPS)
 ALL_BW_OPS = _filter_unsupported_ops(ALL_BW_OPS)
@@ -2234,7 +2234,7 @@ def test_fp8_attention(dtype_init, deterministic, causal, B, nheads, seq_len, he
     torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=1e-4)
 
 
-def _pack_xformer_input(
+def _pack_input(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2302,7 +2302,7 @@ def test_fav3_kvsplit_attn(
     k = torch.randn(B, seq_len_kv, nheads_kv, head_dim, device="cuda", dtype=dtype_init)
     v = torch.randn(B, seq_len_kv, nheads_kv, head_dim, device="cuda", dtype=dtype_init)
 
-    xq, xk, xv, attn_bias = _pack_xformer_input(q, k, v, [seq_len_kv] * B, bias)
+    xq, xk, xv, attn_bias = _pack_input(q, k, v, [seq_len_kv] * B, bias)
 
     out_ref, lse_ref = fmha.memory_efficient_attention_forward_requires_grad(
         xq, xk, xv, attn_bias, op=fmha.flash3.FwOp
