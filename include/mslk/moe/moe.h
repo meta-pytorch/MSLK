@@ -17,8 +17,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
     const std::optional<at::Tensor>& valid_token_count,
     const int64_t top_k);
 
-at::Tensor gather_along_first_dim(at::Tensor data, at::Tensor index);
-
 void scatter_add_along_first_dim(
     at::Tensor dst,
     at::Tensor src,

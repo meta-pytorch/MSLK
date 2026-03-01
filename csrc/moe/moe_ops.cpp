@@ -25,7 +25,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "                int top_k=1) ->                    "
       "(Tensor, Tensor, Tensor)");
 #ifndef USE_ROCM
-  m.def("gather_along_first_dim(Tensor Data, Tensor Index) -> Tensor");
   m.def(
       "scatter_add_along_first_dim(Tensor Dst, Tensor Src, Tensor Index) -> ()");
 #endif
@@ -34,7 +33,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   DISPATCH_TO_CUDA("index_shuffling", index_shuffling_torch);
 #ifndef USE_ROCM
-  DISPATCH_TO_CUDA("gather_along_first_dim", gather_along_first_dim);
   DISPATCH_TO_CUDA("scatter_add_along_first_dim", scatter_add_along_first_dim);
 #endif
 }
@@ -56,13 +54,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch_meta(
   return {token_counts_per_expert, expert_indices, token_indices};
 }
 
-at::Tensor gather_along_first_dim_meta(at::Tensor data, at::Tensor index) {
-  int K = data.size(1);
-  int N = index.size(0);
-  at::Tensor output = at::empty({N, K}, data.options());
-  return output;
-}
-
 void scatter_add_along_first_dim_meta(
     at::Tensor /*dst*/,
     at::Tensor /*src*/,
@@ -73,7 +64,6 @@ void scatter_add_along_first_dim_meta(
 TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   DISPATCH_TO_META("index_shuffling", index_shuffling_torch_meta);
 #ifndef USE_ROCM
-  DISPATCH_TO_META("gather_along_first_dim", gather_along_first_dim_meta);
   DISPATCH_TO_META(
       "scatter_add_along_first_dim", scatter_add_along_first_dim_meta);
 #endif

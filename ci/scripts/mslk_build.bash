@@ -602,7 +602,6 @@ __verify_library_symbols () {
 
     if  [ "${mslk_build_variant}" == "cuda" ]; then
       lib_symbols_to_check+=(
-       mslk::moe::gather_along_first_dim
        mslk::comm::nccl_init
       )
     fi

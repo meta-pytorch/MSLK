@@ -22,49 +22,16 @@ from triton.testing import do_bench, do_bench_cudagraph
 
 
 index_shuffling = None
-gather_along_first_dim = None
 scatter_add_along_first_dim = None
 
 if torch.cuda.is_available():
     index_shuffling = torch.ops.mslk.index_shuffling  # noqa F401
     if not torch.version.hip:
         # SM90 support
-        gather_along_first_dim = torch.ops.mslk.gather_along_first_dim  # noqa F401
         scatter_add_along_first_dim = torch.ops.mslk.scatter_add_along_first_dim  # noqa F401
 
 
 _ACCELERATOR_TAG = torch.accelerator.current_accelerator()
-
-
-def bench_gather_along_first_dim(M: int, N: int, K: int) -> None:
-    src = torch.randn([M, K], device=_ACCELERATOR_TAG, dtype=torch.bfloat16).abs()
-    if M == N:
-        indices = torch.randperm(N, device=_ACCELERATOR_TAG, dtype=torch.int32)
-    else:
-        indices = torch.randint(0, M, [N], device=_ACCELERATOR_TAG, dtype=torch.int32)
-
-    def fn():
-        return torch.ops.mslk.gather_along_first_dim(src, indices)
-
-    def ref_fn():
-        return torch.index_select(src, 0, indices)
-
-    # Load src, store dst. x2.
-    data_size_in_gigabytes = N * K * 2 * 2 / 1e9
-
-    time_in_us = triton.testing.do_bench(fn) * 1e3
-    time_in_second = time_in_us / 1e6
-    gigabytes_per_second = data_size_in_gigabytes / time_in_second
-
-    ref_time_in_us = triton.testing.do_bench(ref_fn) * 1e3
-    ref_time_in_second = ref_time_in_us / 1e6
-    ref_gigabytes_per_second = data_size_in_gigabytes / ref_time_in_second
-
-    print(
-        f"Benchmark gather_along_first_dim: {M=:5d}, {N=:5d}, {K=:5d}, "
-        f"MSLK time: {time_in_us:10.3f} us. Bandwidth: {gigabytes_per_second:10.3f} GB/s, "
-        f"Torch time: {ref_time_in_us:10.3f} us. Bandwidth: {ref_gigabytes_per_second:10.3f} GB/s"
-    )
 
 
 def bench_scatter_add_along_first_dim_(op, M: int, N: int, K: int) -> None:
@@ -314,10 +281,6 @@ def main(kernels: Optional[str]):
     if should_bench_kernel(gather_scale_quant_dense_tokens):
         for E, T, D in itertools.product(Es, Ts, Ds):
             bench_gather_scale_dense_tokens(E, T, D, quantize=True)
-
-    if should_bench_kernel(gather_along_first_dim):
-        for T, D in itertools.product(Ts, Ds):
-            bench_gather_along_first_dim(T, T, D)
 
     if should_bench_kernel(scatter_add_along_first_dim):
         for T, D in itertools.product(Ts, Ds):
