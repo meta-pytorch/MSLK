@@ -8,8 +8,10 @@ import abc
 import functools
 from enum import auto, Enum
 
+import cutlass
 import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
+from mslk.gemm.cutedsl import int4bf16bf16_gemm, mxfp8_gemm
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.quantize.shuffle import ck_preshuffle, quantize_int4_preshuffle
@@ -29,6 +31,7 @@ from mslk.quantize.triton.fp8_quantize import (
     scale_fp8_row,
     triton_quantize_fp8_row,
 )
+from mslk.quantize.triton.mxfp8_quantize import triton_quantize_mxfp8
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 
@@ -71,16 +74,6 @@ try:
     MACHETE_ENABLED = True
 except ImportError:
     MACHETE_ENABLED = False
-
-
-# CuteDSL mixed-input GEMM for Blackwell.
-try:
-    import cutlass
-    from mslk.gemm.blackwell_mixed_input_gemm import int4bf16bf16_gemm
-
-    CUTEDSL_MIXED_INPUT_ENABLED = True
-except ImportError:
-    CUTEDSL_MIXED_INPUT_ENABLED = False
 
 
 class Accelerator(Enum):
@@ -548,10 +541,8 @@ class TorchMXFP8Groupwise(GemmOpBase):
         self.torch_compile = False
 
     def quantize(self, x, w):
-        x_scale, xq = to_mxfp8(x)
-        x_scale = _to_blocked(x_scale)
-        w_scale, wq = to_mxfp8(w)
-        w_scale = _to_blocked(w_scale)
+        x_scale, xq = triton_quantize_mxfp8(x)
+        w_scale, wq = triton_quantize_mxfp8(w)
         return xq, wq.t(), x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
@@ -897,6 +888,44 @@ class TritonBF16Grouped(GemmOpBase):
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
+
+@register_gemm_op
+class CuteDSLBF16Grouped(GemmOpBase):
+    """
+    BF16 grouped matmul implemented with CuteDSL (Blackwell).
+    """
+
+    def preprocess(self, x, w):
+        m_values = [i.shape[0] for i in x]
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)
+        w_stacked = torch.stack(w, dim=0).contiguous()  # [G, N, K]
+        x_cat = torch.concat(x, dim=0).contiguous()  # [GM, K]
+        return x_cat, w_stacked, m_sizes
+
+    def quantize(self, x, w, m_sizes):
+        return x, w, m_sizes
+
+    def compute(self, x, w, m_sizes):
+        from mslk.gemm.cutedsl import bf16_grouped_gemm
+
+        return bf16_grouped_gemm(x, w, m_sizes)
+
+    def quantize_and_compute(self, x, w, m_sizes):
+        x, w, m_sizes = self.quantize(x, w, m_sizes)
+        return self.compute(x, w, m_sizes)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -2991,7 +3020,7 @@ class CuteDSLInt4BF16Groupwise(GemmOpBase):
         # Default configuration for Int4 x BF16
         self._scale_granularity_m = 1
         self._scale_granularity_k = 128
-        self._acc_dtype = cutlass.Float32 if CUTEDSL_MIXED_INPUT_ENABLED else None
+        self._acc_dtype = cutlass.Float32
 
     def _int4_quantize(
         self,
@@ -3104,8 +3133,6 @@ class CuteDSLInt4BF16Groupwise(GemmOpBase):
 
     @property
     def supported(self) -> bool:
-        if not CUTEDSL_MIXED_INPUT_ENABLED:
-            return False
         return super().supported
 
 
@@ -3153,3 +3180,38 @@ class CuteDSLBF16Int4Groupwise(CuteDSLInt4BF16Groupwise):
     @property
     def weight_bytes_per_element(self) -> float:
         return 0.5  # Int4 weight
+
+
+@register_gemm_op
+class CuteDSLMXFP8(GemmOpBase):
+    """
+    CuteDSL Blockscale GEMM (MXFP8) for Blackwell (SM100+).
+    Uses Float8E4M3FN data with Float8E8M0FNU scale factors (sf_vec_size=32).
+    """
+
+    def quantize(self, x, w):
+        x_scale, xq = triton_quantize_mxfp8(x)
+        w_scale, wq = triton_quantize_mxfp8(w)
+        return xq, wq, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return mxfp8_gemm(A=xq, B=wq, A_scale=x_scale, B_scale=w_scale)
+
+    def quantize_and_compute(self, x, w):
+        return self.compute(*self.quantize(x, w))
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+    @property
+    def supported(self) -> bool:
+        return super().supported
