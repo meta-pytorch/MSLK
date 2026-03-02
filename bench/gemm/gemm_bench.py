@@ -601,7 +601,7 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--groups",
     default=None,
-    help="If set with grouped mode, repeat MNK shapes this many times. Comma separated list of groups to benchmark",
+    help="If set with grouped mode, repeat MNK shapes this many times. Comma separated list of groups to benchmark.",
 )
 @click.option(
     "--total-K",
