@@ -143,9 +143,9 @@ at::Tensor f8i4bf16_rowwise_impl(
           EpilogueTileType,
           ElementAccumulator,
           ElementAccumulator,
-          ElementOutput,
-          LayoutOutput,
-          AlignmentOutput,
+          void, // No C input - we are doing C = A @ B, not C = A @ B + beta*C
+          void,
+          0,
           ElementOutput,
           LayoutOutput,
           AlignmentOutput,

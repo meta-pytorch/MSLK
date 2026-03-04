@@ -1846,7 +1846,7 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
         )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
-        m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
         # Quantize weights.
         wq, scales = zip(*[quantize_int4_preshuffle(i) for i in w])
         group_scale, row_scale = zip(*scales)
@@ -1906,7 +1906,7 @@ class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
         )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
-        m_sizes = torch.tensor(m_values).to(dtype=torch.int32, device=x[0].device)
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
         # Quantize weights.
         wq, scales = zip(
             *[quantize_int4_preshuffle(i, dtype="bf16", use_zp=False) for i in w]

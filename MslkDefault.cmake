@@ -172,3 +172,9 @@ add_to_package(
 install(
   DIRECTORY bench
   DESTINATION mslk)
+
+if(BUILD_FB_CODE)
+  install(
+    DIRECTORY fb/mslk/attention/flash_attn
+    DESTINATION mslk/fb/mslk/attention)
+endif()

@@ -1326,7 +1326,7 @@ class BF16Int4Tests(unittest.TestCase):
         else:
             ms = torch.zeros((G,), dtype=torch.int)
 
-        M_sizes = ms.to(device=self.device, dtype=torch.int32)
+        M_sizes = ms.to(device=self.device, dtype=torch.int64)
         ns = [N] * G
         ks = [K] * G
 
@@ -1507,7 +1507,7 @@ class FP8Int4Tests(unittest.TestCase):
         else:
             ms = torch.zeros((G,), dtype=torch.int)
 
-        M_sizes = ms.to(device=self.device, dtype=torch.int32)
+        M_sizes = ms.to(device=self.device, dtype=torch.int64)
         ns = [N] * G
         ks = [K] * G
 

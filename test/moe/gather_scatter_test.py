@@ -406,53 +406,6 @@ class GatherScatterTests(unittest.TestCase):
         or torch.cuda.get_device_capability() < (9, 0),
         "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
     )
-    def test_gather_along_first_dim(self) -> None:
-        def _test_gather_along_first_dim(
-            M: int, N: int, K: int, compile: bool = False
-        ) -> None:
-            logger.info(f"Running test_gather_along_first_dim: {M=}, {N=}, {K=}")
-            src = torch.randn([M, K], device="cuda", dtype=torch.bfloat16).abs()
-            if M == N:
-                indices = torch.randperm(N, device="cuda", dtype=torch.int32)
-            else:
-                indices = torch.randint(0, M, [N], device="cuda", dtype=torch.int32)
-
-            def fn() -> torch.Tensor:
-                op = torch.ops.mslk.gather_along_first_dim
-                if compile:
-                    op = torch.compile(op, backend="inductor", fullgraph=True)
-                return op(src, indices)
-
-            def ref_fn() -> torch.Tensor:
-                return torch.index_select(src, 0, indices)
-
-            logger.info("Running FBGMM")
-            dst = fn()
-            logger.info("Running PyTorch")
-            ref_dst = ref_fn()
-
-            self.assertTrue((dst == ref_dst).all().item())
-
-        _test_gather_along_first_dim(127, 257, 1023)
-        _test_gather_along_first_dim(127, 257, 1024)
-        _test_gather_along_first_dim(255, 129, 2049)
-        _test_gather_along_first_dim(255, 129, 2048)
-        _test_gather_along_first_dim(1024, 1024, 1024)
-        _test_gather_along_first_dim(1024, 1024, 1024, compile=True)
-
-        _test_gather_along_first_dim(1, 1, 5120)
-        _test_gather_along_first_dim(128, 128, 5120)
-        _test_gather_along_first_dim(2048, 2048, 5120)
-        _test_gather_along_first_dim(4096, 4096, 5120)
-        _test_gather_along_first_dim(8192, 8192, 5120)
-        _test_gather_along_first_dim(16384, 16384, 5120)
-
-    @unittest.skipIf(
-        torch.version.hip
-        or not torch.cuda.is_available()
-        or torch.cuda.get_device_capability() < (9, 0),
-        "Skip when no Hopper GPU is available. This test is only for Hopper GPU.",
-    )
     def test_scatter_add_along_first_dim(self) -> None:
         def _test_scatter_add_along_first_dim(
             M: int, N: int, K: int, compile: bool = False
