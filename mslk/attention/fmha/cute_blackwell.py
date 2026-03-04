@@ -352,11 +352,6 @@ class FwOp(AttentionFwOpBase):
                 _,
                 _,
             ) = _convert_input_format(d)
-            if not _is_seqlen_q_le_seqlen_k(
-                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
-                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
-            ):
-                reasons.append("seqlens_k must be >= seqlens_q")
 
         if d.query.ndim < 4 or d.key.ndim < 4 or d.value.ndim < 4:
             reasons.append("Only supports BMHK or BMGHK")
@@ -370,8 +365,6 @@ class FwOp(AttentionFwOpBase):
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
         if K not in [64, 128] or Kv not in [64, 128]:
             reasons.append(f"Embed dim {K} not supported")
-        elif Mkv != 0 and Mq > Mkv:
-            reasons.append(f"Only support Mq ({Mq}) <= Mk ({Mkv})")
         return reasons
 
     @classmethod
