@@ -158,6 +158,19 @@ at::Tensor bf16i4bf16_rowwise_batched_impl(
   using EpilogueSchedule = cute::
       conditional_t<PONG, PongEpilogueSchedule, CooperativeEpilogueSchedule>;
 
+  // Use EVT epilogue to avoid reading C matrix.
+  // This fetches the accumulator and outputs it directly.
+  using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+
+  using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::multiplies,
+          ElementC, // Output type
+          ElementAccumulator, // Input type
+          cutlass::FloatRoundStyle::round_to_nearest>,
+      cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
+      Accum>;
+
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           cutlass::arch::Sm90,
@@ -173,7 +186,8 @@ at::Tensor bf16i4bf16_rowwise_batched_impl(
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type,
           AlignmentC,
-          EpilogueSchedule>::CollectiveOp;
+          EpilogueSchedule,
+          EpilogueEVT>::CollectiveOp;
 
   using CollectiveMainloop =
       typename cutlass::gemm::collective::CollectiveBuilder<
@@ -238,11 +252,20 @@ at::Tensor bf16i4bf16_rowwise_batched_impl(
        stride_S,
        group_size,
        reinterpret_cast<ElementZeroPoint*>(w_zp.data_ptr())},
-      {{1.0, 0.0},
+      {{},
        (ElementC*)Y.data_ptr<at::BFloat16>(),
        stride_c,
        (ElementC*)Y.data_ptr<at::BFloat16>(),
        stride_c}};
+
+  // Initialize EVT epilogue thread args: Compute(multiplies) <-
+  // ScalarBroadcast(1.0), Accum
+  arguments.epilogue.thread = {
+      {{ElementAccumulator(
+          1.0)}}, // ScalarBroadcast: multiply by 1.0 (identity)
+      {}, // Accumulator
+      {}, // Multiplies
+  };
 
   Gemm gemm;
 
