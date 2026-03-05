@@ -11,10 +11,6 @@
 
 namespace mslk::quantize {
 
-#ifdef USE_ROCM
-void flush_icache_ck();
-#endif
-
 at::Tensor per_tensor_quantize_i8(at::Tensor X, double scale);
 
 std::tuple<at::Tensor, at::Tensor> per_tensor_dynamic_quantize_i8(at::Tensor X);
