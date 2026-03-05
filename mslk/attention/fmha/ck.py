@@ -166,7 +166,7 @@ def _custom_mask_type(bias: Optional[Union[torch.Tensor, AttentionBias]]) -> int
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """xFormers' MHA kernel based on Composable Kernel."""
+    """MHA kernel based on Composable Kernel."""
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}

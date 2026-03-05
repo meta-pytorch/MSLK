@@ -36,7 +36,7 @@ sm80_or_better_only = pytest.mark.skipif(
 
 # fmt: off
 # Tree defintions - see doctring of
-# xformers.ops.tree_attention.TreeAttnMetadata.from_tree_choices
+# TreeAttnMetadata.from_tree_choices
 # for the format description
 # from https://github.com/SafeAILab/EAGLE/blob/e98fc7c/model/choices.py
 eagle_mc_sim_7b_63 = [(0,),(1,),(2,),(3,),(0,0),(0,1),(0,2),(1,0),(1,1),(2,0),(2,1),(3,0)  # noqa
@@ -351,11 +351,11 @@ def tree_attention_with_sync(
 ) -> torch.Tensor:
     """
     A wrapper around tree_attention which constructs the biases.
-    Arguments are the same as in xformers.ops.tree_attention.tree_attention, but instead of
+    Arguments are the same as in tree_attention, but instead of
     spec_attn_bias and prefix_attn_bias this function takes in tree definition in the form of tree_choices
     and K/V sequence lengths kv_lens.
     For the format of tree_choices see docstring of
-    xformers.ops.tree_attention.TreeAttnMetadata.from_tree_choices.
+    TreeAttnMetadata.from_tree_choices.
     """
     B, tree_size_q = q.shape[:2]
     Mk = cache_k.shape[1]

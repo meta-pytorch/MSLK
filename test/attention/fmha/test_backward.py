@@ -41,7 +41,7 @@ from .utils import (
     use_cpu_ref,
 )
 
-logger = logging.getLogger("xformers")
+logger = logging.getLogger(__file__)
 
 ALL_FW_OPS = _filter_unsupported_ops(ALL_FW_OPS)
 ALL_BW_OPS = _filter_unsupported_ops(ALL_BW_OPS)
@@ -116,7 +116,7 @@ def test_backward(  # noqa: C901
         op_fw = fmha.ck.FwOp
         if dtype == torch.bfloat16:
             # bfloat16 testing can be enabled by export ENABLE_HIP_FMHA_RTN_BF16_CONVERT=1 when
-            # building xformers and get accurate results
+            # building and get accurate results
             pytest.skip(
                 "CK Fmha backward for bfloat16 currently is not very accurate for some cases!"
             )
