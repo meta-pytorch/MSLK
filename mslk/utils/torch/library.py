@@ -17,6 +17,9 @@ import torch
 def load_library_buck(buck_target: str) -> None:
     import mslk  # noqa: F401
 
+    if getattr(mslk, "_python_only", False):  # pyre-ignore [16]
+        return
+
     # pyre-ignore [16]
     open_source: bool = getattr(mslk, "open_source", False)
 
