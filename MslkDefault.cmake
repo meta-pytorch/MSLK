@@ -177,4 +177,7 @@ if(BUILD_FB_CODE)
   install(
     DIRECTORY fb/mslk/attention/flash_attn
     DESTINATION mslk/fb/mslk/attention)
+  install(
+    DIRECTORY fb/external/quack
+    DESTINATION mslk/fb/external)
 endif()
