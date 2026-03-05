@@ -359,7 +359,7 @@ class FP8Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    @unittest.skipIf(not torch.version.cuda, "Skip on AMD: f8f8bf16 not yet suported.")
+    @unittest.skipIf(not torch.version.cuda, "Skip on AMD: f8f8bf16 not yet supported.")
     @unittest.skipIf(
         not evaluate_cuda_compute_capability(9, 9), "Only SM90 is supported."
     )
@@ -1810,7 +1810,7 @@ class BF16Tests(unittest.TestCase):
 
     @unittest.skipIf(
         not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_wgrad not yet suported.",
+        "Skip on AMD: test_grouped_gemm_wgrad not yet supported.",
     )
     @settings(deadline=None)
     @given(
@@ -1917,7 +1917,7 @@ class BF16Tests(unittest.TestCase):
 
     @unittest.skipIf(
         not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_dgrad not yet suported.",
+        "Skip on AMD: test_grouped_gemm_dgrad not yet supported.",
     )
     @settings(deadline=None)
     @given(
@@ -1995,7 +1995,7 @@ class BF16Tests(unittest.TestCase):
 
     @unittest.skipIf(
         not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_fprop not yet suported.",
+        "Skip on AMD: test_grouped_gemm_fprop not yet supported.",
     )
     @settings(deadline=None)
     @given(

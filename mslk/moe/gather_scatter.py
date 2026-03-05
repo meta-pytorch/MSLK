@@ -616,7 +616,7 @@ def _mslk_gather_scale_fp8_rowwise_quant_dense_tokens(
             None,
             eviction_policy="evict_first",
         ).to(tl.float32)
-        # Rematerilize
+        # Rematerialize
         output_token_value_fp8 = (input_token_value * input_score) * output_scale
 
         # Clamp A to fp8 range to make sure there's no overflow.

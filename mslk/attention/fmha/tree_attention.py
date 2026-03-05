@@ -566,7 +566,7 @@ def tree_attention(
         prefix_attn_bias = BlockDiagonalPaddedKeysMask.from_seqlens(
             q_seqlen=[tree_size_q for _ in range(B)], kv_seqlen=kv_lens, kv_padding=Mk
         )
-        # Create an explit attention bias for the speculative part of the attention
+        # Create an explicit attention bias for the speculative part of the attention
         spec_attn_bias = TreeAttnMetadata.from_tree_choices(tree_choices, q.dtype, q.device).attention_bias
         attn_output = tree_attention(
             q, spec_k, spec_v, cache_k, cache_v, spec_attn_bias, prefix_attn_bias

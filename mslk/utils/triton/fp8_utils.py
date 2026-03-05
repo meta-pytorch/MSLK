@@ -47,7 +47,7 @@ def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
     Returns:
         pt_dtype (torch.dtype): The correct torch fp8 datatype.
         tl_dtype (tl.dtype): The correct triton fp8 datatype.
-        max_fp8 (float): The maximum reprsentable value for the fp8 datatype.
+        max_fp8 (float): The maximum representable value for the fp8 datatype.
         eps (float): Minimum clip value to prevent divide by zero.
     """
     if supports_float8_fnuz(throw_on_hip_incompatibility=(not running_on_github)):
