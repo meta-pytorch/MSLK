@@ -19,11 +19,17 @@ from datetime import date
 from typing import List, Optional
 
 import setuptools
-import setuptools_git_versioning as gitversion
-import torch
 from setuptools.command.install import install as PipInstall
-from skbuild import setup
-from tabulate import tabulate
+
+_PYTHON_ONLY = os.environ.get("MSLK_PYTHON_ONLY", "0") == "1"
+
+if _PYTHON_ONLY:
+    _setup_fn = setuptools.setup
+else:
+    import setuptools_git_versioning as gitversion
+    import torch
+    from skbuild import setup as _setup_fn
+    from tabulate import tabulate
 
 logging.basicConfig(level=logging.INFO)
 
@@ -499,35 +505,6 @@ class CudaUtils:
 class MSLKInstall(PipInstall):
     """MSLK PIP Install Routines"""
 
-    @classmethod
-    def generate_version_file(cls, build: MSLKBuild) -> None:
-        with open("mslk/version.py", "w") as file:
-            print(
-                f"[SETUP.PY] Generating version file at: {os.path.realpath(file.name)}"
-            )
-            text = textwrap.dedent(
-                f"""
-                #!/usr/bin/env python3
-                # Copyright (c) Meta Platforms, Inc. and affiliates.
-                # All rights reserved.
-                #
-                # This source code is licensed under the BSD-style license found in the
-                # LICENSE file in the root directory of this source tree.
-
-                __version__: str = "{build.package_version()}"
-                __target__: str = "{build.target()}"
-                __variant__: str = "{build.variant()}"
-                """
-            )
-            file.write(text)
-
-    @classmethod
-    def description(cls) -> str:
-        # Get the long description from the relevant file
-        current_dir = os.path.dirname(os.path.realpath(__file__))
-        with open(os.path.join(current_dir, "README.md"), encoding="utf-8") as f:
-            return f.read()
-
     def print_versions(self) -> None:
         pytorch_version = (
             subprocess.run(
@@ -579,47 +556,84 @@ class MSLKInstall(PipInstall):
         self.print_versions()
 
 
-def main(argv: List[str]) -> None:
-    # Handle command line args before passing to main setup() method.
-    build = MSLKBuild.from_args(argv)
-    # Repair command line args for setup() method.
-    sys.argv = [sys.argv[0]] + build.other_args
+def _write_version_file(version: str, target: str, variant: str) -> None:
+    with open("mslk/version.py", "w") as f:
+        print(f"[SETUP.PY] Generating version file at: {os.path.realpath(f.name)}")
+        f.write(
+            textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            # Copyright (c) Meta Platforms, Inc. and affiliates.
+            # All rights reserved.
+            #
+            # This source code is licensed under the BSD-style license found in the
+            # LICENSE file in the root directory of this source tree.
 
-    # Skip the build step if running under Nova non-prebuild step
-    if build.nova_non_prebuild_step():
-        print(
-            "[SETUP.PY] Running under Nova workflow context (clean or build wheel step) ... exiting"
+            __version__: str = "{version}"
+            __target__: str = "{target}"
+            __variant__: str = "{variant}"
+        """)
         )
-        sys.exit(0)
 
-    # Set the CUDA environment variables if needed
-    if build.variant() == "cuda":
-        CudaUtils.set_cuda_environment_variables()
 
-    # Print the environment variables
-    print(f"[SETUP.PY] Environment variables: {pprint.pformat(dict(os.environ))}")
+def _description() -> str:
+    current_dir = os.path.dirname(os.path.realpath(__file__))
+    with open(os.path.join(current_dir, "README.md"), encoding="utf-8") as f:
+        return f.read()
 
-    # Extract the package name
-    package_name = build.package_name()
 
-    # Extract the package version
-    package_version = build.package_version()
+def main(argv: List[str]) -> None:
+    extra_kwargs = {}
 
-    print(
-        f"[SETUP.PY] Determined the package name and variant+version: ({package_name} : {package_version})\n"
-    )
-    if build.args.dryrun:
-        sys.exit(0)
+    if _PYTHON_ONLY:
+        print("[SETUP.PY] MSLK_PYTHON_ONLY=1 — skipping C++/CUDA build")
+        package_name = "mslk"
+        package_version = "0.0.0"
+        _write_version_file(package_version, "default", "python_only")
 
-    # Generate the version file
-    MSLKInstall.generate_version_file(build)
+    else:
+        # Handle command line args before passing to main setup() method.
+        build = MSLKBuild.from_args(argv)
+        # Repair command line args for setup() method.
+        sys.argv = [sys.argv[0]] + build.other_args
 
-    setup(
+        # Skip the build step if running under Nova non-prebuild step
+        if build.nova_non_prebuild_step():
+            print(
+                "[SETUP.PY] Running under Nova workflow context"
+                " (clean or build wheel step) ... exiting"
+            )
+            sys.exit(0)
+
+        # Set the CUDA environment variables if needed
+        if build.variant() == "cuda":
+            CudaUtils.set_cuda_environment_variables()
+
+        # Print the environment variables
+        print(f"[SETUP.PY] Environment variables: {pprint.pformat(dict(os.environ))}")
+
+        package_name = build.package_name()
+        package_version = build.package_version()
+
+        print(
+            "[SETUP.PY] Determined the package name and variant+version:"
+            f" ({package_name} : {package_version})\n"
+        )
+        if build.args.dryrun:
+            sys.exit(0)
+
+        _write_version_file(package_version, build.target(), build.variant())
+
+        extra_kwargs = {
+            "cmake_args": build.cmake_args(),
+            "cmdclass": {"install": MSLKInstall},
+        }
+
+    _setup_fn(
         name=package_name,
         version=package_version,
         author="MSLK Team",
         author_email="packages@pytorch.org",
-        long_description=MSLKInstall.description(),
+        long_description=_description(),
         long_description_content_type="text/markdown",
         url="https://github.com/pytorch/MSLK",
         license="BSD-3",
@@ -638,10 +652,6 @@ def main(argv: List[str]) -> None:
             # nightly and test packages
             "numpy",
         ],
-        cmake_args=build.cmake_args(),
-        cmdclass={
-            "install": MSLKInstall,
-        },
         # PyPI package information
         classifiers=[
             "Development Status :: 4 - Beta",
@@ -654,6 +664,7 @@ def main(argv: List[str]) -> None:
             f"Programming Language :: Python :: {x}"
             for x in ["3", "3.9", "3.10", "3.11", "3.12", "3.13"]
         ],
+        **extra_kwargs,
     )
 
 

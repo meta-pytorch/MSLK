@@ -42,15 +42,22 @@ libraries_to_load = {
     "default": _default_libraries,
 }
 
-for library in libraries_to_load.get(__target__, []):
-    # NOTE: In all cases, we want to throw an error if we cannot load the
-    # library.  However, this appears to break the OSS documentation build,
-    # where the Python documentation doesn't show up in the generated docs.
-    #
-    # To work around this problem, we introduce a fake build variant called
-    # `docs` and we only throw a library load error when the variant is not
-    # `docs`.  For more information, see:
-    #
-    #   https://github.com/pytorch/FBGEMM/pull/3477
-    #   https://github.com/pytorch/FBGEMM/pull/3717
-    _load_library(f"{library}.so", __version__, __variant__ == "docs")
+_python_only: bool = (
+    os.environ.get("MSLK_PYTHON_ONLY", "0") == "1" or __variant__ == "python_only"
+)
+
+if _python_only:
+    logging.info("MSLK running in python-only mode — skipping native library loading")
+else:
+    for library in libraries_to_load.get(__target__, []):
+        # NOTE: In all cases, we want to throw an error if we cannot load the
+        # library.  However, this appears to break the OSS documentation build,
+        # where the Python documentation doesn't show up in the generated docs.
+        #
+        # To work around this problem, we introduce a fake build variant called
+        # `docs` and we only throw a library load error when the variant is not
+        # `docs`.  For more information, see:
+        #
+        #   https://github.com/pytorch/FBGEMM/pull/3477
+        #   https://github.com/pytorch/FBGEMM/pull/3717
+        _load_library(f"{library}.so", __version__, __variant__ == "docs")
