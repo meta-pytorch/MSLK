@@ -153,7 +153,7 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
         if not op.VARLEN_LSE_PACKED:
             lse = _block_diag_reshape_lse(lse, attn_bias.q_seqinfo)
     if op is fmha.cutlass.FwOp:
-        # CUTLASS kernel pads the last dimention of LSE to 32
+        # CUTLASS kernel pads the last dimension of LSE to 32
         lse = lse[:, :, : ref_lse.shape[2]]
     if op is fmha.ck.FwOp:
         # relax numerical tolerance for CK FwOp
