@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
-from typing import Any, Dict, List, Type, TypeVar
+from typing import Any, List, Type, TypeVar
 
 import torch
 
@@ -13,17 +13,13 @@ import torch
 def get_operator(library: str, name: str):
     def no_such_operator(*args, **kwargs):
         raise RuntimeError(
-            f"No such operator {library}::{name} - did you forget to build xformers with `python setup.py develop`?"
+            f"No such operator {library}::{name} - did you forget to build the library?"
         )
 
     try:
         return getattr(getattr(torch.ops, library), name)
     except (RuntimeError, AttributeError):
         return no_such_operator
-
-
-def get_xformers_operator(name: str):
-    return get_operator("xformers", name)
 
 
 class BaseOperator:
@@ -43,14 +39,12 @@ class BaseOperator:
 
 
 OPERATORS_REGISTRY: List[Type[BaseOperator]] = []
-FUNC_TO_XFORMERS_OPERATOR: Dict[Any, Type[BaseOperator]] = {}
 
 ClsT = TypeVar("ClsT")
 
 
 def register_operator(cls: ClsT) -> ClsT:
     OPERATORS_REGISTRY.append(cls)  # type: ignore
-    FUNC_TO_XFORMERS_OPERATOR[cls.OPERATOR] = cls  # type: ignore
     return cls
 
 

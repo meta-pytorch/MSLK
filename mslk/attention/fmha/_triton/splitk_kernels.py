@@ -617,7 +617,7 @@ def _fwd_kernel_splitK(  # noqa: C901
             p_scaled = p / p_scale[:, None]
             p_clamped = tl.clamp(p_scaled, 0, MAX_FP8)
 
-            # covert P to FP8
+            # convert P to FP8
             p = p_clamped.to(v_dtype, fp_downcast_rounding="rtne")
 
         # -- scale and update acc --

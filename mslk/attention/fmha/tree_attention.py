@@ -507,7 +507,7 @@ def select_prefix_op(
     elif use_triton_splitk_for_prefix(B, G, tree_size):
         return triton_splitk_op
     else:
-        # use default heuristics from xformers
+        # use default heuristics
         return None
 
 
@@ -566,7 +566,7 @@ def tree_attention(
         prefix_attn_bias = BlockDiagonalPaddedKeysMask.from_seqlens(
             q_seqlen=[tree_size_q for _ in range(B)], kv_seqlen=kv_lens, kv_padding=Mk
         )
-        # Create an explit attention bias for the speculative part of the attention
+        # Create an explicit attention bias for the speculative part of the attention
         spec_attn_bias = TreeAttnMetadata.from_tree_choices(tree_choices, q.dtype, q.device).attention_bias
         attn_output = tree_attention(
             q, spec_k, spec_v, cache_k, cache_v, spec_attn_bias, prefix_attn_bias
@@ -693,8 +693,7 @@ def construct_full_tree_choices(
     Construct a full tree of a given depth where each node (except for leaves) has a given number of children.
     The format is compatible with that used by Medusa and EAGLE:
     https://github.com/FasterDecoding/Medusa/blob/5e98053/medusa/model/medusa_choices.py
-    For detailed description, see docstring of
-    xformers.ops.tree_attention.TreeAttnMetadata.from_tree_choices .
+    For detailed description, see docstring of TreeAttnMetadata.from_tree_choices .
     """
     return construct_tree_choices(branching=[branching] * tree_depth)
 

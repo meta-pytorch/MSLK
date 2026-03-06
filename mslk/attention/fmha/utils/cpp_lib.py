@@ -133,16 +133,20 @@ def _register_extensions():
 
 _cpp_library_load_exception = None
 
-try:
-    _register_extensions()
-except (xFormersInvalidLibException, xFormersWasNotBuiltException) as e:
-    ENV_VAR_FOR_DETAILS = "XFORMERS_MORE_DETAILS"
-    if os.environ.get(ENV_VAR_FOR_DETAILS, False):
-        logger.warning(f"WARNING[XFORMERS]: {e}", exc_info=e)
-    else:
-        logger.warning(
-            f"WARNING[XFORMERS]: {e}\n  Set {ENV_VAR_FOR_DETAILS}=1 for more details"
-        )
-    _cpp_library_load_exception = e
+if os.environ.get("MSLK_PYTHON_ONLY", "0") == "1":
+    _cpp_library_load_exception = xFormersWasNotBuiltException()
+else:
+    try:
+        _register_extensions()
+    except (xFormersInvalidLibException, xFormersWasNotBuiltException) as e:
+        ENV_VAR_FOR_DETAILS = "XFORMERS_MORE_DETAILS"
+        if os.environ.get(ENV_VAR_FOR_DETAILS, False):
+            logger.warning(f"WARNING[XFORMERS]: {e}", exc_info=e)
+        else:
+            logger.warning(
+                f"WARNING[XFORMERS]: {e}\n"
+                f"  Set {ENV_VAR_FOR_DETAILS}=1 for more details"
+            )
+        _cpp_library_load_exception = e
 
 _built_with_cuda = True  # XXXXX
