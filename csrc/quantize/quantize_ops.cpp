@@ -36,8 +36,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #ifndef USE_ROCM
   m.def(
       "fake_quantize_nvfp4_per_tensor(Tensor input, Tensor? static_scales=None, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor[]");
-#else
-  m.def("flush_icache_hip() -> ()");
 #endif
 }
 
@@ -55,8 +53,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
 #ifndef USE_ROCM
   DISPATCH_TO_CUDA(
       "fake_quantize_nvfp4_per_tensor", fake_quantize_nvfp4_per_tensor);
-#else
-  DISPATCH_TO_CUDA("flush_icache_hip", flush_icache_ck);
 #endif
 }
 
