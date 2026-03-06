@@ -38,6 +38,13 @@ def _get_operator(name: str):
             "- did you forget to build the library?"
         )
 
+    def no_cuda_environment(*args, **kwargs):
+        raise RuntimeError(
+            "The operator "
+            f"mslk.attention.cutlass_blackwell_fmha.{name} "
+            "cannot run in a non-cuda environment."
+        )
+
     try:
         # type: ignore  # pyre-ignore
         from mslk.attention.cutlass_blackwell_fmha import (
@@ -47,6 +54,10 @@ def _get_operator(name: str):
         return getattr(fmha, name)  # type: ignore  # pyre-ignore
     except (RuntimeError, ModuleNotFoundError):
         return no_such_operator
+    except OSError as e:
+        if torch.cuda.is_available() is False:
+            return no_cuda_environment
+        raise e
 
 
 def _convert_input_format(
