@@ -28,7 +28,14 @@ except (ImportError, OSError):
     _USE_MTIA_FLASH_ATTENTION = False
 
 
-_USE_FLASH_ATTENTION_3 = False
+try:
+    import ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface  # noqa: F401,E501  # type: ignore
+
+    # fbcode: FA3 off by default
+    _USE_FLASH_ATTENTION_3 = False
+except ImportError:
+    # OSS: FA3 on by default
+    _USE_FLASH_ATTENTION_3 = True
 
 
 def _set_use_fa3(use_flash_attention3: bool) -> None:
@@ -41,9 +48,10 @@ def _get_use_fa3() -> bool:
 
 
 def fa3_available() -> bool:
+    has_cuda = torch.version.cuda is not None
+    is_supported = has_cuda and (8, 0) <= torch.cuda.get_device_capability() <= (9, 0)
     has_valid_flash3 = flash3._C_flashattention3 is not None  # pyre-ignore[16]
-    is_90a = torch.version.cuda and torch.cuda.get_device_capability() >= (9, 0)
-    return has_valid_flash3 and is_90a
+    return is_supported and has_valid_flash3
 
 
 def _format_inputs_description(inp: Inputs) -> str:
@@ -202,7 +210,9 @@ def _dispatch_bw(
                     (
                         op,
                         [
-                            f"LSE is in {'packed' if varlen_lse_packed else 'padded'} format"
+                            "LSE is in "
+                            f"{'packed' if varlen_lse_packed else 'padded'}"
+                            " format"
                         ],
                     )
                 )
