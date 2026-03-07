@@ -6,8 +6,10 @@
 # pyre-unsafe
 
 
+import importlib.util
+import logging
 import os
-from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple, TypeVar
+from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch.utils.flop_counter import (
@@ -55,36 +57,62 @@ from .flash import (
     _post_process_lse,
     _window_size,
 )
+from .flash3_compatibility_check import (
+    _flash_attention3_incompatible_reason,
+    check_ai_codesign_compatibility,
+)
 from .utils.op_common import get_operator, register_operator
 
+
+def _check_different_value_headdim_ampere(d: Inputs, reasons: List[str]) -> None:
+    if (
+        d.query.device.type == "cuda"
+        and (torch.version.hip is None)
+        and d.query.shape[-1] != d.value.shape[-1]
+    ):
+        device_capability = torch.cuda.get_device_capability(d.device)
+        if device_capability < (9, 0):
+            reasons.append(
+                f"Q/K head-dim ({d.query.shape[-1]}) must be equal "
+                f"to V head-dim ({d.value.shape[-1]}) for Ampere GPUs"
+            )
+
+
 FLASH_VERSION = "0.0.0"
-
-T = TypeVar("T")
-
-
-def maybe_contiguous(x: T) -> T:
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x  # type: ignore[attr-defined]
+logger = logging.getLogger(__name__)
 
 
+def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if x is not None and x.stride(-1) != 1:
+        return x.contiguous()
+    return x
+
+
+_FLASH3_HAS_ATTENTION_CHUNK = False
+_C_flashattention3 = None
 try:
-    from xformers import _C_flashattention3  # type: ignore[attr-defined]
+    # fbcode internal path - always fails in OSS
+    from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (  # type: ignore  # noqa: E501
+        flashattn_hopper_cuda as _C_flashattention3,
+    )
 
-    try:
-        from xformers._cpp_lib import _build_metadata  # type: ignore[attr-defined]
-
-        if _build_metadata is not None:
-            FLASH_VERSION = _build_metadata.flash_version
-    except ImportError:
-        FLASH_VERSION = "unknown"
+    check_ai_codesign_compatibility(_C_flashattention3)
 except ImportError:
-    try:
-        # type: ignore
-        from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (
-            flashattn_hopper_cuda as _C_flashattention3,
-        )
-    except ImportError:
-        # We end up here is arch is not 90a
-        _C_flashattention3 = None
+    # OSS: use the official flash_attn_3 package
+    if importlib.util.find_spec("flash_attn_3") and importlib.util.find_spec(
+        "flash_attn_3._C"
+    ):
+        import flash_attn_3._C  # type: ignore[attr-defined]  # noqa: F401
+
+        incompat_reason = _flash_attention3_incompatible_reason()
+        if incompat_reason is None:
+            _C_flashattention3 = torch.ops.flash_attn_3
+            FLASH_VERSION = "pip_pkg"
+            _FLASH3_HAS_ATTENTION_CHUNK = True
+        else:
+            logger.warning(
+                f"Flash-Attention 3 package can't be used: {incompat_reason}"
+            )
 
 
 def _heuristic_kvsplit(
@@ -94,13 +122,13 @@ def _heuristic_kvsplit(
     atten_bias = inp.attn_bias
 
     # make sure Q doesn't have varlen
-    # pyre-ignore Undefined attribute [16]
-    if atten_bias.q_seqinfo.min_seqlen != atten_bias.q_seqinfo.max_seqlen:  # type: ignore[union-attr]
+    q_info = atten_bias.q_seqinfo  # type: ignore[union-attr]
+    k_info = atten_bias.k_seqinfo  # type: ignore[union-attr]
+    if q_info.min_seqlen != q_info.max_seqlen:
         return False
 
     # filter out prefill case
-    # pyre-ignore Undefined attribute [16]
-    if atten_bias.q_seqinfo.max_seqlen == atten_bias.k_seqinfo.max_seqlen:  # type: ignore[union-attr]
+    if q_info.max_seqlen == k_info.max_seqlen:
         return False
 
     return enable_kvsplit_attn
@@ -116,7 +144,8 @@ def mask_non_zeros(s_q: int, s_k: int, window_left: int, window_right: int) -> i
 
     # NOTE: Flops calculations here assume `s_q == s_k`
     # otherwise the local attention computations are too involved
-    # See also https://docs.google.com/spreadsheets/d/1u1ItCZcHLArcqXLj7mwR4H1pI3lMKU1zlxCYi8JCYgk/edit?usp=sharing
+    # See also https://docs.google.com/spreadsheets/d/
+    #   1u1ItCZcHLArcqXLj7mwR4H1pI3lMKU1zlxCYi8JCYgk
     if window_left < 0:
         window_left = s_k
     if window_right < 0:
@@ -176,34 +205,6 @@ def sdpa_flop_count(
 
 
 if _C_flashattention3 is not None:  # noqa: C901
-    # Compatibility check for FAv3 APIs
-    EXPECTED_NUM_OF_ARGS = [
-        ("fwd", 33),
-        ("bwd", 22),
-    ]
-
-    import re
-
-    def count_args_from_doc(docstring) -> int:
-        # Use a regular expression to find the argument list inside parentheses
-        match = re.search(r"\((.*?)\)", docstring)
-        if match:
-            # Extract the argument list and split by commas
-            args_list = match.group(1).split(",")
-            # Count the number of arguments
-            return len(args_list)
-        else:
-            raise ValueError("No valid argument list found in the docstring.")
-
-    for name, num_of_args in EXPECTED_NUM_OF_ARGS:
-        num_of_args_from_doc = count_args_from_doc(
-            getattr(_C_flashattention3, name).__doc__
-        )
-        assert num_of_args_from_doc == num_of_args, (
-            f"Found func signature mismatch for {name}. Expected {num_of_args},"
-            f"actual: {num_of_args_from_doc} Please update the version of Flash Attention3."
-        )
-
     # returns: out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p
     @torch.library.custom_op(
         "mslk_flash3::flash_fwd", mutates_args=(), device_types=["cuda"]
@@ -251,7 +252,8 @@ if _C_flashattention3 is not None:  # noqa: C901
 
         pack_gqa = None
         if use_kvsplit:
-            # For KV split, we need to make sure query in shape [batch, seqlen, num_heads, head_dim_q]
+            # For KV split, query must be
+            # [batch, seqlen, num_heads, head_dim_q]
             # to be compatible with `pack_gqa` feature
             query = query.view(bs, -1, query.shape[-2], query.shape[-1])
             cu_seqlens_q = None
@@ -289,6 +291,9 @@ if _C_flashattention3 is not None:  # noqa: C901
             is_causal,
             window_left,
             window_right,
+            *(
+                [0] if _FLASH3_HAS_ATTENTION_CHUNK else []
+            ),  # attention_chunk (flash_attn_3 pip pkg only)
             0.0,  # softcap
             not use_kvsplit,  # rotary_interleaved
             None,  # scheduler_metadata
@@ -385,7 +390,8 @@ if _C_flashattention3 is not None:  # noqa: C901
         # all ranks always use the "worst case" FLOP estimate. Ranks are in
         # lockstep anyways and will be going as fast as the slowest one.
         if os.environ.get("XFORMERS_FLOP_FORMULA_WORST_CASE", "0") == "1":
-            cu_seqlens_q = cu_seqlens_k = max_seqlen_q = max_seqlen_k = None  # type: ignore[assignment]
+            cu_seqlens_q = cu_seqlens_k = None  # type: ignore[assignment]
+            max_seqlen_q = max_seqlen_k = None  # type: ignore[assignment]
             query = query.unsqueeze(0) if query.ndim == 3 else query
             key = key.unsqueeze(0) if key.ndim == 3 else key
             value = value.unsqueeze(0) if value.ndim == 3 else value
@@ -448,12 +454,13 @@ if _C_flashattention3 is not None:  # noqa: C901
         window_right: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         dq, dk, dv = _create_dq_dk_dv(grads_share_storage, query, key, value)
-        is_deterministic = False
+        is_deterministic = torch.are_deterministic_algorithms_enabled()
         if cu_seqlens_q is None:
             assert cu_seqlens_k is None
 
         assert _C_flashattention3 is not None
-        dq, dk, dv, softmax_d, *rest = _C_flashattention3.bwd(
+        # bwd writes dq/dk/dv in-place; return values are other tensors.
+        _C_flashattention3.bwd(
             dout,
             query,
             key,
@@ -556,7 +563,7 @@ class FwOp(AttentionFwOpBase):
 
     OPERATOR = get_operator("mslk_flash3", "flash_fwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    CUDA_MINIMUM_COMPUTE_CAPABILITY = (9, 0)
+    CUDA_MINIMUM_COMPUTE_CAPABILITY = (8, 0)
     CUDA_MAXIMUM_COMPUTE_CAPABILITY = (9, 0)
     SUPPORTED_DTYPES: Set[torch.dtype] = {
         torch.half,
@@ -592,7 +599,7 @@ class FwOp(AttentionFwOpBase):
 
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     SUPPORTS_BMGHK = True
     SUPPORTS_PARTIAL = True
     UNPADDED_LSE = True
@@ -607,6 +614,7 @@ class FwOp(AttentionFwOpBase):
             reasons.append("only head-dim 64, 128, 192 or 256 is supported")
 
         _check_needs_no_topleft(d, reasons)
+        _check_different_value_headdim_ampere(d, reasons)
 
         return reasons
 
@@ -747,7 +755,6 @@ class BwOp(AttentionBwOpBase):
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
-    IS_DETERMINISTIC = False
     SUPPORTS_BMGHK = False
     SUPPORTS_LSE_FORMATS: Sequence[str] = ["", "varlen_flat"]
     NAME = f"fa3B@{FLASH_VERSION}"
@@ -757,11 +764,11 @@ class BwOp(AttentionBwOpBase):
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
         check_lastdim_alignment_stride1(reasons, "query", d.query, 8)
-        _check_needs_no_topleft(d, reasons)
         if d.query.shape[-1] not in [64, 128, 192, 256]:
             reasons.append("only head-dim 64, 128, 192 or 256 is supported")
 
         _check_needs_no_topleft(d, reasons)
+        _check_different_value_headdim_ampere(d, reasons)
         return reasons
 
     @classmethod
@@ -800,7 +807,7 @@ class BwOp(AttentionBwOpBase):
                 inp.key,
                 inp.value,
                 ctx.out.reshape(kernel_out_shape),
-                ctx.lse,
+                ctx_lse,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 max_seqlen_q,
@@ -826,9 +833,10 @@ class BwOp(AttentionBwOpBase):
 
 @register_operator
 class FwOp_KVSplit(FwOp):
-    """Operator that computes memory-efficient attention using \
-        `Flash-Attention3 <https://github.com/Dao-AILab/flash-attention/tree/main/hopper>`_ \
-        implementation with heuristic rules to dispatch decoding shapes to KVSplit Attention \
+    """Flash-Attention3 with heuristic KVSplit dispatch.
+
+    Uses heuristic rules to dispatch decoding shapes
+    to KVSplit Attention.
     """
 
     NAME = f"fa3F_splitKV@{FLASH_VERSION}"
@@ -841,6 +849,7 @@ class FwOp_KVSplit(FwOp):
         BlockDiagonalCausalWithOffsetGappyKeysMask,
         BlockDiagonalGappyKeysMask,
         BlockDiagonalLocalAttentionPaddedKeysMask,
+        BlockDiagonalCausalLocalAttentionPaddedKeysMask,
         PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
         PagedBlockDiagonalGappyKeysMask,
         PagedBlockDiagonalPaddedKeysMask,
