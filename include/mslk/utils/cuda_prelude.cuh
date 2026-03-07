@@ -34,10 +34,10 @@ namespace mslk {
   at::cuda::OptionalCUDAGuard device_guard; \
   device_guard.set_index(TENSOR.get_device())
 
-#define MSLK_CUDA_CHECK(X)                 \
-  do {                                     \
-    cudaError_t err = X;                   \
-    assert(err == cudaError::cudaSuccess); \
+#define MSLK_CUDA_CHECK(X)                                           \
+  do {                                                               \
+    cudaError_t err = X;                                             \
+    TORCH_CHECK(err == cudaError::cudaSuccess, "CUDA error: ", err); \
   } while (0)
 
 // Warp size
