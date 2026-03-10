@@ -74,7 +74,7 @@ def _get_operator(name: str):
         import mslk.attention.flash_attn.interface as flash_attn
 
         return getattr(flash_attn, name)  # type: ignore  # pyre-ignore
-    except (RuntimeError, ModuleNotFoundError):
+    except (RuntimeError, ModuleNotFoundError, AttributeError):
         return no_such_operator
 
 

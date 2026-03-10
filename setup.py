@@ -628,17 +628,15 @@ def main(argv: List[str]) -> None:
             "cmdclass": {"install": MSLKInstall},
         }
 
-    # Flash Attention 3 package is optional, only for CUDA.
+    # Flash Attention 3 package is optional.
     # Install with: pip install mslk[flash3]
     # flash-attn-3 (v3): Hopper (SM90) and newer
     # NOTE: flash-attn-3 may require:
     #   --extra-index-url https://download.pytorch.org/whl/cu126
     # Flash Attention v2 uses PyTorch's built-in implementation.
-    extras_require = {}
-    if build.variant() == "cuda":
-        extras_require["flash3"] = [
-            "flash-attn-3",
-        ]
+    extras_require = {
+        "flash3": ["flash-attn-3"],
+    }
 
     _setup_fn(
         name=package_name,
