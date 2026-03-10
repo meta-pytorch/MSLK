@@ -1780,6 +1780,138 @@ class MXFP8Tests(unittest.TestCase):
         # Assert outputs are close.
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([4, 16, 32]),
+        M_per_group=st.sampled_from([16, 32, 64]),
+        pad_factor=st.sampled_from([2, 4, 8]),
+        N=st.sampled_from([1024, 2048]),
+        K=st.sampled_from([512, 3072]),
+    )
+    def test_grouped_gemm_2d_3d_actual_num_tokens(
+        self,
+        G: int,
+        M_per_group: int,
+        pad_factor: int,
+        N: int,
+        K: int,
+    ) -> None:
+        """Test that actual_num_tokens hint produces correct results.
+
+        XQ is padded to pad_factor * actual_total_M, but offsets only cover the
+        actual tokens. Verifies that:
+        1. Output with hint matches output without hint (same GEMM, different tile)
+        2. Output matches bf16 reference
+        """
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        block_size = 32
+        actual_total_M = M_per_group * G
+        padded_total_M = actual_total_M * pad_factor
+
+        # Create actual data
+        X = (
+            torch.randn((actual_total_M, K), dtype=torch.bfloat16, device=self.device)
+            * 0.1
+        )
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Uniform offsets for actual tokens
+        offsets = torch.arange(
+            M_per_group,
+            actual_total_M + 1,
+            M_per_group,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        # Quantize weights
+        wq_list = []
+        w_scale_list = []
+        for i in range(G):
+            w_scale, wq = to_mxfp8(W[i])
+            w_scale = _to_blocked(w_scale)
+            wq_list.append(wq)
+            w_scale_list.append(w_scale)
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        w_scale = torch.stack(w_scale_list, dim=0).contiguous()
+
+        # Quantize input per group
+        xq_list = []
+        x_scale_list = []
+        for i in range(G):
+            x_slice = X[i * M_per_group : (i + 1) * M_per_group]
+            xs, xq = to_mxfp8(x_slice)
+            xs = _to_blocked(xs)
+            xq_list.append(xq)
+            x_scale_list.append(xs)
+        xq_actual = torch.cat(xq_list, dim=0).contiguous()
+        x_scale_actual = torch.cat(x_scale_list, dim=0).contiguous()
+        x_scale_actual = x_scale_actual.reshape(-1, K // block_size)
+
+        # Pad XQ and x_scale to simulate static-shape padding
+        xq_padded = torch.zeros(
+            (padded_total_M, K), dtype=torch.float8_e4m3fn, device=self.device
+        )
+        xq_padded[:actual_total_M] = xq_actual
+
+        actual_scale_rows = x_scale_actual.shape[0]
+        padded_scale_rows = max(
+            ((padded_total_M + 127) // 128) * 128, actual_scale_rows
+        )
+        x_scale_padded = torch.zeros(
+            (padded_scale_rows, x_scale_actual.shape[1]),
+            dtype=x_scale_actual.dtype,
+            device=self.device,
+        )
+        x_scale_padded[:actual_scale_rows] = x_scale_actual
+
+        # Run without hint (actual_num_tokens=None)
+        out_no_hint = torch.empty(
+            (padded_total_M, N), dtype=torch.bfloat16, device=self.device
+        )
+        y_no_hint = torch.ops.mslk.mx8mx8bf16_grouped_mm(
+            xq_padded,
+            wq.transpose(-2, -1),
+            x_scale_padded,
+            w_scale,
+            offsets,
+            out_no_hint,
+        )
+
+        # Run with hint (actual_num_tokens=actual_total_M)
+        out_with_hint = torch.empty(
+            (padded_total_M, N), dtype=torch.bfloat16, device=self.device
+        )
+        y_with_hint = torch.ops.mslk.mx8mx8bf16_grouped_mm(
+            xq_padded,
+            wq.transpose(-2, -1),
+            x_scale_padded,
+            w_scale,
+            offsets,
+            out_with_hint,
+            actual_total_M,
+        )
+
+        # Outputs should be identical (only tile selection differs)
+        torch.testing.assert_close(
+            y_no_hint[:actual_total_M],
+            y_with_hint[:actual_total_M],
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        # Compare with bf16 reference
+        y_bf16 = torch._grouped_mm(
+            X,
+            W.transpose(-2, -1),
+            offs=offsets,
+            out_dtype=torch.bfloat16,
+        )
+        torch.testing.assert_close(
+            y_with_hint[:actual_total_M], y_bf16, atol=8.0e-2, rtol=8.0e-2
+        )
+
 
 @unittest.skipIf(
     not SUPPORTS_BF16, "Skip if BF16Tests is not supported on this device."
