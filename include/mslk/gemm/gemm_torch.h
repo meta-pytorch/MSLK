@@ -32,7 +32,8 @@ at::Tensor mx8mx8bf16_grouped_mm(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor offsets,
-    std::optional<at::Tensor> output = std::nullopt);
+    std::optional<at::Tensor> output = std::nullopt,
+    std::optional<int64_t> actual_num_tokens = std::nullopt);
 
 // Torch compliant FP4 grouped GEMM.
 at::Tensor f4f4bf16_grouped_mm(
