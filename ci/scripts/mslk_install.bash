@@ -70,7 +70,6 @@ __install_check_subpackages () {
   local subpackages=(
     mslk.attention
     mslk.conv
-    mslk.comm
     mslk.gemm
     mslk.kv_cache
     mslk.moe
