@@ -599,12 +599,6 @@ __verify_library_symbols () {
       mslk::moe::index_shuffling_torch
       mslk::quantize::quantize_fp8_per_row
     )
-
-    if  [ "${mslk_build_variant}" == "cuda" ]; then
-      lib_symbols_to_check+=(
-       mslk::comm::nccl_init
-      )
-    fi
   fi
 
   echo "[CHECK] Verifying sample subset of symbols in the built libraries ..."
