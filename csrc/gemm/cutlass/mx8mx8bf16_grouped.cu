@@ -33,7 +33,8 @@ Kernel_mx8mx8bf16_grouped get_kernel_via_tuning(
     at::Tensor offsets) {
   static TuningCache cache("mx8mx8bf16_grouped");
 
-  M = nextPowerOf2OrRoundUp(M, 1024, 1024);
+  // Don't round M — fine-grained M values matter for hint path kernel
+  // selection. N and K are model-specific and already in 1024 increments.
   N = nextPowerOf2OrRoundUp(N, 1024, 1024);
   K = nextPowerOf2OrRoundUp(K, 1024, 1024);
   const std::string shape_key =
@@ -48,17 +49,637 @@ Kernel_mx8mx8bf16_grouped get_kernel_via_tuning(
 
 Kernel_mx8mx8bf16_grouped
 get_kernel_via_heuristics(int M, int N, int K, int G) {
-  if (M <= 64) {
+  if (M <= 1) {
     return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
-  } else if (M <= 128) {
+  } else if (M <= 2) {
+    if (N <= 2048) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 3072) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    }
+  } else if (M <= 4) {
     if (N <= 1024) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    }
+  } else if (M <= 8) {
+    if (N <= 2048) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 7168) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else {
       if (K <= 5120) {
         return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    }
+  } else if (M <= 16) {
+    if (N <= 2048) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 3072) {
+      if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    }
+  } else if (M <= 32) {
+    if (N <= 1024) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      }
+    } else if (N <= 4096) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 5120) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 6144) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 7168) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else {
+      if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    }
+  } else if (M <= 48) {
+    if (N <= 1024) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      }
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 5120) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 7168) {
+      if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      }
+    } else {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    }
+  } else if (M <= 64) {
+    if (N <= 1024) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 3072) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 4096) {
+      if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 5120) {
+      return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+    } else if (N <= 6144) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else if (N <= 7168) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    } else {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_128_64_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_64_256_2_1_1_ba;
+      }
+    }
+  } else if (M <= 96) {
+    if (N <= 2048) {
+      return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
       } else {
         return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
       }
-    } else {
+    } else if (N <= 4096) {
+      if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      }
+    } else if (N <= 5120) {
+      if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 6144) {
       return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+    } else if (N <= 7168) {
+      if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      }
+    } else {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    }
+  } else if (M <= 128) {
+    if (N <= 1024) {
+      if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 4096) {
+      return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+    } else if (N <= 5120) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 7168) {
+      return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+    } else {
+      if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    }
+  } else if (M <= 160) {
+    if (N <= 1024) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else if (N <= 3072) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 4096) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 5120) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else if (N <= 6144) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 7168) {
+      return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+    } else {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    }
+  } else if (M <= 192) {
+    if (N <= 1024) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 4096) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 5120) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 6144) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 7168) {
+      return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+    } else {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    }
+  } else if (M <= 256) {
+    if (N <= 1024) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 2048) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 3072) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else if (N <= 4096) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 5120) {
+      return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+    } else if (N <= 6144) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 7168) {
+      if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      }
+    } else {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    }
+  } else if (M <= 384) {
+    if (N <= 1024) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_128_128_256_1_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 2048) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 3072) {
+      return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+    } else if (N <= 4096) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      }
+    } else if (N <= 5120) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 6144) {
+      if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 7168) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else {
+      if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_128_256_2_1_1_ba;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else {
+        return mx8mx8bf16_grouped_128_256_256_1_1_1_ab;
+      }
+    }
+  } else if (M <= 512) {
+    if (N <= 1024) {
+      if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 2048) {
+      if (K <= 5120) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 6144) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 7168) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 3072) {
+      return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+    } else if (N <= 4096) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 5120) {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 6144) {
+      if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 4096) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
+    } else if (N <= 7168) {
+      return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+    } else {
+      if (K <= 1024) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else if (K <= 2048) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      } else if (K <= 3072) {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ba;
+      } else {
+        return mx8mx8bf16_grouped_256_256_256_2_1_1_ab;
+      }
     }
   } else if (M <= 1024) {
     if (N <= 1024) {
@@ -471,7 +1092,8 @@ at::Tensor mx8mx8bf16_grouped_mm(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor offsets,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    std::optional<int64_t> actual_num_tokens) {
   TORCH_CHECK(offsets.dtype() == at::kInt, "offsets must be int32.");
   TORCH_CHECK(offsets.dim() == 1, "offsets must be 1D tensor.");
   TORCH_CHECK(XQ.is_contiguous(), "XQ must be row major.");
@@ -505,10 +1127,24 @@ at::Tensor mx8mx8bf16_grouped_mm(
             output_actual.size(1) == N,
         "for 2d-3d grouped GEMM, output shape must be (total_M, N).");
 
-    // Normalized jagged dim for heuristics
-    M /= G;
+    // Normalized jagged dim for heuristics.
+    // If Matrix is padded in the M dimension, the offsets may be for a
+    // prefix of M. This could lead to a larger tile size picked than necessary.
+    // Callers can pass actual_num_tokens to override the heuristic.
+    if (actual_num_tokens.has_value()) {
+      auto ant = actual_num_tokens.value();
+      TORCH_CHECK(ant > 0, "actual_num_tokens must be > 0, got ", ant);
+      M = ant / G;
+    } else {
+      M /= G;
+    }
     // 2d-2d case.
   } else if (XQ.dim() == 2 && WQ.dim() == 2) {
+    // actual_num_tokens is only used for 2d-3d forward (M-dimension padding).
+    TORCH_CHECK(
+        !actual_num_tokens.has_value(),
+        "actual_num_tokens is not supported for 2d-2d grouped GEMM.");
+
     // Alias for clarity that groups are along K dimension for 2d-2d case.
     int64_t total_K = K;
 
@@ -550,7 +1186,8 @@ at::Tensor mx8mx8bf16_grouped_mm(
     at::Tensor x_scale,
     at::Tensor w_scale,
     at::Tensor offsets,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    std::optional<int64_t> actual_num_tokens) {
   throw std::runtime_error(
       "CUDA version is older than 12.8"); // requires CUDA>=12.8
 }
