@@ -222,6 +222,7 @@ def triton_quantize_fp8_row(
     scale_ub: Optional[torch.Tensor] = None,
     zero_start_index_M: Optional[torch.Tensor] = None,
     align_rows_to: Optional[int] = None,
+    eps_opt: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Call the triton quantize fp8 row kernel to quantize a tensor to fp8 with row-wise scalings.
@@ -231,7 +232,7 @@ def triton_quantize_fp8_row(
         scale_ub (Tensor): Maximum allowed value for scale.
         zero_start_index_M (Tensor): Indicates number of nonzero elements in each row.
         align_rows_to: Pad rows to align to this value. Useful for downstream kernels accepting specific sizes (e.g., multiple of 16)
-
+        eps_opt: Lower bound for amax. If provided, amax will be clamped to this value.
     Returns:
         torch.Tensor: fp8 scaled tensor.
         torch.Tensor: reciprocal scale tensor per row.
@@ -250,6 +251,10 @@ def triton_quantize_fp8_row(
         zero_start_index_M = zero_start_index_M.view(a.shape[0], a.shape[1])
     # Get constant values.
     pt_dtype, tl_dtype, max_fp8, eps = get_fp8_constants()
+    # If eps_opt is provided, use it as the threshold for floor
+    # to align with other kernel implementations.
+    if eps_opt is not None:
+        eps = eps_opt
     num_rows = a.numel() // a.shape[-1]
     a_scale = torch.empty((num_rows), dtype=torch.float32, device=a.device)
     # If align_rows_to is provided, pad the last dimension to be a multiple of it
@@ -688,6 +693,7 @@ def quantize_fp8_row(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     align_rows_to: Optional[int] = None,
+    eps_opt: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a to fp8 with row-wise scalings and optionally move to output device.
@@ -699,7 +705,7 @@ def quantize_fp8_row(
         use_triton (bool): Whether to use triton kernel or pytorch.
         output_device (torch.device): Device to optionally move the scaled tensors to.
         align_rows_to: Pad rows to align to this value. Useful for downstream kernels accepting specific sizes (e.g., multiple of 16)
-
+        eps_opt: Lower bound for amax. If amax is below this value, it will be clamped to this value.
     Returns:
         torch.Tensor: fp8 scaled tensor.
         torch.Tensor: The reciprocal scale tensor per row.
@@ -714,6 +720,7 @@ def quantize_fp8_row(
             scale_ub,
             zero_start_index_M,
             align_rows_to=align_rows_to,
+            eps_opt=eps_opt,
         )
     # else use pytorch implementation.
     if not output_device:
