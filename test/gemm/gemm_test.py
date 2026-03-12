@@ -554,7 +554,7 @@ class FP8Tests(unittest.TestCase):
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
                 xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x, output_dtype=QType)
-                wq, w_scale = torch.ops.mslk.quantize_fp8_per_row(w)
+                wq, w_scale = quantize_fp8_row(w)
                 if UseTriton and torch.version.cuda:
                     zq = matmul_fp8_row(xq, wq, x_scale, w_scale)
                     if bias is not None:
@@ -1461,14 +1461,14 @@ class FP8Int4Tests(unittest.TestCase):
         if CudaGraph:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x)
+                xq, x_scale = quantize_fp8_row(x)
                 zq = torch.ops.mslk.f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
                 zq_shuffled = torch.ops.mslk.f8i4bf16_shuffled(
                     xq, wq_shuffled, x_scale, w_scale_row, w_scale_group
                 )
             g.replay()
         else:
-            xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x)
+            xq, x_scale = quantize_fp8_row(x)
             zq = torch.ops.mslk.f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
             zq_shuffled = torch.ops.mslk.f8i4bf16_shuffled(
                 xq, wq_shuffled, x_scale, w_scale_row, w_scale_group
