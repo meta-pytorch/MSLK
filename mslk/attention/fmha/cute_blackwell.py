@@ -40,6 +40,7 @@ from .common import (
     Gradients,
     Inputs,
     InputsFp8,
+    InputsMXFp8,
 )
 
 _ERROR_ATOL: Mapping[torch.dtype, float] = {
@@ -139,12 +140,15 @@ def _convert_input_format(
         max_seqlen_q = None
         max_seqlen_k = None
 
-    key_scale = (
-        inp.k_fp8_scale_shift if hasattr(inp, "k_fp8_scale_shift") else None
-    )  # pyre-fixme[16]
-    value_scale = (
-        inp.v_fp8_scale_shift if hasattr(inp, "v_fp8_scale_shift") else None
-    )  # pyre-fixme[16]
+    if hasattr(inp, "k_fp8_scale_shift") and hasattr(inp, "v_fp8_scale_shift"):
+        key_scale = inp.k_fp8_scale_shift
+        value_scale = inp.v_fp8_scale_shift
+    elif hasattr(inp, "k_fp8_scale") and hasattr(inp, "v_fp8_scale"):
+        key_scale = inp.k_fp8_scale
+        value_scale = inp.v_fp8_scale
+    else:
+        key_scale = None
+        value_scale = None
 
     if query.ndim == 5:  # GQA
         query, _ = bmghk2bmhk(query, None, handle_rep_heads=True)
@@ -158,8 +162,9 @@ def _convert_input_format(
     if should_fold:
         # Fold to 3D when using varlen or paged attention
         query, _ = bmhk2bhk(query)
-        key, key_scale = bmhk2bhk(key, x_scale=key_scale)
-        value, value_scale = bmhk2bhk(value, x_scale=value_scale)
+        key, key_scale = bmhk2bhk(key, key_scale)
+        value, value_scale = bmhk2bhk(value, value_scale)
+
     # For paged attention, K/V have shape (num_pages, page_size, heads, dim) - view to that shape
     if isinstance(
         attn_bias,
@@ -183,6 +188,26 @@ def _convert_input_format(
             k_fp8_scale_shift=key_scale.view(key.shape[:-1]),
             v_fp8_scale_shift=value_scale.view(value.shape[:-1]),
             use_fp32_scales=inp.use_fp32_scales,
+        )
+    elif isinstance(inp, InputsMXFp8):  # MXFP8 input
+        key = key.view(torch.float8_e4m3fn)
+        value = value.view(torch.float8_e4m3fn)
+        key_scale = key_scale.view(torch.float8_e8m0fnu)
+        value_scale = value_scale.view(torch.float8_e8m0fnu)
+        key_scale = key_scale.view(*key.shape[:-1], key.shape[-1] // 32)
+        value_scale = value_scale.view(*value.shape[:-1], value.shape[-1] // 32)
+
+        new_inp = InputsMXFp8(
+            query=query,
+            key=key,
+            value=value,
+            attn_bias=attn_bias,
+            p=inp.p,
+            scale=inp.scale,
+            output_dtype=inp.output_dtype,
+            is_partial=inp.is_partial,
+            k_fp8_scale=key_scale,
+            v_fp8_scale=value_scale,
         )
     else:
         new_inp = Inputs(
@@ -505,26 +530,34 @@ class FwOpDecode(AttentionFwOpBase):
 
         window_left, window_right = _window_size(inp.attn_bias)
 
-        is_fp8 = isinstance(inp, InputsFp8)
-        if is_fp8:
+        if isinstance(inp, InputsFp8):
             assert (
                 inp.k_fp8_scale_shift is not None
                 and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
             ), (
                 "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
             )
+            k_fp8_scale = inp.k_fp8_scale_shift
+            v_fp8_scale = inp.v_fp8_scale_shift
+
+        elif isinstance(inp, InputsMXFp8):
+            assert (
+                inp.k_fp8_scale is not None
+                and inp.v_fp8_scale is not None  # pyre-fixme[16]
+            ), "k_fp8_scale and v_fp8_scale must be provided when inp is InputsMxfp8"
+            k_fp8_scale = inp.k_fp8_scale
+            v_fp8_scale = inp.v_fp8_scale
+        else:
+            k_fp8_scale = None
+            v_fp8_scale = None
 
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, _ = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
-                k_scale_shift=inp.k_fp8_scale_shift
-                if is_fp8
-                else None,  # pyre-fixme[16]
-                v_scale_shift=inp.v_fp8_scale_shift
-                if is_fp8
-                else None,  # pyre-fixme[16]
+                k_scale_shift=k_fp8_scale,  # Rowwise fp8: scale_shift; MXFP8: scale
+                v_scale_shift=v_fp8_scale,  # Rowwise fp8: scale_shift; MXFP8: scale
                 cu_seqlens_q=cu_seqlens_q,  # not used
                 cu_seqlens_k=cu_seqlens_k,  # not used
                 seqlen_kv=seqused_k,
