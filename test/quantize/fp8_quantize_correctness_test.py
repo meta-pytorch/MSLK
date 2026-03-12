@@ -81,7 +81,6 @@ TRITON_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
 ]
 
 MSLK_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
-    (torch.ops.mslk.quantize_fp8_per_row, undo_rowwise_quant),
     (torch.ops.mslk.quantize_fp8_per_tensor, undo_tensorwise_quant),
 ]
 

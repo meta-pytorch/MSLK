@@ -16,9 +16,9 @@ from mslk.quantize.triton.fp4_utils import dequantize_nvfp4, global_scale_nvfp4
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
+    quantize_fp8_row,
     triton_quantize_fp8_block,
     triton_quantize_fp8_group,
-    triton_quantize_fp8_row,
     triton_quantize_fp8_tensor,
 )
 
@@ -120,7 +120,7 @@ class Copy(QuantizeOpBase):
 @register_op
 class TritonFP8Rowwise(QuantizeOpBase):
     def quantize(self, input: torch.Tensor) -> Any:
-        return triton_quantize_fp8_row(input)
+        return quantize_fp8_row(input)
 
     def dequantize(self, *args: Any) -> torch.Tensor:
         input_quantized: torch.Tensor
@@ -228,7 +228,7 @@ class TritonNVFP4(QuantizeOpBase):
 @register_op
 class CudaFP8Rowwise(QuantizeOpBase):
     def quantize(self, input: torch.Tensor) -> Any:
-        return torch.ops.mslk.quantize_fp8_per_row(input)
+        return quantize_fp8_row(input)
 
     def dequantize(self, *args: Any) -> torch.Tensor:
         input_quantized: torch.Tensor
