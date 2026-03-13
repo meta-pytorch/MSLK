@@ -27,7 +27,6 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_group,
     quantize_fp8_row,
     scale_fp8_row,
-    triton_quantize_fp8_row,
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
@@ -687,8 +686,8 @@ class CublasFP8Rowwise(GemmOpBase):
 
     def quantize(self, x, w):
         # Quantize both input tensors.
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_row(w)
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
         return xq, wq, x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
@@ -961,7 +960,7 @@ class TritonFP8RowwiseGrouped(GemmOpBase):
 
     def quantize(self, x, wq, w_scale, m_sizes):
         B = x.shape[0]
-        xq, x_scale = triton_quantize_fp8_row(x)
+        xq, x_scale = quantize_fp8_row(x)
         x_scale = x_scale.view(B, -1)
         return xq, wq, x_scale, w_scale, m_sizes
 
@@ -1257,7 +1256,7 @@ class FP8RowwiseGrouped(GemmOpBase):
 
     def quantize(self, x, wq, w_scale, m_sizes):
         B = x.shape[0]
-        xq, x_scale = triton_quantize_fp8_row(x)
+        xq, x_scale = quantize_fp8_row(x)
         x_scale = x_scale.view(B, -1)
         return xq, wq, x_scale, w_scale, m_sizes
 
@@ -1861,7 +1860,7 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
 
     def quantize(self, x, wq, row_scale, group_scale, m_sizes):
         B = x.shape[0]
-        xq, x_scale = triton_quantize_fp8_row(x)
+        xq, x_scale = quantize_fp8_row(x)
         x_scale = x_scale.view(B, -1)
         return xq, wq, x_scale, row_scale, group_scale, m_sizes
 

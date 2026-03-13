@@ -426,6 +426,20 @@ class InputsFp8(Inputs):
 
 
 @dataclass
+class InputsMXFp8(Inputs):
+    """
+    Each of k/v_fp8_scales is an torch.float8_e8m0fnu tensor of shape (1, B * Mkv, Hq),
+    or (1, page_size * max_pages_per_lane, Hq) in the paged case.
+    """
+
+    k_fp8_scale: Optional[torch.Tensor] = None
+    v_fp8_scale: Optional[torch.Tensor] = None
+    q_fp8_scale: Optional[torch.Tensor] = None
+    quantize_pv_to_fp8: bool = False
+    quantize_qk_to_fp8: bool = False
+
+
+@dataclass
 class Context:
     lse: torch.Tensor
     out: torch.Tensor

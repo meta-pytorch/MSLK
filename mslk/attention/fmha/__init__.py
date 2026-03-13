@@ -9,12 +9,13 @@ from typing import Any, cast, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 
-from . import (
+from . import (  # noqa: F401
     attn_bias,
     ck,
     ck_decoder,
     ck_splitk,
     cute_blackwell,
+    cute_hopper,
     cutlass,
     cutlass_blackwell,
     flash,
@@ -986,4 +987,5 @@ __all__ = [
     "_get_use_fa3",
     "_set_use_fa3",
     "BlockDiagonalMask",
+    "cute_hopper",
 ]
