@@ -388,9 +388,13 @@ def benchmark_grouped(
                     tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
                     gbps = (
                         (
-                            m[i] * k[i] * quantized_vals[0][0].element_size()
-                            + n[i] * k[i] * quantized_vals[1][0].element_size()
-                            + output_multiplier * m[i] * n[i] * output[0].element_size()
+                            quantized_vals[0][i].numel()
+                            * quantized_vals[0][i].element_size()
+                            + quantized_vals[1][i].numel()
+                            * quantized_vals[1][i].element_size()
+                            + output_multiplier
+                            * output[i].numel()
+                            * output[i].element_size()
                         )
                         / (ms_runtime / 1e3)
                         / 1e9
