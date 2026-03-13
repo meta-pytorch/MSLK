@@ -597,7 +597,6 @@ __verify_library_symbols () {
       mslk::gemm::f8f8bf16_rowwise
       mslk::kv_cache::rope_qkv_decoding
       mslk::moe::index_shuffling_torch
-      mslk::quantize::quantize_fp8_per_row
     )
   fi
 

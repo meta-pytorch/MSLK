@@ -21,13 +21,6 @@ std::vector<at::Tensor> quantize_fp8_per_tensor(
     std::optional<at::Tensor> scale_ub, // scale upperbound
     const bool stochastic_rounding); // whether apply stochastic rounding
 
-std::vector<at::Tensor> quantize_fp8_per_row(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub, // scale upperbound
-    std::optional<c10::ScalarType> output_dtype, // output dtype
-    bool stochastic_rounding); // whether apply stochastic rounding
-
 at::Tensor quantize_fp8_per_tensor_fixed_scale(
     at::Tensor input,
     at::Tensor scale,

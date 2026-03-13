@@ -24,9 +24,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "quantize_fp8_per_tensor(Tensor input, Tensor? bs=None, Tensor? scale_ub=None, bool stochastic_rounding=False) -> Tensor[]");
   m.def(
-      "quantize_fp8_per_row(Tensor input, Tensor? bs=None, Tensor? scale_ub=None, ScalarType? output_dtype=None, bool stochastic_rounding = False) -> Tensor[] ");
-
-  m.def(
       "get_fp8_per_tensor_scale(Tensor input, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor");
 
   m.def(
@@ -41,7 +38,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   DISPATCH_TO_CUDA("quantize_fp8_per_tensor", quantize_fp8_per_tensor);
-  DISPATCH_TO_CUDA("quantize_fp8_per_row", quantize_fp8_per_row);
   DISPATCH_TO_CUDA("per_tensor_quantize_i8", per_tensor_quantize_i8);
   DISPATCH_TO_CUDA(
       "per_tensor_dynamic_quantize_i8", per_tensor_dynamic_quantize_i8);
@@ -74,30 +70,8 @@ std::vector<at::Tensor> quantize_fp8_per_tensor_meta(
   return {Y, scale};
 }
 
-std::vector<at::Tensor> quantize_fp8_per_row_meta(
-    at::Tensor input,
-    std::optional<at::Tensor> /* bs */,
-    std::optional<at::Tensor> /* scale_ub */,
-    std::optional<c10::ScalarType> /* output_dtype */,
-    bool /* stochastic_rounding */) {
-  int dims = input.dim();
-  TORCH_CHECK(dims == 2 || dims == 3, "The dim of input should be 2 or 3");
-  at::Tensor Y = at::empty_like(input, input.options().dtype(torch_fp8_e4m3));
-  at::Tensor scale;
-  if (dims == 2) {
-    const at::SymInt M = input.sym_size(0);
-    scale = at::empty_symint({M}, input.options().dtype(at::kFloat));
-  } else {
-    const at::SymInt B = input.sym_size(0);
-    const at::SymInt M = input.sym_size(1);
-    scale = at::empty_symint({B, M}, input.options().dtype(at::kFloat));
-  }
-  return {Y, scale};
-}
-
 TORCH_LIBRARY_IMPL(mslk, Meta, m) {
   DISPATCH_TO_META("quantize_fp8_per_tensor", quantize_fp8_per_tensor_meta);
-  DISPATCH_TO_META("quantize_fp8_per_row", quantize_fp8_per_row_meta);
 }
 
 } // namespace mslk::quantize
