@@ -155,11 +155,11 @@ def _kernel_quantize_fp8_row(
         else:
             cur_max = tl.maximum(cur_max, EPS)
 
-        # Scale and quantize.
-        a_scale = MAX_FP8 / cur_max
-        tl.store(A_scale + pid, 1.0 / a_scale)
+        # Scale and quantize
+        scale = tl.div_rn(cur_max, MAX_FP8)
+        tl.store(A_scale + pid, scale)
 
-        a_fp8 = a * a_scale
+        a_fp8 = tl.div_rn(a.to(tl.float32), scale)
         a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
         tl.store(
             A_fp8 + a_fp8_offset_base + n_offset * stride_ok,
@@ -188,9 +188,9 @@ def _kernel_quantize_fp8_row(
         else:
             cur_max = tl.maximum(cur_max, EPS)
 
-        # Scale and quantize.
-        a_scale = MAX_FP8 / cur_max
-        tl.store(A_scale + pid, 1.0 / a_scale)
+        # Scale and quantize
+        scale = tl.div_rn(cur_max, MAX_FP8)
+        tl.store(A_scale + pid, scale)
 
         # Write quantized values for the first K elements (from A), and pad the rest with zeros up to K_fp8
         n_offset = tl.arange(0, BLOCK_SIZE)
@@ -202,7 +202,7 @@ def _kernel_quantize_fp8_row(
                 other=0.0,
             )
             # For elements >= K, a will be 0
-            a_fp8 = a * a_scale
+            a_fp8 = tl.div_rn(a.to(tl.float32), scale)
             # Clamp A to fp8 range to make sure there's no overflow.
             # This is required for AMD. Nvidia's default saturation
             # handles it, but it's nice to have anyway.
@@ -222,7 +222,7 @@ def triton_quantize_fp8_row(
     scale_ub: Optional[torch.Tensor] = None,
     zero_start_index_M: Optional[torch.Tensor] = None,
     align_rows_to: Optional[int] = None,
-    eps_opt: Optional[float] = None,
+    eps_opt: Optional[float] = 1.0 / 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Call the triton quantize fp8 row kernel to quantize a tensor to fp8 with row-wise scalings.
@@ -232,10 +232,10 @@ def triton_quantize_fp8_row(
         scale_ub (Tensor): Maximum allowed value for scale.
         zero_start_index_M (Tensor): Indicates number of nonzero elements in each row.
         align_rows_to: Pad rows to align to this value. Useful for downstream kernels accepting specific sizes (e.g., multiple of 16)
-        eps_opt: Lower bound for amax. If provided, amax will be clamped to this value.
+        eps_opt: Lower bound for amax (default 1/512 to match CUDA min_scaling_factor).
     Returns:
         torch.Tensor: fp8 scaled tensor.
-        torch.Tensor: reciprocal scale tensor per row.
+        torch.Tensor: scale tensor per row (scale = amax / MAX_FP8).
     """
     if scale_ub is not None and scale_ub.device != a.device:
         raise Exception("'scale_ub' must be on the same device as 'a'")
@@ -693,7 +693,7 @@ def quantize_fp8_row(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     align_rows_to: Optional[int] = None,
-    eps_opt: Optional[float] = None,
+    eps_opt: Optional[float] = 1.0 / 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a to fp8 with row-wise scalings and optionally move to output device.
@@ -705,10 +705,10 @@ def quantize_fp8_row(
         use_triton (bool): Whether to use triton kernel or pytorch.
         output_device (torch.device): Device to optionally move the scaled tensors to.
         align_rows_to: Pad rows to align to this value. Useful for downstream kernels accepting specific sizes (e.g., multiple of 16)
-        eps_opt: Lower bound for amax. If amax is below this value, it will be clamped to this value.
+        eps_opt: Lower bound for amax (default 1/512 to match CUDA min_scaling_factor).
     Returns:
         torch.Tensor: fp8 scaled tensor.
-        torch.Tensor: The reciprocal scale tensor per row.
+        torch.Tensor: scale tensor per row (scale = amax / MAX_FP8).
     """
 
     if a.device == torch.device("cpu"):

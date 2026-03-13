@@ -553,7 +553,7 @@ class FP8Tests(unittest.TestCase):
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
-                xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x, output_dtype=QType)
+                xq, x_scale = quantize_fp8_row(x)
                 wq, w_scale = quantize_fp8_row(w)
                 if UseTriton and torch.version.cuda:
                     zq = matmul_fp8_row(xq, wq, x_scale, w_scale)
