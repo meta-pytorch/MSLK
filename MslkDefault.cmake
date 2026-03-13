@@ -10,17 +10,13 @@
 
 glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cpp
-  csrc/attention/cuda/gqa_attn_splitk/*.cpp
   csrc/conv/*.cpp
   csrc/gemm/*.cpp
-  csrc/kv_cache/*.cpp
   csrc/moe/*.cpp
   csrc/quantize/*.cpp
   csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
-  csrc/attention/cuda/gqa_attn_splitk/*.cu
-  csrc/kv_cache/*.cu
   csrc/moe/*.cu
   csrc/quantize/*.cu)
 
