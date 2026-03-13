@@ -629,11 +629,9 @@ def main(argv: List[str]) -> None:
         }
 
     # Flash Attention 3 package is optional.
-    # Install with: pip install mslk[flash3]
-    # flash-attn-3 (v3): Hopper (SM90) and newer
-    # NOTE: flash-attn-3 may require:
-    #   --extra-index-url https://download.pytorch.org/whl/cu126
-    # Flash Attention v2 uses PyTorch's built-in implementation.
+    # Install with:
+    # pip install mslk[flash3] --extra-index-url https://download.pytorch.org/whl/cu126
+    # where cu126 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
     }
