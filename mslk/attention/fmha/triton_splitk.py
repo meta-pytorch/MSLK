@@ -135,8 +135,10 @@ class FwOp(AttentionFwOpBase):
     ...
 
     For fp8 only row-wise quantization is supported. To use it, provide input of type
-    xformers.ops.fmha.triton_splitk.InputsFp8 (instead of the usual xformers.ops.fmha.Inputs) to
-    xformers.ops.fmha.triton_splitk.FwOp.apply or xformers.ops.fmha._memory_efficient_attention_forward.
+    mslk.attention.fmha.triton_splitk.InputsFp8
+    (instead of the usual mslk.attention.fmha.Inputs) to
+    mslk.attention.fmha.triton_splitk.FwOp.apply
+    or mslk.attention.fmha._memory_efficient_attention_forward.
 
     This op uses Paged Attention when bias is one of the Paged* classes.
     In this case bias has additional fields:
