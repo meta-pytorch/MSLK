@@ -80,7 +80,8 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip
   csrc/quantize/ck/*.hip
-  csrc/quantize/ck/**/*.hip)
+  csrc/quantize/ck/**/*.hip
+  csrc/attention/ck/fmha/**/*.hip)
 
 # HIP FMHA sources - built separately for only the latest GPU architecture
 # to reduce build time and binary size
