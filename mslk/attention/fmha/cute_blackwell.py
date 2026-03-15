@@ -1,9 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
@@ -426,7 +421,6 @@ class FwOp(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
                 deterministic=True,
             )
         else:
@@ -570,7 +564,6 @@ class FwOpDecode(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
                 deterministic=True,
             )
         else:
@@ -710,7 +703,6 @@ class BwOp(AttentionBwOpBase):
                     window_left=window_left,
                     window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
-                    # Set to True until we create a sub-class for deterministic
                     deterministic=True,
                 )
             )
