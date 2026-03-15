@@ -12,11 +12,12 @@
 #include <ATen/ScalarOps.h>
 #include <ATen/Tensor.h>
 #include <ATen/core/Generator.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
-#include <c10/hip/HIPStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Optional.h>
 #include <torch/library.h>
-#include <ATen/cuda/PhiloxUtils.cuh>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include "ck_fmha_util.h"
 #include "ck_tiled_fmha_fwd_splitkv_selector.h"
@@ -56,23 +57,23 @@ efficient_attention_forward_ck(
     const at::Tensor& query, // [b, seqlen, num_heads_q, K]
     const at::Tensor& key, // [b, seqlen, num_heads_kv, K]
     const at::Tensor& value, // [b, seqlen, num_heads_kv, Kv]
-    const c10::optional<at::Tensor>& bias, // [b, num_heads_q, seqlen, seqlen]
+    const std::optional<at::Tensor>& bias, // [b, num_heads_q, seqlen, seqlen]
     // (Mode 1MHK only) [b+1]: cu_seqlens_q[b] contains the
     // position of the first query token for batch $b
-    const c10::optional<at::Tensor>& seqstart_q,
+    const std::optional<at::Tensor>& seqstart_q,
     // (Mode 1MHK only) [b+1]: cu_seqlen_k[b] contains the
     // position of the first key token for batch $b
-    const c10::optional<at::Tensor>& seqstart_k,
+    const std::optional<at::Tensor>& seqstart_k,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_q_,
+    const std::optional<int64_t> max_seqlen_q_,
     double dropout_p, // attention matrix dropout probability
     bool compute_logsumexp,
     int64_t custom_mask_type,
-    c10::optional<double> scale,
-    const c10::optional<at::Tensor>& seqlen_k,
-    const c10::optional<int64_t> window_size,
-    const c10::optional<at::Tensor>& block_tables,
-    const c10::optional<int64_t> page_size) {
+    std::optional<double> scale,
+    const std::optional<at::Tensor>& seqlen_k,
+    const std::optional<int64_t> window_size,
+    const std::optional<at::Tensor>& block_tables,
+    const std::optional<int64_t> page_size) {
   TORCH_CHECK(query.dim() == 4);
   TORCH_CHECK(key.dim() == 4);
   TORCH_CHECK(value.dim() == 4);
@@ -119,7 +120,7 @@ efficient_attention_forward_ck(
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(key);
   CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(value);
 
-  hipStream_t stream = c10::cuda::getCurrentHIPStream().stream();
+  hipStream_t stream = at::cuda::getCurrentHIPStream().stream();
 
   int64_t B = query.size(0);
   int64_t M = query.size(1);
@@ -146,7 +147,7 @@ efficient_attention_forward_ck(
     at::PhiloxCudaState rng_engine_inputs;
     at::CUDAGeneratorImpl* gen =
         at::get_generator_or_default<at::CUDAGeneratorImpl>(
-            c10::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+            std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
 
     std::lock_guard<std::mutex> lock(gen->mutex_);
     // if using dropout, we produce 1 random number for each element of the
@@ -481,29 +482,26 @@ efficient_attention_forward_ck_meta(
     const at::Tensor& query, // [b, seqlen, num_heads_q, K]
     const at::Tensor& key, // [b, seqlen, num_heads_kv, K]
     const at::Tensor& value, // [b, seqlen, num_heads_kv, Kv]
-    const c10::optional<at::Tensor>& bias, // [b, num_heads_q, seqlen, seqlen]
+    const std::optional<at::Tensor>& bias, // [b, num_heads_q, seqlen, seqlen]
     // (Mode 1MHK only) [b+1]: cu_seqlens_q[b] contains the
     // position of the first query token for batch $b
-    const c10::optional<at::Tensor>& seqstart_q,
+    const std::optional<at::Tensor>& seqstart_q,
     // (Mode 1MHK only) [b+1]: cu_seqlen_k[b] contains the
     // position of the first key token for batch $b
-    const c10::optional<at::Tensor>& seqstart_k,
+    const std::optional<at::Tensor>& seqstart_k,
     // (Mode 1MHK only) Maximum sequence length across batches
-    const c10::optional<int64_t> max_seqlen_q_,
+    const std::optional<int64_t> max_seqlen_q_,
     double dropout_p, // attention matrix dropout probability
     bool compute_logsumexp,
     int64_t custom_mask_type,
-    c10::optional<double> scale,
-    const c10::optional<at::Tensor>& seqlen_k,
-    const c10::optional<int64_t> window_size,
-    const c10::optional<at::Tensor>& block_tables,
-    const c10::optional<int64_t> page_size) {
+    std::optional<double> scale,
+    const std::optional<at::Tensor>& seqlen_k,
+    const std::optional<int64_t> window_size,
+    const std::optional<at::Tensor>& block_tables,
+    const std::optional<int64_t> page_size) {
   at::SymInt B = query.sym_size(0);
   at::SymInt M = query.sym_size(1);
-  at::SymInt N = key.sym_size(1);
   at::SymInt Hq = query.sym_size(-2);
-  at::SymInt Hkv = key.sym_size(-2);
-  at::SymInt K = query.sym_size(-1);
   at::SymInt Kv = value.sym_size(-1);
   auto opts = query.options();
   std::optional<at::Tensor> logsumexp = std::nullopt;

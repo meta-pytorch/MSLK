@@ -11,7 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <torch/all.h>
+#include <torch/torch.h>
 
 #define XFORMERS_CHECK(COND, ERR)          \
   if (!(COND)) {                           \
@@ -46,6 +46,23 @@
       throw std::runtime_error(ostr.str());                                  \
     }                                                                        \
   } while (0)
+
+static inline size_t get_size_in_bytes(size_t n, at::ScalarType dtype) {
+  if (dtype == at::ScalarType::Float) {
+    return n * 4;
+  } else if (dtype == at::ScalarType::Half) {
+    return n * 2;
+  } else if (dtype == at::ScalarType::BFloat16) {
+    return n * 2;
+  } else if (dtype == at::ScalarType::Short) {
+    return n * 2;
+  } else if (dtype == at::ScalarType::Int) {
+    return n * 4;
+  } else if (dtype == at::ScalarType::Byte) {
+    return n;
+  }
+  return 0;
+}
 
 /**
  * kernels expect 4D bias/bias.grad with shape
