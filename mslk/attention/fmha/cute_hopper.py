@@ -49,7 +49,7 @@ def _get_operator(name: str):
         import mslk.attention.flash_attn.interface as flash_attn
 
         return getattr(flash_attn, name)
-    except (RuntimeError, ModuleNotFoundError, AttributeError):
+    except (RuntimeError, ModuleNotFoundError, AttributeError, ImportError):
         return no_such_operator
 
 
