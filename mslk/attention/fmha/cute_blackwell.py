@@ -397,6 +397,7 @@ class FwOp(AttentionFwOpBase):
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         q_shape = inp.query.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -426,8 +427,7 @@ class FwOp(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
-                deterministic=True,
+                deterministic=deterministic,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -518,6 +518,7 @@ class FwOpDecode(AttentionFwOpBase):
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         q_shape = inp.query.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -570,8 +571,7 @@ class FwOpDecode(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
-                deterministic=True,
+                deterministic=deterministic,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -670,6 +670,7 @@ class BwOp(AttentionBwOpBase):
         query_ndim = inp.query.ndim
         assert query_ndim in [4, 5]
         dq_shape, dk_shape, dv_shape = inp.query.shape, inp.key.shape, inp.value.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -710,8 +711,7 @@ class BwOp(AttentionBwOpBase):
                     window_left=window_left,
                     window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
-                    # Set to True until we create a sub-class for deterministic
-                    deterministic=True,
+                    deterministic=deterministic,
                 )
             )
         else:
