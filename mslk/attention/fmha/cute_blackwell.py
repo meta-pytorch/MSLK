@@ -294,6 +294,9 @@ def _is_bottom_right(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) ->
             BlockDiagonalLocalAttentionPaddedKeysMask,
             BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
         ),
     )
 
@@ -349,6 +352,12 @@ class FwOp(AttentionFwOpBase):
         LowerTriangularFromBottomRightLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+        PagedBlockDiagonalPaddedKeysMask,
+        PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+        PagedBlockDiagonalCausalLocalPaddedKeysMask,
+        # Prefill FWD does not support paged + gappy kv
+        # PagedBlockDiagonalGappyKeysMask,
+        # PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
     )
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -410,11 +419,26 @@ class FwOp(AttentionFwOpBase):
 
         window_left, window_right = _window_size(inp.attn_bias)
 
+        is_fp8 = isinstance(inp, InputsFp8)
+        if is_fp8:
+            assert (
+                inp.k_fp8_scale_shift is not None
+                and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
+            ), (
+                "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
+            )
+
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, lse = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
+                k_scale_shift=inp.k_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
+                v_scale_shift=inp.v_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 seqlen_kv=seqused_k,
