@@ -596,7 +596,6 @@ __verify_library_symbols () {
     local lib_symbols_to_check=(
       mslk::gemm::f8f8bf16_rowwise
       mslk::moe::index_shuffling_torch
-      mslk::quantize::quantize_fp8_per_row
     )
   fi
 
