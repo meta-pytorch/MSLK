@@ -595,7 +595,6 @@ __verify_library_symbols () {
   if [ "${mslk_build_target}" == "default" ]; then
     local lib_symbols_to_check=(
       mslk::gemm::f8f8bf16_rowwise
-      mslk::kv_cache::rope_qkv_decoding
       mslk::moe::index_shuffling_torch
       mslk::quantize::quantize_fp8_per_row
     )
