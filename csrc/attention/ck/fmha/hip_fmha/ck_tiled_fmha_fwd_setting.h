@@ -77,7 +77,6 @@ template struct FmhaFwdBlockTile<512>;
 
 using FmhaFwdWarpTile1 = ck_tile::sequence<32, 32, 16>;
 using FmhaFwdWarpTile2 = ck_tile::sequence<16, 16, 16>;
-using FmhaFwdWarpTile3 = ck_tile::sequence<16, 16, 32>;
 
 template <ck_tile::index_t MaxK, ck_tile::index_t MTile>
 struct FmhaFwdShape;
@@ -129,7 +128,7 @@ struct FmhaFwdShape<128, 64> {
   using Type = ck_tile::TileFmhaShape<
       typename FmhaFwdBlockTile<128, 64>::type,
       typename FmhaFwdBlockTile<128, 64>::gemm0_warps,
-      FmhaFwdWarpTile3,
+      FmhaFwdWarpTile2,
       typename FmhaFwdBlockTile<128, 64>::gemm1_warps,
       FmhaFwdWarpTile2,
       IsVLayoutRowMajor>;
@@ -174,10 +173,8 @@ struct FmhaFwdShape<512, MTile> {
 template struct FmhaFwdShape<512, 64>;
 template struct FmhaFwdShape<512, 128>;
 
-static int get_fmha_fwd_mtile(
-    int num_batches,
-    int num_heads,
-    int max_seqlen_q) {
+static int
+get_fmha_fwd_mtile(int num_batches, int num_heads, int max_seqlen_q) {
   int num_SMs = get_number_of_cu();
   auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
 
@@ -187,8 +184,6 @@ static int get_fmha_fwd_mtile(
   if (batch_nhead_mblocks >= 0.8 * num_SMs)
     return 128;
 
-  // currently, only hdim-128 can use mtile-64, for other hdim, the settings for
-  // mtile-64 can be added through tuning/verification
   return 64;
 };
 
