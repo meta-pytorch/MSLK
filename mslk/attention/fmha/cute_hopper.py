@@ -5,14 +5,25 @@
 # LICENSE file in the root directory of this source tree.
 # @nolint # fbcode
 
-from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
 
 from .attn_bias import (
+    AttentionBias,
     BlockDiagonalCausalFromBottomRightMask,
+    BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+    BlockDiagonalCausalLocalAttentionMask,
+    BlockDiagonalCausalLocalAttentionPaddedKeysMask,
     BlockDiagonalCausalMask,
+    BlockDiagonalCausalWithOffsetGappyKeysMask,
+    BlockDiagonalCausalWithOffsetPaddedKeysMask,
+    BlockDiagonalGappyKeysMask,
+    BlockDiagonalLocalAttentionPaddedKeysMask,
     BlockDiagonalMask,
+    BlockDiagonalPaddedKeysMask,
+    LocalAttentionFromBottomRightMask,
+    LowerTriangularFromBottomRightLocalAttentionMask,
     LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
 )
@@ -58,7 +69,25 @@ def _convert_input_format(inp):
     query, key, value = inp.query, inp.key, inp.value
 
     attn_bias = inp.attn_bias
-    if isinstance(attn_bias, BlockDiagonalMask):
+    if isinstance(
+        attn_bias,
+        (
+            BlockDiagonalPaddedKeysMask,
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            BlockDiagonalGappyKeysMask,
+            BlockDiagonalCausalWithOffsetGappyKeysMask,
+            BlockDiagonalLocalAttentionPaddedKeysMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+        ),
+    ):
+        assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
+        cu_seqlen_k = attn_bias.k_seqinfo.seqstart
+        cu_seqlen_q = attn_bias.q_seqinfo.seqstart
+        max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
+        max_seqlen_k = attn_bias.k_seqinfo.max_seqlen
+        seqused_k = attn_bias.k_seqinfo.seqlen
+        assert seqused_k is not None
+    elif isinstance(attn_bias, BlockDiagonalMask):
         assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
         cu_seqlen_k = attn_bias.k_seqinfo.seqstart
         cu_seqlen_q = attn_bias.q_seqinfo.seqstart
@@ -105,7 +134,7 @@ def _convert_input_format(inp):
     )
 
 
-def _is_causal(attn_bias):
+def _is_causal(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
     return isinstance(
         attn_bias,
         (
@@ -113,18 +142,57 @@ def _is_causal(attn_bias):
             BlockDiagonalCausalMask,
             LowerTriangularFromBottomRightMask,
             BlockDiagonalCausalFromBottomRightMask,
+            LowerTriangularFromBottomRightLocalAttentionMask,
+            BlockDiagonalCausalLocalAttentionMask,
+            BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            BlockDiagonalCausalWithOffsetGappyKeysMask,
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
         ),
     )
 
 
-def _is_bottom_right(attn_bias):
+def _is_bottom_right(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) -> bool:
     return isinstance(
         attn_bias,
         (
             LowerTriangularFromBottomRightMask,
             BlockDiagonalCausalFromBottomRightMask,
+            LocalAttentionFromBottomRightMask,
+            BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            BlockDiagonalLocalAttentionPaddedKeysMask,
+            BlockDiagonalCausalWithOffsetGappyKeysMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
         ),
     )
+
+
+def _window_size(
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
+) -> Tuple[int, int]:
+    win_left = -1
+    win_right = -1
+    if isinstance(
+        attn_bias,
+        (
+            BlockDiagonalCausalLocalAttentionMask,
+            BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+            LowerTriangularFromBottomRightLocalAttentionMask,
+            BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+        ),
+    ):
+        win_left = attn_bias._window_size - 1
+    if isinstance(
+        attn_bias,
+        (
+            BlockDiagonalLocalAttentionPaddedKeysMask,
+            LocalAttentionFromBottomRightMask,
+        ),
+    ):
+        win_left = attn_bias.window_left
+        win_right = attn_bias.window_right
+    return (win_left, win_right)
 
 
 class FwOp(AttentionFwOpBase):
@@ -133,13 +201,23 @@ class FwOp(AttentionFwOpBase):
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
     SUPPORTED_MAX_K = 128
     SUPPORTED_MIN_K = 64
-    # SM90 causal is always bottom-right aligned; top-left causal
-    # (LowerTriangularMask, BlockDiagonalCausalMask) is not supported.
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
+        LowerTriangularMask,
         LowerTriangularFromBottomRightMask,
         BlockDiagonalCausalFromBottomRightMask,
         BlockDiagonalMask,
+        BlockDiagonalCausalMask,
+        BlockDiagonalPaddedKeysMask,
+        BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        BlockDiagonalGappyKeysMask,
+        BlockDiagonalCausalWithOffsetGappyKeysMask,
+        BlockDiagonalLocalAttentionPaddedKeysMask,
+        BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+        LocalAttentionFromBottomRightMask,
+        LowerTriangularFromBottomRightLocalAttentionMask,
+        BlockDiagonalCausalLocalAttentionMask,
+        BlockDiagonalCausalLocalAttentionFromBottomRightMask,
     )
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -159,11 +237,20 @@ class FwOp(AttentionFwOpBase):
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(FwOp, cls).not_supported_reasons(d)
+        if isinstance(d.attn_bias, BlockDiagonalCausalMask):
+            (
+                _,
+                cu_seqlens_q,
+                _,
+                cu_seqlens_k,
+                _,
+                _,
+                _,
+            ) = _convert_input_format(d)
+
         if d.query.ndim < 4 or d.key.ndim < 4 or d.value.ndim < 4:
             reasons.append("Only supports BMHK or BMGHK")
-        # SM90 causal has a tile scheduler issue when Mkv > Mq
-        if _is_causal(d.attn_bias) and d.key.shape[1] > d.query.shape[1]:
-            reasons.append("SM90 causal requires Mq >= Mkv")
+
         return reasons
 
     @classmethod
@@ -190,6 +277,8 @@ class FwOp(AttentionFwOpBase):
             page_table,
         ) = _convert_input_format(inp)
 
+        window_left, window_right = _window_size(inp.attn_bias)
+
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, lse = cls.OPERATOR(
                 q=inp.query,
@@ -202,6 +291,8 @@ class FwOp(AttentionFwOpBase):
                 max_seq_len_k=max_seq_len_k,
                 softmax_scale=inp.scale,
                 causal=_is_causal(inp.attn_bias),
+                window_left=window_left,
+                window_right=window_right,
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 deterministic=True,
             )
@@ -230,11 +321,12 @@ class BwOp(AttentionBwOpBase):
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
     SUPPORTED_MIN_K = FwOp.SUPPORTED_MIN_K
+    # SM90 backward does NOT support varlen (cu_seqlens) or local attention (window_size).
+    # Only non-varlen causal masks are supported.
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
+        LowerTriangularMask,
         LowerTriangularFromBottomRightMask,
-        BlockDiagonalCausalFromBottomRightMask,
-        BlockDiagonalMask,
     )
     SUPPORTS_ATTN_BIAS_GRAD = False
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
@@ -329,3 +421,15 @@ class BwOp(AttentionBwOpBase):
         grads.dk = grads.dk.reshape(dk_shape)
         grads.dv = grads.dv.reshape(dv_shape)
         return grads
+
+
+def _is_seqlen_q_le_seqlen_k(
+    cu_seqlens_q_py: List[int], cu_seqlens_k_py: List[int]
+) -> bool:
+    if len(cu_seqlens_q_py) < 2 or len(cu_seqlens_k_py) < 2:
+        return True
+    cu_seqlens_q = torch.as_tensor(cu_seqlens_q_py, dtype=torch.int, device="cpu")
+    cu_seqlens_k = torch.as_tensor(cu_seqlens_k_py, dtype=torch.int, device="cpu")
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    return torch.all(seqlens_k >= seqlens_q).item()  # pyre-fixme[7]
