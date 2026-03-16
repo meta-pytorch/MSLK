@@ -75,7 +75,8 @@ def _kernel_quantize_fp8_row(
 ) -> None:
     """Quantize and scale each row.
 
-    Scale per row i is computed as MAX_FP8 / max(abs(A[i, :]))
+    Scale per row i is computed as max(amax / MAX_FP8, EPS),
+    matching CUDA's quantize_fp8_per_row arithmetic.
 
     Kernel naively iterates through  matrix with [1, BLOCK_SIZE] tiles
     in a max pass then scale/quantize pass.
@@ -85,8 +86,8 @@ def _kernel_quantize_fp8_row(
 
     Args:
         A (Tensor): higher precision input tensor of 4 dimension.
-        A_scale (Tensor): [B * M * N] reciprocal scale tensor per row.
-        A_fp8 (Tensor): fp8 scaled tensor. A_fp8 = A / a_scale
+        A_scale (Tensor): [B * M * N] scale tensor per row (amax / MAX_FP8).
+        A_fp8 (Tensor): fp8 scaled tensor. A_fp8 = A / scale
         scale_ub (Tensor): [1] Maximum value allowed for scale.
         B (int): Size of dimenion 0
         M (int): Size of dimenion 1
@@ -156,10 +157,10 @@ def _kernel_quantize_fp8_row(
             cur_max = tl.maximum(cur_max, EPS)
 
         # Scale and quantize.
-        a_scale = MAX_FP8 / cur_max
-        tl.store(A_scale + pid, 1.0 / a_scale)
+        scale = tl.div_rn(cur_max, MAX_FP8)
+        tl.store(A_scale + pid, scale)
 
-        a_fp8 = a * a_scale
+        a_fp8 = tl.div_rn(a.to(tl.float32), scale)
         a_fp8 = tl.clamp(a_fp8, -MAX_FP8, MAX_FP8).to(TL_FP8_DTYPE)
         tl.store(
             A_fp8 + a_fp8_offset_base + n_offset * stride_ok,
@@ -188,9 +189,9 @@ def _kernel_quantize_fp8_row(
         else:
             cur_max = tl.maximum(cur_max, EPS)
 
-        # Scale and quantize.
-        a_scale = MAX_FP8 / cur_max
-        tl.store(A_scale + pid, 1.0 / a_scale)
+        # Scale and quantize
+        scale = tl.div_rn(cur_max, MAX_FP8)
+        tl.store(A_scale + pid, scale)
 
         # Write quantized values for the first K elements (from A), and pad the rest with zeros up to K_fp8
         n_offset = tl.arange(0, BLOCK_SIZE)
@@ -202,7 +203,7 @@ def _kernel_quantize_fp8_row(
                 other=0.0,
             )
             # For elements >= K, a will be 0
-            a_fp8 = a * a_scale
+            a_fp8 = tl.div_rn(a.to(tl.float32), scale)
             # Clamp A to fp8 range to make sure there's no overflow.
             # This is required for AMD. Nvidia's default saturation
             # handles it, but it's nice to have anyway.
@@ -222,7 +223,7 @@ def triton_quantize_fp8_row(
     scale_ub: Optional[torch.Tensor] = None,
     zero_start_index_M: Optional[torch.Tensor] = None,
     align_rows_to: Optional[int] = None,
-    eps_opt: Optional[float] = None,
+    eps_opt: Optional[float] = 1.0 / 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Call the triton quantize fp8 row kernel to quantize a tensor to fp8 with row-wise scalings.
@@ -693,7 +694,7 @@ def quantize_fp8_row(
     use_triton: bool = True,
     output_device: Optional[torch.device] = None,
     align_rows_to: Optional[int] = None,
-    eps_opt: Optional[float] = None,
+    eps_opt: Optional[float] = 1.0 / 512.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a to fp8 with row-wise scalings and optionally move to output device.
