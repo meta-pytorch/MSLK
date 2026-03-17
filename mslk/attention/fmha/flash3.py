@@ -9,7 +9,7 @@
 import importlib.util
 import logging
 import os
-from typing import Any, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Iterable, List, Optional, overload, Sequence, Set, Tuple
 
 import torch
 from torch.utils.flop_counter import (
@@ -82,6 +82,18 @@ FLASH_VERSION = "0.0.0"
 logger = logging.getLogger(__name__)
 
 
+@overload
+def maybe_contiguous(x: torch.Tensor) -> torch.Tensor: ...  # noqa: E704
+
+
+@overload
+def maybe_contiguous(x: None) -> None: ...  # noqa: E704
+
+
+@overload
+def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]: ...  # noqa: E704,E501
+
+
 def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if x is not None and x.stride(-1) != 1:
         return x.contiguous()
@@ -89,13 +101,14 @@ def maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 
 
 _FLASH3_HAS_ATTENTION_CHUNK = False
-_C_flashattention3 = None
+_C_flashattention3: Optional[Any] = None
 try:
     # fbcode internal path - always fails in OSS
-    from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (  # type: ignore  # noqa: E501
-        flashattn_hopper_cuda as _C_flashattention3,
+    from ai_codesign.gen_ai.flash_attention_v2.hopper.flash_attn_interface import (  # type: ignore  # noqa: E501  # pyre-ignore[21]
+        flashattn_hopper_cuda as _C_flashattention3_impl,
     )
 
+    _C_flashattention3 = _C_flashattention3_impl  # pyre-ignore[16]
     check_ai_codesign_compatibility(_C_flashattention3)
 except ImportError:
     # OSS: use the official flash_attn_3 package
