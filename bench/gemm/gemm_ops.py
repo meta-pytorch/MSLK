@@ -28,6 +28,7 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_group,
     quantize_fp8_row,
     scale_fp8_row,
+    triton_quantize_fp8_tensor,
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
@@ -655,8 +656,8 @@ class CutlassFP8Tensorwise(GemmOpBase):
 
     def quantize(self, x, w):
         # Quantize both input tensors.
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
+        xq, x_scale = triton_quantize_fp8_tensor(x)
+        wq, w_scale = triton_quantize_fp8_tensor(w)
         return xq, wq, x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
@@ -725,8 +726,8 @@ class CublasFP8Tensorwise(GemmOpBase):
 
     def quantize(self, x, w):
         # Quantize both input tensors.
-        xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-        wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
+        xq, x_scale = triton_quantize_fp8_tensor(x)
+        wq, w_scale = triton_quantize_fp8_tensor(w)
         return xq, wq, x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
