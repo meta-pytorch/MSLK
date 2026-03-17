@@ -640,7 +640,7 @@ class BwOp(AttentionBwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (10, 0)
     NAME = "cuteDSLB-blackwell"
 
-    _TEST_K: List[int] = [64, 128]
+    _TEST_K: List[int] = [64, 96, 128]
 
     ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
     ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
