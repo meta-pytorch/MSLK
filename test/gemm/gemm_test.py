@@ -51,6 +51,14 @@ def evaluate_gfx_arch_in(arch_list):
     return any(arch in gcn_arch_name for arch in arch_list)
 
 
+def is_mi300x():
+    return (
+        torch.cuda.is_available()
+        and torch.version.hip is not None
+        and evaluate_gfx_arch_in(["gfx942"])
+    )
+
+
 def evaluate_cuda_compute_capability(major_min, major_max=None):
     major, _ = torch.cuda.get_device_capability()
     return major >= major_min and (major_max is None or major <= major_max)
@@ -59,7 +67,7 @@ def evaluate_cuda_compute_capability(major_min, major_max=None):
 def supports_bf16():
     if torch.cuda.is_available():
         if torch.version.hip:
-            return evaluate_gfx_arch_in(["gfx942"])
+            return is_mi300x()
         return evaluate_cuda_compute_capability(9)
     return False
 
@@ -67,7 +75,9 @@ def supports_bf16():
 def supports_fp8():
     if torch.cuda.is_available():
         if torch.version.hip:
-            return supports_float8_fnuz(throw_on_hip_incompatibility=False)
+            return is_mi300x() and supports_float8_fnuz(
+                throw_on_hip_incompatibility=False
+            )
         return evaluate_cuda_compute_capability(9, 10)
     return False
 
@@ -290,7 +300,7 @@ class ExportCompileTests(unittest.TestCase):
             self.XQ, self.WQ, self.row_scale, self.col_scale, self.output
         )
 
-    @unittest.skipIf(not torch.version.hip, "Requires ROCm")
+    @unittest.skipIf(not is_mi300x(), "Requires MI300X")
     def test_compile_f8f8f16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
             self.XQ, self.WQ, self.row_scale, self.col_scale
@@ -553,7 +563,7 @@ class FP8Tests(unittest.TestCase):
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
-                xq, x_scale = torch.ops.mslk.quantize_fp8_per_row(x, output_dtype=QType)
+                xq, x_scale = quantize_fp8_row(x)
                 wq, w_scale = quantize_fp8_row(w)
                 if UseTriton and torch.version.cuda:
                     zq = matmul_fp8_row(xq, wq, x_scale, w_scale)
@@ -898,8 +908,8 @@ class FP8Tests(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        not torch.version.hip,
-        "Only AMD supports torch 3D-2D grouped gemm API",
+        not is_mi300x(),
+        "Only MI300X supports torch 3D-2D grouped gemm API",
     )
     @settings(deadline=None)
     @given(
@@ -946,8 +956,8 @@ class FP8Tests(unittest.TestCase):
         self.bf16_loopover_validate(X, W_split, y_fp8)
 
     @unittest.skipIf(
-        not torch.version.hip,
-        "Only AMD supports torch 2D-2D grouped gemm API",
+        not is_mi300x(),
+        "Only MI300X supports torch 2D-2D grouped gemm API",
     )
     @settings(deadline=None)
     @given(

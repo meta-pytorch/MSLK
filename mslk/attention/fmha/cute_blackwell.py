@@ -75,7 +75,7 @@ def _get_operator(name: str):
         import mslk.attention.flash_attn.interface as flash_attn
 
         return getattr(flash_attn, name)  # type: ignore  # pyre-ignore
-    except (RuntimeError, ModuleNotFoundError, AttributeError):
+    except (RuntimeError, ModuleNotFoundError, AttributeError, ImportError):
         return no_such_operator
 
 
@@ -294,6 +294,9 @@ def _is_bottom_right(attn_bias: Optional[Union[torch.Tensor, AttentionBias]]) ->
             BlockDiagonalLocalAttentionPaddedKeysMask,
             BlockDiagonalCausalWithOffsetGappyKeysMask,
             BlockDiagonalCausalLocalAttentionPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+            PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
+            PagedBlockDiagonalCausalLocalPaddedKeysMask,
         ),
     )
 
@@ -349,6 +352,12 @@ class FwOp(AttentionFwOpBase):
         LowerTriangularFromBottomRightLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionMask,
         BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+        PagedBlockDiagonalPaddedKeysMask,
+        PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+        PagedBlockDiagonalCausalLocalPaddedKeysMask,
+        # Prefill FWD does not support paged + gappy kv
+        # PagedBlockDiagonalGappyKeysMask,
+        # PagedBlockDiagonalCausalWithOffsetGappyKeysMask,
     )
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -397,6 +406,7 @@ class FwOp(AttentionFwOpBase):
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         q_shape = inp.query.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -409,11 +419,26 @@ class FwOp(AttentionFwOpBase):
 
         window_left, window_right = _window_size(inp.attn_bias)
 
+        is_fp8 = isinstance(inp, InputsFp8)
+        if is_fp8:
+            assert (
+                inp.k_fp8_scale_shift is not None
+                and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
+            ), (
+                "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
+            )
+
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, lse = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
+                k_scale_shift=inp.k_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
+                v_scale_shift=inp.v_fp8_scale_shift
+                if is_fp8
+                else None,  # pyre-fixme[16]
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 seqlen_kv=seqused_k,
@@ -426,8 +451,7 @@ class FwOp(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
-                deterministic=True,
+                deterministic=deterministic,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -518,6 +542,7 @@ class FwOpDecode(AttentionFwOpBase):
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         q_shape = inp.query.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -570,8 +595,7 @@ class FwOpDecode(AttentionFwOpBase):
                 bottom_right=_is_bottom_right(inp.attn_bias),  # not used
                 page_table=_get_paged_block_tables(inp.attn_bias),
                 num_splits=inp.num_splits,
-                # Set to True until we create a sub-class for deterministic
-                deterministic=True,
+                deterministic=deterministic,
             )
         else:
             out = torch.zeros_like(inp.query)
@@ -616,7 +640,7 @@ class BwOp(AttentionBwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (10, 0)
     NAME = "cuteDSLB-blackwell"
 
-    _TEST_K: List[int] = [64, 128]
+    _TEST_K: List[int] = [64, 96, 128]
 
     ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
     ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
@@ -670,6 +694,7 @@ class BwOp(AttentionBwOpBase):
         query_ndim = inp.query.ndim
         assert query_ndim in [4, 5]
         dq_shape, dk_shape, dv_shape = inp.query.shape, inp.key.shape, inp.value.shape
+        deterministic = torch.are_deterministic_algorithms_enabled()
         (
             inp,
             cu_seqlens_q,
@@ -710,8 +735,7 @@ class BwOp(AttentionBwOpBase):
                     window_left=window_left,
                     window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
-                    # Set to True until we create a sub-class for deterministic
-                    deterministic=True,
+                    deterministic=deterministic,
                 )
             )
         else:
