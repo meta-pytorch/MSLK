@@ -60,7 +60,7 @@ if importlib.util.find_spec("flash_attn"):
     import flash_attn
     import flash_attn.flash_attn_interface
 
-    _iface = flash_attn.flash_attn_interface
+    _iface: object = flash_attn.flash_attn_interface
     if hasattr(_iface, "flash_attn_cuda"):
         _flash_attn_cuda = _iface.flash_attn_cuda  # type: ignore
     else:

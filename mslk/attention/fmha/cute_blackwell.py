@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# pyre-unsafe
 
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
@@ -71,10 +72,9 @@ def _get_operator(name: str):
         )
 
     try:
-        # type: ignore  # pyre-ignore
         import mslk.attention.flash_attn.interface as flash_attn
 
-        return getattr(flash_attn, name)  # type: ignore  # pyre-ignore
+        return getattr(flash_attn, name)
     except (RuntimeError, ModuleNotFoundError, AttributeError, ImportError):
         return no_such_operator
 
@@ -140,10 +140,10 @@ def _convert_input_format(
         max_seqlen_q = None
         max_seqlen_k = None
 
-    if hasattr(inp, "k_fp8_scale_shift") and hasattr(inp, "v_fp8_scale_shift"):
+    if isinstance(inp, InputsFp8):
         key_scale = inp.k_fp8_scale_shift
         value_scale = inp.v_fp8_scale_shift
-    elif hasattr(inp, "k_fp8_scale") and hasattr(inp, "v_fp8_scale"):
+    elif isinstance(inp, InputsMXFp8):
         key_scale = inp.k_fp8_scale
         value_scale = inp.v_fp8_scale
     else:
@@ -241,7 +241,7 @@ def _is_seqlen_q_le_seqlen_k(
     cu_seqlens_k = torch.as_tensor(cu_seqlens_k_py, dtype=torch.int, device="cpu")
     seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-    return torch.all(seqlens_k >= seqlens_q).item()  # pyre-fixme[7]
+    return bool(torch.all(seqlens_k >= seqlens_q).item())
 
 
 def _get_paged_block_tables(
@@ -419,11 +419,11 @@ class FwOp(AttentionFwOpBase):
 
         window_left, window_right = _window_size(inp.attn_bias)
 
-        is_fp8 = isinstance(inp, InputsFp8)
-        if is_fp8:
+        fp8_inp = inp if isinstance(inp, InputsFp8) else None
+        if fp8_inp is not None:
             assert (
-                inp.k_fp8_scale_shift is not None
-                and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
+                fp8_inp.k_fp8_scale_shift is not None
+                and fp8_inp.v_fp8_scale_shift is not None
             ), (
                 "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
             )
@@ -433,12 +433,12 @@ class FwOp(AttentionFwOpBase):
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
-                k_scale_shift=inp.k_fp8_scale_shift
-                if is_fp8
-                else None,  # pyre-fixme[16]
-                v_scale_shift=inp.v_fp8_scale_shift
-                if is_fp8
-                else None,  # pyre-fixme[16]
+                k_scale_shift=fp8_inp.k_fp8_scale_shift
+                if fp8_inp is not None
+                else None,
+                v_scale_shift=fp8_inp.v_fp8_scale_shift
+                if fp8_inp is not None
+                else None,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 seqlen_kv=seqused_k,
@@ -519,12 +519,12 @@ class FwOpDecode(AttentionFwOpBase):
         if (
             d.attn_bias is not None
             and hasattr(d.attn_bias, "q_seqinfo")
-            and d.attn_bias.q_seqinfo.max_seqlen is not None  # pyre-fixme[16]
-            and d.attn_bias.q_seqinfo.max_seqlen != 1  # pyre-fixme[16]
+            and d.attn_bias.q_seqinfo.max_seqlen is not None  # pyre-ignore[16]
+            and d.attn_bias.q_seqinfo.max_seqlen != 1  # pyre-ignore[16]
         ):
+            max_seqlen = d.attn_bias.q_seqinfo.max_seqlen  # pyre-ignore[16]
             reasons.append(
-                f"Max Q seq length ({d.attn_bias.q_seqinfo.max_seqlen}) must be "
-                "1 for decode kernel"
+                f"Max Q seq length ({max_seqlen}) must be 1 for decode kernel"
             )
         return reasons
 
@@ -557,8 +557,7 @@ class FwOpDecode(AttentionFwOpBase):
 
         if isinstance(inp, InputsFp8):
             assert (
-                inp.k_fp8_scale_shift is not None
-                and inp.v_fp8_scale_shift is not None  # pyre-fixme[16]
+                inp.k_fp8_scale_shift is not None and inp.v_fp8_scale_shift is not None
             ), (
                 "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
             )
@@ -566,10 +565,9 @@ class FwOpDecode(AttentionFwOpBase):
             v_fp8_scale = inp.v_fp8_scale_shift
 
         elif isinstance(inp, InputsMXFp8):
-            assert (
-                inp.k_fp8_scale is not None
-                and inp.v_fp8_scale is not None  # pyre-fixme[16]
-            ), "k_fp8_scale and v_fp8_scale must be provided when inp is InputsMxfp8"
+            assert inp.k_fp8_scale is not None and inp.v_fp8_scale is not None, (
+                "k_fp8_scale and v_fp8_scale must be provided when inp is InputsMxfp8"
+            )
             k_fp8_scale = inp.k_fp8_scale
             v_fp8_scale = inp.v_fp8_scale
         else:
@@ -669,8 +667,8 @@ class BwOp(AttentionBwOpBase):
 
         if isinstance(d.attn_bias, BlockDiagonalCausalMask):
             if not _is_seqlen_q_le_seqlen_k(
-                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
-                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
+                d.attn_bias.q_seqinfo.seqstart_py,
+                d.attn_bias.k_seqinfo.seqstart_py,
             ):
                 reasons.append("seqlens_k must be >= seqlens_q")
 
