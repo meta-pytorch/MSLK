@@ -251,26 +251,6 @@ class CudaFP8Rowwise(QuantizeOpBase):
 
 
 @register_op
-class CudaFP8Tensorwise(QuantizeOpBase):
-    def quantize(self, input: torch.Tensor) -> Any:
-        return torch.ops.mslk.quantize_fp8_per_tensor(input)
-
-    def dequantize(self, *args: Any) -> torch.Tensor:
-        input_quantized: torch.Tensor
-        scale: torch.Tensor
-        input_quantized, scale = args
-        return input_quantized.to(torch.float32) * scale
-
-    @property
-    def hip(self) -> bool:
-        return True
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_op
 class TritonFP8Tensorwise(QuantizeOpBase):
     def quantize(self, input: torch.Tensor) -> Any:
         return triton_quantize_fp8_tensor(input)

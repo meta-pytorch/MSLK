@@ -24,7 +24,11 @@ from mslk.quantize.triton.fp4_quantize import (
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.shuffle import quantize_int4_preshuffle
-    from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.quantize.triton.fp8_quantize import (
+        quantize_fp8_block,
+        quantize_fp8_row,
+        triton_quantize_fp8_tensor,
+    )
     from mslk.utils.triton.fp8_utils import supports_float8_fnuz
 
     if torch.cuda.get_device_capability() >= (10, 0):
@@ -511,8 +515,8 @@ class FP8Tests(unittest.TestCase):
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
-                xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-                wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
+                xq, x_scale = triton_quantize_fp8_tensor(x)
+                wq, w_scale = triton_quantize_fp8_tensor(w)
                 zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale)
                 if bias is not None:
                     zq += bias
@@ -543,8 +547,8 @@ class FP8Tests(unittest.TestCase):
                     zq += bias
                 return zq
 
-            xq, x_scale = torch.ops.mslk.quantize_fp8_per_tensor(x)
-            wq, w_scale = torch.ops.mslk.quantize_fp8_per_tensor(w)
+            xq, x_scale = triton_quantize_fp8_tensor(x)
+            wq, w_scale = triton_quantize_fp8_tensor(w)
             x_scale = x_scale.item()
             w_scale = w_scale.item()
 
