@@ -646,120 +646,6 @@ at::Tensor quantize_fp8_per_tensor_fixed_scale(
   return quantized_input;
 }
 
-// TODO: Extend to support other data types for other
-// usecases/models when needed
-std::vector<at::Tensor> quantize_fp8_per_tensor(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub, // scale upperbound
-    bool stochastic_rounding) // stochastic rounding
-{
-  CUDA_DEVICE_GUARD(input);
-  TORCH_CHECK(
-      input.dim() >= 2,
-      "Invalid dim. The dim of input should be greater than or equal to 2");
-  TORCH_CHECK(
-      input.scalar_type() == torch::kBFloat16 ||
-          input.scalar_type() == torch::kFloat,
-      "Invalid datatype. input must be BF16 or FP32");
-  TORCH_CHECK(
-      !stochastic_rounding || input.size(-1) % 4 == 0,
-      "input row dim must be 4's multiple when stochastic_rounding is True");
-  std::vector<long int> quantized_input_shape;
-  quantized_input_shape.reserve(input.dim());
-  for (int i = 0; i < input.dim(); i++) {
-    quantized_input_shape.push_back(input.size(i));
-  }
-  std::vector<long int> scale_shape = {};
-  input = input.cuda();
-  at::Tensor quantized_input = torch::empty(
-      quantized_input_shape,
-      torch::dtype(torch_fp8_e4m3)
-          .device(torch::kCUDA, at::cuda::current_device())
-          .requires_grad(false));
-  at::Tensor scales = torch::empty(
-      scale_shape,
-      torch::dtype(torch::kFloat32)
-          .device(torch::kCUDA, at::cuda::current_device())
-          .requires_grad(false));
-  // When input is empty, return empty tensors.
-  if (input.numel() == 0) {
-    return std::vector<at::Tensor>{quantized_input, scales};
-  }
-  auto* const quantized_input_ptr =
-      reinterpret_cast<__nv_fp8_e4m3*>(quantized_input.data_ptr());
-  const auto stream = at::cuda::getCurrentCUDAStream();
-  if (bs.has_value()) {
-    int64_t total_elements_per_slice = quantized_input_shape[0];
-    for (int i = 1; i < input.dim() - 1; i++) {
-      total_elements_per_slice =
-          total_elements_per_slice * quantized_input_shape[i];
-    }
-    invokeComputeScale(
-        reinterpret_cast<float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        input.numel(),
-        input.size(-1),
-        total_elements_per_slice,
-        reinterpret_cast<int64_t*>(bs.value().data_ptr()),
-        scale_ub.has_value()
-            ? reinterpret_cast<float*>(scale_ub.value().data_ptr())
-            : nullptr,
-        stream);
-    if (input.scalar_type() == torch::kBFloat16) {
-      invokeQuantizeMatrix(
-          quantized_input_ptr,
-          reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-          input.numel(),
-          input.size(-1),
-          stochastic_rounding,
-          stream);
-    } else {
-      invokeQuantizeMatrix(
-          quantized_input_ptr,
-          reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const float*>(input.data_ptr()),
-          input.numel(),
-          input.size(-1),
-          stochastic_rounding,
-          stream);
-    }
-  } else {
-    invokeComputeScale(
-        reinterpret_cast<float*>(scales.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-        input.numel(),
-        input.size(-1),
-        -1,
-        nullptr,
-        scale_ub.has_value()
-            ? reinterpret_cast<float*>(scale_ub.value().data_ptr())
-            : nullptr,
-        stream);
-    if (input.scalar_type() == torch::kBFloat16) {
-      invokeQuantizeMatrix(
-          quantized_input_ptr,
-          reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
-          input.numel(),
-          input.size(-1),
-          stochastic_rounding,
-          stream);
-    } else {
-      invokeQuantizeMatrix(
-          quantized_input_ptr,
-          reinterpret_cast<float*>(scales.data_ptr()),
-          reinterpret_cast<const float*>(input.data_ptr()),
-          input.numel(),
-          input.size(-1),
-          stochastic_rounding,
-          stream);
-    }
-  }
-  return std::vector<at::Tensor>{quantized_input, scales};
-}
-
 template <typename T>
 __inline__ __device__ T blockAllReduceMax(T val) {
   static __shared__ T shared[32];
@@ -1288,15 +1174,6 @@ std::vector<at::Tensor> fake_quantize_nvfp4_per_tensor(
 #endif
 
 #else
-std::vector<at::Tensor> quantize_fp8_per_tensor(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub,
-    bool stochastic_rounding) { // scale upperbound
-  throw std::runtime_error(
-      "CUDA version is older than 12.0"); // requires CUDA>=12
-}
-
 std::vector<at::Tensor> quantize_fp8_per_row(
     at::Tensor input,
     std::optional<at::Tensor> bs, // batch size

@@ -15,12 +15,6 @@ at::Tensor per_tensor_quantize_i8(at::Tensor X, double scale);
 
 std::tuple<at::Tensor, at::Tensor> per_tensor_dynamic_quantize_i8(at::Tensor X);
 
-std::vector<at::Tensor> quantize_fp8_per_tensor(
-    at::Tensor input,
-    std::optional<at::Tensor> bs, // batch size
-    std::optional<at::Tensor> scale_ub, // scale upperbound
-    const bool stochastic_rounding); // whether apply stochastic rounding
-
 at::Tensor quantize_fp8_per_tensor_fixed_scale(
     at::Tensor input,
     at::Tensor scale,

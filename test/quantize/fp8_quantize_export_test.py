@@ -10,7 +10,6 @@
 import unittest
 from typing import Any, Callable, List
 
-import mslk.quantize  # noqa: F401
 import torch
 from hypothesis import given, settings, strategies as st
 from mslk.quantize.triton.fp8_quantize import (
@@ -55,7 +54,6 @@ class Fp8QuantizeExportTest(unittest.TestCase):
                 quantize_fp8_row,
                 quantize_fp8_block,
                 quantize_fp8_tensor,
-                torch.ops.mslk.quantize_fp8_per_tensor,
             ]
         ),
     )

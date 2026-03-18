@@ -33,7 +33,6 @@ from .attn_bias import (
     PagedBlockDiagonalGappyKeysMask,
     PagedBlockDiagonalPaddedKeysMask,
 )
-from .utils.cpp_lib import _built_with_cuda
 from .utils.op_common import BaseOperator
 
 
@@ -538,12 +537,6 @@ class AttentionOpBase(BaseOperator):
         dtype = d.query.dtype
         if device_type not in cls.SUPPORTED_DEVICES:
             reasons.append(f"device={device_type} (supported: {cls.SUPPORTED_DEVICES})")
-        if (
-            device_type == "cuda"
-            and not _built_with_cuda
-            and (torch.version.hip is None)
-        ):
-            reasons.append("Library not built with CUDA support")
         if device_type == "cuda" and (torch.version.hip is None):
             device_capability = torch.cuda.get_device_capability(d.device)
             if device_capability < cls.CUDA_MINIMUM_COMPUTE_CAPABILITY:
@@ -582,9 +575,7 @@ class AttentionOpBase(BaseOperator):
         if dtype is torch.bfloat16 and not supports_bf16:
             reasons.append("bf16 is only supported on A100+ GPUs and MTIA")
         if not cls.is_available():
-            reasons.append(
-                "operator wasn't built - see `python -m xformers.info` for more info"
-            )
+            reasons.append("operator wasn't built")
         if not cls.IS_DETERMINISTIC and torch.are_deterministic_algorithms_enabled():
             reasons.append(
                 "operator is non-deterministic, but `torch.use_deterministic_algorithms` is set"

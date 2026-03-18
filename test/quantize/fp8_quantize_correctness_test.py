@@ -9,7 +9,6 @@
 import unittest
 from typing import Any, Callable, List, Tuple
 
-import mslk.quantize  # noqa: F401
 import torch
 from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
@@ -80,12 +79,8 @@ TRITON_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
     (quantize_fp8_tensor, undo_tensorwise_quant),
 ]
 
-MSLK_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = [
-    (torch.ops.mslk.quantize_fp8_per_tensor, undo_tensorwise_quant),
-]
-
 ALL_QUANTIZE_OPS: List[Tuple[Callable[..., Any], Callable[..., Any]]] = (
-    TRITON_QUANTIZE_OPS + MSLK_QUANTIZE_OPS
+    TRITON_QUANTIZE_OPS
 )
 
 
