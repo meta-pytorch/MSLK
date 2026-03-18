@@ -246,7 +246,7 @@ class FwOp(AttentionFwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        if K not in [64, 128] or Kv not in [64, 128]:
+        if K not in cls._TEST_K or Kv not in cls._TEST_K:
             reasons.append(f"Embed dim {K} not supported")
         return reasons
 
@@ -333,6 +333,8 @@ class BwOp(AttentionBwOpBase):
     CUDA_MAXIMUM_COMPUTE_CAPABILITY = (9, 9)
     NAME = "cuteDSLB-hopper"
 
+    _TEST_K: List[int] = [64, 128]
+
     ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
     ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
 
@@ -377,7 +379,7 @@ class BwOp(AttentionBwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        if K not in [64, 128]:
+        if K not in cls._TEST_K:
             reasons.append(f"Embed dim {K} not supported")
         elif Mkv != 0 and Mq > Mkv:
             reasons.append(f"Only support Mq ({Mq}) <= Mk ({Mkv})")
