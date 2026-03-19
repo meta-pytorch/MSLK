@@ -23,6 +23,7 @@ from mslk.quantize.triton.fp4_quantize import (
     FP8_E4M3_MAX,
     nvfp4_quantize_stacked,
     RoundingMode,
+    triton_fake_quantize_nvfp4_per_tensor,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
     triton_rms_quantize_mx4_unpack,
@@ -256,10 +257,10 @@ class TestNVFp4Quantize:
             * 0.01
         )
 
-        xq, _ = torch.ops.mslk.fake_quantize_nvfp4_per_tensor(
+        xq, _ = triton_fake_quantize_nvfp4_per_tensor(
             x, static_scales=static_scale, scale_ub=scale_ub
         )
-        wq, _ = torch.ops.mslk.fake_quantize_nvfp4_per_tensor(
+        wq, _ = triton_fake_quantize_nvfp4_per_tensor(
             w, static_scales=static_scale, scale_ub=scale_ub
         )
         fake_quant_y = xq @ wq.T
