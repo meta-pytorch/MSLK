@@ -5316,7 +5316,7 @@ def cal_global_scale_mx4_as_nvfp4(x: torch.Tensor):
 
 def triton_quantize_nvfp4(
     x: torch.Tensor,
-    global_scale: torch.Tensor,
+    global_scale: torch.Tensor | None,
     use_e8m0_scale: bool = False,
     use_precise_math: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -5324,7 +5324,8 @@ def triton_quantize_nvfp4(
 
     Args:
         x (torch.Tensor): Input tensor to be quantized.
-        global_scale (torch.Tensor): Per-tensor scale for two-level quantization.
+        global_scale (torch.Tensor | None): Per-tensor scale for two-level quantization.
+            If None, the global scale is not applied (treated as 1.0).
         use_e8m0_scale (bool): Whether to use E8M0 for quantization. If True will mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale.
         use_precise_math (bool): Whether to use precise math for quantization.
             If disabled the kernel would multiply by the reciprocal instead of dividing when computing scales.
@@ -5364,6 +5365,11 @@ def triton_quantize_nvfp4(
     if M_PER_BLOCK != 128:
         grid = (grid[0], grid[1] + 1)
 
+    use_global_scale = global_scale is not None
+    if not use_global_scale:
+        # Pass a dummy pointer; the kernel won't load from it.
+        global_scale = x.new_empty(())
+
     triton_quantize_nvfp4_kernel[grid](
         x,
         global_scale,
@@ -5381,6 +5387,8 @@ def triton_quantize_nvfp4(
         USE_E8M0_SCALE=use_e8m0_scale,
         # pyre-ignore[6]
         USE_PRECISE_MATH=use_precise_math,
+        # pyre-ignore[6]
+        USE_GLOBAL_SCALE=use_global_scale,
     )
 
     # reshape back to original shape
@@ -5404,6 +5412,7 @@ def triton_quantize_nvfp4_kernel(
     USE_MASK: tl.constexpr,
     USE_E8M0_SCALE: tl.constexpr,
     USE_PRECISE_MATH: tl.constexpr,
+    USE_GLOBAL_SCALE: tl.constexpr,
 ):
     E4M3_EPS = 1.5258789e-05
     FP8_E4M3_MAX = 448.0
@@ -5442,7 +5451,10 @@ def triton_quantize_nvfp4_kernel(
         mask = None
         other = None
 
-    global_scale = tl.load(global_scale_ptr)  # Scalar
+    if USE_GLOBAL_SCALE:
+        global_scale = tl.load(global_scale_ptr)  # Scalar
+    else:
+        global_scale = 1.0
 
     x = tl.load(
         x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other
