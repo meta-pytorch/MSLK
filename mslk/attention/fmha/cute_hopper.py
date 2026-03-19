@@ -246,7 +246,7 @@ class FwOp(AttentionFwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        if K not in [64, 128] or Kv not in [64, 128]:
+        if K not in cls._TEST_K or Kv not in cls._TEST_K:
             reasons.append(f"Embed dim {K} not supported")
         return reasons
 
@@ -310,12 +310,17 @@ class BwOp(AttentionBwOpBase):
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
     SUPPORTED_MIN_K = FwOp.SUPPORTED_MIN_K
-    # SM90 backward does NOT support varlen (cu_seqlens) or local attention (window_size).
-    # Only non-varlen causal masks are supported.
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
         LowerTriangularMask,
         LowerTriangularFromBottomRightMask,
+        BlockDiagonalCausalFromBottomRightMask,
+        BlockDiagonalMask,
+        BlockDiagonalCausalMask,
+        LocalAttentionFromBottomRightMask,
+        LowerTriangularFromBottomRightLocalAttentionMask,
+        BlockDiagonalCausalLocalAttentionMask,
+        BlockDiagonalCausalLocalAttentionFromBottomRightMask,
     )
     SUPPORTS_ATTN_BIAS_GRAD = False
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
@@ -327,6 +332,8 @@ class BwOp(AttentionBwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = (9, 0)
     CUDA_MAXIMUM_COMPUTE_CAPABILITY = (9, 9)
     NAME = "cuteDSLB-hopper"
+
+    _TEST_K: List[int] = [64, 128]
 
     ERROR_ATOL: Mapping[torch.dtype, float] = _ERROR_ATOL
     ERROR_RTOL: Mapping[torch.dtype, float] = _ERROR_RTOL
@@ -340,8 +347,31 @@ class BwOp(AttentionBwOpBase):
             or d.value.ndim not in [4, 5]
         ):
             reasons.append("Only supports BMHK and BMGHK formats")
-        if _is_causal(d.attn_bias) and d.key.shape[1] > d.query.shape[1]:
-            reasons.append("SM90 causal requires Mq >= Mkv")
+
+            return reasons
+
+        (
+            _,
+            cu_seqlens_q,
+            _,
+            cu_seqlens_k,
+            _,
+            _,
+            _,
+        ) = _convert_input_format(d)
+
+        if isinstance(d.attn_bias, BlockDiagonalCausalMask):
+            if not _is_seqlen_q_le_seqlen_k(
+                d.attn_bias.q_seqinfo.seqstart_py,  # pyre-fixme[16]
+                d.attn_bias.k_seqinfo.seqstart_py,  # pyre-fixme[16]
+            ):
+                reasons.append("seqlens_k must be >= seqlens_q")
+
+        # SM90 top-left causal backward has a kernel limitation when Mkv > Mq
+        if _is_causal(d.attn_bias) and not _is_bottom_right(d.attn_bias):
+            if d.key.shape[1] > d.query.shape[1]:
+                reasons.append("SM90 top-left causal backward requires Mq >= Mkv")
+
         return reasons
 
     @classmethod
@@ -349,7 +379,7 @@ class BwOp(AttentionBwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        if K not in [64, 128]:
+        if K not in cls._TEST_K:
             reasons.append(f"Embed dim {K} not supported")
         elif Mkv != 0 and Mq > Mkv:
             reasons.append(f"Only support Mq ({Mq}) <= Mk ({Mkv})")
@@ -372,6 +402,8 @@ class BwOp(AttentionBwOpBase):
             _,
             _,
         ) = _convert_input_format(inp)
+
+        window_left, window_right = _window_size(inp.attn_bias)
 
         is_varlen = cu_seqlens_q is not None
         if query_ndim == 5:
@@ -396,6 +428,8 @@ class BwOp(AttentionBwOpBase):
                     max_seq_len_q=max_seq_len_q,
                     max_seq_len_k=max_seq_len_k,
                     causal=_is_causal(inp.attn_bias),
+                    window_left=window_left,
+                    window_right=window_right,
                     bottom_right=_is_bottom_right(inp.attn_bias),
                     deterministic=deterministic,
                 )
@@ -411,3 +445,15 @@ class BwOp(AttentionBwOpBase):
         grads.dk = grads.dk.reshape(dk_shape)
         grads.dv = grads.dv.reshape(dv_shape)
         return grads
+
+
+def _is_seqlen_q_le_seqlen_k(
+    cu_seqlens_q_py: List[int], cu_seqlens_k_py: List[int]
+) -> bool:
+    if len(cu_seqlens_q_py) < 2 or len(cu_seqlens_k_py) < 2:
+        return True
+    cu_seqlens_q = torch.as_tensor(cu_seqlens_q_py, dtype=torch.int, device="cpu")
+    cu_seqlens_k = torch.as_tensor(cu_seqlens_k_py, dtype=torch.int, device="cpu")
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+    return torch.all(seqlens_k >= seqlens_q).item()  # pyre-fixme[7]
