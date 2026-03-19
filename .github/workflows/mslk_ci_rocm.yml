@@ -18,6 +18,7 @@ on:
       # Workflow and CI scripts
       - '.github/scripts/generate_ci_matrix.py'
       - '.github/workflows/mslk_ci_rocm.yml'
+      - '.github/workflows/_mslk_rocm_test.yml'
       - 'ci/scripts/utils_rocm.bash'
       # CMake ROCm/HIP configuration
       - 'cmake/Hip.cmake'
