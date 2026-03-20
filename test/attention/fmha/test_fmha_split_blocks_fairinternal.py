@@ -46,6 +46,7 @@ def test_split_blocks_for_decoding():
     assert (chunked_bias.k_seqinfo.seqstart >= attn_bias.k_seqinfo.seqstart).all()
 
 
+@cuda_only
 def test_split_blocks_for_decoding_with_paged():
     torch.manual_seed(0)
     max_len_kv = 2048

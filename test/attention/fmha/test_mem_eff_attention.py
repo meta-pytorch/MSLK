@@ -313,7 +313,7 @@ def test_dropout_ck(q_len, kv_len, batch_size, k_len, p, seed, attn_bias):
 def test_dropout_backward_ck(q_len, kv_len, batch_size, k, p):
     op = fmha.ck.FwOp
     dtype = torch.float16
-    if not op.is_available():
+    if not fmha.ck.BwOp.is_available():
         if UNSUPPORTED_OP_PASSES:
             return
         pytest.skip()
@@ -614,6 +614,7 @@ def test_unsupported_stride_alignment(op: Type[fmha.AttentionFwOpBase]):
 
 
 @sm75_or_better_only
+@cuda_only
 def test_unsupported_dropout_combine_flash_cutlass() -> None:
     q = torch.empty(
         [1, 4, 1, 16], device="cuda", dtype=torch.float16, requires_grad=True
@@ -1890,6 +1891,10 @@ def paged_attention_run_inner(
 def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
     torch.manual_seed(0)
     if op is not None and not op[0].is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
+        pytest.skip("Op is not available")
+    if (not not torch.version.hip) and not fmha.ck.BwOp.is_available():
         if UNSUPPORTED_OP_PASSES:
             return
         pytest.skip("Op is not available")

@@ -22,6 +22,7 @@ from mslk.attention.fmha.merge_training import (
 
 from .utils import (
     assert_allclose,
+    cuda_only,
     disable_on_rocm,
     sm80_or_better_only,
     UNSUPPORTED_OP_PASSES,
@@ -479,6 +480,7 @@ def test_merge_attentions_sharedinput(
     )
 
 
+@cuda_only
 @sm80_or_better_only
 @pytest.mark.parametrize("bmghk", (False, True))
 def test_merge_attentions_against_ref(bmghk: bool):
@@ -685,6 +687,7 @@ def test_merge_training_zilch():
 
 
 @sm80_or_better_only
+@cuda_only
 def test_merge_training_undilate():
     torch.manual_seed(1)
 
