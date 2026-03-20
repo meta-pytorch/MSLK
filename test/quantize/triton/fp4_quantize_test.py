@@ -284,6 +284,7 @@ class TestNVFp4Quantize:
             (4000, 4096),  # large matrix with m padding
             (4096, 4080),  # large square matrix with n padding
             (4000, 4080),  # large square matrix with m and n padding
+            (147456, 15360),  # > int32 addressing
         ],
     )
     @pytest.mark.parametrize("use_global_scale", [True, False])
