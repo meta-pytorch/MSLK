@@ -136,7 +136,14 @@ if [[ ${CHANNEL} == "" ]]; then
   export CHANNEL="nightly"
 fi
 
+################################################################################
+# Build the wheel
+#
+# The build is performed in the pre-script stage of the build workflow since we
+# have no control over the invocation of setup.py in the actual build stage.
+################################################################################
+
+build_mslk_package "${BUILD_ENV_NAME}" "${CHANNEL}" "${mslk_build_target}/${mslk_build_variant}"
 end_time=$(date +%s)
 runtime=$((end_time-start_time))
-start_time=${end_time}
-echo "[NOVA] Time taken to prepare to build the package: ${runtime} seconds / $(display_time ${runtime})"
+echo "[NOVA] Time taken to build the package: ${runtime} seconds / $(display_time ${runtime})"
