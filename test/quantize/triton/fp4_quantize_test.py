@@ -23,6 +23,7 @@ from mslk.quantize.triton.fp4_quantize import (
     FP8_E4M3_MAX,
     nvfp4_quantize_stacked,
     RoundingMode,
+    triton_fake_quantize_nvfp4_per_tensor,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
     triton_rms_quantize_mx4_unpack,
@@ -256,10 +257,10 @@ class TestNVFp4Quantize:
             * 0.01
         )
 
-        xq, _ = torch.ops.mslk.fake_quantize_nvfp4_per_tensor(
+        xq, _ = triton_fake_quantize_nvfp4_per_tensor(
             x, static_scales=static_scale, scale_ub=scale_ub
         )
-        wq, _ = torch.ops.mslk.fake_quantize_nvfp4_per_tensor(
+        wq, _ = triton_fake_quantize_nvfp4_per_tensor(
             w, static_scales=static_scale, scale_ub=scale_ub
         )
         fake_quant_y = xq @ wq.T
@@ -285,23 +286,29 @@ class TestNVFp4Quantize:
             (4000, 4080),  # large square matrix with m and n padding
         ],
     )
-    def test_numerical_correctness(self, problem_shape):
+    @pytest.mark.parametrize("use_global_scale", [True, False])
+    def test_numerical_correctness(self, problem_shape, use_global_scale):
         """
         Quantize against torch NVFP4 reference and compare for numerical correctness.
+        When use_global_scale is False, quantize without global scale.
         """
         torch.manual_seed(0)
         M, N = problem_shape
         x = torch.randn(M, N, dtype=torch.bfloat16, device=self.device)
 
-        x_global_scale = global_scale_nvfp4(x)
+        if use_global_scale:
+            x_global_scale = global_scale_nvfp4(x)
+        else:
+            x_global_scale = None
+
         x_fp4, x_scales = triton_quantize_nvfp4(x, x_global_scale)
         x_fp4_ref, x_scales_ref, x_global_scale_ref = data_to_nvfp4_with_global_scale(
-            x, 16
+            x, 16, skip_global_scale=not use_global_scale
         )
-        # Compare the scales with padding to ensure the padding zero'd out.
         x_scales_ref = _to_blocked(x_scales_ref).view(x_scales.shape)
 
-        torch.testing.assert_close(x_global_scale, x_global_scale_ref.reciprocal())
+        if use_global_scale:
+            torch.testing.assert_close(x_global_scale, x_global_scale_ref.reciprocal())
         assert torch.equal(x_scales, x_scales_ref)
         assert torch.equal(x_fp4, x_fp4_ref)
 
@@ -389,21 +396,24 @@ class TestNVFp4RmsQuantize:
 
 
 # When the below functions is added to Torch core, remove it and use it there instead.
-def data_to_nvfp4_with_global_scale(x, block_size):
+def data_to_nvfp4_with_global_scale(x, block_size, skip_global_scale=False):
     # Simple (slow) reference implementation of NVFP4 two-level-scaling
     orig_shape = x.shape
     x = x.reshape(-1, block_size).to(torch.float32)
 
+    if skip_global_scale:
+        S_enc = torch.tensor(1.0, dtype=torch.float32)
+    else:
+        # Per-tensor max
+        global_max = x.abs().max()
+        assert global_max.dtype == torch.float32
+
+        # Global encoding scale for block-scales
+        S_enc = (FP8_E4M3_MAX * FP4_E2M1_MAX) / global_max
+
     # Per-block-amax
     block_max = torch.amax(torch.abs(x), 1) + 1e-12
 
-    # Per-tensor max
-    global_max = x.abs().max()
-    assert global_max.dtype == torch.float32
-
-    # Constants
-    # Global encoding scale for block-scales
-    S_enc = (FP8_E4M3_MAX * FP4_E2M1_MAX) / global_max
     S_dec = 1.0 / S_enc
 
     # Per-block decode-scale

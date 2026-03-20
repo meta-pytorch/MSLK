@@ -28,10 +28,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "quantize_fp8_per_tensor_fixed_scale(Tensor input, Tensor scale, Tensor? bs=None, bool stochatic_rounding=False) -> Tensor");
   m.def("per_tensor_quantize_i8(Tensor X, float scale) -> Tensor");
   m.def("per_tensor_dynamic_quantize_i8(Tensor X) -> (Tensor, Tensor)");
-#ifndef USE_ROCM
-  m.def(
-      "fake_quantize_nvfp4_per_tensor(Tensor input, Tensor? static_scales=None, Tensor? bs=None, Tensor? scale_ub=None) -> Tensor[]");
-#endif
 }
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
@@ -42,11 +38,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   DISPATCH_TO_CUDA(
       "quantize_fp8_per_tensor_fixed_scale",
       quantize_fp8_per_tensor_fixed_scale);
-
-#ifndef USE_ROCM
-  DISPATCH_TO_CUDA(
-      "fake_quantize_nvfp4_per_tensor", fake_quantize_nvfp4_per_tensor);
-#endif
 }
 
 } // namespace mslk::quantize
