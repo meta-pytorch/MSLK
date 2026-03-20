@@ -9,6 +9,8 @@ from typing import Any, List, Type, TypeVar
 
 import torch
 
+from . import cpp_lib as _cpp_lib  # noqa: F401 -- loads _C_hip native extension
+
 
 def get_operator(library: str, name: str):
     def no_such_operator(*args, **kwargs):
