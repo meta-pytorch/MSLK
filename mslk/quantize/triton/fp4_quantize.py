@@ -5370,6 +5370,9 @@ def triton_quantize_nvfp4(
         # Pass a dummy pointer; the kernel won't load from it.
         global_scale = x.new_empty(())
 
+    # Use int64 indexing when pointer offsets can exceed INT32_MAX
+    use_int64_indexing = M * N > 2**31 - 1
+
     triton_quantize_nvfp4_kernel[grid](
         x,
         global_scale,
@@ -5389,6 +5392,8 @@ def triton_quantize_nvfp4(
         USE_PRECISE_MATH=use_precise_math,
         # pyre-ignore[6]
         USE_GLOBAL_SCALE=use_global_scale,
+        # pyre-ignore[6]
+        USE_INT64_INDEXING=use_int64_indexing,
     )
 
     # reshape back to original shape
@@ -5413,6 +5418,7 @@ def triton_quantize_nvfp4_kernel(
     USE_E8M0_SCALE: tl.constexpr,
     USE_PRECISE_MATH: tl.constexpr,
     USE_GLOBAL_SCALE: tl.constexpr,
+    USE_INT64_INDEXING: tl.constexpr,
 ):
     E4M3_EPS = 1.5258789e-05
     FP8_E4M3_MAX = 448.0
@@ -5444,6 +5450,10 @@ def triton_quantize_nvfp4_kernel(
 
     offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
     offs_n = pid_n * 64 + tl.arange(0, 64)[None, :]
+    if USE_INT64_INDEXING:
+        offs_m = offs_m.to(tl.int64)
+        offs_n = offs_n.to(tl.int64)
+
     if USE_MASK:
         mask = (offs_m < M) & (offs_n < N)
         other = 0.0
@@ -5456,9 +5466,8 @@ def triton_quantize_nvfp4_kernel(
     else:
         global_scale = 1.0
 
-    x = tl.load(
-        x_ptr + offs_m * stride_xm + offs_n * stride_xn, mask=mask, other=other
-    )  # [M_PER_BLOCK, 64]
+    load_offsets = offs_m * stride_xm + offs_n * stride_xn
+    x = tl.load(x_ptr + load_offsets, mask=mask, other=other)  # [M_PER_BLOCK, 64]
     x_blocks = x.to(tl.float32).reshape(M_PER_BLOCK, 4, 16)  # [M_PER_BLOCK, 4, 16]
 
     # Block-wise max
@@ -5519,7 +5528,13 @@ def triton_quantize_nvfp4_kernel(
         mask = (offs_m < M) & (offs_n < N // 2)
     else:
         mask = None
-    tl.store(q_ptr + offs_m * (N // 2) + offs_n, x_fp4x2, mask=mask)
+
+    if USE_INT64_INDEXING:
+        offs_m = offs_m.to(tl.int64)
+        offs_n = offs_n.to(tl.int64)
+
+    store_offsets = offs_m * (N // 2) + offs_n
+    tl.store(q_ptr + store_offsets, x_fp4x2, mask=mask)
 
 
 @triton.jit
