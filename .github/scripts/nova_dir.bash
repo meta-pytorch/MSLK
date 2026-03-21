@@ -9,7 +9,15 @@
 MSLK_DIR="/__w/MSLK/MSLK"
 export MSLK_REPO="${MSLK_DIR}/${REPOSITORY}"
 
-export BUILD_FROM_NOVA=0
+################################################################################
+# Because we have a custom setup.py with extra flags, we have to do clean /
+# build_wheel during the pre-script stage, since we have no control over the
+# invocation of setup.py in the Nova build stage.
+#
+# As such, set the flag here so that setup.py will skip these steps in Nova
+# workflow in the build stage.
+################################################################################
+export BUILD_FROM_NOVA=1
 
 # Disable HIP FMHA build in the manywheel CI (the runner is too small)
 export MSLK_BUILD_HIP_FMHA=0
