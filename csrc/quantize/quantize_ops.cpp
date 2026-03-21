@@ -7,7 +7,6 @@
  */
 
 #include <mslk/quantize/quantize.h> // @manual
-#include <mslk/utils/torch/op_registration.h> // @manual
 #include <torch/library.h>
 
 namespace mslk::quantize {
@@ -31,11 +30,10 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 }
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
-  DISPATCH_TO_CUDA("per_tensor_quantize_i8", per_tensor_quantize_i8);
-  DISPATCH_TO_CUDA(
-      "per_tensor_dynamic_quantize_i8", per_tensor_dynamic_quantize_i8);
-  DISPATCH_TO_CUDA("get_fp8_per_tensor_scale", get_fp8_per_tensor_scale);
-  DISPATCH_TO_CUDA(
+  m.impl("per_tensor_quantize_i8", per_tensor_quantize_i8);
+  m.impl("per_tensor_dynamic_quantize_i8", per_tensor_dynamic_quantize_i8);
+  m.impl("get_fp8_per_tensor_scale", get_fp8_per_tensor_scale);
+  m.impl(
       "quantize_fp8_per_tensor_fixed_scale",
       quantize_fp8_per_tensor_fixed_scale);
 }
