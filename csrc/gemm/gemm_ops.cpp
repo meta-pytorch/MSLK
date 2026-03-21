@@ -8,7 +8,6 @@
 
 #include <mslk/gemm/gemm.h> // @manual
 #include <mslk/gemm/gemm_torch.h> // @manual
-#include <mslk/utils/torch/op_registration.h> // @manual
 #include <torch/library.h>
 
 namespace mslk::gemm {
