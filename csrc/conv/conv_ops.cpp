@@ -7,7 +7,6 @@
  */
 
 #include <mslk/conv/conv.h> // @manual
-#include <mslk/utils/torch/op_registration.h> // @manual
 #include <torch/library.h>
 
 namespace mslk::conv {

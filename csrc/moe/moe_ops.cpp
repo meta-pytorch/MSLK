@@ -8,7 +8,6 @@
 
 #include <ATen/ATen.h>
 #include <mslk/moe/moe.h> // @manual
-#include <mslk/utils/torch/op_registration.h> // @manual
 #include <torch/library.h>
 #include <cstdint>
 #include <optional>
@@ -31,9 +30,9 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 }
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
-  DISPATCH_TO_CUDA("index_shuffling", index_shuffling_torch);
+  m.impl("index_shuffling", index_shuffling_torch);
 #ifndef USE_ROCM
-  DISPATCH_TO_CUDA("scatter_add_along_first_dim", scatter_add_along_first_dim);
+  m.impl("scatter_add_along_first_dim", scatter_add_along_first_dim);
 #endif
 }
 
@@ -62,10 +61,9 @@ void scatter_add_along_first_dim_meta(
 }
 
 TORCH_LIBRARY_IMPL(mslk, Meta, m) {
-  DISPATCH_TO_META("index_shuffling", index_shuffling_torch_meta);
+  m.impl("index_shuffling", index_shuffling_torch_meta);
 #ifndef USE_ROCM
-  DISPATCH_TO_META(
-      "scatter_add_along_first_dim", scatter_add_along_first_dim_meta);
+  m.impl("scatter_add_along_first_dim", scatter_add_along_first_dim_meta);
 #endif
 }
 
