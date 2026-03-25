@@ -72,6 +72,7 @@ def run_benchmark(
     from mslk.fb.mslk.attention.flash_attn.autograd_interface import flash_attn_func
     from mslk.attention.sparse_attn.compress import compress_kv
     from mslk.attention.sparse_attn.gating import compute_gates, gate_and_combine
+    from mslk.attention.sparse_attn.gating import fused_gate_and_combine
     from mslk.attention.sparse_attn.nsa_forward import nsa_forward
     from mslk.attention.sparse_attn.select import score_and_select_blocks
     from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
@@ -157,13 +158,26 @@ def run_benchmark(
         warmup=warmup, repeat=repeat,
     )
 
-    # Gating
+    # Gating (gate_and_combine only)
     O_cmp = torch.randn_like(Q)
     O_slc = torch.randn_like(Q)
     O_sld = torch.randn_like(Q)
     gates = torch.randn(B, N, H, 3, device="cuda", dtype=dtype)
     gate_ms = benchmark_fn(
         lambda: gate_and_combine(O_cmp, O_slc, O_sld, gates),
+        warmup=warmup, repeat=repeat,
+    )
+
+    # Gating (compute_gates only)
+    gate_proj_weight = torch.randn(H, 3, D, device="cuda", dtype=dtype)
+    compute_gates_ms = benchmark_fn(
+        lambda: compute_gates(Q, gate_proj_weight),
+        warmup=warmup, repeat=repeat,
+    )
+
+    # Fused gating (compute_gates + gate_and_combine in one kernel)
+    fused_gate_ms = benchmark_fn(
+        lambda: fused_gate_and_combine(Q, O_cmp, O_slc, O_sld, gate_proj_weight),
         warmup=warmup, repeat=repeat,
     )
 
@@ -185,6 +199,8 @@ def run_benchmark(
         "fa4_slc_ms": fa4_slc_ms,
         "fa4_sld_ms": fa4_sld_ms,
         "gate_ms": gate_ms,
+        "compute_gates_ms": compute_gates_ms,
+        "fused_gate_ms": fused_gate_ms,
     }
 
 
@@ -214,7 +230,7 @@ def main():
         f"{'N':>8} | {'Dense(ms)':>10} {'TFLOPS':>8} | "
         f"{'NSA(ms)':>10} {'TFLOPS':>8} | {'Speedup':>8} {'Theory':>8} | "
         f"{'Cmp':>6} {'Sel':>6} {'Mask':>6} "
-        f"{'FA4c':>6} {'FA4s':>6} {'FA4w':>6} {'Gate':>6}"
+        f"{'FA4c':>6} {'FA4s':>6} {'FA4w':>6} {'Gate':>6} {'CmpG':>6} {'Fuse':>6}"
     )
     print(header)
     print("-" * len(header))
@@ -240,7 +256,8 @@ def main():
             f"{result['compress_ms']:>6.2f} {result['select_ms']:>6.2f} "
             f"{result['mask_ms']:>6.2f} {result['fa4_cmp_ms']:>6.2f} "
             f"{result['fa4_slc_ms']:>6.2f} {result['fa4_sld_ms']:>6.2f} "
-            f"{result['gate_ms']:>6.2f}"
+            f"{result['gate_ms']:>6.2f} {result['compute_gates_ms']:>6.2f} "
+            f"{result['fused_gate_ms']:>6.2f}"
         )
 
     print(f"{'='*100}")
