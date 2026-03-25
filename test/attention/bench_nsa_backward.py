@@ -3,9 +3,14 @@
 """Benchmark NSA forward + backward at various sequence lengths."""
 
 import gc
+import os
 import time
 
 import torch
+
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+)
 
 
 def benchmark_nsa_fwd_bwd(
@@ -49,6 +54,21 @@ def benchmark_nsa_fwd_bwd(
             K.grad = None
             V.grad = None
         return out
+
+    # Warmup — compile kernels at a smaller size first to avoid
+    # CuTe DSL JIT compilation at the target size consuming all memory
+    if N >= 262144:
+        small_N = 1024
+        Q_small = torch.randn(B, small_N, H, D, device="cuda", dtype=torch.bfloat16)
+        K_small = torch.randn(B, small_N, H_kv, D, device="cuda", dtype=torch.bfloat16)
+        V_small = torch.randn(B, small_N, H_kv, D, device="cuda", dtype=torch.bfloat16)
+        _ = nsa(Q_small, K_small, V_small,
+                compress_block_size=compress_block_size,
+                num_selected_blocks=num_selected_blocks,
+                window_size=window_size)
+        del Q_small, K_small, V_small, _
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # Warmup
     for _ in range(warmup):
