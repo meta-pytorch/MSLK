@@ -34,48 +34,60 @@ All three branches now use FA4 CuteDSL kernels for both forward and backward.
   `False`, producing incorrect non-causal, non-windowed gradients.
 - Fixed by using FA4 backward with explicit `window_size_left`.
 
-## Performance (GB200, B=1, H=32, H_kv=8, D=128)
+## Performance (B200, B=1, H=32, H_kv=8, D=128)
+
+Measured on NVIDIA B200 (178 GiB), devgpu016.snb3, 2026-03-25.
 
 ### Forward: NSA vs Dense FA4
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 4K | 0.26ms | 2.48ms | 0.11x |
-| 8K | 0.53ms | 2.57ms | 0.21x |
-| 16K | 1.54ms | 4.09ms | 0.38x |
-| 32K | 5.47ms | 6.09ms | 0.90x |
-| **64K** | **24.02ms** | **10.31ms** | **2.33x** |
-| 128K | 100.17ms | 23.89ms | 4.19x |
-| 256K | 400.45ms | 62.83ms | 6.37x |
-| 512K | 1589.36ms | 187.37ms | 8.48x |
-| **1M** | **6356.49ms** | **623.98ms** | **10.19x** |
+| 1K | 0.09ms | 0.91ms | 0.10x |
+| 2K | 0.10ms | 1.02ms | 0.10x |
+| 4K | 0.17ms | 1.28ms | 0.13x |
+| 8K | 0.48ms | 1.77ms | 0.27x |
+| 16K | 1.74ms | 2.84ms | 0.61x |
+| **32K** | **6.93ms** | **5.27ms** | **1.32x** |
+| 64K | 30.61ms | 11.22ms | 2.73x |
+| 128K | 121.16ms | 27.09ms | 4.47x |
+| 256K | 485.24ms | 74.81ms | 6.49x |
+| 512K | 1939.75ms | 226.35ms | 8.57x |
+| **1M** | **7816.42ms** | **772.59ms** | **10.12x** |
+| 2M | 31604.78ms | OOM | — |
+| 3M | 72051.59ms | OOM | — |
 
-Crossover at ~32K tokens.
+Forward crossover at ~25K tokens.
 
-### Backward (fwd+bwd)
+### Forward + Backward: NSA vs Dense FA4
 
-| Seq Length | fwd+bwd |
-|-----------|---------|
-| 1K | 3.60ms |
-| 8K | 3.69ms |
-| 32K | 13.04ms |
-| 64K | 28.50ms |
-| 128K | 67.64ms |
-| 256K | 178.69ms |
-| 512K | 537.54ms |
-| **1M** | **1787.53ms** |
-| 2M+ | OOM (CuTe DSL compilation cache) |
+| Seq Length | Dense FA4 | NSA | Speedup |
+|-----------|----------|-----|---------|
+| 1K | 0.41ms | 2.42ms | 0.17x |
+| 2K | 0.44ms | 2.34ms | 0.19x |
+| 4K | 0.68ms | 2.63ms | 0.26x |
+| 8K | 1.85ms | 4.28ms | 0.43x |
+| 16K | 6.31ms | 7.62ms | 0.83x |
+| **32K** | **27.37ms** | **15.45ms** | **1.77x** |
+| 64K | 108.85ms | 34.31ms | 3.17x |
+| 128K | 418.86ms | 86.48ms | 4.84x |
+| 256K | 1669.69ms | 236.09ms | 7.07x |
+| 512K | 6644.73ms | 695.13ms | 9.56x |
+| **1M** | **26581.04ms** | **2309.82ms** | **11.51x** |
+| 2M | 106785.33ms | OOM | — |
 
-### Forward Component Breakdown (profiled on GB200)
+Fwd+bwd crossover at ~20K tokens (lower than forward-only because
+dense backward is O(N^2) while NSA backward stays sub-quadratic).
 
-At N=16K (where NSA is ~2.7x slower than dense):
+### Forward Component Breakdown (profiled on B200)
+
+At N=16K (where NSA is ~1.6x slower than dense):
 - Mask construction: 20% (PyTorch op launch overhead)
 - Block selection: 18%
 - Gating: 17%
 - 3x FA4 attention: 34%
 - Compression: 12%
 
-At N=128K (where NSA is 4.2x faster than dense):
+At N=128K (where NSA is 4.5x faster than dense):
 - FA4 compressed attention: 33%
 - Gating: 22%
 - FA4 selected attention: 18%
@@ -86,19 +98,21 @@ At N=128K (where NSA is 4.2x faster than dense):
 
 ## 2M/3M Context Limit
 
-On this GB200 (184 GiB), CuTe DSL JIT compilation cache consumes ~170 GiB,
-leaving only ~14 GiB for computation. Both forward and backward OOM at 2M.
-The forward was previously benchmarked at 2M/3M on a machine with more
-GPU memory. The backward pass itself has no architectural limit beyond
-the forward's — all three branches use FA4 tiled kernels with O(1) memory
-per tile.
+On the B200 (178 GiB), CuTe DSL JIT compilation cache consumes ~165 GiB,
+leaving only ~13 GiB for computation. NSA OOMs at 2M for both forward and
+backward. Dense FA4 can run at 2M (31.6s fwd, 106.8s fwd+bwd) and 3M
+(72.1s fwd) since it has a single kernel with lower JIT cache footprint.
+The NSA backward pass itself has no architectural limit beyond the
+forward's — all three branches use FA4 tiled kernels with O(1) memory
+per tile. The OOM is purely a JIT cache issue.
 
 ## Next Steps
 
-### 1. Test on Larger GPU (immediate)
-Run on a machine with more GPU memory (or fewer CuTe DSL kernel variants
-compiled) to verify 2M/3M backward works. The backward should scale
-identically to the forward since both use the same FA4 kernels.
+### 1. Reduce CuTe DSL JIT Cache Footprint
+NSA compiles many more kernel variants than dense FA4 (3 attention
+branches x fwd/bwd + compress + select + gating). Reducing the number
+of compiled variants or sharing JIT cache across branches would unlock
+2M+ contexts.
 
 ### 2. Submit FA4 Block-Sparse Backward Fix Upstream
 The one-line fix in `flash_bwd_sm100.py` (missing `is_leader_cta` argument)
