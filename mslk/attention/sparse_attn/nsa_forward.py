@@ -143,9 +143,9 @@ def _fa4_fwd_simple(
 
 
 def nsa_forward(
-    Q: Tensor,  # (B, N, H, D)
-    K: Tensor,  # (B, N, H_kv, D)
-    V: Tensor,  # (B, N, H_kv, D)
+    Q: Tensor,  # (B, N, H, D) or (total_tokens, H, D) for varlen
+    K: Tensor,  # (B, N, H_kv, D) or (total_tokens, H_kv, D)
+    V: Tensor,  # (B, N, H_kv, D) or (total_tokens, H_kv, D)
     compress_block_size: int = 64,
     num_selected_blocks: int = 16,
     window_size: int = 512,
@@ -156,19 +156,19 @@ def nsa_forward(
     softmax_scale: float | None = None,
     q_tile_size: int = 256,
     n_block_size: int = 128,
+    cu_seqlens: Tensor | None = None,  # (batch_size + 1,) int32 for varlen
+    max_seqlen: int | None = None,
 ) -> Tensor:
     """NSA forward pass using FA4 for all attention branches.
 
-    Orchestrates:
-    1. KV compression (mean-pool + optional projection)
-    2. Block scoring and top-k selection
-    3. Three FA4 calls: compressed, selected (block-sparse), sliding window
-    4. Gating and combination
+    Supports both fixed-length (4D) and variable-length (3D + cu_seqlens) inputs.
+    For varlen, sequences are padded to max_seqlen internally (FA4 block_sparsity
+    does not yet support varlen natively).
 
     Args:
-        Q: Query tensor, shape (B, N, H, D).
-        K: Key tensor, shape (B, N, H_kv, D).
-        V: Value tensor, shape (B, N, H_kv, D).
+        Q: Query tensor, (B, N, H, D) or (total_tokens, H, D) for varlen.
+        K: Key tensor, (B, N, H_kv, D) or (total_tokens, H_kv, D).
+        V: Value tensor, (B, N, H_kv, D) or (total_tokens, H_kv, D).
         compress_block_size: Number of KV positions per block for compression.
         num_selected_blocks: Number of KV blocks to select per query tile.
         window_size: Sliding window size (left window, causal).
@@ -177,12 +177,60 @@ def nsa_forward(
         gate_proj_weight: Gate projection weights, shape (H, 3, D).
         causal: Whether to use causal masking.
         softmax_scale: Attention scaling factor (default: 1/sqrt(D)).
-        q_tile_size: Query tile size for block selection (FA4 CTA tile: 2*128=256).
+        q_tile_size: Query tile size for block selection.
         n_block_size: FA4 KV block size (128 for SM100).
+        cu_seqlens: Cumulative sequence lengths, shape (B+1,) int32 for varlen.
+        max_seqlen: Maximum sequence length for varlen padding.
 
     Returns:
-        Output tensor, shape (B, N, H, D).
+        Output tensor, same shape as Q.
     """
+    is_varlen = cu_seqlens is not None
+
+    if is_varlen:
+        # Varlen: pad 3D → 4D, run fixed-length NSA, unpad
+        assert Q.dim() == 3, f"Varlen requires 3D input, got {Q.dim()}D"
+        H = Q.shape[1]
+        H_kv = K.shape[1]
+        D_dim = Q.shape[2]
+        batch_size = cu_seqlens.shape[0] - 1
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
+        if max_seqlen is None:
+            max_seqlen = max(seqlens)
+        # Pad to nearest multiple of q_tile_size
+        pad_N = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
+
+        Q_pad = Q.new_zeros(batch_size, pad_N, H, D_dim)
+        K_pad = K.new_zeros(batch_size, pad_N, H_kv, D_dim)
+        V_pad = V.new_zeros(batch_size, pad_N, H_kv, D_dim)
+        for i, slen in enumerate(seqlens):
+            s = cu_seqlens[i].item()
+            Q_pad[i, :slen] = Q[s : s + slen]
+            K_pad[i, :slen] = K[s : s + slen]
+            V_pad[i, :slen] = V[s : s + slen]
+
+        O_pad = nsa_forward(
+            Q_pad, K_pad, V_pad,
+            compress_block_size=compress_block_size,
+            num_selected_blocks=num_selected_blocks,
+            window_size=window_size,
+            W_k_compress=W_k_compress,
+            W_v_compress=W_v_compress,
+            gate_proj_weight=gate_proj_weight,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            q_tile_size=q_tile_size,
+            n_block_size=n_block_size,
+        )
+
+        O = Q.new_zeros(Q.shape[0], H, D_dim)
+        for i, slen in enumerate(seqlens):
+            s = cu_seqlens[i].item()
+            O[s : s + slen] = O_pad[i, :slen]
+        return O
+
+    # Fixed-length path
     B, N, H, D = Q.shape
 
     if softmax_scale is None:
