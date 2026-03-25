@@ -36,7 +36,14 @@ class TestBenchmark:
         from mslk.fb.mslk.attention.flash_attn.autograd_interface import flash_attn_func
         from mslk.attention.sparse_attn.nsa_forward import nsa_forward
 
-        B, H, H_kv, D = 2, 32, 32, 128
+        # Scale down dimensions for large N to avoid OOM when GPU memory is
+        # shared across parallel test processes.
+        if N >= 65536:
+            B, H, H_kv, D = 1, 8, 8, 128
+        elif N >= 32768:
+            B, H, H_kv, D = 1, 32, 32, 128
+        else:
+            B, H, H_kv, D = 2, 32, 32, 128
         dtype = torch.bfloat16
 
         Q = torch.randn(B, N, H, D, device="cuda", dtype=dtype)
