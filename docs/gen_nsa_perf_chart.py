@@ -17,9 +17,9 @@ def main():
     dense_fwd_ms = [0.12, 0.26, 0.26, 0.53, 1.54, 5.47, 24.02, 100.17, 400.45, 1589.36, 6356.49]
     nsa_fwd_ms = [1.54, 2.54, 2.48, 2.57, 4.09, 6.09, 10.31, 23.89, 62.83, 187.37, 623.98]
 
-    # NSA fwd+bwd
-    nsa_bwd_seq = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288]
-    nsa_fwdbwd_ms = [5.77, 7.98, 12.60, 22.25, 40.29, 77.73, 156.98, 327.90, 722.12, 1661.73]
+    # NSA fwd+bwd (all FA4 CuteDSL)
+    nsa_bwd_seq = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
+    nsa_fwdbwd_ms = [4.77, 4.71, 4.80, 5.01, 6.65, 13.06, 28.48, 67.50, 177.82, 536.55, 1785.84]
     nsa_bwd_only_ms = [fb - f for f, fb in zip(nsa_fwd_ms[: len(nsa_bwd_seq)], nsa_fwdbwd_ms)]
 
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
@@ -53,7 +53,7 @@ def main():
                 arrowprops=dict(arrowstyle="->", color="black"))
 
     ax = axes[2]
-    bar_labels = ["1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K"]
+    bar_labels = ["1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K", "256K", "512K", "1M"]
     x = np.arange(len(bar_labels))
     fwd_vals = nsa_fwd_ms[: len(nsa_bwd_seq)]
     ax.bar(x, fwd_vals, 0.4, label="Forward", color="#2ca02c", alpha=0.8)
@@ -66,7 +66,7 @@ def main():
     ax.legend(fontsize=11)
     ax.set_yscale("log")
     ax.grid(True, alpha=0.3, which="both", axis="y")
-    ax.annotate("OOM at 1M\n(FA4 block-sparse\nbwd needed)", xy=(9.5, 1500), fontsize=9, color="#d62728",
+    ax.annotate("OOM at 2M\n(input tensor size)", xy=(10.5, 1500), fontsize=9, color="#d62728",
                 ha="center", style="italic")
 
     plt.suptitle("NSA Sparse Attention Performance — GB200 (B=1, H=32, H_kv=8, D=128)",
