@@ -530,18 +530,59 @@ class NSAFunction(torch.autograd.Function):
         dK_slc = dK_slc_full.transpose(1, 2).to(K.dtype)
         dV_slc = dV_slc_full.transpose(1, 2).to(V.dtype)
 
-        # Branch 3: Sliding window backward
-        dQ_sld, dK_sld, dV_sld = _attn_bwd_pytorch(
-            Q,
-            K,
-            V,
-            O_sld,
-            dO_sld,
-            lse_sld,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=window_size,
-        )
+        # Branch 3: Sliding window backward — use PyTorch SDPA which has
+        # built-in memory-efficient backward (no N×N materialization).
+        # We recompute forward + backward together via SDPA's autograd.
+        H_kv_sld = K.shape[2]
+        groups_sld = H_size // H_kv_sld
+        q_sld = Q.float()
+        k_sld = K.float()
+        v_sld = V.float()
+
+        # SDPA needs (B, H, N, D) layout
+        q_sld_t = q_sld.transpose(1, 2)  # (B, H, N, D)
+        k_sld_t = k_sld.transpose(1, 2)  # (B, H_kv, N, D)
+        v_sld_t = v_sld.transpose(1, 2)
+
+        # Expand for GQA
+        if groups_sld > 1:
+            k_sld_t = k_sld_t.repeat_interleave(groups_sld, dim=1)
+            v_sld_t = v_sld_t.repeat_interleave(groups_sld, dim=1)
+
+        # Enable grad for SDPA backward
+        q_sld_t.requires_grad_(True)
+        k_sld_t.requires_grad_(True)
+        v_sld_t.requires_grad_(True)
+
+        # Build causal+window mask via attn_mask
+        # For sliding window: each query attends to [q_pos - window + 1, q_pos]
+        with torch.enable_grad():
+            O_sld_recomputed = torch.nn.functional.scaled_dot_product_attention(
+                q_sld_t,
+                k_sld_t,
+                v_sld_t,
+                is_causal=causal and window_size is None,
+                scale=softmax_scale,
+            )
+            # Get dO in the right layout
+            dO_sld_t = dO_sld.transpose(1, 2).float()
+            O_sld_recomputed.backward(dO_sld_t)
+
+        dQ_sld = q_sld_t.grad.transpose(1, 2).to(Q.dtype)
+        dk_sld_t = k_sld_t.grad
+        dv_sld_t = v_sld_t.grad
+
+        # Handle GQA: sum across head groups for dK, dV
+        if groups_sld > 1:
+            dk_sld_t = dk_sld_t.reshape(B_size, H_kv_sld, groups_sld, N_size, D).sum(
+                dim=2
+            )
+            dv_sld_t = dv_sld_t.reshape(B_size, H_kv_sld, groups_sld, N_size, D).sum(
+                dim=2
+            )
+
+        dK_sld = dk_sld_t.transpose(1, 2).to(K.dtype)
+        dV_sld = dv_sld_t.transpose(1, 2).to(V.dtype)
 
         # --- Stage 3: Compression backward ---
         # dK_cmp, dV_cmp are gradients w.r.t. compressed KV
