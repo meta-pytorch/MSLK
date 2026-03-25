@@ -114,6 +114,7 @@ def _fa4_bwd(
     window_size_right: int | None = None,
     block_sparse_tensors=None,
     mask_mod: Callable | None = None,
+    aux_tensors: list[Tensor] | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Call FA4's backward pass (low-level, supports block sparsity and mask_mod).
 
@@ -146,8 +147,7 @@ def _fa4_bwd(
         window_size_right=window_size_right,
         block_sparse_tensors=block_sparse_tensors,
         mask_mod=mask_mod,
-        # Disable 2-CTA mode for block sparsity compatibility
-        num_threads=128 if block_sparse_tensors is not None else 256,
+        aux_tensors=aux_tensors,
     )
     return dq, dk, dv
 
@@ -369,11 +369,35 @@ class NSAFunction(torch.autograd.Function):
             mask_mod=compressed_mask,
         )
 
-        # For the selected branch backward, skip block sparsity since FA4's
-        # backward block-sparse path has compatibility issues on SM100.
-        # Using causal-only (no block sparsity) with the forward's LSE is correct
-        # because the LSE already encodes the block selection — non-selected blocks
-        # get near-zero attention weights in the backward.
+        # For the selected branch backward, use mask_mod to implement block
+        # selection. This avoids FA4's block_sparse_tensors backward path which
+        # has 2-CTA compatibility issues on SM100. The mask_mod checks if each
+        # (q_idx, kv_idx) pair falls within a selected block, using the block
+        # indices passed as aux_tensors.
+        block_indices = ctx.block_indices
+        q_tile_size = ctx.q_tile_size
+        num_sel = ctx.num_selected_blocks
+
+        import cutlass
+        import cutlass.cute as cute
+
+        @cute.jit
+        def _selected_block_mask(
+            batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+        ):
+            # aux_tensors[0] = block_indices: (B, H, N_q_tiles, k) int32
+            indices = aux_tensors[0]
+            q_tile = q_idx[0] // cutlass.const_expr(q_tile_size)
+            kv_block = kv_idx[0] // cutlass.const_expr(compress_block_size)
+
+            found = cutlass.Boolean(False)
+            for i in cutlass.range_constexpr(num_sel):
+                sel_block = indices[batch_idx[0], head_idx[0], q_tile, i]
+                found = found | (sel_block == kv_block)
+            if cutlass.const_expr(causal):
+                found = found & (kv_idx <= q_idx)
+            return found
+
         dQ_slc, dK_slc, dV_slc = _fa4_bwd(
             Q,
             K,
@@ -382,7 +406,9 @@ class NSAFunction(torch.autograd.Function):
             dO_slc,
             lse_slc,
             softmax_scale=softmax_scale,
-            causal=causal,
+            causal=False,  # causal handled in mask_mod
+            mask_mod=_selected_block_mask,
+            aux_tensors=[block_indices],
         )
 
         dQ_sld, dK_sld, dV_sld = _fa4_bwd(
