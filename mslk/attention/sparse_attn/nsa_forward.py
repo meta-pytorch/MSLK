@@ -251,7 +251,12 @@ def nsa_forward(
         window_size=(window_size, 0),  # (left, right=0 for causal)
     )
 
-    # Step 5: Fused gate and combine
-    O = fused_gate_and_combine(Q, O_cmp, O_slc, O_sld, gate_proj_weight)
+    # Step 5: Gate and combine branch outputs
+    if gate_proj_weight is not None:
+        O = fused_gate_and_combine(Q, O_cmp, O_slc, O_sld, gate_proj_weight)
+    else:
+        # No gate weights — uniform 1/3 gates. Simple average avoids launching
+        # the CuteDSL gating kernel (saves ~0.3-1ms at small N).
+        O = (O_cmp + O_slc + O_sld) * (1.0 / 3.0)
 
     return O
