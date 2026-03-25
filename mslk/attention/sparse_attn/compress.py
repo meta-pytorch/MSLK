@@ -37,7 +37,9 @@ def compress_kv(
         V_cmp: Compressed values, shape (B, N // block_size, H_kv, D).
     """
     B, N, H_kv, D = K.shape
-    assert N % block_size == 0, f"Sequence length {N} must be divisible by block_size {block_size}"
+    assert N % block_size == 0, (
+        f"Sequence length {N} must be divisible by block_size {block_size}"
+    )
 
     N_cmp = N // block_size
 
@@ -84,9 +86,7 @@ def _make_fused_compress_kernel(cute_dtype: Type, D: int, block_size: int):
 
     class _Kernel:
         @cute.jit
-        def __call__(
-            self, mK, mV, mK_out, mV_out, N_cmp, H_kv, N, stream
-        ):
+        def __call__(self, mK, mV, mK_out, mV_out, N_cmp, H_kv, N, stream):
             grid_x = mK_out.shape[0]  # B * N_cmp * H_kv
             self.kernel(mK, mV, mK_out, mV_out, N_cmp, H_kv, N).launch(
                 grid=[grid_x, 1, 1],
@@ -113,11 +113,15 @@ def _make_fused_compress_kernel(cute_dtype: Type, D: int, block_size: int):
                     acc_v = Float32(0.0)
 
                     for t in cutlass.range_constexpr(block_size):
-                        input_row = b * N * H_kv + (j * const_expr(block_size) + const_expr(t)) * H_kv + h
+                        input_row = cutlass.Int64(
+                            b * N * H_kv
+                            + (j * const_expr(block_size) + const_expr(t)) * H_kv
+                            + h
+                        )
                         acc_k += Float32(mK[input_row, d])
                         acc_v += Float32(mV[input_row, d])
 
-                    output_row = b * N_cmp * H_kv + j * H_kv + h
+                    output_row = cutlass.Int64(b * N_cmp * H_kv + j * H_kv + h)
                     mK_out[output_row, d] = cute_dtype(acc_k * inv_block_size)
                     mV_out[output_row, d] = cute_dtype(acc_v * inv_block_size)
 
@@ -156,7 +160,9 @@ def fused_compress_kv(
     from cutlass.cute.runtime import from_dlpack
 
     B, N, H_kv, D = K.shape
-    assert N % block_size == 0, f"Sequence length {N} must be divisible by block_size {block_size}"
+    assert N % block_size == 0, (
+        f"Sequence length {N} must be divisible by block_size {block_size}"
+    )
 
     N_cmp = N // block_size
 

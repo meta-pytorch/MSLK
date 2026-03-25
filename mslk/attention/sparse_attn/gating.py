@@ -54,7 +54,7 @@ def _make_fused_gating_kernel(cute_dtype: Type, D: int, has_gate_weight: bool):
             warp_id = cute.arch.warp_idx()
             bidx = cute.arch.block_idx()[0]
 
-            row = bidx * WARPS_PER_BLOCK + warp_id
+            row = cutlass.Int64(bidx * WARPS_PER_BLOCK + warp_id)
             num_rows = mQ.shape[0]
 
             if row < num_rows:
