@@ -69,7 +69,7 @@ def run_benchmark(
     repeat: int = 20,
 ):
     """Run NSA vs dense FA4 benchmark for a given sequence length."""
-    from mslk.attention.sparse_attn.compress import compress_kv
+    from mslk.attention.sparse_attn.compress import compress_kv, fused_compress_kv
     from mslk.attention.sparse_attn.gating import (
         compute_gates,
         fused_gate_and_combine,
@@ -119,6 +119,13 @@ def run_benchmark(
     # Compression
     cmp_ms = benchmark_fn(
         lambda: compress_kv(K, V, compress_block_size),
+        warmup=warmup,
+        repeat=repeat,
+    )
+
+    # Fused compression (CuteDSL kernel)
+    fused_cmp_ms = benchmark_fn(
+        lambda: fused_compress_kv(K, V, compress_block_size),
         warmup=warmup,
         repeat=repeat,
     )
@@ -249,6 +256,7 @@ def run_benchmark(
         "speedup": speedup,
         "theoretical_speedup": theoretical_speedup,
         "compress_ms": cmp_ms,
+        "fused_cmp_ms": fused_cmp_ms,
         "select_ms": sel_ms,
         "fused_sel_ms": fused_sel_ms,
         "mask_ms": mask_ms,
@@ -289,7 +297,7 @@ def main():
     header = (
         f"{'N':>8} | {'Dense(ms)':>10} {'TFLOPS':>8} | "
         f"{'NSA(ms)':>10} {'TFLOPS':>8} | {'Speedup':>8} {'Theory':>8} | "
-        f"{'Cmp':>6} {'Sel':>6} {'FSel':>6} {'Mask':>6} "
+        f"{'Cmp':>6} {'FCmp':>6} {'Sel':>6} {'FSel':>6} {'Mask':>6} "
         f"{'FA4c':>6} {'FA4s':>6} {'FA4w':>6} {'Gate':>6} {'CmpG':>6} {'Fuse':>6}"
     )
     print(header)
@@ -313,7 +321,8 @@ def main():
             f"{result['dense_ms']:>10.2f} {result['dense_tflops']:>8.1f} | "
             f"{result['nsa_ms']:>10.2f} {result['nsa_tflops']:>8.1f} | "
             f"{result['speedup']:>8.2f}x {result['theoretical_speedup']:>7.1f}x | "
-            f"{result['compress_ms']:>6.2f} {result['select_ms']:>6.2f} "
+            f"{result['compress_ms']:>6.2f} {result['fused_cmp_ms']:>6.2f} "
+            f"{result['select_ms']:>6.2f} "
             f"{result['fused_sel_ms']:>6.2f} {result['mask_ms']:>6.2f} "
             f"{result['fa4_cmp_ms']:>6.2f} "
             f"{result['fa4_slc_ms']:>6.2f} {result['fa4_sld_ms']:>6.2f} "

@@ -16,7 +16,7 @@ import math
 from typing import Callable, Optional, Tuple
 
 import torch
-from mslk.attention.sparse_attn.compress import compress_kv
+from mslk.attention.sparse_attn.compress import fused_compress_kv
 from mslk.attention.sparse_attn.gating import fused_gate_and_combine
 from mslk.attention.sparse_attn.select import fused_score_and_select_blocks
 from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
@@ -148,7 +148,7 @@ def nsa_forward(
         softmax_scale = 1.0 / math.sqrt(D)
 
     # Step 1: Compress KV
-    K_cmp, V_cmp = compress_kv(K, V, compress_block_size, W_k_compress, W_v_compress)
+    K_cmp, V_cmp = fused_compress_kv(K, V, compress_block_size, W_k_compress, W_v_compress)
     # K_cmp, V_cmp: (B, N_cmp, H_kv, D) where N_cmp = N // compress_block_size
 
     # Step 2: Score blocks and select top-k

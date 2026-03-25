@@ -1,6 +1,6 @@
 # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
 
-from mslk.attention.sparse_attn.compress import compress_kv
+from mslk.attention.sparse_attn.compress import compress_kv, fused_compress_kv
 from mslk.attention.sparse_attn.gating import (
     compute_gates,
     fused_gate_and_combine,
@@ -18,6 +18,7 @@ __all__ = [
     "nsa_forward",
     "nsa_forward_reference",
     "compress_kv",
+    "fused_compress_kv",
     "score_and_select_blocks",
     "fused_score_and_select_blocks",
     "build_fa4_block_sparse_tensors",
