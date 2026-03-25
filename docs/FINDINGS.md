@@ -56,7 +56,22 @@ Measured on NVIDIA B200 (178 GiB), devgpu016.snb3, 2026-03-25.
 | 2M | 31604.78ms | OOM | — |
 | 3M | 72051.59ms | OOM | — |
 
-Forward crossover at ~25K tokens.
+Forward crossover at ~25K tokens (without CUDA graphs), **~4K tokens with CUDA graphs**.
+
+### CUDA Graph Speedup (forward only)
+
+CuTe DSL kernels use `cuda.cuLaunchKernel` and are fully CUDA Graph compatible.
+After warmup, the NSA forward can be captured in `torch.cuda.CUDAGraph`:
+
+| N | No Graph | CUDA Graph | Speedup |
+|------|----------|-----------|---------|
+| 4K | 1.49ms | 0.29ms | 5.08x |
+| 8K | 1.27ms | 0.51ms | 2.49x |
+| 16K | 2.00ms | 1.01ms | 1.97x |
+| 32K | 2.37ms | 2.21ms | 1.07x |
+| 64K+ | — | — | <2% |
+
+With CUDA graphs, NSA at 4K (0.29ms) is comparable to dense FA4 (0.26ms).
 
 ### Forward + Backward: NSA vs Dense FA4
 
