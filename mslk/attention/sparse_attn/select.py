@@ -587,3 +587,59 @@ def fused_score_and_select_blocks(
     # Reshape output: (B * H * N_q_tiles, k) -> (B, H, N_q_tiles, k)
     block_indices = out_2d.reshape(B, H, N_q_tiles, k_actual)
     return block_indices
+
+
+def fused_select_and_build_sparse(
+    Q: Tensor,
+    K_cmp: Tensor,
+    num_selected_blocks: int,
+    compress_block_size: int,
+    n_block_size: int = 128,
+    seqlen_k: int | None = None,
+    causal: bool = True,
+    q_tile_size: int = 256,
+    softmax_scale: float | None = None,
+    cu_seqlens: Tensor | None = None,
+    max_seqlen: int | None = None,
+):
+    """Fused block selection + FA4 block-sparse tensor construction.
+
+    Combines fused_score_and_select_blocks + build_fa4_block_sparse_tensors
+    into a single call, avoiding 6+ intermediate PyTorch op launches for
+    mask construction.
+
+    Returns:
+        (block_indices, sparse_tensors): The selected block indices and
+        the corresponding BlockSparseTensorsTorch.
+    """
+    from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+
+    block_indices = fused_score_and_select_blocks(
+        Q,
+        K_cmp,
+        num_selected_blocks,
+        compress_block_size,
+        causal=causal,
+        q_tile_size=q_tile_size,
+        softmax_scale=softmax_scale,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+    )
+
+    if seqlen_k is None:
+        if cu_seqlens is not None:
+            if max_seqlen is None:
+                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+                max_seqlen = max(seqlens)
+            seqlen_k = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
+        elif Q.dim() == 4:
+            seqlen_k = Q.shape[1]
+
+    sparse_tensors = build_fa4_block_sparse_tensors(
+        block_indices,
+        compress_block_size,
+        n_block_size=n_block_size,
+        seqlen_k=seqlen_k,
+    )
+
+    return block_indices, sparse_tensors

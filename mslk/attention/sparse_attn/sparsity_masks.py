@@ -60,48 +60,54 @@ def build_fa4_block_sparse_tensors(
         )
         k_fa4 = k * fa4_blocks_per_nsa_block
     else:
-        # Multiple NSA blocks map to a single FA4 block — use scatter-based
-        # dedup (faster than sort + consecutive dedup for small tensors)
+        # Multiple NSA blocks map to a single FA4 block — contraction case.
+        # Optimized path: since k is small (typically 16), we dedup by sorting
+        # the k indices per tile and removing consecutive duplicates. This avoids
+        # materializing a large (B, H, N_q_tiles, n_blocks_k) attendance matrix.
         assert n_block_size % compress_block_size == 0, (
             f"n_block_size ({n_block_size}) must be divisible by "
             f"compress_block_size ({compress_block_size})"
         )
         fa4_block_indices = (block_indices.long() * compress_block_size) // n_block_size
 
-        # Deduplicate via boolean scatter: O(1) per element, no sorting
         if seqlen_k is not None:
-            n_blocks_k_tmp = (seqlen_k + n_block_size - 1) // n_block_size
+            n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
         else:
-            n_blocks_k_tmp = fa4_block_indices.max().item() + 1
+            n_blocks_k = fa4_block_indices.max().item() + 1
 
-        # Build attendance mask: (B, H, N_q_tiles, n_blocks_k)
-        attendance = torch.zeros(
-            B, H, N_q_tiles, n_blocks_k_tmp, dtype=torch.bool, device=device
+        # Sort the k indices per tile, then remove consecutive duplicates
+        sorted_idx, _ = fa4_block_indices.sort(dim=-1)  # (B, H, N_q_tiles, k)
+
+        # Consecutive dedup: mark positions where value differs from previous
+        is_new = torch.ones_like(sorted_idx, dtype=torch.bool)
+        is_new[..., 1:] = sorted_idx[..., 1:] != sorted_idx[..., :-1]
+
+        # Count unique per tile
+        counts = is_new.sum(dim=-1)  # (B, H, N_q_tiles)
+        max_unique = counts.max().item()
+
+        # Pack unique indices: scatter unique values to front
+        # Use cumsum of is_new as destination positions
+        dest_positions = is_new.long().cumsum(dim=-1) - 1  # 0-indexed positions
+
+        fa4_indices = torch.zeros(
+            B, H, N_q_tiles, n_blocks_k, dtype=torch.int64, device=device
         )
-        attendance.scatter_(3, fa4_block_indices.clamp(max=n_blocks_k_tmp - 1), True)
+        # Scatter sorted unique values into the packed output
+        fa4_indices.scatter_(3, dest_positions, sorted_idx)
 
-        # Count unique blocks per tile
-        counts = attendance.sum(dim=-1)
-
-        # Pack indices: sort boolean descending to push True values first,
-        # then extract the sorted positions as the FA4 block indices
-        _, sorted_positions = attendance.int().sort(dim=-1, descending=True, stable=True)
-        fa4_indices = sorted_positions.to(torch.int64)
+        full_block_cnt = counts.to(torch.int32)
         k_fa4 = k
 
     # Compute the full number of KV blocks for FA4
-    if seqlen_k is not None:
-        n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
-    else:
-        n_blocks_k = fa4_indices.max().item() + 1
-
-    # full_block_cnt: (B, H, N_q_tiles)
     if compress_block_size >= n_block_size:
+        if seqlen_k is not None:
+            n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
+        else:
+            n_blocks_k = fa4_indices.max().item() + 1
         full_block_cnt = torch.full(
             (B, H, N_q_tiles), k_fa4, dtype=torch.int32, device=device
         )
-    else:
-        full_block_cnt = counts.to(torch.int32)
 
     # full_block_idx: use dense shape (B, H, N_q_tiles, n_blocks_k) so that
     # FA4's backward can transpose to Q-direction indexing. The compact format
