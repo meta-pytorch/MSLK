@@ -50,13 +50,15 @@ def _fa4_fwd(
     window_size_right: int | None = None,
     block_sparse_tensors=None,
     mask_mod: Callable | None = None,
+    cu_seqlens_q: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
 ) -> Tuple[Tensor, Tensor]:
-    """Call FA4's forward pass (low-level, supports block sparsity and mask_mod).
+    """Call FA4's forward pass.
 
-    Uses _flash_attn_fwd from the fb interface which supports block_sparse_tensors
-    and mask_mod.
-
-    All inputs are (B, N, H, D) layout.
+    Supports block sparsity, mask_mod, and varlen (cu_seqlens).
+    Inputs are (B, N, H, D) for fixed-length or (total_tokens, H, D) for varlen.
     Returns (output, lse).
     """
     from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_fwd
@@ -76,6 +78,10 @@ def _fa4_fwd(
         mask_mod=mask_mod,
         pack_gqa=pack_gqa,
         return_lse=True,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
     return out, lse
 
@@ -93,13 +99,14 @@ def _fa4_bwd(
     window_size_right: int | None = None,
     block_sparse_tensors=None,
     mask_mod: Callable | None = None,
+    cu_seqlens_q: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Call FA4's backward pass (low-level, supports block sparsity and mask_mod).
+    """Call FA4's backward pass.
 
-    Uses _flash_attn_bwd from the fb interface which supports block_sparse_tensors
-    and mask_mod.
-
-    All inputs are (B, N, H, D) layout.
+    Supports block sparsity, mask_mod, and varlen (cu_seqlens).
     Returns (dq, dk, dv).
     """
     from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_bwd
@@ -117,6 +124,10 @@ def _fa4_bwd(
         window_size_right=window_size_right,
         block_sparse_tensors=block_sparse_tensors,
         mask_mod=mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
     )
     return dq, dk, dv
 
@@ -188,7 +199,8 @@ def nsa_forward(
     is_varlen = cu_seqlens is not None
 
     if is_varlen:
-        # Varlen: pad 3D → 4D, run fixed-length NSA, unpad
+        # Varlen: pad only for compress+select (need uniform blocks),
+        # use native FA4 varlen (cu_seqlens) for the attention branches.
         assert Q.dim() == 3, f"Varlen requires 3D input, got {Q.dim()}D"
         H = Q.shape[1]
         H_kv = K.shape[1]
@@ -198,9 +210,11 @@ def nsa_forward(
 
         if max_seqlen is None:
             max_seqlen = max(seqlens)
-        # Pad to nearest multiple of q_tile_size
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(D_dim)
         pad_N = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
 
+        # Pad Q, K, V to 4D for compress + select (CuteDSL kernels need uniform N)
         Q_pad = Q.new_zeros(batch_size, pad_N, H, D_dim)
         K_pad = K.new_zeros(batch_size, pad_N, H_kv, D_dim)
         V_pad = V.new_zeros(batch_size, pad_N, H_kv, D_dim)
@@ -210,24 +224,87 @@ def nsa_forward(
             K_pad[i, :slen] = K[s : s + slen]
             V_pad[i, :slen] = V[s : s + slen]
 
-        O_pad = nsa_forward(
-            Q_pad, K_pad, V_pad,
-            compress_block_size=compress_block_size,
-            num_selected_blocks=num_selected_blocks,
-            window_size=window_size,
-            W_k_compress=W_k_compress,
-            W_v_compress=W_v_compress,
-            gate_proj_weight=gate_proj_weight,
+        # Step 1: Compress KV (on padded 4D)
+        K_cmp_pad, V_cmp_pad = fused_compress_kv(
+            K_pad, V_pad, compress_block_size, W_k_compress, W_v_compress
+        )
+        N_cmp = pad_N // compress_block_size
+
+        # Step 2: Score blocks and select top-k (on padded 4D)
+        block_indices = fused_score_and_select_blocks(
+            Q_pad,
+            K_cmp_pad,
+            num_selected_blocks,
+            compress_block_size,
             causal=causal,
-            softmax_scale=softmax_scale,
             q_tile_size=q_tile_size,
-            n_block_size=n_block_size,
+            softmax_scale=softmax_scale,
         )
 
-        O = Q.new_zeros(Q.shape[0], H, D_dim)
+        # Step 3: Build FA4 sparsity masks (on padded 4D)
+        sparse_tensors = build_fa4_block_sparse_tensors(
+            block_indices,
+            compress_block_size,
+            n_block_size=n_block_size,
+            seqlen_k=pad_N,
+        )
+
+        # Step 4: Three FA4 branches
+        # Compressed branch uses padded 4D (mask_mod not supported with varlen in FA4).
+        # Selected and sliding window use native varlen.
+
+        # Branch 1: Compressed attention (padded 4D — mask_mod not supported with varlen)
+        compressed_mask = (
+            _make_compressed_causal_mask(compress_block_size) if causal else None
+        )
+        O_cmp_pad, _ = _fa4_fwd(
+            Q_pad,
+            K_cmp_pad,
+            V_cmp_pad,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+        )
+        # Unpad compressed output to 3D
+        O_cmp = Q.new_zeros(Q.shape[0], H, D_dim)
         for i, slen in enumerate(seqlens):
             s = cu_seqlens[i].item()
-            O[s : s + slen] = O_pad[i, :slen]
+            O_cmp[s : s + slen] = O_cmp_pad[i, :slen]
+
+        # Branch 2: Selected attention (varlen Q/K/V + block sparse)
+        O_slc, _ = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            block_sparse_tensors=sparse_tensors,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=pad_N,
+            max_seqlen_k=pad_N,
+        )
+
+        # Branch 3: Sliding window (varlen Q/K/V)
+        O_sld, _ = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            window_size_left=window_size,
+            window_size_right=0,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
+
+        # Step 5: Gating (element-wise, works on 3D)
+        if gate_proj_weight is not None:
+            O = fused_gate_and_combine(Q, O_cmp, O_slc, O_sld, gate_proj_weight)
+        else:
+            O = (O_cmp + O_slc + O_sld) * (1.0 / 3.0)
         return O
 
     # Fixed-length path

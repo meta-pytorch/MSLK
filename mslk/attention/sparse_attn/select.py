@@ -401,13 +401,15 @@ def _make_fused_select_kernel(
 
 
 def fused_score_and_select_blocks(
-    Q: Tensor,  # (B, N, H, D)
+    Q: Tensor,  # (B, N, H, D) or (total_tokens, H, D) for varlen
     K_cmp: Tensor,  # (B, N_cmp, H_kv, D)
     num_selected_blocks: int,
     compress_block_size: int,
     causal: bool = True,
     q_tile_size: int = 256,
     softmax_scale: float | None = None,
+    cu_seqlens: Tensor | None = None,  # (B+1,) int32 for varlen
+    max_seqlen: int | None = None,
 ) -> Tensor:
     """Fused block scoring and top-k selection using a CuteDSL kernel.
 
@@ -418,6 +420,9 @@ def fused_score_and_select_blocks(
     The Q_mean computation is done in PyTorch (single kernel), then the
     CuteDSL kernel fuses dot products, causal masking, top-k selection, and
     sorting into one launch.
+
+    For varlen (3D + cu_seqlens): computes Q_mean per-sequence and pads to
+    max_N_q_tiles. The CuteDSL kernel operates on this small padded Q_mean.
 
     Falls back to PyTorch reference for N_cmp > 128 * 128 = 16384 blocks.
 
@@ -438,14 +443,51 @@ def fused_score_and_select_blocks(
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    B, N, H, D = Q.shape
+    is_varlen = cu_seqlens is not None
+
+    if is_varlen:
+        # Varlen: compute Q_mean per-sequence and pad to max_N_q_tiles
+        assert Q.dim() == 3, f"Varlen requires 3D Q, got {Q.dim()}D"
+        H = Q.shape[1]
+        D = Q.shape[2]
+        batch_size = cu_seqlens.shape[0] - 1
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        if max_seqlen is None:
+            max_seqlen = max(seqlens)
+        N_q_tiles = max_seqlen // q_tile_size
+        N = max_seqlen  # for fallback and downstream
+        B = batch_size
+
+        Q_mean_parts = []
+        for i, slen in enumerate(seqlens):
+            s = cu_seqlens[i].item()
+            n_tiles_i = slen // q_tile_size
+            if n_tiles_i > 0:
+                Q_mean_i = (
+                    Q[s : s + n_tiles_i * q_tile_size]
+                    .reshape(n_tiles_i, q_tile_size, H, D)
+                    .mean(dim=1)
+                    .float()
+                )
+            else:
+                Q_mean_i = Q.new_zeros(0, H, D, dtype=torch.float32)
+            Q_mean_parts.append(Q_mean_i)
+
+        # Pad to (B, max_N_q_tiles, H, D)
+        Q_mean = Q.new_zeros(B, N_q_tiles, H, D, dtype=torch.float32)
+        for i, qm in enumerate(Q_mean_parts):
+            if qm.shape[0] > 0:
+                Q_mean[i, : qm.shape[0]] = qm
+    else:
+        B, N, H, D = Q.shape
+        N_q_tiles = N // q_tile_size
+        assert N % q_tile_size == 0, (
+            f"Sequence length {N} must be divisible by q_tile_size {q_tile_size}"
+        )
+        Q_mean = None  # computed below
+
     H_kv = K_cmp.shape[2]
     N_cmp = K_cmp.shape[1]
-
-    N_q_tiles = N // q_tile_size
-    assert N % q_tile_size == 0, (
-        f"Sequence length {N} must be divisible by q_tile_size {q_tile_size}"
-    )
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(D)
@@ -469,13 +511,17 @@ def fused_score_and_select_blocks(
         )
 
     # --- Q_mean in PyTorch ---
-    # Q: (B, N, H, D) -> (B, N_q_tiles, q_tile_size, H, D) -> mean over q_tile_size
-    Q_mean = (
-        Q.reshape(B, N_q_tiles, q_tile_size, H, D)
-        .mean(dim=2)  # (B, N_q_tiles, H, D)
-        .float()
-        * softmax_scale
-    )
+    if Q_mean is None:
+        # 4D path: Q: (B, N, H, D) -> (B, N_q_tiles, q_tile_size, H, D) -> mean
+        Q_mean = (
+            Q.reshape(B, N_q_tiles, q_tile_size, H, D)
+            .mean(dim=2)  # (B, N_q_tiles, H, D)
+            .float()
+            * softmax_scale
+        )
+    else:
+        # Varlen path: Q_mean already computed above, just scale
+        Q_mean = Q_mean * softmax_scale
 
     # Reshape Q_mean to 2D: row (b, tile, h) -> b * N_q_tiles * H + tile * H + h
     Q_mean_2d = Q_mean.reshape(B * N_q_tiles * H, D).contiguous()

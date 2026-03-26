@@ -99,10 +99,10 @@ def _make_fused_gating_kernel(cute_dtype: Type, D: int, has_gate_weight: bool):
 
 
 def fused_gate_and_combine(
-    Q: Tensor,  # (B, N, H, D)
-    O_cmp: Tensor,  # (B, N, H, D)
-    O_slc: Tensor,  # (B, N, H, D)
-    O_sld: Tensor,  # (B, N, H, D)
+    Q: Tensor,  # (B, N, H, D) or (T, H, D) for varlen
+    O_cmp: Tensor,  # same shape as Q
+    O_slc: Tensor,  # same shape as Q
+    O_sld: Tensor,  # same shape as Q
     gate_proj_weight: Tensor | None = None,  # (H, 3, D)
 ) -> Tensor:
     """Fused gate computation and branch combination using a CuteDSL kernel.
@@ -112,29 +112,33 @@ def fused_gate_and_combine(
     traffic by fusing the dot-product gate computation with the weighted sum.
 
     Args:
-        Q: Query tensor, shape (B, N, H, D).
-        O_cmp: Compressed attention output, shape (B, N, H, D).
-        O_slc: Selected attention output, shape (B, N, H, D).
-        O_sld: Sliding window attention output, shape (B, N, H, D).
+        Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
+        O_cmp: Compressed attention output, same shape as Q.
+        O_slc: Selected attention output, same shape as Q.
+        O_sld: Sliding window attention output, same shape as Q.
         gate_proj_weight: Gate projection weights, shape (H, 3, D).
             If None, uses uniform gates (1/3 each).
 
     Returns:
-        Combined output, shape (B, N, H, D).
+        Combined output, same shape as Q.
     """
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    B, N, H, D = Q.shape
+    if Q.dim() == 3:
+        T, H, D = Q.shape
+        M = T * H
+    else:
+        B, N, H, D = Q.shape
+        M = B * N * H
     assert D % 32 == 0, f"D={D} must be divisible by 32"
 
     out = torch.empty_like(O_cmp)
     has_gate_weight = gate_proj_weight is not None
 
-    # Reshape to 2D: (B*N*H, D)
-    M = B * N * H
+    # Reshape to 2D: (M, D)
     Q_2d = Q.reshape(M, D)
     O_cmp_2d = O_cmp.reshape(M, D)
     O_slc_2d = O_slc.reshape(M, D)
@@ -320,12 +324,12 @@ def _make_fused_gating_bwd_kernel(cute_dtype: Type, D: int):
 
 
 def fused_gating_backward(
-    Q: Tensor,  # (B, N, H, D)
-    dO: Tensor,  # (B, N, H, D)
-    O_cmp: Tensor,  # (B, N, H, D)
-    O_slc: Tensor,  # (B, N, H, D)
-    O_sld: Tensor,  # (B, N, H, D)
-    gates: Tensor,  # (B, N, H, 3)
+    Q: Tensor,  # (B, N, H, D) or (T, H, D) for varlen
+    dO: Tensor,  # same shape as Q
+    O_cmp: Tensor,  # same shape as Q
+    O_slc: Tensor,  # same shape as Q
+    O_sld: Tensor,  # same shape as Q
+    gates: Tensor,  # (..., H, 3) matching leading dims of Q
     gate_proj_weight: Tensor,  # (H, 3, D)
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Fused gating backward using CuteDSL kernel + PyTorch for dW_gate.
@@ -334,10 +338,10 @@ def fused_gating_backward(
     dW_gate is computed via PyTorch einsum (cross-row reduction).
 
     Args:
-        Q: Query tensor, shape (B, N, H, D).
-        dO: Upstream gradient, shape (B, N, H, D).
-        O_cmp, O_slc, O_sld: Branch outputs, shape (B, N, H, D).
-        gates: Sigmoid gate values, shape (B, N, H, 3).
+        Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
+        dO: Upstream gradient, same shape as Q.
+        O_cmp, O_slc, O_sld: Branch outputs, same shape as Q.
+        gates: Sigmoid gate values, (..., H, 3) matching leading dims of Q.
         gate_proj_weight: Gate weights, shape (H, 3, D).
 
     Returns:
@@ -348,12 +352,13 @@ def fused_gating_backward(
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    B, N, H, D = Q.shape
+    if Q.dim() == 3:
+        T, H, D = Q.shape
+        M = T * H
+    else:
+        B, N, H, D = Q.shape
+        M = B * N * H
     assert D % 32 == 0, f"D={D} must be divisible by 32"
-
-    M = B * N * H
-
-    # Allocate outputs
     dO_cmp = torch.empty_like(dO)
     dO_slc = torch.empty_like(dO)
     dO_sld = torch.empty_like(dO)
@@ -433,16 +438,19 @@ def fused_gating_backward(
         current_stream,
     )
 
-    # dW_gate via PyTorch einsum: d_logit (B,N,H,3) @ Q (B,N,H,D) -> (H,3,D)
+    # dW_gate via PyTorch einsum: d_logit (...,H,3) @ Q (...,H,D) -> (H,3,D)
     # Recompute d_logit from gates and dO·O products
     g = gates.float()
     dO_f = dO.float()
     O_branches = torch.stack([O_cmp.float(), O_slc.float(), O_sld.float()], dim=-1)
-    dg = (dO_f.unsqueeze(-1) * O_branches).sum(dim=-2)  # (B, N, H, 3)
+    dg = (dO_f.unsqueeze(-1) * O_branches).sum(dim=-2)  # (..., H, 3)
     d_logit = dg * g * (1 - g)
-    dW_gate = torch.einsum("bnhg,bnhd->hgd", d_logit, Q.float()).to(
-        gate_proj_weight.dtype
-    )
+    # Reshape to (M, H, ...) for einsum — works for both 3D and 4D
+    dW_gate = torch.einsum(
+        "mhg,mhd->hgd",
+        d_logit.reshape(-1, H, 3),
+        Q.float().reshape(-1, H, D),
+    ).to(gate_proj_weight.dtype)
 
     return dO_cmp, dO_slc, dO_sld, dQ_gate, dW_gate
 
@@ -453,34 +461,39 @@ def fused_gating_backward(
 
 
 def compute_gates(
-    Q: Tensor,  # (B, N, H, D)
+    Q: Tensor,  # (B, N, H, D) or (T, H, D) for varlen
     gate_proj_weight: Tensor | None = None,  # (H, 3, D)
     chunk_size: int | None = None,
 ) -> Tensor:
     """Compute per-head sigmoid gates for the three NSA branches.
 
     Args:
-        Q: Query tensor, shape (B, N, H, D).
+        Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
         gate_proj_weight: Learned gate projection, shape (H, 3, D).
             If None, returns uniform gates (1/3 each).
         chunk_size: If set, process the sequence dimension in chunks to
             reduce peak float32 memory usage. Recommended for N > 32K.
+            Only supported for 4D input.
 
     Returns:
-        gates: Sigmoid gates, shape (B, N, H, 3).
+        gates: Sigmoid gates, shape (..., H, 3) matching leading dims of Q.
     """
     if gate_proj_weight is None:
-        B, N, H, D = Q.shape
-        return torch.ones(B, N, H, 3, device=Q.device, dtype=Q.dtype) / 3.0
+        return torch.ones(*Q.shape[:-1], 3, device=Q.device, dtype=Q.dtype) / 3.0
 
     if chunk_size is None:
-        # Original path for short sequences
+        # Reshape to (M, H, D) for einsum — works for both 3D and 4D
+        orig_shape = Q.shape
+        H, D = orig_shape[-2], orig_shape[-1]
         gate_logits = torch.einsum(
-            "bnhd,hgd->bnhg", Q.float(), gate_proj_weight.float()
+            "mhd,hgd->mhg",
+            Q.float().reshape(-1, H, D),
+            gate_proj_weight.float(),
         )
-        return gate_logits.sigmoid().to(Q.dtype)
+        return gate_logits.sigmoid().to(Q.dtype).reshape(*orig_shape[:-1], 3)
 
     # Chunked path: process sequence in chunks to bound float32 intermediates
+    assert Q.dim() == 4, "Chunked gating only supported for 4D input"
     B, N, H, D = Q.shape
     gates = torch.empty(B, N, H, 3, device=Q.device, dtype=Q.dtype)
     w = gate_proj_weight.float()
@@ -492,27 +505,26 @@ def compute_gates(
 
 
 def gate_and_combine(
-    O_cmp: Tensor,  # (B, N, H, D)
-    O_slc: Tensor,  # (B, N, H, D)
-    O_sld: Tensor,  # (B, N, H, D)
-    gates: Tensor,  # (B, N, H, 3)
+    O_cmp: Tensor,  # (B, N, H, D) or (T, H, D) for varlen
+    O_slc: Tensor,  # same shape as O_cmp
+    O_sld: Tensor,  # same shape as O_cmp
+    gates: Tensor,  # (..., H, 3) matching leading dims
     chunk_size: int | None = None,
 ) -> Tensor:
     """Combine three attention branch outputs with sigmoid gates.
 
     Args:
-        O_cmp: Compressed attention output, shape (B, N, H, D).
-        O_slc: Selected attention output, shape (B, N, H, D).
-        O_sld: Sliding window attention output, shape (B, N, H, D).
-        gates: Sigmoid gates, shape (B, N, H, 3).
+        O_cmp: Compressed attention output, shape (B, N, H, D) or (T, H, D).
+        O_slc: Selected attention output, same shape as O_cmp.
+        O_sld: Sliding window attention output, same shape as O_cmp.
+        gates: Sigmoid gates, (..., H, 3) matching leading dims.
         chunk_size: If set, process the sequence dimension in chunks to
-            reduce peak float32 memory usage. Recommended for N > 32K.
+            reduce peak float32 memory usage. Only supported for 4D input.
 
     Returns:
-        Combined output, shape (B, N, H, D).
+        Combined output, same shape as O_cmp.
     """
     if chunk_size is None:
-        # Original path for short sequences
         g = gates.float()
         return (
             g[..., 0:1] * O_cmp.float()
@@ -521,6 +533,7 @@ def gate_and_combine(
         ).to(O_cmp.dtype)
 
     # Chunked path: avoid materializing 3 full (B,N,H,D) float32 tensors at once
+    assert O_cmp.dim() == 4, "Chunked gating only supported for 4D input"
     B, N, H, D = O_cmp.shape
     out = torch.empty(B, N, H, D, dtype=O_cmp.dtype, device=O_cmp.device)
     for start in range(0, N, chunk_size):

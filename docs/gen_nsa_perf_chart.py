@@ -13,8 +13,8 @@ import numpy as np
 
 
 def main():
-    # Benchmark data from B200, devgpu016 (B=1, H=32, H_kv=8, D=128)
-    # Measured 2026-03-25
+    # Benchmark data from GB200 (B=1, H=32, H_kv=8, D=128)
+    # Measured 2026-03-26
     seq_lengths = [
         1024,
         2048,
@@ -26,63 +26,58 @@ def main():
         131072,
         262144,
         524288,
-        1048576,
     ]
 
     # Forward: Dense FA4 vs NSA
     dense_fwd_ms = [
-        0.09,
         0.10,
-        0.17,
-        0.48,
-        1.74,
-        6.93,
-        30.61,
-        121.16,
-        485.24,
-        1939.75,
-        7816.42,
+        0.19,
+        0.27,
+        0.53,
+        1.53,
+        5.16,
+        24.06,
+        96.53,
+        403.51,
+        1617.79,
     ]
     nsa_fwd_ms = [
-        0.91,
-        1.02,
-        1.28,
-        1.77,
-        2.84,
-        5.27,
-        11.22,
-        27.09,
-        74.81,
-        226.35,
-        772.59,
+        1.46,
+        2.34,
+        2.27,
+        2.17,
+        3.87,
+        5.72,
+        10.35,
+        24.18,
+        65.11,
+        194.81,
     ]
 
     # Fwd+Bwd: Dense FA4 vs NSA
     dense_fwdbwd_ms = [
-        0.41,
-        0.44,
-        0.68,
-        1.85,
-        6.31,
-        27.37,
-        108.85,
-        418.86,
-        1669.69,
-        6644.73,
-        26581.04,
+        0.57,
+        0.55,
+        0.76,
+        1.63,
+        5.06,
+        21.35,
+        84.15,
+        338.68,
+        1356.51,
+        5423.31,
     ]
     nsa_fwdbwd_ms = [
-        2.42,
-        2.34,
-        2.63,
-        4.28,
-        7.62,
-        15.45,
-        34.31,
-        86.48,
-        236.09,
-        695.13,
-        2309.82,
+        3.33,
+        3.83,
+        3.62,
+        4.51,
+        7.45,
+        13.83,
+        29.00,
+        68.78,
+        182.45,
+        833.78,
     ]
 
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
@@ -115,14 +110,14 @@ def main():
     ax.set_title("Forward Pass Latency", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
-    ax.axvline(x=25000, color="gray", linestyle="--", alpha=0.5)
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
+    ax.axvline(x=32000, color="gray", linestyle="--", alpha=0.5)
     ax.annotate(
-        "NSA wins\n(>~25K)", xy=(50000, 6), fontsize=9, color="gray", ha="center"
+        "NSA wins\n(>~32K)", xy=(50000, 6), fontsize=9, color="gray", ha="center"
     )
 
-    # --- Panel 2: Fwd+Bwd latency (NEW: shows both dense and NSA) ---
+    # --- Panel 2: Fwd+Bwd latency ---
     ax = axes[1]
     ax.loglog(
         seq_lengths,
@@ -147,14 +142,14 @@ def main():
     ax.set_title("Fwd + Bwd Latency", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
-    ax.axvline(x=20000, color="gray", linestyle="--", alpha=0.5)
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
+    ax.axvline(x=32000, color="gray", linestyle="--", alpha=0.5)
     ax.annotate(
-        "NSA wins\n(>~20K)", xy=(40000, 12), fontsize=9, color="gray", ha="center"
+        "NSA wins\n(>~32K)", xy=(50000, 12), fontsize=9, color="gray", ha="center"
     )
 
-    # --- Panel 3: Speedup comparison (fwd vs fwd+bwd) ---
+    # --- Panel 3: Speedup comparison ---
     ax = axes[2]
     ax.semilogx(
         seq_lengths,
@@ -182,21 +177,24 @@ def main():
     ax.set_title("NSA Speedup vs Dense FA4", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
+
+    max_fwd_speedup = max(fwd_speedup)
+    max_fwdbwd_speedup = max(fwdbwd_speedup)
     ax.annotate(
-        "11.5x",
-        xy=(1048576, 11.51),
-        xytext=(300000, 10.0),
+        f"{max_fwdbwd_speedup:.1f}x",
+        xy=(seq_lengths[fwdbwd_speedup.index(max_fwdbwd_speedup)], max_fwdbwd_speedup),
+        xytext=(100000, max_fwdbwd_speedup - 1),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#ff7f0e"),
         color="#ff7f0e",
     )
     ax.annotate(
-        "10.1x",
-        xy=(1048576, 10.12),
-        xytext=(300000, 7.5),
+        f"{max_fwd_speedup:.1f}x",
+        xy=(seq_lengths[fwd_speedup.index(max_fwd_speedup)], max_fwd_speedup),
+        xytext=(100000, max_fwd_speedup - 1.5),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#1f77b4"),
@@ -204,7 +202,7 @@ def main():
     )
 
     plt.suptitle(
-        "NSA Sparse Attention Performance — B200 (B=1, H=32, H_kv=8, D=128)",
+        "NSA Sparse Attention Performance — GB200 (B=1, H=32, H_kv=8, D=128)",
         fontsize=14,
         fontweight="bold",
         y=1.02,
