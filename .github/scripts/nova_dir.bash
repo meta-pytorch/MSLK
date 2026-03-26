@@ -19,9 +19,6 @@ export MSLK_REPO="${MSLK_DIR}/${REPOSITORY}"
 ################################################################################
 export BUILD_FROM_NOVA=1
 
-# Disable HIP FMHA build in the manywheel CI (the runner is too small)
-export MSLK_BUILD_HIP_FMHA=0
-
 if [[ "$CU_VERSION" == "cu"* ]]; then
     echo "Current TORCH_CUDA_ARCH_LIST value: ${TORCH_CUDA_ARCH_LIST}"
 elif [[ "$CU_VERSION" == "rocm"* ]]; then
