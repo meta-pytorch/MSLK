@@ -3,7 +3,14 @@
 """NSA vs Dense FA4 benchmark — forward and backward at various sequence lengths."""
 
 import gc
+import os
 import time
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault(
+    "CUTLASS_CUTE_DSL_KERNEL_CACHE_DIR",
+    os.path.expanduser("~/.cache/cutlass_dsl_kernels"),
+)
 
 import torch
 
