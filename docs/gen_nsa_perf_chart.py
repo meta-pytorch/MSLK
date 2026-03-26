@@ -9,7 +9,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 
 
 def main():
@@ -26,58 +25,63 @@ def main():
         131072,
         262144,
         524288,
+        1048576,
     ]
 
     # Forward: Dense FA4 vs NSA
     dense_fwd_ms = [
-        0.10,
-        0.19,
-        0.27,
-        0.53,
-        1.53,
-        5.16,
-        24.06,
-        96.53,
-        403.51,
-        1617.79,
+        0.14,
+        0.14,
+        0.37,
+        0.60,
+        1.60,
+        6.06,
+        24.36,
+        96.30,
+        404.93,
+        1617.06,
+        7988.35,
     ]
     nsa_fwd_ms = [
-        1.46,
-        2.34,
-        2.27,
-        2.17,
-        3.87,
-        5.72,
-        10.35,
-        24.18,
-        65.11,
-        194.81,
+        1.72,
+        4.03,
+        3.71,
+        2.67,
+        4.46,
+        6.66,
+        10.56,
+        24.32,
+        64.53,
+        196.30,
+        1007.97,
     ]
 
     # Fwd+Bwd: Dense FA4 vs NSA
     dense_fwdbwd_ms = [
+        0.64,
         0.57,
-        0.55,
-        0.76,
-        1.63,
-        5.06,
-        21.35,
-        84.15,
-        338.68,
-        1356.51,
-        5423.31,
+        0.79,
+        1.65,
+        5.11,
+        21.52,
+        80.41,
+        339.29,
+        1356.74,
+        5436.21,
+        26076.29,
     ]
     nsa_fwdbwd_ms = [
-        3.33,
-        3.83,
-        3.62,
-        4.51,
-        7.45,
-        13.83,
-        29.00,
-        68.78,
-        182.45,
-        833.78,
+        4.10,
+        3.64,
+        3.71,
+        4.61,
+        8.71,
+        14.02,
+        29.27,
+        68.31,
+        181.52,
+        545.76,
+        1853.34,
     ]
 
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
@@ -110,12 +114,8 @@ def main():
     ax.set_title("Forward Pass Latency", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
-    ax.axvline(x=32000, color="gray", linestyle="--", alpha=0.5)
-    ax.annotate(
-        "NSA wins\n(>~32K)", xy=(50000, 6), fontsize=9, color="gray", ha="center"
-    )
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
 
     # --- Panel 2: Fwd+Bwd latency ---
     ax = axes[1]
@@ -142,8 +142,8 @@ def main():
     ax.set_title("Fwd + Bwd Latency", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
     ax.axvline(x=32000, color="gray", linestyle="--", alpha=0.5)
     ax.annotate(
         "NSA wins\n(>~32K)", xy=(50000, 12), fontsize=9, color="gray", ha="center"
@@ -177,24 +177,21 @@ def main():
     ax.set_title("NSA Speedup vs Dense FA4", fontsize=13, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_xticks([1024, 4096, 16384, 65536, 262144])
-    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K"], fontsize=10)
-
-    max_fwd_speedup = max(fwd_speedup)
-    max_fwdbwd_speedup = max(fwdbwd_speedup)
+    ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
+    ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
     ax.annotate(
-        f"{max_fwdbwd_speedup:.1f}x",
-        xy=(seq_lengths[fwdbwd_speedup.index(max_fwdbwd_speedup)], max_fwdbwd_speedup),
-        xytext=(100000, max_fwdbwd_speedup - 1),
+        f"{fwdbwd_speedup[-1]:.1f}x",
+        xy=(1048576, fwdbwd_speedup[-1]),
+        xytext=(300000, fwdbwd_speedup[-1] - 2),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#ff7f0e"),
         color="#ff7f0e",
     )
     ax.annotate(
-        f"{max_fwd_speedup:.1f}x",
-        xy=(seq_lengths[fwd_speedup.index(max_fwd_speedup)], max_fwd_speedup),
-        xytext=(100000, max_fwd_speedup - 1.5),
+        f"{fwd_speedup[-1]:.1f}x",
+        xy=(1048576, fwd_speedup[-1]),
+        xytext=(300000, fwd_speedup[-1] - 2),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#1f77b4"),
@@ -209,7 +206,6 @@ def main():
     )
     plt.tight_layout()
 
-    # Add hostname and timestamp
     hostname = platform.node()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     fig.text(
