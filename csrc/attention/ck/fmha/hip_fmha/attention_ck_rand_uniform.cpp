@@ -94,6 +94,11 @@ at::Tensor rand_uniform_int(
 
 } // namespace
 
+TORCH_LIBRARY_FRAGMENT(xformers, m) {
+  m.def(TORCH_SELECTIVE_SCHEMA(
+      "xformers::_ck_rand_uniform(float p, Tensor out) -> Tensor"));
+}
+
 TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("xformers::_ck_rand_uniform"),

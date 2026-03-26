@@ -524,6 +524,14 @@ efficient_attention_forward_ck_meta(
 
 } // namespace
 
+TORCH_LIBRARY_FRAGMENT(xformers, m) {
+  m.def(TORCH_SELECTIVE_SCHEMA(
+      "xformers::efficient_attention_forward_ck(Tensor query, "
+      "Tensor key, Tensor value, Tensor? attn_bias, Tensor? seqstart_q, "
+      "Tensor? seqstart_k, int? max_seqlen_q, float dropout_p, "
+      "bool compute_logsumexp, int custom_mask_type, float? scale, Tensor? seqlen_k, int? window_size, Tensor? block_tables, int? page_size) -> (Tensor, Tensor?, int, int)"));
+}
+
 TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("xformers::efficient_attention_forward_ck"),

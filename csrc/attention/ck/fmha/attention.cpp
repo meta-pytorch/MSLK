@@ -22,22 +22,14 @@ PyMODINIT_FUNC PyInit__C(void) {
 
 TORCH_LIBRARY_FRAGMENT(xformers, m) {
 #if defined(USE_ROCM)
-  m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::efficient_attention_forward_ck(Tensor query, "
-      "Tensor key, Tensor value, Tensor? attn_bias, Tensor? seqstart_q, "
-      "Tensor? seqstart_k, int? max_seqlen_q, float dropout_p, "
-      "bool compute_logsumexp, int custom_mask_type, float? scale, Tensor? seqlen_k, int? window_size, Tensor? block_tables, int? page_size) -> (Tensor, Tensor?, int, int)"));
+  // Schemas for ops whose implementations live in hip_fmha/ are registered
+  // there, alongside their TORCH_LIBRARY_IMPL, so that they are absent from
+  // builds where hip_fmha is not compiled (e.g. MSLK_BUILD_HIP_FMHA=0).
   m.def(TORCH_SELECTIVE_SCHEMA(
       "xformers::efficient_attention_forward_decoder_ck(Tensor query, "
       "Tensor key, Tensor value, Tensor? seq_positions, float scale) -> Tensor"));
   m.def(TORCH_SELECTIVE_SCHEMA(
       "xformers::efficient_attention_forward_decoder_splitk_ck(Tensor query, Tensor key, "
       " Tensor value, Tensor? seq_positions, float scale, int split_k) -> Tensor"));
-#ifndef FMHA_OMIT_BACKWARD
-  m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::efficient_attention_backward_ck(Tensor grad_out, Tensor query, Tensor key, Tensor value, Tensor? attn_bias, Tensor? seqstart_q, Tensor? seqstart_k, int? max_seqlen_q, int? max_seqlen_k, Tensor? seqlen_k, Tensor logsumexp, Tensor output, float dropout_p, int rng_seed, int rng_offset, int custom_mask_type, float? scale, int? window_size) -> (Tensor, Tensor, Tensor, Tensor)"));
-#endif
-  m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::_ck_rand_uniform(float p, Tensor out) -> Tensor"));
 #endif
 }
