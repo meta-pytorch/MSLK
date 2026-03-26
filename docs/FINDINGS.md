@@ -85,23 +85,38 @@ Fwd+bwd crossover at ~32K tokens.
 Native varlen (selected + sliding window branches use cu_seqlens directly)
 is 23-33% faster than the padded approach at 256K-1M token contexts.
 
-### Forward Component Breakdown (profiled on B200)
+### Forward Component Breakdown (profiled on GB200)
 
-At N=16K (where NSA is ~1.6x slower than dense):
-- Mask construction: 20% (PyTorch op launch overhead)
-- Block selection: 18%
-- Gating: 17%
-- 3x FA4 attention: 34%
-- Compression: 12%
+At N=4K (where NSA is ~10x slower than dense):
+- Mask construction: 29% (PyTorch op launch overhead)
+- Block selection: 22%
+- Gating: 16%
+- 3x FA4 attention: 22%
+- Compression: 11%
 
-At N=128K (where NSA is 4.5x faster than dense):
+At N=128K (where NSA is 4x faster than dense):
 - FA4 compressed attention: 33%
-- Gating: 22%
+- Gating: 21%
 - FA4 selected attention: 18%
-- Block selection: 15%
-- FA4 sliding window: 7%
+- Block selection: 16%
+- FA4 sliding window: 6%
 - Mask construction: 4%
 - Compression: 2%
+
+At N=1M (where NSA is 7.9x faster — forward only):
+- **FA4 compressed attention: 57.5%** — O(N × N/64) = O(N²/64), dominates at large N
+- Block selection: 21.5% — CuteDSL kernel, scales with N_cmp²
+- Mask construction: 9.4% — PyTorch ops, scales with N
+- FA4 selected attention: 5.2% — sparse, sub-quadratic
+- Gating: 4.6% — O(N)
+- FA4 sliding window: 1.6% — window is fixed 512, O(N)
+- Compression: 0.2% — O(N)
+
+**Key insight**: The compressed branch is the performance bottleneck at large N.
+It attends Q(N) to K_cmp(N/64), which is O(N²/64) — quadratic in N but 64x
+smaller than dense. At 1M, this alone takes 364ms out of 633ms total.
+The forward speedup regression from 8.24x (512K) to 7.93x (1M) is explained by
+this quadratic scaling in the compressed branch.
 
 ## 2M/3M Context Limit
 
