@@ -971,7 +971,7 @@ class FP8Tests(unittest.TestCase):
         K=st.sampled_from([16, 256, 512, 3584]),
         use_cudagraph=st.booleans(),
     )
-    def test_grouped_gemm_2d_2d(
+    def test_grouped_gemm_2d_2d_test(
         self,
         G: int,
         M: int,
