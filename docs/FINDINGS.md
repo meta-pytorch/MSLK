@@ -36,22 +36,23 @@ All three branches now use FA4 CuteDSL kernels for both forward and backward.
 
 ## Performance (GB200, B=1, H=32, H_kv=8, D=128)
 
-Measured on NVIDIA GB200, 2026-03-26.
+Measured on NVIDIA GB200 (184 GiB), 2026-03-26.
 
 ### Forward: NSA vs Dense FA4
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 1K | 0.10ms | 1.46ms | 0.07x |
-| 2K | 0.19ms | 2.34ms | 0.08x |
-| 4K | 0.27ms | 2.27ms | 0.12x |
-| 8K | 0.53ms | 2.17ms | 0.25x |
-| 16K | 1.53ms | 3.87ms | 0.40x |
-| **32K** | **5.16ms** | **5.72ms** | **0.90x** |
-| 64K | 24.06ms | 10.35ms | 2.33x |
-| 128K | 96.53ms | 24.18ms | 3.99x |
-| 256K | 403.51ms | 65.11ms | 6.20x |
-| **512K** | **1617.06ms** | **196.30ms** | **8.24x** |
+| 1K | 0.27ms | 1.79ms | 0.15x |
+| 2K | 0.19ms | 2.54ms | 0.08x |
+| 4K | 0.27ms | 2.53ms | 0.11x |
+| 8K | 0.55ms | 2.24ms | 0.25x |
+| 16K | 1.52ms | 3.15ms | 0.48x |
+| **32K** | **5.44ms** | **5.78ms** | **0.94x** |
+| 64K | 24.79ms | 10.78ms | 2.30x |
+| 128K | 99.62ms | 24.15ms | 4.12x |
+| 256K | 397.26ms | 63.07ms | 6.30x |
+| 512K | 1600.45ms | 188.18ms | 8.51x |
+| **1M** | **6413.33ms** | **629.22ms** | **10.19x** |
 
 Forward crossover at ~32K tokens.
 
@@ -59,17 +60,17 @@ Forward crossover at ~32K tokens.
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 1K | 0.64ms | 4.10ms | 0.16x |
-| 2K | 0.57ms | 3.64ms | 0.16x |
-| 4K | 0.79ms | 3.71ms | 0.21x |
-| 8K | 1.65ms | 4.61ms | 0.36x |
-| 16K | 5.11ms | 8.71ms | 0.59x |
-| **32K** | **21.52ms** | **14.02ms** | **1.54x** |
-| 64K | 80.41ms | 29.27ms | 2.75x |
-| 128K | 339.29ms | 68.31ms | 4.97x |
-| 256K | 1356.74ms | 181.52ms | 7.47x |
-| 512K | 5436.21ms | 545.76ms | 9.96x |
-| **1M** | **26076.29ms** | **1853.34ms** | **14.07x** |
+| 1K | 0.56ms | 3.70ms | 0.15x |
+| 2K | 0.57ms | 3.62ms | 0.16x |
+| 4K | 0.78ms | 3.51ms | 0.22x |
+| 8K | 1.65ms | 5.32ms | 0.31x |
+| 16K | 5.11ms | 8.02ms | 0.64x |
+| **32K** | **21.02ms** | **14.17ms** | **1.48x** |
+| 64K | 84.46ms | 29.46ms | 2.87x |
+| 128K | 340.14ms | 68.41ms | 4.97x |
+| 256K | 1339.51ms | 179.66ms | 7.46x |
+| 512K | 5374.25ms | 540.77ms | 9.94x |
+| **1M** | **27270.16ms** | **2432.94ms** | **11.21x** |
 
 Fwd+bwd crossover at ~32K tokens.
 
@@ -77,13 +78,13 @@ Fwd+bwd crossover at ~32K tokens.
 
 | Total N | Varlen F+B | Regular F+B | Varlen Speedup |
 |---------|-----------|------------|----------------|
-| 128K | 67.42ms | 68.39ms | 1.01x |
-| 256K | 156.79ms | 180.76ms | 1.15x |
-| 512K | 621.28ms | 826.52ms | 1.33x |
-| **1M** | **1901.55ms** | **2331.09ms** | **1.23x** |
+| 128K | 67.86ms | 69.22ms | 1.02x |
+| 256K | 156.67ms | 181.19ms | 1.16x |
+| 512K | 411.58ms | 541.68ms | 1.32x |
+| **1M** | **1224.64ms** | **1797.96ms** | **1.47x** |
 
 Native varlen (selected + sliding window branches use cu_seqlens directly)
-is 23-33% faster than the padded approach at 256K-1M token contexts.
+is 32-47% faster than the padded approach at 256K-1M token contexts.
 
 ### Forward Component Breakdown (profiled on GB200)
 
