@@ -11,14 +11,21 @@ class TestBuildFA4BlockSparseTensors:
 
     def test_output_types(self) -> None:
         """Output is a valid BlockSparseTensorsTorch."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
         from mslk.attention.flash_attn.block_sparsity import BlockSparseTensorsTorch
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         B, H, N_q_tiles, k = 2, 4, 4, 8
-        indices = torch.randint(0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32)
+        indices = torch.randint(
+            0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32
+        )
 
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=128, n_block_size=128, seqlen_k=2048,
+            indices,
+            compress_block_size=128,
+            n_block_size=128,
+            seqlen_k=2048,
         )
         assert isinstance(result, BlockSparseTensorsTorch)
         assert result.full_block_cnt is not None
@@ -28,42 +35,65 @@ class TestBuildFA4BlockSparseTensors:
 
     def test_shapes(self) -> None:
         """Output tensors have correct shapes."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         B, H, N_q_tiles, k = 2, 4, 8, 4
-        indices = torch.randint(0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32)
+        seqlen_k = 2048
+        n_block_size = 128
+        n_blocks_k = seqlen_k // n_block_size  # 16
+        indices = torch.randint(
+            0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32
+        )
 
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=128, n_block_size=128, seqlen_k=2048,
+            indices,
+            compress_block_size=128,
+            n_block_size=n_block_size,
+            seqlen_k=seqlen_k,
         )
 
         assert result.full_block_cnt.shape == (B, H, N_q_tiles)
-        assert result.full_block_idx.shape == (B, H, N_q_tiles, k)
+        # full_block_idx uses dense shape (n_blocks_k) for backward transpose compatibility
+        assert result.full_block_idx.shape == (B, H, N_q_tiles, n_blocks_k)
         assert result.mask_block_cnt.shape == (B, H, N_q_tiles)
 
     def test_full_block_count(self) -> None:
         """Full block count matches expected value."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         B, H, N_q_tiles, k = 1, 2, 4, 8
-        indices = torch.randint(0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32)
+        indices = torch.randint(
+            0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32
+        )
 
         # compress_block_size == n_block_size, so 1:1 mapping
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=128, n_block_size=128, seqlen_k=2048,
+            indices,
+            compress_block_size=128,
+            n_block_size=128,
+            seqlen_k=2048,
         )
         assert (result.full_block_cnt == k).all()
 
     def test_block_expansion(self) -> None:
         """When compress_block_size > n_block_size, blocks expand correctly."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         B, H, N_q_tiles, k = 1, 1, 2, 2
         # Select block 0 and block 3
         indices = torch.tensor([[[[0, 3]]]], device="cuda", dtype=torch.int32)
 
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=256, n_block_size=128, seqlen_k=1024,
+            indices,
+            compress_block_size=256,
+            n_block_size=128,
+            seqlen_k=1024,
         )
 
         # Each NSA block of 256 -> 2 FA4 blocks of 128
@@ -75,23 +105,35 @@ class TestBuildFA4BlockSparseTensors:
 
     def test_mask_blocks_are_zero(self) -> None:
         """All mask block counts should be zero (selected blocks are fully attended)."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         B, H, N_q_tiles, k = 2, 4, 4, 8
-        indices = torch.randint(0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32)
+        indices = torch.randint(
+            0, 16, (B, H, N_q_tiles, k), device="cuda", dtype=torch.int32
+        )
 
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=128, n_block_size=128, seqlen_k=2048,
+            indices,
+            compress_block_size=128,
+            n_block_size=128,
+            seqlen_k=2048,
         )
         assert (result.mask_block_cnt == 0).all()
 
     def test_int32_dtype(self) -> None:
         """All output tensors are int32."""
-        from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+        from mslk.attention.sparse_attn.sparsity_masks import (
+            build_fa4_block_sparse_tensors,
+        )
 
         indices = torch.randint(0, 8, (1, 2, 4, 4), device="cuda", dtype=torch.int32)
         result = build_fa4_block_sparse_tensors(
-            indices, compress_block_size=128, n_block_size=128, seqlen_k=1024,
+            indices,
+            compress_block_size=128,
+            n_block_size=128,
+            seqlen_k=1024,
         )
         assert result.full_block_cnt.dtype == torch.int32
         assert result.full_block_idx.dtype == torch.int32
