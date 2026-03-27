@@ -409,13 +409,29 @@ class NSAFunction(torch.autograd.Function):
             W_k_compress,
             W_v_compress,
         )
+        del dK_cmp, dV_cmp
 
-        # Gradient accumulation
-        dQ = dQ_cmp + dQ_slc + dQ_sld
+        # Gradient accumulation — in-place to minimize peak memory
+        dQ_cmp += dQ_slc
+        del dQ_slc
+        dQ_cmp += dQ_sld
+        del dQ_sld
         if dQ_gate is not None:
-            dQ = dQ + dQ_gate
-        dK = dK_slc + dK_sld + dK_compress
-        dV = dV_slc + dV_sld + dV_compress
+            dQ_cmp += dQ_gate
+            del dQ_gate
+        dQ = dQ_cmp
+
+        dK_slc += dK_sld
+        del dK_sld
+        dK_slc += dK_compress
+        del dK_compress
+        dK = dK_slc
+
+        dV_slc += dV_sld
+        del dV_sld
+        dV_slc += dV_compress
+        del dV_compress
+        dV = dV_slc
 
         # Return gradients matching forward() args order:
         # Q, K, V, K_cmp, V_cmp, W_k, W_v, gate_proj_weight, + 10 non-tensor args
@@ -746,12 +762,27 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         cu_seqlens=cu_seqlens,
     )
 
-    # --- Gradient accumulation (all 3D) ---
-    dQ = dQ_cmp + dQ_slc + dQ_sld
+    # --- Gradient accumulation (all 3D) — in-place to minimize peak memory ---
+    dQ_cmp += dQ_slc
+    del dQ_slc
+    dQ_cmp += dQ_sld
+    del dQ_sld
     if dQ_gate is not None:
-        dQ = dQ + dQ_gate
-    dK = dK_slc + dK_sld + dK_compress
-    dV = dV_slc + dV_sld + dV_compress
+        dQ_cmp += dQ_gate
+        del dQ_gate
+    dQ = dQ_cmp
+
+    dK_slc += dK_sld
+    del dK_sld
+    dK_slc += dK_compress
+    del dK_compress
+    dK = dK_slc
+
+    dV_slc += dV_sld
+    del dV_sld
+    dV_slc += dV_compress
+    del dV_compress
+    dV = dV_slc
 
     # Return gradients matching forward() args order
     return (
