@@ -53,7 +53,9 @@ def build_sliding_window_block_sparse(
     #                     ((t+1)*q_tile_size - 1) // n_block_size]
 
     # Build per-tile block lists
-    max_blocks_per_tile = (window_size + q_tile_size + n_block_size - 1) // n_block_size + 1
+    max_blocks_per_tile = (
+        window_size + q_tile_size + n_block_size - 1
+    ) // n_block_size + 1
 
     full_block_cnt = torch.zeros(1, 1, n_q_tiles, dtype=torch.int32, device=device)
     full_block_idx = torch.zeros(

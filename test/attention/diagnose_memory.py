@@ -35,23 +35,31 @@ def main():
     B, H, H_kv, D = 1, 32, 8, 128
     N_warmup = 4096
 
-    print(f"Before import: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"Before import: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     Q = torch.randn(B, N_warmup, H, D, device="cuda", dtype=torch.bfloat16)
     K = torch.randn(B, N_warmup, H_kv, D, device="cuda", dtype=torch.bfloat16)
     V = torch.randn(B, N_warmup, H_kv, D, device="cuda", dtype=torch.bfloat16)
 
-    print(f"After tensor alloc: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"After tensor alloc: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     # Forward warmup
     O = nsa_forward(Q, K, V)
     torch.cuda.synchronize()
-    print(f"After fwd warmup 1: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"After fwd warmup 1: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     del O
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"After cleanup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"After cleanup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     # Forward + backward warmup
     Q.requires_grad_(True)
@@ -60,13 +68,17 @@ def main():
     O = nsa(Q, K, V)
     O.sum().backward()
     torch.cuda.synchronize()
-    print(f"After fwd+bwd warmup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"After fwd+bwd warmup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     Q.grad = K.grad = V.grad = None
     del O
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"After cleanup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+    print(
+        f"After cleanup: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+    )
 
     # Now try larger N
     for N in [131072, 262144, 524288, 1048576, 2097152]:
@@ -78,14 +90,18 @@ def main():
         V = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16)
 
         tensor_mb = 3 * B * N * max(H, H_kv) * D * 2 / 1024**2  # approx
-        print(f"\n=== N={N} ({N//1024}K) ===")
+        print(f"\n=== N={N} ({N // 1024}K) ===")
         print(f"Tensor size: ~{tensor_mb:.0f} MB")
-        print(f"Before: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+        print(
+            f"Before: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+        )
 
         try:
             O = nsa_forward(Q, K, V)
             torch.cuda.synchronize()
-            print(f"Forward OK: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+            print(
+                f"Forward OK: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+            )
             del O
         except Exception as e:
             print(f"Forward FAILED: {e}")
@@ -96,14 +112,22 @@ def main():
 
         # Try fwd+bwd
         try:
-            Q = torch.randn(B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            K = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            V = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            Q = torch.randn(
+                B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            K = torch.randn(
+                B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            V = torch.randn(
+                B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
 
             O = nsa(Q, K, V)
             O.sum().backward()
             torch.cuda.synchronize()
-            print(f"Fwd+Bwd OK: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved")
+            print(
+                f"Fwd+Bwd OK: {mem_mb():.0f} MB allocated, {mem_reserved_mb():.0f} MB reserved"
+            )
             Q.grad = K.grad = V.grad = None
             del O, Q, K, V
         except Exception as e:

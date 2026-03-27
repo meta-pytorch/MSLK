@@ -411,20 +411,17 @@ def fused_score_and_select_blocks(
     cu_seqlens: Tensor | None = None,  # (B+1,) int32 for varlen
     max_seqlen: int | None = None,
 ) -> Tensor:
-    """Fused block scoring and top-k selection using a CuteDSL kernel.
+    """Fused block scoring and top-k selection using GEMM + topk.
 
-    Replaces score_and_select_blocks with a single kernel launch. Uses the
-    Q_mean optimization: mean(Q @ K) = mean(Q) @ K, reducing scoring from a
-    full GEMM to a GEMV per query tile (256x fewer FLOPs).
+    Uses the Q_mean optimization: mean(Q @ K) = mean(Q) @ K, reducing scoring
+    from a full GEMM to a GEMV per query tile (256x fewer FLOPs).
 
-    The Q_mean computation is done in PyTorch (single kernel), then the
-    CuteDSL kernel fuses dot products, causal masking, top-k selection, and
-    sorting into one launch.
+    Q_mean is computed in PyTorch (single kernel), then cuBLAS GEMM computes
+    scores, and torch.topk selects the top-k blocks. Chunked over Q tiles
+    to bound peak memory.
 
     For varlen (3D + cu_seqlens): computes Q_mean per-sequence and pads to
-    max_N_q_tiles. The CuteDSL kernel operates on this small padded Q_mean.
-
-    Falls back to PyTorch reference for N_cmp > 128 * 128 = 16384 blocks.
+    max_N_q_tiles.
 
     Args:
         Q: Query tensor, shape (B, N, H, D).
@@ -438,11 +435,6 @@ def fused_score_and_select_blocks(
     Returns:
         block_indices: Selected KV block indices, shape (B, H, N_q_tiles, k).
     """
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
     is_varlen = cu_seqlens is not None
 
     if is_varlen:
@@ -494,22 +486,6 @@ def fused_score_and_select_blocks(
 
     k_actual = min(num_selected_blocks, N_cmp)
 
-    THREADS = 128
-    raw_n_per_thread = (N_cmp + THREADS - 1) // THREADS
-    max_n_per_thread = _bucket_n_per_thread(raw_n_per_thread)
-
-    # Fall back to PyTorch reference for very large N_cmp
-    if max_n_per_thread > _N_PER_THREAD_BUCKETS[-1]:
-        return score_and_select_blocks(
-            Q,
-            K_cmp,
-            num_selected_blocks,
-            compress_block_size,
-            causal=causal,
-            q_tile_size=q_tile_size,
-            softmax_scale=softmax_scale,
-        )
-
     # --- Q_mean in PyTorch ---
     if Q_mean is None:
         # 4D path: Q: (B, N, H, D) -> (B, N_q_tiles, q_tile_size, H, D) -> mean
@@ -523,69 +499,69 @@ def fused_score_and_select_blocks(
         # Varlen path: Q_mean already computed above, just scale
         Q_mean = Q_mean * softmax_scale
 
-    # Reshape Q_mean to 2D: row (b, tile, h) -> b * N_q_tiles * H + tile * H + h
-    Q_mean_2d = Q_mean.reshape(B * N_q_tiles * H, D).contiguous()
+    # --- Scoring via GEMM + top-k in PyTorch ---
+    # Uses bmm at KV-head granularity to avoid expanding K_cmp for GQA.
+    # Q groups are folded into the M dimension of the GEMM.
 
-    # Reshape K_cmp to 2D: row (b, j, h_kv) -> b * N_cmp * H_kv + j * H_kv + h_kv
-    K_cmp_2d = K_cmp.reshape(B * N_cmp * H_kv, D).contiguous().float()
+    groups = H // H_kv
 
-    # Output: (B * H * N_q_tiles, k_actual) int32
-    out_2d = torch.empty(
-        B * H * N_q_tiles, k_actual, dtype=torch.int32, device=Q.device
+    # K_cmp: (B, N_cmp, H_kv, D) -> (B*H_kv, D, N_cmp) for bmm
+    K_cmp_t = K_cmp.permute(0, 2, 3, 1).reshape(B * H_kv, D, N_cmp).float()
+
+    # Causal mask data
+    if causal:
+        q_tile_end = (torch.arange(N_q_tiles, device=Q.device) + 1) * q_tile_size
+        kv_block_start = torch.arange(N_cmp, device=Q.device) * compress_block_size
+
+    block_indices = torch.empty(
+        B, H, N_q_tiles, k_actual, dtype=torch.int32, device=Q.device
     )
 
-    torch2cute_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    cute_dtype = torch2cute_dtype[Q_mean_2d.dtype]
+    # Process in chunks to bound peak memory
+    chunk_tiles = min(64, N_q_tiles)
+    for chunk_start in range(0, N_q_tiles, chunk_tiles):
+        chunk_end = min(chunk_start + chunk_tiles, N_q_tiles)
+        n_tiles = chunk_end - chunk_start
 
-    def to_cute(tensor):
-        return from_dlpack(
-            tensor.detach(), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
+        # Q_mean chunk: (B, n_tiles, H, D) -> (B, n_tiles, H_kv, groups, D)
+        # -> (B*H_kv, n_tiles*groups, D) for bmm
+        q_chunk = Q_mean[:, chunk_start:chunk_end]  # (B, n_tiles, H, D)
+        q_grouped = q_chunk.reshape(B, n_tiles, H_kv, groups, D)
+        q_bmm = q_grouped.permute(0, 2, 1, 3, 4).reshape(B * H_kv, n_tiles * groups, D)
 
-    mQ_mean = to_cute(Q_mean_2d)
-    mK_cmp = to_cute(K_cmp_2d)
-    mOut = to_cute(out_2d)
+        # bmm: (B*H_kv, n_tiles*groups, D) @ (B*H_kv, D, N_cmp)
+        #    -> (B*H_kv, n_tiles*groups, N_cmp)
+        scores_flat = torch.bmm(q_bmm, K_cmp_t)
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (cute_dtype, D, k_actual, max_n_per_thread, causal)
-    if compile_key not in _fused_select_compile_cache:
-        kernel_op = _make_fused_select_kernel(
-            cute_dtype, D, k_actual, max_n_per_thread, causal
-        )
-        _fused_select_compile_cache[compile_key] = cute.compile(
-            kernel_op,
-            mQ_mean,
-            mK_cmp,
-            mOut,
-            N_cmp,
-            N_q_tiles,
-            H,
-            H_kv,
-            compress_block_size,
-            q_tile_size,
-            current_stream,
+        # Reshape: (B, H_kv, n_tiles, groups, N_cmp) -> (B, n_tiles, H_kv, groups, N_cmp)
+        #        -> (B, n_tiles, H, N_cmp) -> (B, H, n_tiles, N_cmp)
+        scores = (
+            scores_flat.reshape(B, H_kv, n_tiles, groups, N_cmp)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B, n_tiles, H, N_cmp)
+            .permute(0, 2, 1, 3)
         )
 
-    _fused_select_compile_cache[compile_key](
-        mQ_mean,
-        mK_cmp,
-        mOut,
-        N_cmp,
-        N_q_tiles,
-        H,
-        H_kv,
-        compress_block_size,
-        q_tile_size,
-        current_stream,
-    )
+        # Causal mask: block j is future if j * block_size >= (tile+1) * q_tile_size
+        if causal:
+            future_mask = kv_block_start.unsqueeze(0) >= q_tile_end[
+                chunk_start:chunk_end
+            ].unsqueeze(1)
+            scores.masked_fill_(future_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-    # Reshape output: (B * H * N_q_tiles, k) -> (B, H, N_q_tiles, k)
-    block_indices = out_2d.reshape(B, H, N_q_tiles, k_actual)
+        # Top-k
+        topk_scores, chunk_idx = scores.topk(k_actual, dim=-1)
+
+        # Replace -inf selections with block 0
+        invalid = topk_scores == float("-inf")
+        if invalid.any():
+            chunk_idx = chunk_idx.masked_fill(invalid, 0)
+
+        # Sort ascending for better memory access patterns
+        block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(dim=-1).values.to(
+            torch.int32
+        )
+
     return block_indices
 
 
