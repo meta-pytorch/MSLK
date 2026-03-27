@@ -30,8 +30,14 @@ from mslk.attention.sparse_attn.nsa_forward import (
     _fa4_fwd,
     _make_compressed_causal_mask,
 )
-from mslk.attention.sparse_attn.select import fused_score_and_select_blocks
-from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_blocks,
+    select_compressed_blocks,
+)
+from mslk.attention.sparse_attn.sparsity_masks import (
+    build_compressed_block_sparse_tensors,
+    build_fa4_block_sparse_tensors,
+)
 from torch import Tensor
 
 
@@ -40,6 +46,7 @@ def _transpose_block_sparse_for_bwd(
     seqlen_q: int,
     seqlen_k: int,
     n_block_size: int,
+    use_mask_blocks: bool = False,
 ):
     """Transpose forward block-sparse tensors for the backward pass.
 
@@ -48,11 +55,20 @@ def _transpose_block_sparse_for_bwd(
 
     The backward kernel iterates over KV-blocks and needs to know which Q-tiles
     contribute gradients to each KV-block.
+
+    Args:
+        use_mask_blocks: If True, read from mask_block_cnt/idx instead of
+            full_block_cnt/idx, and output as mask blocks. Used for the
+            compressed branch where mask_mod is needed.
     """
     from mslk.attention.flash_attn.block_sparsity import BlockSparseTensorsTorch
 
-    fwd_cnt = fwd_tensors.full_block_cnt  # (B, H, n_q_tiles)
-    fwd_idx = fwd_tensors.full_block_idx  # (B, H, n_q_tiles, max_kv_per_tile)
+    if use_mask_blocks:
+        fwd_cnt = fwd_tensors.mask_block_cnt
+        fwd_idx = fwd_tensors.mask_block_idx
+    else:
+        fwd_cnt = fwd_tensors.full_block_cnt  # (B, H, n_q_tiles)
+        fwd_idx = fwd_tensors.full_block_idx  # (B, H, n_q_tiles, max_kv_per_tile)
     q_block_size, _ = fwd_tensors.block_size
 
     B, H, n_q_tiles = fwd_cnt.shape
@@ -79,6 +95,15 @@ def _transpose_block_sparse_for_bwd(
     bwd_mask_idx = torch.zeros(
         B, H, n_kv_blocks, n_q_tiles, dtype=torch.int32, device=device
     )
+
+    if use_mask_blocks:
+        return BlockSparseTensorsTorch(
+            mask_block_cnt=bwd_cnt,
+            mask_block_idx=bwd_idx,
+            full_block_cnt=bwd_mask_cnt,
+            full_block_idx=bwd_mask_idx,
+            block_size=(q_block_size, n_block_size),
+        )
 
     return BlockSparseTensorsTorch(
         mask_block_cnt=bwd_mask_cnt,
@@ -161,6 +186,7 @@ class NSAFunction(torch.autograd.Function):
         cu_seqlens: Tensor | None,
         max_seqlen: int | None,
         sparse_tensors,  # BlockSparseTensorsTorch
+        cmp_sparse_tensors,  # BlockSparseTensorsTorch | None
     ) -> Tensor:
         is_varlen = cu_seqlens is not None
 
@@ -185,6 +211,7 @@ class NSAFunction(torch.autograd.Function):
                 cu_seqlens,
                 max_seqlen,
                 sparse_tensors,
+                cmp_sparse_tensors,
             )
 
         # Fixed-length 4D path (unchanged)
@@ -192,14 +219,25 @@ class NSAFunction(torch.autograd.Function):
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
         )
-        O_cmp, _ = _fa4_fwd(
-            Q,
-            K_cmp,
-            V_cmp,
-            causal=False,
-            softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
-        )
+        if cmp_sparse_tensors is not None:
+            O_cmp, _ = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+                block_sparse_tensors=cmp_sparse_tensors,
+            )
+        else:
+            O_cmp, _ = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+            )
         O_slc, _ = _fa4_fwd(
             Q,
             K,
@@ -233,6 +271,7 @@ class NSAFunction(torch.autograd.Function):
             W_v_compress,
         )
         ctx.sparse_tensors = sparse_tensors
+        ctx.cmp_sparse_tensors = cmp_sparse_tensors
         ctx.compress_block_size = compress_block_size
         ctx.window_size = window_size
         ctx.causal = causal
@@ -269,6 +308,7 @@ class NSAFunction(torch.autograd.Function):
         compress_block_size = ctx.compress_block_size
         window_size = ctx.window_size
         sparse_tensors = ctx.sparse_tensors
+        cmp_sparse_tensors = ctx.cmp_sparse_tensors
 
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
@@ -285,6 +325,7 @@ class NSAFunction(torch.autograd.Function):
                 causal=False,
                 softmax_scale=softmax_scale,
                 mask_mod=compressed_mask,
+                block_sparse_tensors=cmp_sparse_tensors,
             )
             O_slc, lse_slc = _fa4_fwd(
                 Q,
@@ -331,7 +372,18 @@ class NSAFunction(torch.autograd.Function):
                 causal=False,
                 softmax_scale=softmax_scale,
                 mask_mod=compressed_mask,
+                block_sparse_tensors=cmp_sparse_tensors,
             )
+        if cmp_sparse_tensors is not None:
+            cmp_bwd_sparse = _transpose_block_sparse_for_bwd(
+                cmp_sparse_tensors,
+                seqlen_q=Q.shape[1],
+                seqlen_k=K_cmp.shape[1],
+                n_block_size=cmp_sparse_tensors.block_size[1],
+                use_mask_blocks=True,
+            )
+        else:
+            cmp_bwd_sparse = None
         dQ_cmp, dK_cmp, dV_cmp = _fa4_bwd(
             Q,
             K_cmp,
@@ -342,6 +394,7 @@ class NSAFunction(torch.autograd.Function):
             softmax_scale=softmax_scale,
             causal=False,
             mask_mod=compressed_mask,
+            block_sparse_tensors=cmp_bwd_sparse,
         )
         del O_cmp, lse_cmp, dO_cmp
 
@@ -434,7 +487,7 @@ class NSAFunction(torch.autograd.Function):
         dV = dV_slc
 
         # Return gradients matching forward() args order:
-        # Q, K, V, K_cmp, V_cmp, W_k, W_v, gate_proj_weight, + 10 non-tensor args
+        # Q, K, V, K_cmp, V_cmp, W_k, W_v, gate_proj_weight, + 11 non-tensor args
         return (
             dQ,
             dK,
@@ -454,6 +507,7 @@ class NSAFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # cmp_sparse_tensors
         )
 
 
@@ -477,6 +531,7 @@ def _nsa_forward_varlen(
     cu_seqlens: Tensor,
     max_seqlen: int | None,
     sparse_tensors,
+    cmp_sparse_tensors,
 ) -> Tensor:
     """Varlen forward: native varlen for selected + sliding, padded for compressed."""
     H = Q.shape[1]
@@ -493,14 +548,25 @@ def _nsa_forward_varlen(
 
     # Branch 1: Compressed attention (padded 4D — mask_mod blocks varlen)
     Q_pad = _pad_to_4d(Q, cu_seqlens, seqlens, batch_size, pad_N)
-    O_cmp_pad, _ = _fa4_fwd(
-        Q_pad,
-        K_cmp,
-        V_cmp,
-        causal=False,
-        softmax_scale=softmax_scale,
-        mask_mod=compressed_mask,
-    )
+    if cmp_sparse_tensors is not None:
+        O_cmp_pad, _ = _fa4_fwd(
+            Q_pad,
+            K_cmp,
+            V_cmp,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+            block_sparse_tensors=cmp_sparse_tensors,
+        )
+    else:
+        O_cmp_pad, _ = _fa4_fwd(
+            Q_pad,
+            K_cmp,
+            V_cmp,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+        )
     O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
     del Q_pad, O_cmp_pad
 
@@ -550,6 +616,7 @@ def _nsa_forward_varlen(
         cu_seqlens,
     )
     ctx.sparse_tensors = sparse_tensors
+    ctx.cmp_sparse_tensors = cmp_sparse_tensors
     ctx.compress_block_size = compress_block_size
     ctx.window_size = window_size
     ctx.causal = causal
@@ -583,6 +650,7 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
     compress_block_size = ctx.compress_block_size
     window_size = ctx.window_size
     sparse_tensors = ctx.sparse_tensors
+    cmp_sparse_tensors = ctx.cmp_sparse_tensors
     max_seqlen = ctx.max_seqlen
     seqlens, batch_size, pad_N = ctx.varlen_meta
 
@@ -603,6 +671,7 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
             causal=False,
             softmax_scale=softmax_scale,
             mask_mod=compressed_mask,
+            block_sparse_tensors=cmp_sparse_tensors,
         )
         O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
         del O_cmp_pad
@@ -664,8 +733,19 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         causal=False,
         softmax_scale=softmax_scale,
         mask_mod=compressed_mask,
+        block_sparse_tensors=cmp_sparse_tensors,
     )
     dO_cmp_pad = _pad_to_4d(dO_cmp, cu_seqlens, seqlens, batch_size, pad_N)
+    if cmp_sparse_tensors is not None:
+        cmp_bwd_sparse = _transpose_block_sparse_for_bwd(
+            cmp_sparse_tensors,
+            seqlen_q=pad_N,
+            seqlen_k=K_cmp.shape[1],
+            n_block_size=cmp_sparse_tensors.block_size[1],
+            use_mask_blocks=True,
+        )
+    else:
+        cmp_bwd_sparse = None
     dQ_cmp_pad, dK_cmp, dV_cmp = _fa4_bwd(
         Q_pad,
         K_cmp,
@@ -676,6 +756,7 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         softmax_scale=softmax_scale,
         causal=False,
         mask_mod=compressed_mask,
+        block_sparse_tensors=cmp_bwd_sparse,
     )
     dQ_cmp = _unpad_to_3d(dQ_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
     del Q_pad, O_cmp_pad, lse_cmp_pad, dO_cmp_pad, dQ_cmp_pad, dO_cmp
@@ -804,6 +885,7 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         None,
         None,
         None,
+        None,  # cmp_sparse_tensors
     )
 
 
@@ -823,6 +905,7 @@ def nsa(
     n_block_size: int = 128,
     cu_seqlens: Tensor | None = None,  # (batch_size + 1,) int32 for varlen
     max_seqlen: int | None = None,
+    num_cmp_selected_blocks: int | None = None,
 ) -> Tensor:
     """NSA with autograd support (forward + backward).
 
@@ -850,6 +933,10 @@ def nsa(
         n_block_size: FA4 KV block size (128 for SM100).
         cu_seqlens: Cumulative sequence lengths for varlen, shape (B+1,) int32.
         max_seqlen: Maximum sequence length for varlen.
+        num_cmp_selected_blocks: Number of FA4 KV blocks to select for the
+            compressed branch. When set, the compressed branch uses block-sparse
+            attention (sub-quadratic). When None (default), full compressed
+            attention is used.
 
     Returns:
         Output tensor, same shape as Q.
@@ -899,6 +986,33 @@ def nsa(
         seqlen_k=seqlen_k,
     )
 
+    # Step 3b: Block-sparse compressed attention (optional)
+    cmp_sparse_tensors = None
+    if num_cmp_selected_blocks is not None:
+        N_cmp = K_cmp.shape[1]
+        cmp_n_block_size = n_block_size
+        n_cmp_kv_blocks = (N_cmp + cmp_n_block_size - 1) // cmp_n_block_size
+        if n_cmp_kv_blocks > num_cmp_selected_blocks:
+            # Only use block sparsity when there are more blocks than we select
+            cmp_block_indices = select_compressed_blocks(
+                Q,
+                K_cmp,
+                num_cmp_selected_blocks,
+                compress_block_size,
+                cmp_n_block_size=cmp_n_block_size,
+                causal=causal,
+                q_tile_size=q_tile_size,
+                softmax_scale=softmax_scale,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen if is_varlen else None,
+            )
+            cmp_sparse_tensors = build_compressed_block_sparse_tensors(
+                cmp_block_indices,
+                n_kv_blocks=n_cmp_kv_blocks,
+                q_tile_size=q_tile_size,
+                cmp_n_block_size=cmp_n_block_size,
+            )
+
     # Step 4: NSAFunction handles the three FA4 branches + gating
     return NSAFunction.apply(
         Q,
@@ -919,4 +1033,5 @@ def nsa(
         cu_seqlens,
         max_seqlen,
         sparse_tensors,
+        cmp_sparse_tensors,
     )

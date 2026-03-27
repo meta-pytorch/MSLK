@@ -18,8 +18,14 @@ from typing import Callable, Optional, Tuple
 import torch
 from mslk.attention.sparse_attn.compress import fused_compress_kv
 from mslk.attention.sparse_attn.gating import fused_gate_and_combine
-from mslk.attention.sparse_attn.select import fused_score_and_select_blocks
-from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
+from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_blocks,
+    select_compressed_blocks,
+)
+from mslk.attention.sparse_attn.sparsity_masks import (
+    build_compressed_block_sparse_tensors,
+    build_fa4_block_sparse_tensors,
+)
 from torch import Tensor
 
 
@@ -169,6 +175,7 @@ def nsa_forward(
     n_block_size: int = 128,
     cu_seqlens: Tensor | None = None,  # (batch_size + 1,) int32 for varlen
     max_seqlen: int | None = None,
+    num_cmp_selected_blocks: int | None = None,
 ) -> Tensor:
     """NSA forward pass using FA4 for all attention branches.
 
@@ -192,6 +199,11 @@ def nsa_forward(
         n_block_size: FA4 KV block size (128 for SM100).
         cu_seqlens: Cumulative sequence lengths, shape (B+1,) int32 for varlen.
         max_seqlen: Maximum sequence length for varlen padding.
+        num_cmp_selected_blocks: Number of FA4 KV blocks to select for the
+            compressed branch. When set, the compressed branch uses block-sparse
+            attention (only attending to the top-k most relevant blocks of
+            compressed KV), making it O(N) instead of O(N^2/compress_block_size).
+            When None (default), full compressed attention is used.
 
     Returns:
         Output tensor, same shape as Q.
@@ -257,14 +269,45 @@ def nsa_forward(
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
         )
-        O_cmp_pad, _ = _fa4_fwd(
-            Q_pad,
-            K_cmp_pad,
-            V_cmp_pad,
-            causal=False,
-            softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
-        )
+
+        if num_cmp_selected_blocks is not None:
+            N_cmp_pad = K_cmp_pad.shape[1]
+            cmp_n_block_size = n_block_size
+            n_cmp_kv_blocks = (N_cmp_pad + cmp_n_block_size - 1) // cmp_n_block_size
+            cmp_block_indices = select_compressed_blocks(
+                Q_pad,
+                K_cmp_pad,
+                num_cmp_selected_blocks,
+                compress_block_size,
+                cmp_n_block_size=cmp_n_block_size,
+                causal=causal,
+                q_tile_size=q_tile_size,
+                softmax_scale=softmax_scale,
+            )
+            cmp_sparse = build_compressed_block_sparse_tensors(
+                cmp_block_indices,
+                n_kv_blocks=n_cmp_kv_blocks,
+                q_tile_size=q_tile_size,
+                cmp_n_block_size=cmp_n_block_size,
+            )
+            O_cmp_pad, _ = _fa4_fwd(
+                Q_pad,
+                K_cmp_pad,
+                V_cmp_pad,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+                block_sparse_tensors=cmp_sparse,
+            )
+        else:
+            O_cmp_pad, _ = _fa4_fwd(
+                Q_pad,
+                K_cmp_pad,
+                V_cmp_pad,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+            )
         # Unpad compressed output to 3D
         O_cmp = Q.new_zeros(Q.shape[0], H, D_dim)
         for i, slen in enumerate(seqlens):
@@ -347,14 +390,46 @@ def nsa_forward(
     compressed_mask = (
         _make_compressed_causal_mask(compress_block_size) if causal else None
     )
-    O_cmp, lse_cmp = _fa4_fwd(
-        Q,
-        K_cmp,
-        V_cmp,
-        causal=False,
-        softmax_scale=softmax_scale,
-        mask_mod=compressed_mask,
-    )
+
+    if num_cmp_selected_blocks is not None:
+        # Block-sparse compressed attention: select top-k FA4 blocks of K_cmp
+        N_cmp = K_cmp.shape[1]
+        cmp_n_block_size = n_block_size
+        n_cmp_kv_blocks = (N_cmp + cmp_n_block_size - 1) // cmp_n_block_size
+        cmp_block_indices = select_compressed_blocks(
+            Q,
+            K_cmp,
+            num_cmp_selected_blocks,
+            compress_block_size,
+            cmp_n_block_size=cmp_n_block_size,
+            causal=causal,
+            q_tile_size=q_tile_size,
+            softmax_scale=softmax_scale,
+        )
+        cmp_sparse = build_compressed_block_sparse_tensors(
+            cmp_block_indices,
+            n_kv_blocks=n_cmp_kv_blocks,
+            q_tile_size=q_tile_size,
+            cmp_n_block_size=cmp_n_block_size,
+        )
+        O_cmp, lse_cmp = _fa4_fwd(
+            Q,
+            K_cmp,
+            V_cmp,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+            block_sparse_tensors=cmp_sparse,
+        )
+    else:
+        O_cmp, lse_cmp = _fa4_fwd(
+            Q,
+            K_cmp,
+            V_cmp,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+        )
 
     # Branch 2: Selected attention — block-sparse attention on full KV
     O_slc, lse_slc = _fa4_fwd(

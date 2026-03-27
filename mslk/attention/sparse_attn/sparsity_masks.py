@@ -142,3 +142,52 @@ def build_fa4_block_sparse_tensors(
         full_block_idx=full_block_idx_dense,
         block_size=(q_block_size, n_block_size),
     )
+
+
+def build_compressed_block_sparse_tensors(
+    cmp_block_indices: Tensor,  # (B, H, N_q_tiles, k_cmp) int32
+    n_kv_blocks: int,
+    q_tile_size: int = 256,
+    cmp_n_block_size: int = 128,
+) -> BlockSparseTensorsTorch:
+    """Build block-sparse tensors for block-sparse compressed attention.
+
+    All selected blocks go into mask_block (not full_block) because the
+    compressed causal mask (mask_mod) must be applied within each block.
+
+    Args:
+        cmp_block_indices: FA4 block indices in the compressed KV sequence,
+            shape (B, H, N_q_tiles, k_cmp). Values in [0, n_kv_blocks).
+        n_kv_blocks: Total number of FA4 KV blocks in the compressed sequence.
+        q_tile_size: Q tile size (256 for SM100).
+        cmp_n_block_size: FA4 KV block size for the compressed branch (128).
+
+    Returns:
+        BlockSparseTensorsTorch with selected blocks in mask_block
+        (so FA4 applies mask_mod for compressed causal masking).
+    """
+    B, H, N_q_tiles, k_cmp = cmp_block_indices.shape
+    device = cmp_block_indices.device
+
+    # All blocks in mask_block (need compressed causal mask via mask_mod)
+    mask_block_cnt = torch.full(
+        (B, H, N_q_tiles), k_cmp, dtype=torch.int32, device=device
+    )
+    mask_block_idx = torch.zeros(
+        (B, H, N_q_tiles, n_kv_blocks), dtype=torch.int32, device=device
+    )
+    mask_block_idx[:, :, :, :k_cmp] = cmp_block_indices
+
+    # No full blocks
+    full_block_cnt = torch.zeros((B, H, N_q_tiles), dtype=torch.int32, device=device)
+    full_block_idx = torch.zeros(
+        (B, H, N_q_tiles, n_kv_blocks), dtype=torch.int32, device=device
+    )
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_tile_size, cmp_n_block_size),
+    )
