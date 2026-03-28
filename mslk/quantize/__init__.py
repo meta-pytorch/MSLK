@@ -5,7 +5,3 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-
-from mslk.utils.torch.library import load_library_buck
-
-load_library_buck("//mslk/csrc/quantize:quantize_ops")

@@ -13,12 +13,10 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/conv/*.cpp
   csrc/gemm/*.cpp
   csrc/moe/*.cpp
-  csrc/quantize/*.cpp
   csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
-  csrc/moe/*.cu
-  csrc/quantize/*.cu)
+  csrc/moe/*.cu)
 
 # Include FB-internal sources into the build
 if(BUILD_FB_CODE
@@ -67,16 +65,12 @@ file(GLOB_RECURSE mslk_cpp_source_files_cuda
   csrc/gemm/cublas/*.cu
   csrc/gemm/cublas/**/*.cu
   csrc/gemm/cutlass/*.cu
-  csrc/gemm/cutlass/**/*.cu
-  csrc/quantize/cutlass/*.cu
-  csrc/quantize/cutlass/**/*.cu)
+  csrc/gemm/cutlass/**/*.cu)
 
 # HIP-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
-  csrc/gemm/ck/**/*.hip
-  csrc/quantize/ck/*.hip
-  csrc/quantize/ck/**/*.hip)
+  csrc/gemm/ck/**/*.hip)
 
 # HIP FMHA sources - built separately for only the latest GPU architecture
 # to reduce build time and binary size
