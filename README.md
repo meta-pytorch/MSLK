@@ -28,7 +28,10 @@ older than the one that the MSLK release corresponds to.
 
 | MSLK Release | Corresponding PyTorch Release | Supported Python Versions | Supported CUDA Versions | Supported CUDA Architectures | Supported ROCm Versions | Supported ROCm Architectures |
 |---------|---------|---------|---------|----------|-------------|-------------|
-| 1.0.0 | 2.10.x | 3.10, 3.11, 3.12, 3.13, 3.14 | 12.6, 12.8, 12.9, 13.0 | 8.0, 9.0a, 10.0a, 12.0a | 7.0, 7.1 | gfx908, gfx90a, gfx942, gfx950 |
+| 1.1.0 | 2.11.x | 3.10, 3.11, 3.12, 3.13, 3.14 | 12.6, 12.8, 12.9, 13.0 | 8.0, 9.0a, 10.0a, 12.0a | 7.0, 7.1 | gfx908, gfx90a, gfx942, gfx950 |
+| 1.0.0 | 2.10.x | 3.10, 3.11, 3.12, 3.13, 3.14 | 12.6, 12.8, 12.9, 13.0 | 8.0, 9.0a, 10.0a, 12.0a | 7.1, 7.2 | gfx908, gfx90a, gfx942, gfx950 |
+
+Note that the supported CUDA/ROCm Architectures refer to compiled C++ kernels. In addition, some kernels (e.g. CUTLASS/CK) would be specific to certain architectures. Python JIT DSL based kernels (e.g. Triton) would potentially work on wider variety of architectures.
 
 ## **Running Benchmarks**
 ```bash
@@ -59,6 +62,12 @@ git submodule update --init --recursive
 # After the initial environment setup, you can activate the environment and iterate faster:
 conda activate build-py3.14-torchnightly-cuda12.9.1
 python setup.py install
+```
+
+### **Python-Only Build**
+If you don't need the C++/CUDA kernels (e.g. for testing Python only changes), you can install MSLK in Python-only mode by setting the `MSLK_PYTHON_ONLY` environment variable. This skips the C++/CUDA compilation entirely.
+```bash
+MSLK_PYTHON_ONLY=1 pip install -e .
 ```
 
 ## Join the MSLK community
