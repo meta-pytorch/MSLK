@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 
 def main():
     # Benchmark data from GB200 (B=1, H=32, H_kv=8, D=128)
-    # Measured 2026-03-26
+    # Measured 2026-03-26 — with all optimizations (mask construction, in-place grad accum)
     seq_lengths = [
         1024,
         2048,
@@ -30,73 +30,73 @@ def main():
 
     # Forward: Dense FA4 vs NSA
     dense_fwd_ms = [
-        0.14,
-        0.14,
-        0.37,
-        0.60,
-        1.60,
-        6.06,
-        24.36,
-        96.30,
-        404.93,
-        1617.06,
-        7988.35,
+        0.27,
+        0.19,
+        0.27,
+        0.55,
+        1.52,
+        5.44,
+        24.79,
+        99.62,
+        397.26,
+        1600.45,
+        6413.33,
     ]
     nsa_fwd_ms = [
-        1.72,
-        4.03,
-        3.71,
-        2.67,
-        4.46,
-        6.66,
-        10.56,
-        24.32,
-        64.53,
-        196.30,
-        1007.97,
+        1.79,
+        2.54,
+        2.53,
+        2.24,
+        3.15,
+        5.78,
+        10.78,
+        24.15,
+        63.07,
+        188.18,
+        629.22,
     ]
 
     # Fwd+Bwd: Dense FA4 vs NSA
     dense_fwdbwd_ms = [
-        0.64,
+        0.56,
         0.57,
-        0.79,
+        0.78,
         1.65,
         5.11,
-        21.52,
-        80.41,
-        339.29,
-        1356.74,
-        5436.21,
-        26076.29,
+        21.02,
+        84.46,
+        340.14,
+        1339.51,
+        5374.25,
+        27270.16,
     ]
     nsa_fwdbwd_ms = [
-        4.10,
-        3.64,
-        3.71,
-        4.61,
-        8.71,
-        14.02,
-        29.27,
-        68.31,
-        181.52,
-        545.76,
-        1853.34,
+        3.70,
+        3.62,
+        3.51,
+        5.32,
+        8.02,
+        14.17,
+        29.46,
+        68.41,
+        179.66,
+        540.77,
+        2432.94,
     ]
 
     # Varlen Fwd+Bwd (2 packed sequences, 60/40 split)
     nsa_varlen_fwdbwd_ms = [
-        4.78,
-        5.09,
-        5.11,
-        6.71,
-        9.73,
-        16.54,
-        31.76,
-        67.42,
-        156.79,
-        621.28,
-        1901.55,
+        5.34,
+        5.55,
+        5.90,
+        7.22,
+        10.00,
+        17.01,
+        32.83,
+        67.86,
+        156.67,
+        411.58,
+        1224.64,
     ]
 
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
@@ -206,7 +206,7 @@ def main():
     ax.annotate(
         f"{fwdbwd_speedup[-1]:.1f}x",
         xy=(1048576, fwdbwd_speedup[-1]),
-        xytext=(300000, fwdbwd_speedup[-1] - 2),
+        xytext=(300000, fwdbwd_speedup[-1] - 1.5),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#ff7f0e"),
@@ -215,7 +215,7 @@ def main():
     ax.annotate(
         f"{fwd_speedup[-1]:.1f}x",
         xy=(1048576, fwd_speedup[-1]),
-        xytext=(300000, fwd_speedup[-1] + 1),
+        xytext=(300000, fwd_speedup[-1] + 0.5),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#1f77b4"),
