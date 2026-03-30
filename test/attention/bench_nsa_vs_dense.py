@@ -38,7 +38,7 @@ def benchmark_dense_fa4(N, B=1, H=32, H_kv=8, D=128, backward=False):
     )
 
     def run():
-        out = flash_attn_func(Q, K, V, softmax_scale=1.0 / D**0.5, causal=True)
+        out, _lse = flash_attn_func(Q, K, V, softmax_scale=1.0 / D**0.5, causal=True)
         if backward:
             loss = out.sum()
             loss.backward()
