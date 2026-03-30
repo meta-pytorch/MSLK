@@ -84,6 +84,21 @@ def main():
         1853.34,
     ]
 
+    # Varlen Fwd+Bwd (2 packed sequences, 60/40 split)
+    nsa_varlen_fwdbwd_ms = [
+        4.78,
+        5.09,
+        5.11,
+        6.71,
+        9.73,
+        16.54,
+        31.76,
+        67.42,
+        156.79,
+        621.28,
+        1901.55,
+    ]
+
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
     fwdbwd_speedup = [d / n for d, n in zip(dense_fwdbwd_ms, nsa_fwdbwd_ms)]
 
@@ -117,7 +132,7 @@ def main():
     ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
     ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
 
-    # --- Panel 2: Fwd+Bwd latency ---
+    # --- Panel 2: Fwd+Bwd latency (with varlen) ---
     ax = axes[1]
     ax.loglog(
         seq_lengths,
@@ -133,14 +148,23 @@ def main():
         nsa_fwdbwd_ms,
         "s-",
         color="#2ca02c",
-        label="NSA Sparse",
+        label="NSA (padded)",
         linewidth=2,
         markersize=6,
+    )
+    ax.loglog(
+        seq_lengths,
+        nsa_varlen_fwdbwd_ms,
+        "^--",
+        color="#1f77b4",
+        label="NSA (varlen)",
+        linewidth=2,
+        markersize=5,
     )
     ax.set_xlabel("Sequence Length", fontsize=12)
     ax.set_ylabel("Latency (ms)", fontsize=12)
     ax.set_title("Fwd + Bwd Latency", fontsize=13, fontweight="bold")
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, which="both")
     ax.set_xticks([1024, 4096, 16384, 65536, 262144, 1048576])
     ax.set_xticklabels(["1K", "4K", "16K", "64K", "256K", "1M"], fontsize=10)
@@ -191,7 +215,7 @@ def main():
     ax.annotate(
         f"{fwd_speedup[-1]:.1f}x",
         xy=(1048576, fwd_speedup[-1]),
-        xytext=(300000, fwd_speedup[-1] - 2),
+        xytext=(300000, fwd_speedup[-1] + 1),
         fontsize=11,
         fontweight="bold",
         arrowprops=dict(arrowstyle="->", color="#1f77b4"),
@@ -218,8 +242,8 @@ def main():
         va="top",
     )
 
-    plt.savefig("docs/nsa_bwd_perf.svg", format="svg", bbox_inches="tight", dpi=150)
-    print("Saved docs/nsa_bwd_perf.svg")
+    plt.savefig("docs/nsa_perf.svg", format="svg", bbox_inches="tight", dpi=150)
+    print("Saved docs/nsa_perf.svg")
 
 
 if __name__ == "__main__":

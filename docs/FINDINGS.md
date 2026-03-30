@@ -185,4 +185,4 @@ processing. Options:
 | `test/attention/bench_nsa_backward.py` | Backward benchmark (1K-3M) |
 | `test/attention/bench_nsa_vs_dense.py` | NSA vs dense FA4 comparison |
 | `docs/gen_nsa_perf_chart.py` | Performance chart generator |
-| `docs/nsa_bwd_perf.svg` | Performance chart |
+| `docs/nsa_perf.svg` | Performance chart |
