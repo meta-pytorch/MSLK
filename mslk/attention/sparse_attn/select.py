@@ -119,6 +119,268 @@ def score_and_select_blocks(
     return block_indices
 
 
+def _compute_q_mean(
+    Q: Tensor,
+    q_tile_size: int,
+    softmax_scale: float,
+    cu_seqlens: Tensor | None = None,
+    max_seqlen: int | None = None,
+) -> tuple[Tensor, int, int, int, int]:
+    """Compute per-tile Q_mean for block scoring.
+
+    Shared helper for both selected-branch and compressed-branch selectors.
+
+    Args:
+        Q: Query tensor, (B, N, H, D) or (total_tokens, H, D) for varlen.
+        q_tile_size: Query tile size (typically 256).
+        softmax_scale: Attention scaling factor.
+        cu_seqlens: Cumulative sequence lengths for varlen.
+        max_seqlen: Max sequence length for varlen.
+
+    Returns:
+        Q_mean: Scaled per-tile mean, shape (B, N_q_tiles, H, D) in float32.
+        B: Batch size.
+        N_q_tiles: Number of query tiles.
+        H: Number of query heads.
+        D: Head dimension.
+    """
+    is_varlen = cu_seqlens is not None
+
+    if is_varlen:
+        assert Q.dim() == 3, f"Varlen requires 3D Q, got {Q.dim()}D"
+        H = Q.shape[1]
+        D = Q.shape[2]
+        batch_size = cu_seqlens.shape[0] - 1
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        if max_seqlen is None:
+            max_seqlen = max(seqlens)
+        N_q_tiles = max_seqlen // q_tile_size
+        B = batch_size
+
+        Q_mean_parts = []
+        for i, slen in enumerate(seqlens):
+            s = cu_seqlens[i].item()
+            n_tiles_i = slen // q_tile_size
+            if n_tiles_i > 0:
+                Q_mean_i = (
+                    Q[s : s + n_tiles_i * q_tile_size]
+                    .reshape(n_tiles_i, q_tile_size, H, D)
+                    .mean(dim=1)
+                    .float()
+                )
+            else:
+                Q_mean_i = Q.new_zeros(0, H, D, dtype=torch.float32)
+            Q_mean_parts.append(Q_mean_i)
+
+        # Pad to (B, max_N_q_tiles, H, D)
+        Q_mean = Q.new_zeros(B, N_q_tiles, H, D, dtype=torch.float32)
+        for i, qm in enumerate(Q_mean_parts):
+            if qm.shape[0] > 0:
+                Q_mean[i, : qm.shape[0]] = qm
+
+        Q_mean = Q_mean * softmax_scale
+    else:
+        B, N, H, D = Q.shape
+        N_q_tiles = N // q_tile_size
+        assert N % q_tile_size == 0, (
+            f"Sequence length {N} must be divisible by q_tile_size {q_tile_size}"
+        )
+        Q_mean = (
+            Q.reshape(B, N_q_tiles, q_tile_size, H, D).mean(dim=2).float()
+            * softmax_scale
+        )
+
+    return Q_mean, B, N_q_tiles, H, D
+
+
+def _score_and_topk(
+    Q_mean: Tensor,  # (B, N_q_tiles, H, D) float32, already scaled
+    K_cmp_t: Tensor,  # (B*H_kv, D, N_cmp) float32
+    B: int,
+    H: int,
+    H_kv: int,
+    N_q_tiles: int,
+    N_cmp: int,
+    k: int,
+    causal: bool,
+    compress_block_size: int,
+    q_tile_size: int,
+    chunk_tiles: int = 64,
+    device: torch.device | None = None,
+) -> Tensor:
+    """Score Q_mean against K_cmp and select top-k compressed blocks.
+
+    Uses GQA-aware bmm: Q groups are folded into the M dimension of the GEMM,
+    avoiding K_cmp expansion from H_kv to H heads.
+
+    Returns:
+        block_indices: (B, H, N_q_tiles, k) int32.
+    """
+    groups = H // H_kv
+    D = Q_mean.shape[-1]
+
+    if device is None:
+        device = Q_mean.device
+
+    k_actual = min(k, N_cmp)
+
+    # Causal mask data
+    if causal:
+        q_tile_end = (torch.arange(N_q_tiles, device=device) + 1) * q_tile_size
+        kv_block_start = torch.arange(N_cmp, device=device) * compress_block_size
+
+    block_indices = torch.empty(
+        B, H, N_q_tiles, k_actual, dtype=torch.int32, device=device
+    )
+
+    for chunk_start in range(0, N_q_tiles, chunk_tiles):
+        chunk_end = min(chunk_start + chunk_tiles, N_q_tiles)
+        n_tiles = chunk_end - chunk_start
+
+        # Q_mean chunk: (B, n_tiles, H, D) -> (B, n_tiles, H_kv, groups, D)
+        # -> (B*H_kv, n_tiles*groups, D) for bmm
+        q_chunk = Q_mean[:, chunk_start:chunk_end]
+        q_grouped = q_chunk.reshape(B, n_tiles, H_kv, groups, D)
+        q_bmm = q_grouped.permute(0, 2, 1, 3, 4).reshape(B * H_kv, n_tiles * groups, D)
+
+        # bmm: (B*H_kv, n_tiles*groups, D) @ (B*H_kv, D, N_cmp)
+        scores_flat = torch.bmm(q_bmm, K_cmp_t)
+
+        # Reshape to (B, H, n_tiles, N_cmp)
+        scores = (
+            scores_flat.reshape(B, H_kv, n_tiles, groups, N_cmp)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B, n_tiles, H, N_cmp)
+            .permute(0, 2, 1, 3)
+        )
+
+        # Causal mask
+        if causal:
+            future_mask = kv_block_start.unsqueeze(0) >= q_tile_end[
+                chunk_start:chunk_end
+            ].unsqueeze(1)
+            scores.masked_fill_(future_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        # Top-k
+        topk_scores, chunk_idx = scores.topk(k_actual, dim=-1)
+
+        # Replace -inf selections with block 0
+        invalid = topk_scores == float("-inf")
+        if invalid.any():
+            chunk_idx = chunk_idx.masked_fill(invalid, 0)
+
+        # Sort ascending
+        block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(dim=-1).values.to(
+            torch.int32
+        )
+
+    return block_indices
+
+
+def _score_aggregate_and_topk(
+    Q_mean: Tensor,  # (B, N_q_tiles, H, D) float32, already scaled
+    K_cmp_t: Tensor,  # (B*H_kv, D, N_cmp) float32
+    B: int,
+    H: int,
+    H_kv: int,
+    N_q_tiles: int,
+    N_cmp: int,
+    k: int,
+    compress_block_size: int,
+    cmp_n_block_size: int,
+    causal: bool,
+    q_tile_size: int,
+    chunk_tiles: int = 64,
+    device: torch.device | None = None,
+) -> Tensor:
+    """Score Q_mean against K_cmp, aggregate per FA4 block, and select top-k.
+
+    Same GEMM scoring as _score_and_topk, but aggregates per-compressed-token
+    scores into FA4 block scores (groups of cmp_n_block_size tokens) before topk.
+
+    Returns:
+        block_indices: (B, H, N_q_tiles, k) int32, FA4 block indices.
+    """
+    groups = H // H_kv
+    D = Q_mean.shape[-1]
+
+    if device is None:
+        device = Q_mean.device
+
+    n_kv_blocks = N_cmp // cmp_n_block_size
+    if n_kv_blocks == 0:
+        n_kv_blocks = 1
+    k_actual = min(k, n_kv_blocks)
+
+    # Causal mask at FA4 block level
+    if causal:
+        q_tile_end = (torch.arange(N_q_tiles, device=device) + 1) * q_tile_size
+        kv_block_start = (
+            torch.arange(n_kv_blocks, device=device)
+            * cmp_n_block_size
+            * compress_block_size
+        )
+
+    block_indices = torch.empty(
+        B, H, N_q_tiles, k_actual, dtype=torch.int32, device=device
+    )
+
+    for chunk_start in range(0, N_q_tiles, chunk_tiles):
+        chunk_end = min(chunk_start + chunk_tiles, N_q_tiles)
+        n_tiles = chunk_end - chunk_start
+
+        # Q_mean chunk: (B, n_tiles, H, D) -> GQA-aware bmm
+        q_chunk = Q_mean[:, chunk_start:chunk_end]
+        q_grouped = q_chunk.reshape(B, n_tiles, H_kv, groups, D)
+        q_bmm = q_grouped.permute(0, 2, 1, 3, 4).reshape(B * H_kv, n_tiles * groups, D)
+
+        # bmm: -> (B*H_kv, n_tiles*groups, N_cmp)
+        scores_flat = torch.bmm(q_bmm, K_cmp_t)
+
+        # Reshape to (B, H, n_tiles, N_cmp)
+        scores = (
+            scores_flat.reshape(B, H_kv, n_tiles, groups, N_cmp)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B, n_tiles, H, N_cmp)
+            .permute(0, 2, 1, 3)
+        )
+
+        # Aggregate per FA4 block: (B, H, n_tiles, n_kv_blocks)
+        if N_cmp % cmp_n_block_size == 0:
+            block_scores = scores.reshape(
+                B, H, n_tiles, n_kv_blocks, cmp_n_block_size
+            ).mean(dim=-1)
+        else:
+            pad = cmp_n_block_size - (N_cmp % cmp_n_block_size)
+            scores_padded = torch.nn.functional.pad(
+                scores, (0, pad), value=float("-inf")
+            )
+            block_scores = scores_padded.reshape(
+                B, H, n_tiles, n_kv_blocks, cmp_n_block_size
+            ).mean(dim=-1)
+
+        # Causal mask at FA4 block level
+        if causal:
+            future_mask = kv_block_start.unsqueeze(0) >= q_tile_end[
+                chunk_start:chunk_end
+            ].unsqueeze(1)
+            block_scores.masked_fill_(
+                future_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+            )
+
+        topk_scores, chunk_idx = block_scores.topk(k_actual, dim=-1)
+
+        invalid = topk_scores == float("-inf")
+        if invalid.any():
+            chunk_idx = chunk_idx.masked_fill(invalid, 0)
+
+        block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(dim=-1).values.to(
+            torch.int32
+        )
+
+    return block_indices
+
+
 def fused_score_and_select_blocks(
     Q: Tensor,  # (B, N, H, D) or (total_tokens, H, D) for varlen
     K_cmp: Tensor,  # (B, N_cmp, H_kv, D)
@@ -154,134 +416,34 @@ def fused_score_and_select_blocks(
     Returns:
         block_indices: Selected KV block indices, shape (B, H, N_q_tiles, k).
     """
-    is_varlen = cu_seqlens is not None
-
-    if is_varlen:
-        # Varlen: compute Q_mean per-sequence and pad to max_N_q_tiles
-        assert Q.dim() == 3, f"Varlen requires 3D Q, got {Q.dim()}D"
-        H = Q.shape[1]
-        D = Q.shape[2]
-        batch_size = cu_seqlens.shape[0] - 1
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        if max_seqlen is None:
-            max_seqlen = max(seqlens)
-        N_q_tiles = max_seqlen // q_tile_size
-        N = max_seqlen  # for fallback and downstream
-        B = batch_size
-
-        Q_mean_parts = []
-        for i, slen in enumerate(seqlens):
-            s = cu_seqlens[i].item()
-            n_tiles_i = slen // q_tile_size
-            if n_tiles_i > 0:
-                Q_mean_i = (
-                    Q[s : s + n_tiles_i * q_tile_size]
-                    .reshape(n_tiles_i, q_tile_size, H, D)
-                    .mean(dim=1)
-                    .float()
-                )
-            else:
-                Q_mean_i = Q.new_zeros(0, H, D, dtype=torch.float32)
-            Q_mean_parts.append(Q_mean_i)
-
-        # Pad to (B, max_N_q_tiles, H, D)
-        Q_mean = Q.new_zeros(B, N_q_tiles, H, D, dtype=torch.float32)
-        for i, qm in enumerate(Q_mean_parts):
-            if qm.shape[0] > 0:
-                Q_mean[i, : qm.shape[0]] = qm
-    else:
-        B, N, H, D = Q.shape
-        N_q_tiles = N // q_tile_size
-        assert N % q_tile_size == 0, (
-            f"Sequence length {N} must be divisible by q_tile_size {q_tile_size}"
-        )
-        Q_mean = None  # computed below
-
     H_kv = K_cmp.shape[2]
     N_cmp = K_cmp.shape[1]
 
     if softmax_scale is None:
+        D = Q.shape[-1]
         softmax_scale = 1.0 / math.sqrt(D)
 
-    k_actual = min(num_selected_blocks, N_cmp)
-
-    # --- Q_mean in PyTorch ---
-    if Q_mean is None:
-        # 4D path: Q: (B, N, H, D) -> (B, N_q_tiles, q_tile_size, H, D) -> mean
-        Q_mean = (
-            Q.reshape(B, N_q_tiles, q_tile_size, H, D)
-            .mean(dim=2)  # (B, N_q_tiles, H, D)
-            .float()
-            * softmax_scale
-        )
-    else:
-        # Varlen path: Q_mean already computed above, just scale
-        Q_mean = Q_mean * softmax_scale
-
-    # --- Scoring via GEMM + top-k in PyTorch ---
-    # Uses bmm at KV-head granularity to avoid expanding K_cmp for GQA.
-    # Q groups are folded into the M dimension of the GEMM.
-
-    groups = H // H_kv
-
-    # K_cmp: (B, N_cmp, H_kv, D) -> (B*H_kv, D, N_cmp) for bmm
-    K_cmp_t = K_cmp.permute(0, 2, 3, 1).reshape(B * H_kv, D, N_cmp).float()
-
-    # Causal mask data
-    if causal:
-        q_tile_end = (torch.arange(N_q_tiles, device=Q.device) + 1) * q_tile_size
-        kv_block_start = torch.arange(N_cmp, device=Q.device) * compress_block_size
-
-    block_indices = torch.empty(
-        B, H, N_q_tiles, k_actual, dtype=torch.int32, device=Q.device
+    Q_mean, B, N_q_tiles, H, D = _compute_q_mean(
+        Q, q_tile_size, softmax_scale, cu_seqlens, max_seqlen
     )
 
-    # Process in chunks to bound peak memory
-    chunk_tiles = min(64, N_q_tiles)
-    for chunk_start in range(0, N_q_tiles, chunk_tiles):
-        chunk_end = min(chunk_start + chunk_tiles, N_q_tiles)
-        n_tiles = chunk_end - chunk_start
+    # K_cmp: (B, N_cmp, H_kv, D) -> (B*H_kv, D, N_cmp) for GQA-aware bmm
+    K_cmp_t = K_cmp.permute(0, 2, 3, 1).reshape(B * H_kv, D, N_cmp).float()
 
-        # Q_mean chunk: (B, n_tiles, H, D) -> (B, n_tiles, H_kv, groups, D)
-        # -> (B*H_kv, n_tiles*groups, D) for bmm
-        q_chunk = Q_mean[:, chunk_start:chunk_end]  # (B, n_tiles, H, D)
-        q_grouped = q_chunk.reshape(B, n_tiles, H_kv, groups, D)
-        q_bmm = q_grouped.permute(0, 2, 1, 3, 4).reshape(B * H_kv, n_tiles * groups, D)
-
-        # bmm: (B*H_kv, n_tiles*groups, D) @ (B*H_kv, D, N_cmp)
-        #    -> (B*H_kv, n_tiles*groups, N_cmp)
-        scores_flat = torch.bmm(q_bmm, K_cmp_t)
-
-        # Reshape: (B, H_kv, n_tiles, groups, N_cmp) -> (B, n_tiles, H_kv, groups, N_cmp)
-        #        -> (B, n_tiles, H, N_cmp) -> (B, H, n_tiles, N_cmp)
-        scores = (
-            scores_flat.reshape(B, H_kv, n_tiles, groups, N_cmp)
-            .permute(0, 2, 1, 3, 4)
-            .reshape(B, n_tiles, H, N_cmp)
-            .permute(0, 2, 1, 3)
-        )
-
-        # Causal mask: block j is future if j * block_size >= (tile+1) * q_tile_size
-        if causal:
-            future_mask = kv_block_start.unsqueeze(0) >= q_tile_end[
-                chunk_start:chunk_end
-            ].unsqueeze(1)
-            scores.masked_fill_(future_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        # Top-k
-        topk_scores, chunk_idx = scores.topk(k_actual, dim=-1)
-
-        # Replace -inf selections with block 0
-        invalid = topk_scores == float("-inf")
-        if invalid.any():
-            chunk_idx = chunk_idx.masked_fill(invalid, 0)
-
-        # Sort ascending for better memory access patterns
-        block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(dim=-1).values.to(
-            torch.int32
-        )
-
-    return block_indices
+    return _score_and_topk(
+        Q_mean,
+        K_cmp_t,
+        B,
+        H,
+        H_kv,
+        N_q_tiles,
+        N_cmp,
+        k=num_selected_blocks,
+        causal=causal,
+        compress_block_size=compress_block_size,
+        q_tile_size=q_tile_size,
+        device=Q.device,
+    )
 
 
 def select_compressed_blocks(
@@ -301,9 +463,6 @@ def select_compressed_blocks(
     Scores Q tiles against compressed K, aggregates scores per FA4 block
     (groups of cmp_n_block_size compressed tokens), and selects the top-k.
 
-    Uses chunked computation to avoid materializing the full (B, H, N, N_cmp)
-    score matrix.
-
     Args:
         Q: Query tensor, (B, N, H, D) or (total_tokens, H, D) for varlen.
         K_cmp: Compressed key tensor, (B, N_cmp, H_kv, D).
@@ -320,96 +479,185 @@ def select_compressed_blocks(
         cmp_block_indices: (B, H, N_q_tiles, k_cmp) int32.
             FA4 block indices into the compressed KV sequence.
     """
-    is_varlen = cu_seqlens is not None
-
-    if is_varlen:
-        assert Q.dim() == 3, f"Varlen requires 3D Q, got {Q.dim()}D"
-        H = Q.shape[1]
-        D = Q.shape[2]
-        batch_size = cu_seqlens.shape[0] - 1
-        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        if max_seqlen is None:
-            max_seqlen = max(seqlens)
-        N_q_tiles = max_seqlen // q_tile_size
-        B = batch_size
-
-        Q_mean_parts = []
-        for i, slen in enumerate(seqlens):
-            s = cu_seqlens[i].item()
-            n_tiles_i = slen // q_tile_size
-            if n_tiles_i > 0:
-                Q_mean_i = (
-                    Q[s : s + n_tiles_i * q_tile_size]
-                    .reshape(n_tiles_i, q_tile_size, H, D)
-                    .mean(dim=1)
-                    .float()
-                )
-            else:
-                Q_mean_i = Q.new_zeros(0, H, D, dtype=torch.float32)
-            Q_mean_parts.append(Q_mean_i)
-
-        Q_mean = Q.new_zeros(B, N_q_tiles, H, D, dtype=torch.float32)
-        for i, qm in enumerate(Q_mean_parts):
-            if qm.shape[0] > 0:
-                Q_mean[i, : qm.shape[0]] = qm
-    else:
-        B, N, H, D = Q.shape
-        N_q_tiles = N // q_tile_size
-        assert N % q_tile_size == 0
-        Q_mean = Q.reshape(B, N_q_tiles, q_tile_size, H, D).mean(dim=2).float()
-
     H_kv = K_cmp.shape[2]
     N_cmp = K_cmp.shape[1]
-    groups = H // H_kv
 
     if softmax_scale is None:
+        D = Q.shape[-1]
         softmax_scale = 1.0 / math.sqrt(D)
 
-    Q_mean = Q_mean * softmax_scale
+    Q_mean, B, N_q_tiles, H, D = _compute_q_mean(
+        Q, q_tile_size, softmax_scale, cu_seqlens, max_seqlen
+    )
 
-    n_kv_blocks = N_cmp // cmp_n_block_size
-    if n_kv_blocks == 0:
-        n_kv_blocks = 1
-    k_actual = min(num_blocks, n_kv_blocks)
+    # K_cmp: (B, N_cmp, H_kv, D) -> (B*H_kv, D, N_cmp) for GQA-aware bmm
+    K_cmp_t = K_cmp.permute(0, 2, 3, 1).reshape(B * H_kv, D, N_cmp).float()
 
-    # Expand K_cmp for GQA: (B, N_cmp, H_kv, D) -> (B, H, D, N_cmp)
-    if groups > 1:
-        K_cmp_expanded = K_cmp.repeat_interleave(groups, dim=2)
-    else:
-        K_cmp_expanded = K_cmp
-    K_cmp_t = K_cmp_expanded.permute(0, 2, 3, 1).float()  # (B, H, D, N_cmp)
+    return _score_aggregate_and_topk(
+        Q_mean,
+        K_cmp_t,
+        B,
+        H,
+        H_kv,
+        N_q_tiles,
+        N_cmp,
+        k=num_blocks,
+        compress_block_size=compress_block_size,
+        cmp_n_block_size=cmp_n_block_size,
+        causal=causal,
+        q_tile_size=q_tile_size,
+        device=Q.device,
+    )
 
-    # Causal mask data
+
+def fused_score_and_select_all(
+    Q: Tensor,  # (B, N, H, D) or (total_tokens, H, D) for varlen
+    K_cmp: Tensor,  # (B, N_cmp, H_kv, D)
+    num_selected_blocks: int,
+    compress_block_size: int,
+    num_cmp_selected_blocks: int | None = None,
+    cmp_n_block_size: int = 128,
+    causal: bool = True,
+    q_tile_size: int = 256,
+    softmax_scale: float | None = None,
+    cu_seqlens: Tensor | None = None,
+    max_seqlen: int | None = None,
+) -> tuple[Tensor, Tensor | None]:
+    """Score once, select for both selected and compressed branches.
+
+    Computes Q_mean and the Q_mean x K_cmp GEMM once, then derives:
+    1. Selected-branch block indices (top-k over compressed tokens)
+    2. Compressed-branch FA4 block indices (aggregate + top-k over FA4 blocks)
+
+    This eliminates the duplicate GEMM that occurs when calling
+    fused_score_and_select_blocks and select_compressed_blocks separately.
+
+    Args:
+        Q: Query tensor, (B, N, H, D) or (total_tokens, H, D) for varlen.
+        K_cmp: Compressed key tensor, (B, N_cmp, H_kv, D).
+        num_selected_blocks: Number of compressed blocks for selected branch.
+        compress_block_size: Compression block size (e.g. 64).
+        num_cmp_selected_blocks: Number of FA4 blocks for compressed branch.
+            If None, only selected-branch indices are computed.
+        cmp_n_block_size: FA4 KV block size for compressed branch (128).
+        causal: Whether to apply causal masking.
+        q_tile_size: Query tile size (256).
+        softmax_scale: Attention scaling factor.
+        cu_seqlens: Cumulative sequence lengths for varlen.
+        max_seqlen: Max sequence length for varlen.
+
+    Returns:
+        block_indices: (B, H, N_q_tiles, k) int32 for selected branch.
+        cmp_block_indices: (B, H, N_q_tiles, k_cmp) int32 for compressed
+            branch, or None if num_cmp_selected_blocks is None.
+    """
+    H_kv = K_cmp.shape[2]
+    N_cmp = K_cmp.shape[1]
+
+    if softmax_scale is None:
+        D = Q.shape[-1]
+        softmax_scale = 1.0 / math.sqrt(D)
+
+    # --- Shared: compute Q_mean once ---
+    Q_mean, B, N_q_tiles, H, D = _compute_q_mean(
+        Q, q_tile_size, softmax_scale, cu_seqlens, max_seqlen
+    )
+
+    # --- Shared: prepare K_cmp once ---
+    K_cmp_t = K_cmp.permute(0, 2, 3, 1).reshape(B * H_kv, D, N_cmp).float()
+
+    # --- Check if compressed branch selection is needed ---
+    need_cmp = False
+    if num_cmp_selected_blocks is not None:
+        n_kv_blocks = N_cmp // cmp_n_block_size
+        if n_kv_blocks == 0:
+            n_kv_blocks = 1
+        if n_kv_blocks > num_cmp_selected_blocks:
+            need_cmp = True
+            k_cmp_actual = min(num_cmp_selected_blocks, n_kv_blocks)
+
+    if not need_cmp:
+        # Only selected branch — delegate to existing function
+        block_indices = _score_and_topk(
+            Q_mean,
+            K_cmp_t,
+            B,
+            H,
+            H_kv,
+            N_q_tiles,
+            N_cmp,
+            k=num_selected_blocks,
+            causal=causal,
+            compress_block_size=compress_block_size,
+            q_tile_size=q_tile_size,
+            device=Q.device,
+        )
+        return block_indices, None
+
+    # --- Shared GEMM loop: score once, derive both outputs ---
+    groups = H // H_kv
+    k_sel_actual = min(num_selected_blocks, N_cmp)
+
+    # Causal mask data for selected branch (per compressed token)
     if causal:
-        q_tile_end = (torch.arange(N_q_tiles, device=Q_mean.device) + 1) * q_tile_size
-        kv_block_start = (
-            torch.arange(n_kv_blocks, device=Q_mean.device)
+        q_tile_end = (torch.arange(N_q_tiles, device=Q.device) + 1) * q_tile_size
+        kv_block_start_sel = torch.arange(N_cmp, device=Q.device) * compress_block_size
+        kv_block_start_cmp = (
+            torch.arange(n_kv_blocks, device=Q.device)
             * cmp_n_block_size
             * compress_block_size
         )
 
+    block_indices = torch.empty(
+        B, H, N_q_tiles, k_sel_actual, dtype=torch.int32, device=Q.device
+    )
     cmp_block_indices = torch.empty(
-        B, H, N_q_tiles, k_actual, dtype=torch.int32, device=Q_mean.device
+        B, H, N_q_tiles, k_cmp_actual, dtype=torch.int32, device=Q.device
     )
 
-    chunk_tiles = min(16, N_q_tiles)
+    chunk_tiles = min(64, N_q_tiles)
     for chunk_start in range(0, N_q_tiles, chunk_tiles):
         chunk_end = min(chunk_start + chunk_tiles, N_q_tiles)
         n_tiles = chunk_end - chunk_start
 
-        # Score: (B, H, n_tiles, N_cmp)
-        scores = torch.matmul(
-            Q_mean[:, chunk_start:chunk_end].permute(0, 2, 1, 3),
-            K_cmp_t,
+        # --- SHARED GEMM: compute scores once ---
+        q_chunk = Q_mean[:, chunk_start:chunk_end]
+        q_grouped = q_chunk.reshape(B, n_tiles, H_kv, groups, D)
+        q_bmm = q_grouped.permute(0, 2, 1, 3, 4).reshape(B * H_kv, n_tiles * groups, D)
+        scores_flat = torch.bmm(q_bmm, K_cmp_t)
+
+        # Reshape to (B, H, n_tiles, N_cmp)
+        scores = (
+            scores_flat.reshape(B, H_kv, n_tiles, groups, N_cmp)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B, n_tiles, H, N_cmp)
+            .permute(0, 2, 1, 3)
         )
 
-        # Aggregate per FA4 block: (B, H, n_tiles, n_kv_blocks)
+        # --- Selected branch: per-token causal mask + top-k ---
+        sel_scores = scores.clone()
+        if causal:
+            future_mask = kv_block_start_sel.unsqueeze(0) >= q_tile_end[
+                chunk_start:chunk_end
+            ].unsqueeze(1)
+            sel_scores.masked_fill_(
+                future_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+            )
+
+        topk_scores, chunk_idx = sel_scores.topk(k_sel_actual, dim=-1)
+        invalid = topk_scores == float("-inf")
+        if invalid.any():
+            chunk_idx = chunk_idx.masked_fill(invalid, 0)
+        block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(dim=-1).values.to(
+            torch.int32
+        )
+
+        # --- Compressed branch: aggregate per FA4 block + top-k ---
         if N_cmp % cmp_n_block_size == 0:
             block_scores = scores.reshape(
                 B, H, n_tiles, n_kv_blocks, cmp_n_block_size
             ).mean(dim=-1)
         else:
-            # Handle non-divisible case: pad scores
             pad = cmp_n_block_size - (N_cmp % cmp_n_block_size)
             scores_padded = torch.nn.functional.pad(
                 scores, (0, pad), value=float("-inf")
@@ -418,80 +666,20 @@ def select_compressed_blocks(
                 B, H, n_tiles, n_kv_blocks, cmp_n_block_size
             ).mean(dim=-1)
 
-        # Causal mask: block b is future if
-        # b * cmp_n_block_size * compress_block_size >= (tile+1) * q_tile_size
         if causal:
-            future_mask = kv_block_start.unsqueeze(0) >= q_tile_end[
+            future_mask_cmp = kv_block_start_cmp.unsqueeze(0) >= q_tile_end[
                 chunk_start:chunk_end
             ].unsqueeze(1)
             block_scores.masked_fill_(
-                future_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+                future_mask_cmp.unsqueeze(0).unsqueeze(0), float("-inf")
             )
 
-        topk_scores, chunk_idx = block_scores.topk(k_actual, dim=-1)
-
-        invalid = topk_scores == float("-inf")
-        if invalid.any():
-            chunk_idx = chunk_idx.masked_fill(invalid, 0)
-
-        cmp_block_indices[:, :, chunk_start:chunk_end] = chunk_idx.sort(
+        topk_scores_cmp, chunk_idx_cmp = block_scores.topk(k_cmp_actual, dim=-1)
+        invalid_cmp = topk_scores_cmp == float("-inf")
+        if invalid_cmp.any():
+            chunk_idx_cmp = chunk_idx_cmp.masked_fill(invalid_cmp, 0)
+        cmp_block_indices[:, :, chunk_start:chunk_end] = chunk_idx_cmp.sort(
             dim=-1
         ).values.to(torch.int32)
 
-    return cmp_block_indices
-
-
-def fused_select_and_build_sparse(
-    Q: Tensor,
-    K_cmp: Tensor,
-    num_selected_blocks: int,
-    compress_block_size: int,
-    n_block_size: int = 128,
-    seqlen_k: int | None = None,
-    causal: bool = True,
-    q_tile_size: int = 256,
-    softmax_scale: float | None = None,
-    cu_seqlens: Tensor | None = None,
-    max_seqlen: int | None = None,
-):
-    """Fused block selection + FA4 block-sparse tensor construction.
-
-    Combines fused_score_and_select_blocks + build_fa4_block_sparse_tensors
-    into a single call, avoiding 6+ intermediate PyTorch op launches for
-    mask construction.
-
-    Returns:
-        (block_indices, sparse_tensors): The selected block indices and
-        the corresponding BlockSparseTensorsTorch.
-    """
-    from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
-
-    block_indices = fused_score_and_select_blocks(
-        Q,
-        K_cmp,
-        num_selected_blocks,
-        compress_block_size,
-        causal=causal,
-        q_tile_size=q_tile_size,
-        softmax_scale=softmax_scale,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=max_seqlen,
-    )
-
-    if seqlen_k is None:
-        if cu_seqlens is not None:
-            if max_seqlen is None:
-                seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-                max_seqlen = max(seqlens)
-            seqlen_k = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
-        elif Q.dim() == 4:
-            seqlen_k = Q.shape[1]
-
-    sparse_tensors = build_fa4_block_sparse_tensors(
-        block_indices,
-        compress_block_size,
-        n_block_size=n_block_size,
-        seqlen_k=seqlen_k,
-    )
-
-    return block_indices, sparse_tensors
+    return block_indices, cmp_block_indices

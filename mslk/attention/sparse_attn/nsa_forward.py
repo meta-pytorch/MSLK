@@ -19,6 +19,7 @@ import torch
 from mslk.attention.sparse_attn.compress import fused_compress_kv
 from mslk.attention.sparse_attn.gating import fused_gate_and_combine
 from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_all,
     fused_score_and_select_blocks,
     select_compressed_blocks,
 )
@@ -222,11 +223,13 @@ def nsa_forward(
         N_cmp = pad_N // compress_block_size
 
         # Step 2: Score blocks and select top-k (on padded 4D)
-        block_indices = fused_score_and_select_blocks(
+        block_indices, cmp_block_indices = fused_score_and_select_all(
             Q_pad,
             K_cmp_pad,
             num_selected_blocks,
             compress_block_size,
+            num_cmp_selected_blocks=num_cmp_selected_blocks,
+            cmp_n_block_size=n_block_size,
             causal=causal,
             q_tile_size=q_tile_size,
             softmax_scale=softmax_scale,
@@ -253,31 +256,31 @@ def nsa_forward(
             N_cmp_pad = K_cmp_pad.shape[1]
             cmp_n_block_size = n_block_size
             n_cmp_kv_blocks = (N_cmp_pad + cmp_n_block_size - 1) // cmp_n_block_size
-            cmp_block_indices = select_compressed_blocks(
-                Q_pad,
-                K_cmp_pad,
-                num_cmp_selected_blocks,
-                compress_block_size,
-                cmp_n_block_size=cmp_n_block_size,
-                causal=causal,
-                q_tile_size=q_tile_size,
-                softmax_scale=softmax_scale,
-            )
-            cmp_sparse = build_compressed_block_sparse_tensors(
-                cmp_block_indices,
-                n_kv_blocks=n_cmp_kv_blocks,
-                q_tile_size=q_tile_size,
-                cmp_n_block_size=cmp_n_block_size,
-            )
-            O_cmp_pad, _ = _fa4_fwd(
-                Q_pad,
-                K_cmp_pad,
-                V_cmp_pad,
-                causal=False,
-                softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
-                block_sparse_tensors=cmp_sparse,
-            )
+            if cmp_block_indices is not None:
+                cmp_sparse = build_compressed_block_sparse_tensors(
+                    cmp_block_indices,
+                    n_kv_blocks=n_cmp_kv_blocks,
+                    q_tile_size=q_tile_size,
+                    cmp_n_block_size=cmp_n_block_size,
+                )
+                O_cmp_pad, _ = _fa4_fwd(
+                    Q_pad,
+                    K_cmp_pad,
+                    V_cmp_pad,
+                    causal=False,
+                    softmax_scale=softmax_scale,
+                    mask_mod=compressed_mask,
+                    block_sparse_tensors=cmp_sparse,
+                )
+            else:
+                O_cmp_pad, _ = _fa4_fwd(
+                    Q_pad,
+                    K_cmp_pad,
+                    V_cmp_pad,
+                    causal=False,
+                    softmax_scale=softmax_scale,
+                    mask_mod=compressed_mask,
+                )
         else:
             O_cmp_pad, _ = _fa4_fwd(
                 Q_pad,
@@ -342,11 +345,13 @@ def nsa_forward(
     # K_cmp, V_cmp: (B, N_cmp, H_kv, D) where N_cmp = N // compress_block_size
 
     # Step 2: Score blocks and select top-k
-    block_indices = fused_score_and_select_blocks(
+    block_indices, cmp_block_indices = fused_score_and_select_all(
         Q,
         K_cmp,
         num_selected_blocks,
         compress_block_size,
+        num_cmp_selected_blocks=num_cmp_selected_blocks,
+        cmp_n_block_size=n_block_size,
         causal=causal,
         q_tile_size=q_tile_size,
         softmax_scale=softmax_scale,
@@ -375,31 +380,31 @@ def nsa_forward(
         N_cmp = K_cmp.shape[1]
         cmp_n_block_size = n_block_size
         n_cmp_kv_blocks = (N_cmp + cmp_n_block_size - 1) // cmp_n_block_size
-        cmp_block_indices = select_compressed_blocks(
-            Q,
-            K_cmp,
-            num_cmp_selected_blocks,
-            compress_block_size,
-            cmp_n_block_size=cmp_n_block_size,
-            causal=causal,
-            q_tile_size=q_tile_size,
-            softmax_scale=softmax_scale,
-        )
-        cmp_sparse = build_compressed_block_sparse_tensors(
-            cmp_block_indices,
-            n_kv_blocks=n_cmp_kv_blocks,
-            q_tile_size=q_tile_size,
-            cmp_n_block_size=cmp_n_block_size,
-        )
-        O_cmp, lse_cmp = _fa4_fwd(
-            Q,
-            K_cmp,
-            V_cmp,
-            causal=False,
-            softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
-            block_sparse_tensors=cmp_sparse,
-        )
+        if cmp_block_indices is not None:
+            cmp_sparse = build_compressed_block_sparse_tensors(
+                cmp_block_indices,
+                n_kv_blocks=n_cmp_kv_blocks,
+                q_tile_size=q_tile_size,
+                cmp_n_block_size=cmp_n_block_size,
+            )
+            O_cmp, lse_cmp = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+                block_sparse_tensors=cmp_sparse,
+            )
+        else:
+            O_cmp, lse_cmp = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+            )
     else:
         O_cmp, lse_cmp = _fa4_fwd(
             Q,
