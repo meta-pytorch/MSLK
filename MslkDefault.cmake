@@ -40,7 +40,7 @@ if(BUILD_FB_CODE
 
     # To allow a directory, add it to the regex group below, e.g.:
     #   set(FB_ONLY_ALLOW_REGEX "fb/csrc/(my_kernel_1|my_kernel_2)")
-    set(FB_ONLY_ALLOW_REGEX "^$")
+    set(FB_ONLY_ALLOW_REGEX "fb/csrc/(internal)")
 
     list(FILTER fb_only_sources_cpu
       INCLUDE REGEX "${FB_ONLY_ALLOW_REGEX}")
