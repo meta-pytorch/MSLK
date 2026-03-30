@@ -60,32 +60,34 @@ def build_fa4_block_sparse_tensors(
         )
         k_fa4 = k * fa4_blocks_per_nsa_block
     else:
-        # Multiple NSA blocks map to a single FA4 block
+        # Multiple NSA blocks map to a single FA4 block — use scatter-based
+        # dedup (faster than sort + consecutive dedup for small tensors)
         assert n_block_size % compress_block_size == 0, (
             f"n_block_size ({n_block_size}) must be divisible by "
             f"compress_block_size ({compress_block_size})"
         )
-        # NSA block j maps to FA4 block j * compress_block_size // n_block_size
         fa4_block_indices = (block_indices.long() * compress_block_size) // n_block_size
 
-        # Remove duplicates per query tile: sort, then unique via consecutive dedup
-        fa4_block_indices = fa4_block_indices.sort(dim=-1).values
-        # Mark duplicates: compare with previous element
-        shifted = torch.roll(fa4_block_indices, 1, dims=-1)
-        is_dup = (fa4_block_indices == shifted) & (torch.arange(k, device=device) > 0)
-        # Replace duplicates with a sentinel (max_n_blocks) that we'll filter out
+        # Deduplicate via boolean scatter: O(1) per element, no sorting
         if seqlen_k is not None:
-            sentinel = (seqlen_k + n_block_size - 1) // n_block_size
+            n_blocks_k_tmp = (seqlen_k + n_block_size - 1) // n_block_size
         else:
-            sentinel = fa4_block_indices.max().item() + 1
-        fa4_block_indices = fa4_block_indices.masked_fill(is_dup, sentinel)
-        # Re-sort to push sentinels to the end
-        fa4_block_indices = fa4_block_indices.sort(dim=-1).values
-        # Count non-sentinel entries per query tile
-        counts = (fa4_block_indices < sentinel).sum(dim=-1)  # (B, H, N_q_tiles)
+            n_blocks_k_tmp = fa4_block_indices.max().item() + 1
 
-        fa4_indices = fa4_block_indices
-        k_fa4 = k  # max possible, actual counts may be smaller
+        # Build attendance mask: (B, H, N_q_tiles, n_blocks_k)
+        attendance = torch.zeros(
+            B, H, N_q_tiles, n_blocks_k_tmp, dtype=torch.bool, device=device
+        )
+        attendance.scatter_(3, fa4_block_indices.clamp(max=n_blocks_k_tmp - 1), True)
+
+        # Count unique blocks per tile
+        counts = attendance.sum(dim=-1)
+
+        # Pack indices: sort boolean descending to push True values first,
+        # then extract the sorted positions as the FA4 block indices
+        _, sorted_positions = attendance.int().sort(dim=-1, descending=True, stable=True)
+        fa4_indices = sorted_positions.to(torch.int64)
+        k_fa4 = k
 
     # Compute the full number of KV blocks for FA4
     if seqlen_k is not None:
