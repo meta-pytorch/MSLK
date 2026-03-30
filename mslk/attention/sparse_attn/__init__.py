@@ -13,6 +13,7 @@ from mslk.attention.sparse_attn.reference import (
     nsa_forward_reference,
 )
 from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_all,
     fused_score_and_select_blocks,
     score_and_select_blocks,
     select_compressed_blocks,
@@ -31,6 +32,7 @@ __all__ = [
     "fused_compress_kv",
     "score_and_select_blocks",
     "fused_score_and_select_blocks",
+    "fused_score_and_select_all",
     "select_compressed_blocks",
     "build_fa4_block_sparse_tensors",
     "build_compressed_block_sparse_tensors",

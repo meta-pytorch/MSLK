@@ -31,6 +31,7 @@ from mslk.attention.sparse_attn.nsa_forward import (
     _make_compressed_causal_mask,
 )
 from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_all,
     fused_score_and_select_blocks,
     select_compressed_blocks,
 )
@@ -965,11 +966,13 @@ def nsa(
     )
 
     # Step 2: Score blocks and select top-k (varlen-aware Q_mean)
-    block_indices = fused_score_and_select_blocks(
+    block_indices, cmp_block_indices = fused_score_and_select_all(
         Q,
         K_cmp,
         num_selected_blocks,
         compress_block_size,
+        num_cmp_selected_blocks=num_cmp_selected_blocks,
+        cmp_n_block_size=n_block_size,
         causal=causal,
         q_tile_size=q_tile_size,
         softmax_scale=softmax_scale,
@@ -992,20 +995,7 @@ def nsa(
         N_cmp = K_cmp.shape[1]
         cmp_n_block_size = n_block_size
         n_cmp_kv_blocks = (N_cmp + cmp_n_block_size - 1) // cmp_n_block_size
-        if n_cmp_kv_blocks > num_cmp_selected_blocks:
-            # Only use block sparsity when there are more blocks than we select
-            cmp_block_indices = select_compressed_blocks(
-                Q,
-                K_cmp,
-                num_cmp_selected_blocks,
-                compress_block_size,
-                cmp_n_block_size=cmp_n_block_size,
-                causal=causal,
-                q_tile_size=q_tile_size,
-                softmax_scale=softmax_scale,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen if is_varlen else None,
-            )
+        if cmp_block_indices is not None:
             cmp_sparse_tensors = build_compressed_block_sparse_tensors(
                 cmp_block_indices,
                 n_kv_blocks=n_cmp_kv_blocks,
