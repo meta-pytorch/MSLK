@@ -16,12 +16,13 @@
   <rect width="900" height="560" rx="12" fill="url(#bg)" stroke="#dde1e6" stroke-width="1"/>
 
   <!-- Title -->
-  <text x="450" y="36" text-anchor="middle" font-size="18" font-weight="700" fill="#1a1a2e">Dense FA4 vs NSA Sparse Attention — Fused Selection Kernel</text>
-  <text x="450" y="56" text-anchor="middle" font-size="12" fill="#6b7280">B=1, H=8, H_kv=2, D=128 | k=16 selected blocks, w=512 window | bf16 on B200</text>
+  <text x="450" y="36" text-anchor="middle" font-size="18" font-weight="700" fill="#1a1a2e">Dense FA4 vs NSA Sparse Attention — NVIDIA B200</text>
+  <text x="450" y="56" text-anchor="middle" font-size="12" fill="#6b7280">B=1, H=8, H_kv=2, D=128 | k=16 selected blocks, w=512 | bf16 | Fused CuteDSL kernels</text>
 
   <!-- Chart area: x=100..820, y=80..440 (log-log) -->
-  <!-- X: 2^10..2^20 (1K..1M), 72px per octave -->
+  <!-- X: 2^10..2^22 (1K..4M), 60px per octave -->
   <!-- Y: 0.1ms..100s, 6 decades, 60px per decade -->
+  <!-- x = 100 + 60 * (log2(N) - 10) -->
   <!-- y = 440 - 60 * (log10(t_ms) + 1) -->
 
   <!-- Horizontal grid -->
@@ -50,31 +51,35 @@
   <!-- Vertical grid -->
   <g stroke="#e5e7eb" stroke-width="0.7" stroke-dasharray="4,3">
     <line x1="100" y1="80" x2="100" y2="440"/>
-    <line x1="172" y1="80" x2="172" y2="440"/>
-    <line x1="244" y1="80" x2="244" y2="440"/>
-    <line x1="316" y1="80" x2="316" y2="440"/>
-    <line x1="388" y1="80" x2="388" y2="440"/>
+    <line x1="160" y1="80" x2="160" y2="440"/>
+    <line x1="220" y1="80" x2="220" y2="440"/>
+    <line x1="280" y1="80" x2="280" y2="440"/>
+    <line x1="340" y1="80" x2="340" y2="440"/>
+    <line x1="400" y1="80" x2="400" y2="440"/>
     <line x1="460" y1="80" x2="460" y2="440"/>
-    <line x1="532" y1="80" x2="532" y2="440"/>
-    <line x1="604" y1="80" x2="604" y2="440"/>
-    <line x1="676" y1="80" x2="676" y2="440"/>
-    <line x1="748" y1="80" x2="748" y2="440"/>
+    <line x1="520" y1="80" x2="520" y2="440"/>
+    <line x1="580" y1="80" x2="580" y2="440"/>
+    <line x1="640" y1="80" x2="640" y2="440"/>
+    <line x1="700" y1="80" x2="700" y2="440"/>
+    <line x1="760" y1="80" x2="760" y2="440"/>
     <line x1="820" y1="80" x2="820" y2="440"/>
   </g>
 
   <!-- X axis labels -->
   <g font-size="10" fill="#6b7280" text-anchor="middle">
     <text x="100" y="458">1K</text>
-    <text x="172" y="458">2K</text>
-    <text x="244" y="458">4K</text>
-    <text x="316" y="458">8K</text>
-    <text x="388" y="458">16K</text>
-    <text x="460" y="458">32K</text>
-    <text x="532" y="458">64K</text>
-    <text x="604" y="458">128K</text>
-    <text x="676" y="458">256K</text>
-    <text x="748" y="458">512K</text>
-    <text x="820" y="458">1M</text>
+    <text x="160" y="458">2K</text>
+    <text x="220" y="458">4K</text>
+    <text x="280" y="458">8K</text>
+    <text x="340" y="458">16K</text>
+    <text x="400" y="458">32K</text>
+    <text x="460" y="458">64K</text>
+    <text x="520" y="458">128K</text>
+    <text x="580" y="458">256K</text>
+    <text x="640" y="458">512K</text>
+    <text x="700" y="458">1M</text>
+    <text x="760" y="458">2M</text>
+    <text x="820" y="458">4M</text>
   </g>
   <text x="460" y="480" text-anchor="middle" font-size="13" font-weight="600" fill="#374151">Sequence length (tokens)</text>
 
@@ -83,141 +88,138 @@
   <line x1="100" y1="80" x2="100" y2="440" stroke="#9ca3af" stroke-width="1.5"/>
 
   <!--
-    MEASURED DATA (B200, B=1, H=8, H_kv=2, D=128, k=16, w=512, bf16):
+    MEASURED DATA (B200, bf16, CUDA_VISIBLE_DEVICES isolated per run):
+    Config: B=1, H=8, H_kv=2, D=128, k=16, w=512
+    Fused compress, fused select, fused gating kernels active.
+    All data measured end-to-end, no interpolation or scaling.
 
-    N       Dense    NSA-old   NSA l=32  NSA l=64  NSA l=128
-            (ms)     l=64(ms)  new(ms)   new(ms)   new(ms)
-    4K      0.18     1.13      1.08      1.06      0.91      measured
-    8K      0.15     1.21      0.95      0.93      0.78      measured
-    16K     0.43     1.69      0.94      0.95      0.79      measured
-    32K     1.62     4.39      1.15      1.09      1.04      measured
-    64K     7.61     8.14      2.15      1.73      1.47      measured
-    128K    29.71    24.08     5.76      4.11      3.11      measured
-    256K    118.63   81.37     18.29     11.79     8.12      measured
-    512K    474.50   302.66    66.55     37.90     23.76     measured
-    1M      1944     1190      251       133       73        measured (H=4,H_kv=1 scaled 2x)
+    Dense FA4 (from l=64 run, GPU 1):
+    4K:   0.19ms    8K:   0.15ms    16K:  0.44ms    32K:  1.67ms
+    64K:  8.17ms    128K: 32.03ms   256K: 126.72ms  512K: 506.70ms
+    1M:   2026.53ms 2M:   7626.38ms 3M:   18150.16ms
 
-    1M measured with H=4,H_kv=1 (half heads to fit 12GB GPU), times scaled 2x
-    to H=8 equivalent. Dense at 1M validates: 972*2=1944 vs 474.5*4=1898 (2.4% err).
+    NSA l=32 (GPU 3):
+    4K:   1.36ms    8K:   1.09ms    16K:  1.09ms    32K:  1.28ms
+    64K:  2.30ms    128K: 5.90ms    256K: 18.67ms   512K: 66.43ms
+    1M:   254.07ms  (7.97x vs dense)
 
+    NSA l=64 (GPU 1):
+    4K:   1.18ms    8K:   1.07ms    16K:  1.07ms    32K:  1.46ms
+    64K:  1.87ms    128K: 4.11ms    256K: 11.51ms   512K: 37.54ms
+    1M:   139.90ms  2M:   503.71ms  3M:   1117.56ms (16.24x vs dense)
+
+    NSA l=128 (GPU 4):
+    4K:   1.06ms    8K:   0.95ms    16K:  0.94ms    32K:  1.31ms
+    64K:  2.03ms    128K: 3.16ms    256K: 8.05ms    512K: 23.94ms
+    1M:   76.85ms   2M:   282.68ms  3M:   616.48ms  (29.44x vs dense)
+
+    x = 100 + 60 * (log2(N) - 10)
     y = 440 - 60 * (log10(t_ms) + 1)
   -->
 
   <!-- ===== Dense FA4 ===== -->
   <polyline
-    points="244,424.7 316,429.4 388,402.0 460,367.4 532,327.1 604,291.6 676,255.6 748,219.4 820,182.7"
+    points="220,423.3 280,429.4 340,401.4 400,366.6 460,325.3 520,289.7 580,253.8 640,217.7 700,181.6 760,147.1 795,124.5"
     fill="none" stroke="#e74c3c" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
     filter="url(#lineShadow)"/>
   <g fill="#e74c3c">
-    <circle cx="244" cy="424.7" r="3"/>
-    <circle cx="316" cy="429.4" r="3"/>
-    <circle cx="388" cy="402.0" r="3"/>
-    <circle cx="460" cy="367.4" r="3"/>
-    <circle cx="532" cy="327.1" r="3"/>
-    <circle cx="604" cy="291.6" r="3"/>
-    <circle cx="676" cy="255.6" r="3"/>
-    <circle cx="748" cy="219.4" r="3"/>
-    <circle cx="820" cy="182.7" r="3"/>
+    <circle cx="220" cy="423.3" r="3"/>
+    <circle cx="280" cy="429.4" r="3"/>
+    <circle cx="340" cy="401.4" r="3"/>
+    <circle cx="400" cy="366.6" r="3"/>
+    <circle cx="460" cy="325.3" r="3"/>
+    <circle cx="520" cy="289.7" r="3"/>
+    <circle cx="580" cy="253.8" r="3"/>
+    <circle cx="640" cy="217.7" r="3"/>
+    <circle cx="700" cy="181.6" r="3"/>
+    <circle cx="760" cy="147.1" r="3"/>
+    <circle cx="795" cy="124.5" r="3"/>
   </g>
 
-  <!-- ===== NSA-old l=64 (PyTorch selection — the bottleneck we fixed) ===== -->
+  <!-- ===== NSA l=32 (fused CuteDSL) ===== -->
   <polyline
-    points="244,376.8 316,375.0 388,366.3 460,341.5 532,325.3 604,297.1 676,265.3 748,231.1 820,195.4"
-    fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-    stroke-dasharray="6,4"
-    filter="url(#lineShadow)"/>
-  <g fill="#f59e0b">
-    <circle cx="460" cy="341.5" r="2.5"/>
-    <circle cx="532" cy="325.3" r="2.5"/>
-    <circle cx="604" cy="297.1" r="2.5"/>
-    <circle cx="676" cy="265.3" r="2.5"/>
-    <circle cx="748" cy="231.1" r="2.5"/>
-  </g>
-
-  <!-- ===== NSA-new l=32 (fused CuteDSL) ===== -->
-  <polyline
-    points="244,378.0 316,381.3 388,381.6 460,376.3 532,360.1 604,334.4 676,304.3 748,270.6 820,236.0"
+    points="220,372.0 280,377.8 340,377.8 400,373.6 460,358.3 520,333.7 580,303.7 640,270.7 700,235.7"
     fill="none" stroke="#a3e635" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
     stroke-dasharray="8,4"
     filter="url(#lineShadow)"/>
   <g fill="#a3e635">
-    <circle cx="460" cy="376.3" r="2.5"/>
-    <circle cx="532" cy="360.1" r="2.5"/>
-    <circle cx="604" cy="334.4" r="2.5"/>
-    <circle cx="676" cy="304.3" r="2.5"/>
-    <circle cx="748" cy="270.6" r="2.5"/>
-    <circle cx="820" cy="236.0" r="2.5"/>
+    <circle cx="220" cy="372.0" r="2.5"/>
+    <circle cx="280" cy="377.8" r="2.5"/>
+    <circle cx="340" cy="377.8" r="2.5"/>
+    <circle cx="400" cy="373.6" r="2.5"/>
+    <circle cx="460" cy="358.3" r="2.5"/>
+    <circle cx="520" cy="333.7" r="2.5"/>
+    <circle cx="580" cy="303.7" r="2.5"/>
+    <circle cx="640" cy="270.7" r="2.5"/>
+    <circle cx="700" cy="235.7" r="2.5"/>
   </g>
 
-  <!-- ===== NSA-new l=64 (fused CuteDSL) ===== -->
+  <!-- ===== NSA l=64 (fused CuteDSL) ===== -->
   <polyline
-    points="244,378.5 316,381.9 388,381.3 460,377.8 532,365.7 604,343.2 676,315.7 748,285.3 820,252.6"
+    points="220,375.7 280,378.2 340,378.2 400,370.1 460,363.7 520,343.2 580,316.3 640,285.5 700,251.3 760,217.9 795,197.1"
     fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
     filter="url(#lineShadow)"/>
   <g fill="#22c55e">
-    <circle cx="244" cy="378.5" r="3"/>
-    <circle cx="316" cy="381.9" r="3"/>
-    <circle cx="388" cy="381.3" r="3"/>
-    <circle cx="460" cy="377.8" r="3"/>
-    <circle cx="532" cy="365.7" r="3"/>
-    <circle cx="604" cy="343.2" r="3"/>
-    <circle cx="676" cy="315.7" r="3"/>
-    <circle cx="748" cy="285.3" r="3"/>
-    <circle cx="820" cy="252.6" r="3"/>
+    <circle cx="220" cy="375.7" r="3"/>
+    <circle cx="280" cy="378.2" r="3"/>
+    <circle cx="340" cy="378.2" r="3"/>
+    <circle cx="400" cy="370.1" r="3"/>
+    <circle cx="460" cy="363.7" r="3"/>
+    <circle cx="520" cy="343.2" r="3"/>
+    <circle cx="580" cy="316.3" r="3"/>
+    <circle cx="640" cy="285.5" r="3"/>
+    <circle cx="700" cy="251.3" r="3"/>
+    <circle cx="760" cy="217.9" r="3"/>
+    <circle cx="795" cy="197.1" r="3"/>
   </g>
 
-  <!-- ===== NSA-new l=128 (fused CuteDSL) ===== -->
+  <!-- ===== NSA l=128 (fused CuteDSL) ===== -->
   <polyline
-    points="244,382.5 316,386.5 388,386.1 460,379.0 532,370.0 604,350.4 676,325.4 748,297.4 820,268.2"
+    points="220,378.5 280,381.3 340,381.6 400,373.0 460,361.6 520,350.0 580,325.7 640,297.3 700,266.9 760,232.9 795,212.6"
     fill="none" stroke="#059669" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
     filter="url(#lineShadow)"/>
   <g fill="#059669">
-    <circle cx="244" cy="382.5" r="3.5"/>
-    <circle cx="316" cy="386.5" r="3.5"/>
-    <circle cx="388" cy="386.1" r="3.5"/>
-    <circle cx="460" cy="379.0" r="3.5"/>
-    <circle cx="532" cy="370.0" r="3.5"/>
-    <circle cx="604" cy="350.4" r="3.5"/>
-    <circle cx="676" cy="325.4" r="3.5"/>
-    <circle cx="748" cy="297.4" r="3.5"/>
-    <circle cx="820" cy="268.2" r="3.5"/>
+    <circle cx="220" cy="378.5" r="3.5"/>
+    <circle cx="280" cy="381.3" r="3.5"/>
+    <circle cx="340" cy="381.6" r="3.5"/>
+    <circle cx="400" cy="373.0" r="3.5"/>
+    <circle cx="460" cy="361.6" r="3.5"/>
+    <circle cx="520" cy="350.0" r="3.5"/>
+    <circle cx="580" cy="325.7" r="3.5"/>
+    <circle cx="640" cy="297.3" r="3.5"/>
+    <circle cx="700" cy="266.9" r="3.5"/>
+    <circle cx="760" cy="232.9" r="3.5"/>
+    <circle cx="795" cy="212.6" r="3.5"/>
   </g>
 
-  <!-- Speedup annotation: old l=64 vs new l=64 at N=1M -->
-  <line x1="820" y1="197" x2="820" y2="250" stroke="#7c3aed" stroke-width="1.5"/>
-  <text x="807" y="222" font-size="9" font-weight="600" fill="#7c3aed" text-anchor="end">8.9x</text>
-  <text x="807" y="232" font-size="8" fill="#7c3aed" text-anchor="end">faster</text>
+  <!-- Speedup bracket: Dense vs NSA l=128 at N=3M -->
+  <line x1="795" y1="127" x2="795" y2="210" stroke="#7c3aed" stroke-width="1.5"/>
+  <line x1="791" y1="127" x2="799" y2="127" stroke="#7c3aed" stroke-width="1.5"/>
+  <line x1="791" y1="210" x2="799" y2="210" stroke="#7c3aed" stroke-width="1.5"/>
 
-  <!-- Speedup labels at N=1M (measured) -->
+  <!-- Speedup labels at N=3M (vs dense) -->
   <g font-size="9" font-weight="600">
-    <text x="835" y="234" fill="#a3e635">7.7x</text>
-    <text x="835" y="250" fill="#22c55e">14.6x</text>
-    <text x="835" y="266" fill="#059669">26.5x</text>
+    <text x="808" y="193" fill="#a3e635">8.0x</text>
+    <text x="808" y="203" fill="#22c55e">16.2x</text>
+    <text x="808" y="213" fill="#059669">29.4x</text>
   </g>
 
   <!-- Scaling annotations -->
   <g font-size="9" fill="#6b7280" font-style="italic">
-    <text x="800" y="170" text-anchor="end">O(N²)</text>
+    <text x="775" y="115" text-anchor="end">O(N&#xB2;)</text>
   </g>
 
   <!-- "l" labels at right side of each NSA curve -->
   <g font-size="10" font-weight="600">
-    <text x="828" y="242" fill="#a3e635">l=32</text>
-    <text x="828" y="258" fill="#22c55e">l=64</text>
-    <text x="828" y="274" fill="#059669">l=128</text>
+    <text x="708" y="232" fill="#a3e635">l=32</text>
+    <text x="808" y="200" fill="#22c55e">l=64</text>
+    <text x="808" y="218" fill="#059669">l=128</text>
   </g>
 
-  <!-- NSA-old label -->
-  <text x="828" y="200" font-size="9" font-weight="500" fill="#f59e0b">old l=64</text>
-
   <!-- Crossover annotation -->
-  <text x="445" y="395" text-anchor="middle" font-size="8" fill="#7c3aed" font-weight="500">NSA faster than dense</text>
-  <text x="445" y="404" text-anchor="middle" font-size="8" fill="#7c3aed">above N ~24K</text>
-  <line x1="445" y1="375" x2="445" y2="387" stroke="#7c3aed" stroke-width="0.8" stroke-dasharray="2,2"/>
-
-  <!-- Old crossover annotation -->
-  <text x="610" y="302" text-anchor="start" font-size="7" fill="#f59e0b">old: barely faster</text>
-  <text x="610" y="310" text-anchor="start" font-size="7" fill="#f59e0b">than dense at 128K</text>
+  <text x="380" y="395" text-anchor="middle" font-size="8" fill="#7c3aed" font-weight="500">NSA faster than dense</text>
+  <text x="380" y="404" text-anchor="middle" font-size="8" fill="#7c3aed">above N ~24K</text>
+  <line x1="380" y1="375" x2="380" y2="387" stroke="#7c3aed" stroke-width="0.8" stroke-dasharray="2,2"/>
 
   <!-- Legend -->
   <g transform="translate(110, 495)" filter="url(#shadow)">
@@ -227,20 +229,18 @@
     <circle cx="24" cy="16" r="3" fill="#e74c3c"/>
     <text x="40" y="20" font-size="10" fill="#374151" font-weight="500">Dense FA4</text>
 
-    <line x1="115" y1="16" x2="135" y2="16" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6,4"/>
-    <text x="141" y="20" font-size="10" fill="#374151" font-weight="500">NSA old l=64 (PyTorch select)</text>
+    <line x1="115" y1="16" x2="135" y2="16" stroke="#a3e635" stroke-width="2" stroke-dasharray="8,4"/>
+    <circle cx="125" cy="16" r="2.5" fill="#a3e635"/>
+    <text x="141" y="20" font-size="10" fill="#374151" font-weight="500">NSA l=32</text>
 
-    <line x1="350" y1="16" x2="370" y2="16" stroke="#a3e635" stroke-width="2" stroke-dasharray="8,4"/>
-    <text x="376" y="20" font-size="10" fill="#374151" font-weight="500">l=32</text>
+    <line x1="230" y1="16" x2="250" y2="16" stroke="#22c55e" stroke-width="2.5"/>
+    <circle cx="240" cy="16" r="3" fill="#22c55e"/>
+    <text x="256" y="20" font-size="10" fill="#374151" font-weight="500">NSA l=64</text>
 
-    <line x1="14" y1="40" x2="34" y2="40" stroke="#22c55e" stroke-width="2.5"/>
-    <circle cx="24" cy="40" r="3" fill="#22c55e"/>
-    <text x="40" y="44" font-size="10" fill="#374151" font-weight="500">NSA fused l=64</text>
+    <line x1="340" y1="16" x2="360" y2="16" stroke="#059669" stroke-width="2.5"/>
+    <circle cx="350" cy="16" r="3.5" fill="#059669"/>
+    <text x="366" y="20" font-size="10" fill="#374151" font-weight="500">NSA l=128</text>
 
-    <line x1="155" y1="40" x2="175" y2="40" stroke="#059669" stroke-width="2.5"/>
-    <circle cx="165" cy="40" r="3" fill="#059669"/>
-    <text x="181" y="44" font-size="10" fill="#374151" font-weight="500">l=128</text>
-
-    <text x="260" y="44" font-size="9" fill="#9ca3af">Measured on B200, 4K&#x2013;512K at H=8, 1M at H=4 (scaled)</text>
+    <text x="14" y="44" font-size="9" fill="#9ca3af">All data measured on B200 (180GB). B=1, H=8, H_kv=2, D=128. Fused compress, select, gating kernels. No interpolated points.</text>
   </g>
 </svg>

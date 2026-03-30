@@ -127,7 +127,7 @@ def score_and_select_blocks(
 _fused_select_compile_cache: dict = {}
 
 # Bucket sizes for max_n_per_thread to limit compilations
-_N_PER_THREAD_BUCKETS = [4, 8, 16, 32, 64, 128]
+_N_PER_THREAD_BUCKETS = [4, 8, 16, 32, 64, 128, 256, 512]
 
 
 def _bucket_n_per_thread(n: int) -> int:
@@ -135,7 +135,7 @@ def _bucket_n_per_thread(n: int) -> int:
     for b in _N_PER_THREAD_BUCKETS:
         if n <= b:
             return b
-    return _N_PER_THREAD_BUCKETS[-1]
+    return n
 
 
 def _make_fused_select_kernel(
