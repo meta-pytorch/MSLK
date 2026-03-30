@@ -17,9 +17,9 @@ def main():
     dense_fwd_ms = [0.12, 0.26, 0.26, 0.53, 1.54, 5.47, 24.02, 100.17, 400.45, 1589.36, 6356.49]
     nsa_fwd_ms = [1.54, 2.54, 2.48, 2.57, 4.09, 6.09, 10.31, 23.89, 62.83, 187.37, 623.98]
 
-    # NSA fwd+bwd (all FA4 CuteDSL)
+    # NSA fwd+bwd (all FA4 CuteDSL, sequential per-branch)
     nsa_bwd_seq = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
-    nsa_fwdbwd_ms = [4.77, 4.71, 4.80, 5.01, 6.65, 13.06, 28.48, 67.50, 177.82, 536.55, 1785.84]
+    nsa_fwdbwd_ms = [3.60, 3.37, 3.30, 3.69, 6.67, 13.04, 28.50, 67.64, 178.69, 537.54, 1787.53]
     nsa_bwd_only_ms = [fb - f for f, fb in zip(nsa_fwd_ms[: len(nsa_bwd_seq)], nsa_fwdbwd_ms)]
 
     fwd_speedup = [d / n for d, n in zip(dense_fwd_ms, nsa_fwd_ms)]
