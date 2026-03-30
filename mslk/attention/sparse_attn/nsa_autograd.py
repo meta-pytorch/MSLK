@@ -227,50 +227,47 @@ class NSAFunction(torch.autograd.Function):
         window_size = ctx.window_size
         sparse_tensors = ctx.sparse_tensors
 
-        # --- Stage 1: Gating backward ---
-        # O = g0*O_cmp + g1*O_slc + g2*O_sld
-        # dO_i = gi * dO
-        # dgi = (dO * Oi).sum(dim=-1)  (need Oi, so must recompute)
+        # --- Backward: sequential per-branch to minimize peak memory ---
+        # Without gate weights, dO_i = g_i * dO (no O_i needed).
+        # With gate weights, we need all O_i for dgate — fall back to
+        # recomputing all three upfront.
 
-        # --- Recompute FA4 forward outputs (activation checkpointing) ---
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
         )
 
-        O_cmp, lse_cmp = _fa4_fwd(
-            Q,
-            K_cmp,
-            V_cmp,
-            causal=False,
-            softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
-        )
-
-        O_slc, lse_slc = _fa4_fwd(
-            Q,
-            K,
-            V,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            block_sparse_tensors=sparse_tensors,
-        )
-
-        O_sld, lse_sld = _fa4_fwd(
-            Q,
-            K,
-            V,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            window_size_left=window_size,
-            window_size_right=0,
-        )
-
-        # --- Gating backward ---
         dQ_gate = None
         dgate_proj_weight = None
+
         if gate_proj_weight is not None:
-            # Fused CuteDSL kernel for dO branches + dQ_gate,
-            # PyTorch einsum for dW_gate (cross-row reduction)
+            # Gate weights present — need all O_i for gating backward.
+            # Recompute all three forwards (existing behavior).
+            O_cmp, lse_cmp = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+            )
+            O_slc, lse_slc = _fa4_fwd(
+                Q,
+                K,
+                V,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                block_sparse_tensors=sparse_tensors,
+            )
+            O_sld, lse_sld = _fa4_fwd(
+                Q,
+                K,
+                V,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                window_size_left=window_size,
+                window_size_right=0,
+            )
+
             dO_cmp, dO_slc, dO_sld, dQ_gate, dgate_proj_weight = fused_gating_backward(
                 Q,
                 dO,
@@ -281,16 +278,29 @@ class NSAFunction(torch.autograd.Function):
                 gate_proj_weight,
             )
         else:
-            # No gate weights — uniform 1/3 gates, simple scaling
+            # No gate weights — dO_i = g_i * dO, independent of O_i.
+            # Process each branch sequentially to minimize peak memory.
             g = gates.float()
             dO_f = dO.float()
             dO_cmp = (g[..., 0:1] * dO_f).to(dO.dtype)
             dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
             dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
+            del g, dO_f
 
-        # --- Stage 2: Three attention backward passes (FA4 CuteDSL) ---
+            # Recompute and backward each branch one at a time.
+            lse_cmp = lse_slc = lse_sld = None
+            O_cmp = O_slc = O_sld = None
 
-        # Branch 1: Compressed attention backward
+        # --- Branch 1: Compressed attention ---
+        if O_cmp is None:
+            O_cmp, lse_cmp = _fa4_fwd(
+                Q,
+                K_cmp,
+                V_cmp,
+                causal=False,
+                softmax_scale=softmax_scale,
+                mask_mod=compressed_mask,
+            )
         dQ_cmp, dK_cmp, dV_cmp = _fa4_bwd(
             Q,
             K_cmp,
@@ -302,11 +312,18 @@ class NSAFunction(torch.autograd.Function):
             causal=False,
             mask_mod=compressed_mask,
         )
+        del O_cmp, lse_cmp, dO_cmp
 
-        # Branch 2: Selected attention backward (FA4 block-sparse)
-        # The backward kernel iterates over KV-blocks (N direction) and for
-        # each one needs to know which Q-tiles interact with it. This is the
-        # transpose of the forward sparsity pattern.
+        # --- Branch 2: Selected attention (block-sparse) ---
+        if O_slc is None:
+            O_slc, lse_slc = _fa4_fwd(
+                Q,
+                K,
+                V,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                block_sparse_tensors=sparse_tensors,
+            )
         bwd_sparse_tensors = _transpose_block_sparse_for_bwd(
             sparse_tensors,
             seqlen_q=Q.shape[1],
@@ -324,8 +341,19 @@ class NSAFunction(torch.autograd.Function):
             causal=causal,
             block_sparse_tensors=bwd_sparse_tensors,
         )
+        del O_slc, lse_slc, dO_slc, bwd_sparse_tensors
 
-        # Branch 3: Sliding window attention backward
+        # --- Branch 3: Sliding window attention ---
+        if O_sld is None:
+            O_sld, lse_sld = _fa4_fwd(
+                Q,
+                K,
+                V,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                window_size_left=window_size,
+                window_size_right=0,
+            )
         dQ_sld, dK_sld, dV_sld = _fa4_bwd(
             Q,
             K,
@@ -338,6 +366,7 @@ class NSAFunction(torch.autograd.Function):
             window_size_left=window_size,
             window_size_right=0,
         )
+        del O_sld, lse_sld, dO_sld
 
         # --- Stage 3: Compression backward ---
         # dK_cmp, dV_cmp are gradients w.r.t. compressed KV

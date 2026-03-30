@@ -2,6 +2,7 @@
 
 """Benchmark NSA forward + backward at various sequence lengths."""
 
+import gc
 import time
 
 import torch
@@ -76,42 +77,23 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name()}")
     print()
 
-    for N in [
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
-        524288,
-        1048576,
-        2097152,
-        3145728,
-    ]:
+    seq_lengths = [
+        1024, 2048, 4096, 8192, 16384, 32768, 65536,
+        131072, 262144, 524288, 1048576, 2097152, 3145728,
+    ]
+
+    for N in seq_lengths:
+        gc.collect()
+        torch.cuda.empty_cache()
         try:
             benchmark_nsa_fwd_bwd(N, backward=False)
         except Exception as e:
             print(f"N={N:>7d} | fwd     | FAILED: {e}")
 
     print()
-    for N in [
-        1024,
-        2048,
-        4096,
-        8192,
-        16384,
-        32768,
-        65536,
-        131072,
-        262144,
-        524288,
-        1048576,
-        2097152,
-        3145728,
-    ]:
+    for N in seq_lengths:
+        gc.collect()
+        torch.cuda.empty_cache()
         try:
             benchmark_nsa_fwd_bwd(N, backward=True)
         except Exception as e:
