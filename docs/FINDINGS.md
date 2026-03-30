@@ -51,7 +51,7 @@ Measured on NVIDIA GB200, 2026-03-26.
 | 64K | 24.06ms | 10.35ms | 2.33x |
 | 128K | 96.53ms | 24.18ms | 3.99x |
 | 256K | 403.51ms | 65.11ms | 6.20x |
-| **512K** | **1617.79ms** | **194.81ms** | **8.30x** |
+| **512K** | **1617.06ms** | **196.30ms** | **8.24x** |
 
 Forward crossover at ~32K tokens.
 
@@ -59,18 +59,31 @@ Forward crossover at ~32K tokens.
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 1K | 0.57ms | 3.33ms | 0.17x |
-| 2K | 0.55ms | 3.83ms | 0.14x |
-| 4K | 0.76ms | 3.62ms | 0.21x |
-| 8K | 1.63ms | 4.51ms | 0.36x |
-| 16K | 5.06ms | 7.45ms | 0.68x |
-| **32K** | **21.35ms** | **13.83ms** | **1.54x** |
-| 64K | 84.15ms | 29.00ms | 2.90x |
-| 128K | 338.68ms | 68.78ms | 4.92x |
-| 256K | 1356.51ms | 182.45ms | 7.44x |
-| **512K** | **5423.31ms** | **833.78ms** | **6.50x** |
+| 1K | 0.64ms | 4.10ms | 0.16x |
+| 2K | 0.57ms | 3.64ms | 0.16x |
+| 4K | 0.79ms | 3.71ms | 0.21x |
+| 8K | 1.65ms | 4.61ms | 0.36x |
+| 16K | 5.11ms | 8.71ms | 0.59x |
+| **32K** | **21.52ms** | **14.02ms** | **1.54x** |
+| 64K | 80.41ms | 29.27ms | 2.75x |
+| 128K | 339.29ms | 68.31ms | 4.97x |
+| 256K | 1356.74ms | 181.52ms | 7.47x |
+| 512K | 5436.21ms | 545.76ms | 9.96x |
+| **1M** | **26076.29ms** | **1853.34ms** | **14.07x** |
 
 Fwd+bwd crossover at ~32K tokens.
+
+### Varlen Performance (native varlen vs padded)
+
+| Total N | Varlen F+B | Regular F+B | Varlen Speedup |
+|---------|-----------|------------|----------------|
+| 128K | 67.42ms | 68.39ms | 1.01x |
+| 256K | 156.79ms | 180.76ms | 1.15x |
+| 512K | 621.28ms | 826.52ms | 1.33x |
+| **1M** | **1901.55ms** | **2331.09ms** | **1.23x** |
+
+Native varlen (selected + sliding window branches use cu_seqlens directly)
+is 23-33% faster than the padded approach at 256K-1M token contexts.
 
 ### Forward Component Breakdown (profiled on B200)
 

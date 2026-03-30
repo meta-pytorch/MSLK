@@ -87,9 +87,15 @@ def test_cuda_graph_nsa_fwd_bwd():
         torch.cuda.empty_cache()
 
         # Static tensors for graph capture — must persist across replay
-        Q = torch.randn(B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        K = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        V = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        Q = torch.randn(
+            B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        K = torch.randn(
+            B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        V = torch.randn(
+            B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
 
         # Warmup — compile all CuTe DSL kernels (fwd + bwd)
         for _ in range(3):

@@ -367,13 +367,14 @@ def nsa_forward(
     )
 
     # Branch 3: Sliding window attention
-    O_sld, lse_sld = _fa4_fwd_simple(
+    O_sld, lse_sld = _fa4_fwd(
         Q,
         K,
         V,
         causal=causal,
         softmax_scale=softmax_scale,
-        window_size=(window_size, 0),  # (left, right=0 for causal)
+        window_size_left=window_size,
+        window_size_right=0,
     )
 
     # Step 5: Gate and combine branch outputs
