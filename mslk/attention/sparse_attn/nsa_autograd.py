@@ -369,47 +369,67 @@ class NSAFunction(torch.autograd.Function):
             mask_mod=compressed_mask,
         )
 
-        # For the selected branch backward, use mask_mod to implement block
-        # selection. This avoids FA4's block_sparse_tensors backward path which
-        # has 2-CTA compatibility issues on SM100. The mask_mod checks if each
-        # (q_idx, kv_idx) pair falls within a selected block, using the block
-        # indices passed as aux_tensors.
-        block_indices = ctx.block_indices
-        q_tile_size = ctx.q_tile_size
-        num_sel = ctx.num_selected_blocks
-
-        import cutlass
-        import cutlass.cute as cute
-
-        @cute.jit
-        def _selected_block_mask(
-            batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-        ):
-            # aux_tensors[0] = block_indices: (B, H, N_q_tiles, k) int32
-            indices = aux_tensors[0]
-            q_tile = q_idx[0] // cutlass.const_expr(q_tile_size)
-            kv_block = kv_idx[0] // cutlass.const_expr(compress_block_size)
-
-            found = cutlass.Boolean(False)
-            for i in cutlass.range_constexpr(num_sel):
-                sel_block = indices[batch_idx[0], head_idx[0], q_tile, i]
-                found = found | (sel_block == kv_block)
-            if cutlass.const_expr(causal):
-                found = found & (kv_idx <= q_idx)
-            return found
-
-        dQ_slc, dK_slc, dV_slc = _fa4_bwd(
-            Q,
-            K,
-            V,
-            O_slc,
-            dO_slc,
-            lse_slc,
-            softmax_scale=softmax_scale,
-            causal=False,  # causal handled in mask_mod
-            mask_mod=_selected_block_mask,
-            aux_tensors=[block_indices],
+        # For the selected branch backward, transpose block sparse tensors
+        # to Q-direction format for FA4 backward. Falls back to mask_mod if
+        # block sparsity backward fails.
+        B_size, N_size = Q.shape[:2]
+        bwd_sparse_tensors = _transpose_block_sparse_for_bwd(
+            sparse_tensors,
+            seqlen_q=N_size,
+            seqlen_k=N_size,
+            n_block_size=ctx.n_block_size,
+            q_tile_size=ctx.q_tile_size,
         )
+
+        try:
+            dQ_slc, dK_slc, dV_slc = _fa4_bwd(
+                Q,
+                K,
+                V,
+                O_slc,
+                dO_slc,
+                lse_slc,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                block_sparse_tensors=bwd_sparse_tensors,
+            )
+        except Exception:
+            # Fallback: use mask_mod with aux_tensors for block selection
+            block_indices = ctx.block_indices
+            q_tile_size = ctx.q_tile_size
+            num_sel = ctx.num_selected_blocks
+
+            import cutlass
+            import cutlass.cute as cute
+
+            @cute.jit
+            def _selected_block_mask(
+                batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+            ):
+                indices = aux_tensors[0]
+                q_tile = q_idx[0] // cutlass.const_expr(q_tile_size)
+                kv_block = kv_idx[0] // cutlass.const_expr(compress_block_size)
+
+                found = cutlass.Boolean(False)
+                for i in cutlass.range_constexpr(num_sel):
+                    sel_block = indices[batch_idx[0], head_idx[0], q_tile, i]
+                    found = found | (sel_block == kv_block)
+                if cutlass.const_expr(causal):
+                    found = found & (kv_idx <= q_idx)
+                return found
+
+            dQ_slc, dK_slc, dV_slc = _fa4_bwd(
+                Q,
+                K,
+                V,
+                O_slc,
+                dO_slc,
+                lse_slc,
+                softmax_scale=softmax_scale,
+                causal=False,
+                mask_mod=_selected_block_mask,
+                aux_tensors=[block_indices],
+            )
 
         dQ_sld, dK_sld, dV_sld = _fa4_bwd(
             Q,
