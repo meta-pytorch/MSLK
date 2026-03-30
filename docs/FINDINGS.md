@@ -36,25 +36,28 @@ All three branches now use FA4 CuteDSL kernels for both forward and backward.
 
 ## Performance (GB200, B=1, H=32, H_kv=8, D=128)
 
-Measured on NVIDIA GB200 (184 GiB), 2026-03-26.
+Measured on NVIDIA GB200 (184 GiB), 2026-03-27.
 
 ### Forward: NSA vs Dense FA4
 
-| Seq Length | Dense FA4 | NSA | Speedup |
-|-----------|----------|-----|---------|
-| 1K | 0.27ms | 1.79ms | 0.15x |
-| 2K | 0.19ms | 2.54ms | 0.08x |
-| 4K | 0.27ms | 2.53ms | 0.11x |
-| 8K | 0.55ms | 2.24ms | 0.25x |
-| 16K | 1.52ms | 3.15ms | 0.48x |
-| **32K** | **5.44ms** | **5.78ms** | **0.94x** |
-| 64K | 24.79ms | 10.78ms | 2.30x |
-| 128K | 99.62ms | 24.15ms | 4.12x |
-| 256K | 397.26ms | 63.07ms | 6.30x |
-| 512K | 1600.45ms | 188.18ms | 8.51x |
-| **1M** | **6413.33ms** | **629.22ms** | **10.19x** |
+| Seq Length | Dense FA4 | NSA | Speedup | NSA+CmpSparse | CmpSp Speedup |
+|-----------|----------|-----|---------|---------------|---------------|
+| 4K | 0.24ms | 2.99ms | 0.08x | 3.98ms | 0.06x |
+| 8K | 0.60ms | 1.97ms | 0.30x | 2.88ms | 0.21x |
+| 16K | 1.62ms | 3.20ms | 0.51x | 6.01ms | 0.27x |
+| **32K** | **5.22ms** | **4.44ms** | **1.18x** | 8.12ms | 0.64x |
+| 64K | 24.98ms | 8.40ms | 2.97x | 14.31ms | 1.75x |
+| 128K | 98.59ms | 17.71ms | 5.57x | 27.27ms | 3.61x |
+| 256K | 407.38ms | 43.58ms | 9.35x | 49.07ms | 8.30x |
+| 512K | 1633.69ms | 138.47ms | 11.80x | 102.91ms | 15.87x |
+| **1M** | **6472.56ms** | **492.89ms** | **13.13x** | **244.98ms** | **26.42x** |
 
-Forward crossover at ~32K tokens.
+Forward crossover at ~32K (NSA) or ~64K (NSA+CmpSparse with k_cmp=16).
+
+NSA+CmpSparse uses `num_cmp_selected_blocks=16`: selects top-16 FA4 blocks
+of compressed KV per Q tile (out of N_cmp/128 total blocks), making the
+compressed branch sub-quadratic. Beneficial at 512K+ where the compressed
+branch dominates.
 
 ### Forward + Backward: NSA vs Dense FA4
 
@@ -86,38 +89,37 @@ Fwd+bwd crossover at ~32K tokens.
 Native varlen (selected + sliding window branches use cu_seqlens directly)
 is 32-47% faster than the padded approach at 256K-1M token contexts.
 
-### Forward Component Breakdown (profiled on GB200)
+### Forward Component Breakdown (profiled on GB200, GEMM-based scoring)
 
-At N=4K (where NSA is ~10x slower than dense):
-- Mask construction: 29% (PyTorch op launch overhead)
-- Block selection: 22%
-- Gating: 16%
-- 3x FA4 attention: 22%
+At N=4K (where NSA is ~12x slower than dense):
+- Block selection (GEMM): 28%
+- Mask construction: 26%
+- Gating: 15%
+- 3x FA4 attention: 20%
 - Compression: 11%
 
-At N=128K (where NSA is 4x faster than dense):
-- FA4 compressed attention: 33%
-- Gating: 21%
-- FA4 selected attention: 18%
-- Block selection: 16%
-- FA4 sliding window: 6%
-- Mask construction: 4%
+At N=128K (where NSA is 5.6x faster than dense):
+- Block selection (GEMM): 43%
+- FA4 compressed attention: 22%
+- Gating: 14%
+- FA4 selected attention: 12%
+- FA4 sliding window: 4%
+- Mask construction: 2%
 - Compression: 2%
 
-At N=1M (where NSA is 7.9x faster — forward only):
-- **FA4 compressed attention: 57.5%** — O(N × N/64) = O(N²/64), dominates at large N
-- Block selection: 21.5% — CuteDSL kernel, scales with N_cmp²
-- Mask construction: 9.4% — PyTorch ops, scales with N
-- FA4 selected attention: 5.2% — sparse, sub-quadratic
-- Gating: 4.6% — O(N)
-- FA4 sliding window: 1.6% — window is fixed 512, O(N)
-- Compression: 0.2% — O(N)
+At N=262K:
+- Block selection (GEMM): 39%
+- FA4 compressed attention: 34%
+- FA4 selected attention: 11%
+- Gating: estimated 10%
+- FA4 sliding window: 3%
+- Mask construction: 1%
 
-**Key insight**: The compressed branch is the performance bottleneck at large N.
-It attends Q(N) to K_cmp(N/64), which is O(N²/64) — quadratic in N but 64x
-smaller than dense. At 1M, this alone takes 364ms out of 633ms total.
-The forward speedup regression from 8.24x (512K) to 7.93x (1M) is explained by
-this quadratic scaling in the compressed branch.
+**Key insight**: With GEMM-based scoring, block selection is now the dominant
+cost at medium N (43% at 128K). At large N, the compressed branch (still
+quadratic without `num_cmp_selected_blocks`) catches up. Using
+`num_cmp_selected_blocks` makes the compressed branch sub-quadratic,
+leaving block selection as the universal bottleneck.
 
 ## 2M/3M Context Limit
 
@@ -129,13 +131,33 @@ The NSA backward pass itself has no architectural limit beyond the
 forward's — all three branches use FA4 tiled kernels with O(1) memory
 per tile. The OOM is purely a JIT cache issue.
 
+## What We Optimized
+
+### GEMM-Based Scoring (replacing CuteDSL scalar dot products)
+The block selection kernel was replaced from CuteDSL scalar dot products to
+cuBLAS GEMM via `torch.matmul`. Uses GQA-aware bmm to avoid expanding K_cmp
+from H_kv to H heads. Eliminates CuteDSL JIT compilation for the select kernel.
+The Q_mean optimization (mean(Q @ K) = mean(Q) @ K) is preserved.
+
+### Block-Sparse Compressed Attention (sub-quadratic compressed branch)
+New `num_cmp_selected_blocks` parameter selects top-k FA4 blocks of compressed
+KV per Q tile, making the compressed branch O(N * k_cmp) instead of O(N²/64).
+Uses FA4's `mask_mod` + `block_sparse_tensors` simultaneously: block sparsity
+determines which blocks to process, mask_mod applies compressed causal masking
+within each block. Beneficial at 512K+ contexts.
+
+### Multi-Stream FA4 Branches — Investigated, Not Beneficial
+Attempted overlapping the 3 FA4 branches on separate CUDA streams. Result:
+stream creation/synchronization overhead (0.1-0.5ms) exceeded any overlap
+benefit. Each FA4 call saturates all SMs on GB200, so there's nothing to overlap.
+
 ## Next Steps
 
 ### 1. Reduce CuTe DSL JIT Cache Footprint
 NSA compiles many more kernel variants than dense FA4 (3 attention
-branches x fwd/bwd + compress + select + gating). Reducing the number
-of compiled variants or sharing JIT cache across branches would unlock
-2M+ contexts.
+branches x fwd/bwd + compress + gating). The select kernel no longer uses
+CuteDSL (switched to GEMM). Reducing compiled variants or sharing JIT cache
+across branches would unlock 2M+ contexts.
 
 ### 2. Submit FA4 Block-Sparse Backward Fix Upstream
 The one-line fix in `flash_bwd_sm100.py` (missing `is_leader_cta` argument)
@@ -145,23 +167,21 @@ test from `test_fa4_block_sparse_bwd.py` as the regression test.
 ### 3. Lower the Crossover Point (performance)
 NSA breaks even at ~32K. To lower this:
 
-**a. Fuse mask construction into the select kernel (biggest win: 20% at small N)**
-The CuteDSL select kernel (`fused_score_and_select_blocks`) already computes
-block indices. It could output the `BlockSparseTensorsTorch` format directly,
-eliminating the separate Python mask construction step with its 6+ PyTorch op
-launches.
+**a. Fuse mask construction into the select output**
+The GEMM scoring + topk already produces block indices. Computing the
+`BlockSparseTensorsTorch` format inline (integer division + dedup) would
+eliminate 6+ separate PyTorch op launches (25% at small N).
 
 **b. Reduce kernel launch count**
-NSA launches 7+ GPU kernels per forward (compress, select, mask, 3x FA4,
-gating). At small N, kernel launch latency (~5-10us each) dominates actual
-compute. Options:
-- Fuse compress + select into one kernel
-- Fuse sliding window into the selected branch (both attend to full K,V)
-- Use CUDA graphs to amortize launch overhead
+NSA launches 7+ GPU kernels per forward (compress, Q_mean, GEMM, topk,
+mask, 3x FA4, gating). At small N, kernel launch latency dominates.
+CUDA graphs could amortize launch overhead (existing test infrastructure
+in `test_cuda_graph_nsa.py`).
 
 **c. Optimize gating kernel**
-Gating takes 17-25% across all sizes. The current CuteDSL kernel may have
-suboptimal tile sizes for small N. Profile with nsight to identify bottlenecks.
+Gating takes 14-15% across all sizes. The current CuteDSL kernel uses
+4 warps/block, 1 row per warp. Increasing rows per block and using
+vectorized loads could yield 20-30% improvement.
 
 ### 4. Varlen Support
 The backward pass now supports native varlen (variable-length packed sequences)
