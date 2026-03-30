@@ -34,64 +34,43 @@ All three branches now use FA4 CuteDSL kernels for both forward and backward.
   `False`, producing incorrect non-causal, non-windowed gradients.
 - Fixed by using FA4 backward with explicit `window_size_left`.
 
-## Performance (B200, B=1, H=32, H_kv=8, D=128)
+## Performance (GB200, B=1, H=32, H_kv=8, D=128)
 
-Measured on NVIDIA B200 (178 GiB), devgpu016.snb3, 2026-03-25.
+Measured on NVIDIA GB200, 2026-03-26.
 
 ### Forward: NSA vs Dense FA4
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 1K | 0.09ms | 0.91ms | 0.10x |
-| 2K | 0.10ms | 1.02ms | 0.10x |
-| 4K | 0.17ms | 1.28ms | 0.13x |
-| 8K | 0.48ms | 1.77ms | 0.27x |
-| 16K | 1.74ms | 2.84ms | 0.61x |
-| **32K** | **6.93ms** | **5.27ms** | **1.32x** |
-| 64K | 30.61ms | 11.22ms | 2.73x |
-| 128K | 121.16ms | 27.09ms | 4.47x |
-| 256K | 485.24ms | 74.81ms | 6.49x |
-| 512K | 1939.75ms | 226.35ms | 8.57x |
-| **1M** | **7816.42ms** | **772.59ms** | **10.12x** |
-| 2M | 31604.78ms | OOM | — |
-| 3M | 72051.59ms | OOM | — |
+| 1K | 0.10ms | 1.46ms | 0.07x |
+| 2K | 0.19ms | 2.34ms | 0.08x |
+| 4K | 0.27ms | 2.27ms | 0.12x |
+| 8K | 0.53ms | 2.17ms | 0.25x |
+| 16K | 1.53ms | 3.87ms | 0.40x |
+| **32K** | **5.16ms** | **5.72ms** | **0.90x** |
+| 64K | 24.06ms | 10.35ms | 2.33x |
+| 128K | 96.53ms | 24.18ms | 3.99x |
+| 256K | 403.51ms | 65.11ms | 6.20x |
+| **512K** | **1617.79ms** | **194.81ms** | **8.30x** |
 
-Forward crossover at ~25K tokens (without CUDA graphs), **~4K tokens with CUDA graphs**.
-
-### CUDA Graph Speedup (forward only)
-
-CuTe DSL kernels use `cuda.cuLaunchKernel` and are fully CUDA Graph compatible.
-After warmup, the NSA forward can be captured in `torch.cuda.CUDAGraph`:
-
-| N | No Graph | CUDA Graph | Speedup |
-|------|----------|-----------|---------|
-| 4K | 1.49ms | 0.29ms | 5.08x |
-| 8K | 1.27ms | 0.51ms | 2.49x |
-| 16K | 2.00ms | 1.01ms | 1.97x |
-| 32K | 2.37ms | 2.21ms | 1.07x |
-| 64K+ | — | — | <2% |
-
-With CUDA graphs, NSA at 4K (0.29ms) is comparable to dense FA4 (0.26ms).
+Forward crossover at ~32K tokens.
 
 ### Forward + Backward: NSA vs Dense FA4
 
 | Seq Length | Dense FA4 | NSA | Speedup |
 |-----------|----------|-----|---------|
-| 1K | 0.41ms | 2.42ms | 0.17x |
-| 2K | 0.44ms | 2.34ms | 0.19x |
-| 4K | 0.68ms | 2.63ms | 0.26x |
-| 8K | 1.85ms | 4.28ms | 0.43x |
-| 16K | 6.31ms | 7.62ms | 0.83x |
-| **32K** | **27.37ms** | **15.45ms** | **1.77x** |
-| 64K | 108.85ms | 34.31ms | 3.17x |
-| 128K | 418.86ms | 86.48ms | 4.84x |
-| 256K | 1669.69ms | 236.09ms | 7.07x |
-| 512K | 6644.73ms | 695.13ms | 9.56x |
-| **1M** | **26581.04ms** | **2309.82ms** | **11.51x** |
-| 2M | 106785.33ms | OOM | — |
+| 1K | 0.57ms | 3.33ms | 0.17x |
+| 2K | 0.55ms | 3.83ms | 0.14x |
+| 4K | 0.76ms | 3.62ms | 0.21x |
+| 8K | 1.63ms | 4.51ms | 0.36x |
+| 16K | 5.06ms | 7.45ms | 0.68x |
+| **32K** | **21.35ms** | **13.83ms** | **1.54x** |
+| 64K | 84.15ms | 29.00ms | 2.90x |
+| 128K | 338.68ms | 68.78ms | 4.92x |
+| 256K | 1356.51ms | 182.45ms | 7.44x |
+| **512K** | **5423.31ms** | **833.78ms** | **6.50x** |
 
-Fwd+bwd crossover at ~20K tokens (lower than forward-only because
-dense backward is O(N^2) while NSA backward stays sub-quadratic).
+Fwd+bwd crossover at ~32K tokens.
 
 ### Forward Component Breakdown (profiled on B200)
 
@@ -156,11 +135,16 @@ Gating takes 17-25% across all sizes. The current CuteDSL kernel may have
 suboptimal tile sizes for small N. Profile with nsight to identify bottlenecks.
 
 ### 4. Varlen Support
-Currently all sequences in a batch must have the same length. For training
-with packed sequences, need to:
-- Adapt compression, scoring, mask construction for variable lengths
-- Pass `cu_seqlens_q/k` through to FA4 (already supported by FA4)
-- Handle block indices that span sequence boundaries
+The backward pass now supports native varlen (variable-length packed sequences)
+without padding Q, K, V to max_seqlen:
+- Selected and sliding window branches use native FA4 varlen in both fwd and bwd
+- Compressed branch uses padded Q for mask_mod compatibility (FA4 limitation)
+- Compress/select read from 3D varlen input directly
+- Only the compressed KV output (max_seqlen/64) remains padded as an implementation detail
+
+Remaining work:
+- Add varlen + mask_mod support to FA4 SM100 backward (commits 6-7)
+- This would let the compressed branch also use native varlen
 
 ### 5. Memory Optimization for Gate Weights Case
 When `gate_proj_weight` is provided, the backward needs all three O_i

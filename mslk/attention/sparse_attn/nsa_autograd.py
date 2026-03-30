@@ -4,6 +4,11 @@
 
 Provides NSAFunction(torch.autograd.Function) and a user-facing nsa() function
 that supports training (backward pass).
+
+Supports both fixed-length (4D) and variable-length (3D + cu_seqlens) inputs.
+For varlen, the selected and sliding window branches use native FA4 varlen
+(no padding), while the compressed branch uses padded 4D (mask_mod blocks
+varlen in FA4 backward).
 """
 
 from __future__ import annotations
@@ -84,6 +89,35 @@ def _transpose_block_sparse_for_bwd(
     )
 
 
+def _pad_to_4d(
+    src: Tensor,
+    cu_seqlens: Tensor,
+    seqlens: list[int],
+    batch_size: int,
+    pad_N: int,
+) -> Tensor:
+    """Pad a 3D varlen tensor (total_tokens, ...) to 4D (B, pad_N, ...)."""
+    out = src.new_zeros(batch_size, pad_N, *src.shape[1:])
+    for i, slen in enumerate(seqlens):
+        s = cu_seqlens[i].item()
+        out[i, :slen] = src[s : s + slen]
+    return out
+
+
+def _unpad_to_3d(
+    src: Tensor,
+    cu_seqlens: Tensor,
+    seqlens: list[int],
+    total_tokens: int,
+) -> Tensor:
+    """Unpad a 4D tensor (B, N, ...) to 3D (total_tokens, ...)."""
+    out = src.new_zeros(total_tokens, *src.shape[2:])
+    for i, slen in enumerate(seqlens):
+        s = cu_seqlens[i].item()
+        out[s : s + slen] = src[i, :slen]
+    return out
+
+
 class NSAFunction(torch.autograd.Function):
     """Autograd function for NSA with activation checkpointing.
 
@@ -91,11 +125,15 @@ class NSAFunction(torch.autograd.Function):
     Backward: recomputes FA4 branch outputs (activation checkpointing),
     then calls _flash_attn_bwd for each branch.
 
+    Supports varlen via cu_seqlens: selected + sliding window branches use
+    native FA4 varlen (no padding), compressed branch uses padded 4D
+    (mask_mod blocks varlen in FA4 backward).
+
     Saved for backward (small tensors only):
         - Q, K, V (inputs, already in autograd graph)
-        - K_cmp, V_cmp (compressed KV)
+        - K_cmp, V_cmp (compressed KV, padded to max_N_cmp)
         - block_indices, sparse_tensors (discrete, small)
-        - gates (B, N, H, 3)
+        - gates (..., H, 3)
         - Config scalars
 
     Recomputed during backward (activation checkpointing):
@@ -108,6 +146,8 @@ class NSAFunction(torch.autograd.Function):
         Q: Tensor,
         K: Tensor,
         V: Tensor,
+        K_cmp: Tensor,
+        V_cmp: Tensor,
         W_k_compress: Tensor | None,
         W_v_compress: Tensor | None,
         gate_proj_weight: Tensor | None,
@@ -118,38 +158,41 @@ class NSAFunction(torch.autograd.Function):
         softmax_scale: float,
         q_tile_size: int,
         n_block_size: int,
+        cu_seqlens: Tensor | None,
+        max_seqlen: int | None,
+        sparse_tensors,  # BlockSparseTensorsTorch
     ) -> Tensor:
+        is_varlen = cu_seqlens is not None
+
+        if is_varlen:
+            return _nsa_forward_varlen(
+                ctx,
+                Q,
+                K,
+                V,
+                K_cmp,
+                V_cmp,
+                W_k_compress,
+                W_v_compress,
+                gate_proj_weight,
+                compress_block_size,
+                num_selected_blocks,
+                window_size,
+                causal,
+                softmax_scale,
+                q_tile_size,
+                n_block_size,
+                cu_seqlens,
+                max_seqlen,
+                sparse_tensors,
+            )
+
+        # Fixed-length 4D path (unchanged)
         B, N, H, D = Q.shape
-
-        # Step 1: Compress KV
-        K_cmp, V_cmp = fused_compress_kv(
-            K, V, compress_block_size, W_k_compress, W_v_compress
-        )
-
-        # Step 2: Score blocks and select top-k
-        block_indices = fused_score_and_select_blocks(
-            Q,
-            K_cmp,
-            num_selected_blocks,
-            compress_block_size,
-            causal=causal,
-            q_tile_size=q_tile_size,
-            softmax_scale=softmax_scale,
-        )
-
-        # Step 3: Build FA4 sparsity masks
-        sparse_tensors = build_fa4_block_sparse_tensors(
-            block_indices,
-            compress_block_size,
-            n_block_size=n_block_size,
-            seqlen_k=N,
-        )
-
-        # Step 4: Three FA4 branches
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
         )
-        O_cmp, lse_cmp = _fa4_fwd(
+        O_cmp, _ = _fa4_fwd(
             Q,
             K_cmp,
             V_cmp,
@@ -157,8 +200,7 @@ class NSAFunction(torch.autograd.Function):
             softmax_scale=softmax_scale,
             mask_mod=compressed_mask,
         )
-
-        O_slc, lse_slc = _fa4_fwd(
+        O_slc, _ = _fa4_fwd(
             Q,
             K,
             V,
@@ -166,8 +208,7 @@ class NSAFunction(torch.autograd.Function):
             softmax_scale=softmax_scale,
             block_sparse_tensors=sparse_tensors,
         )
-
-        O_sld, lse_sld = _fa4_fwd(
+        O_sld, _ = _fa4_fwd(
             Q,
             K,
             V,
@@ -177,12 +218,9 @@ class NSAFunction(torch.autograd.Function):
             window_size_right=0,
         )
 
-        # Step 5: Compute gates and combine
         gates = compute_gates(Q, gate_proj_weight)
         O = gate_and_combine(O_cmp, O_slc, O_sld, gates)
 
-        # Save for backward — small tensors + inputs only
-        # (activation checkpointing: we do NOT save O_cmp, O_slc, O_sld, lse_*)
         ctx.save_for_backward(
             Q,
             K,
@@ -194,21 +232,25 @@ class NSAFunction(torch.autograd.Function):
             W_k_compress,
             W_v_compress,
         )
-        # Save block sparsity info (non-tensor or small)
-        ctx.block_indices = block_indices
         ctx.sparse_tensors = sparse_tensors
         ctx.compress_block_size = compress_block_size
-        ctx.num_selected_blocks = num_selected_blocks
         ctx.window_size = window_size
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.q_tile_size = q_tile_size
         ctx.n_block_size = n_block_size
+        ctx.cu_seqlens = None
+        ctx.max_seqlen = None
+        ctx.varlen_meta = None
 
         return O
 
     @staticmethod
     def backward(ctx, dO: Tensor):
+        is_varlen = ctx.cu_seqlens is not None
+        if is_varlen:
+            return _nsa_backward_varlen(ctx, dO)
+
         (
             Q,
             K,
@@ -221,16 +263,12 @@ class NSAFunction(torch.autograd.Function):
             W_v_compress,
         ) = ctx.saved_tensors
 
+        # Fixed-length 4D backward (unchanged from original)
         causal = ctx.causal
         softmax_scale = ctx.softmax_scale
         compress_block_size = ctx.compress_block_size
         window_size = ctx.window_size
         sparse_tensors = ctx.sparse_tensors
-
-        # --- Backward: sequential per-branch to minimize peak memory ---
-        # Without gate weights, dO_i = g_i * dO (no O_i needed).
-        # With gate weights, we need all O_i for dgate — fall back to
-        # recomputing all three upfront.
 
         compressed_mask = (
             _make_compressed_causal_mask(compress_block_size) if causal else None
@@ -240,8 +278,6 @@ class NSAFunction(torch.autograd.Function):
         dgate_proj_weight = None
 
         if gate_proj_weight is not None:
-            # Gate weights present — need all O_i for gating backward.
-            # Recompute all three forwards (existing behavior).
             O_cmp, lse_cmp = _fa4_fwd(
                 Q,
                 K_cmp,
@@ -267,7 +303,6 @@ class NSAFunction(torch.autograd.Function):
                 window_size_left=window_size,
                 window_size_right=0,
             )
-
             dO_cmp, dO_slc, dO_sld, dQ_gate, dgate_proj_weight = fused_gating_backward(
                 Q,
                 dO,
@@ -278,20 +313,16 @@ class NSAFunction(torch.autograd.Function):
                 gate_proj_weight,
             )
         else:
-            # No gate weights — dO_i = g_i * dO, independent of O_i.
-            # Process each branch sequentially to minimize peak memory.
             g = gates.float()
             dO_f = dO.float()
             dO_cmp = (g[..., 0:1] * dO_f).to(dO.dtype)
             dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
             dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
             del g, dO_f
-
-            # Recompute and backward each branch one at a time.
             lse_cmp = lse_slc = lse_sld = None
             O_cmp = O_slc = O_sld = None
 
-        # --- Branch 1: Compressed attention ---
+        # Branch 1: Compressed
         if O_cmp is None:
             O_cmp, lse_cmp = _fa4_fwd(
                 Q,
@@ -314,7 +345,7 @@ class NSAFunction(torch.autograd.Function):
         )
         del O_cmp, lse_cmp, dO_cmp
 
-        # --- Branch 2: Selected attention (block-sparse) ---
+        # Branch 2: Selected (block-sparse)
         if O_slc is None:
             O_slc, lse_slc = _fa4_fwd(
                 Q,
@@ -324,7 +355,7 @@ class NSAFunction(torch.autograd.Function):
                 softmax_scale=softmax_scale,
                 block_sparse_tensors=sparse_tensors,
             )
-        bwd_sparse_tensors = _transpose_block_sparse_for_bwd(
+        bwd_sparse = _transpose_block_sparse_for_bwd(
             sparse_tensors,
             seqlen_q=Q.shape[1],
             seqlen_k=K.shape[1],
@@ -339,11 +370,11 @@ class NSAFunction(torch.autograd.Function):
             lse_slc,
             softmax_scale=softmax_scale,
             causal=causal,
-            block_sparse_tensors=bwd_sparse_tensors,
+            block_sparse_tensors=bwd_sparse,
         )
-        del O_slc, lse_slc, dO_slc, bwd_sparse_tensors
+        del O_slc, lse_slc, dO_slc, bwd_sparse
 
-        # --- Branch 3: Sliding window attention ---
+        # Branch 3: Sliding window
         if O_sld is None:
             O_sld, lse_sld = _fa4_fwd(
                 Q,
@@ -368,9 +399,7 @@ class NSAFunction(torch.autograd.Function):
         )
         del O_sld, lse_sld, dO_sld
 
-        # --- Stage 3: Compression backward ---
-        # dK_cmp, dV_cmp are gradients w.r.t. compressed KV
-        # CuteDSL kernel for mean-pool scatter, PyTorch for projection
+        # Compression backward
         dK_compress, dV_compress, dW_k, dW_v = fused_compress_kv_backward(
             dK_cmp,
             dV_cmp,
@@ -381,20 +410,21 @@ class NSAFunction(torch.autograd.Function):
             W_v_compress,
         )
 
-        # --- Stage 4: Gradient accumulation ---
+        # Gradient accumulation
         dQ = dQ_cmp + dQ_slc + dQ_sld
         if dQ_gate is not None:
             dQ = dQ + dQ_gate
-
         dK = dK_slc + dK_sld + dK_compress
         dV = dV_slc + dV_sld + dV_compress
 
         # Return gradients matching forward() args order:
-        # Q, K, V, W_k_compress, W_v_compress, gate_proj_weight, + 7 non-tensor args
+        # Q, K, V, K_cmp, V_cmp, W_k, W_v, gate_proj_weight, + 10 non-tensor args
         return (
             dQ,
             dK,
             dV,
+            None,
+            None,  # K_cmp, V_cmp (not differentiable inputs)
             dW_k,
             dW_v,
             dgate_proj_weight,
@@ -405,7 +435,345 @@ class NSAFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
+
+
+def _nsa_forward_varlen(
+    ctx,
+    Q: Tensor,  # (total_tokens, H, D)
+    K: Tensor,  # (total_tokens, H_kv, D)
+    V: Tensor,  # (total_tokens, H_kv, D)
+    K_cmp: Tensor,  # (B, max_N_cmp, H_kv, D)
+    V_cmp: Tensor,  # (B, max_N_cmp, H_kv, D)
+    W_k_compress: Tensor | None,
+    W_v_compress: Tensor | None,
+    gate_proj_weight: Tensor | None,
+    compress_block_size: int,
+    num_selected_blocks: int,
+    window_size: int,
+    causal: bool,
+    softmax_scale: float,
+    q_tile_size: int,
+    n_block_size: int,
+    cu_seqlens: Tensor,
+    max_seqlen: int | None,
+    sparse_tensors,
+) -> Tensor:
+    """Varlen forward: native varlen for selected + sliding, padded for compressed."""
+    H = Q.shape[1]
+    D = Q.shape[2]
+    batch_size = cu_seqlens.shape[0] - 1
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    if max_seqlen is None:
+        max_seqlen = max(seqlens)
+    pad_N = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
+
+    compressed_mask = (
+        _make_compressed_causal_mask(compress_block_size) if causal else None
+    )
+
+    # Branch 1: Compressed attention (padded 4D — mask_mod blocks varlen)
+    Q_pad = _pad_to_4d(Q, cu_seqlens, seqlens, batch_size, pad_N)
+    O_cmp_pad, _ = _fa4_fwd(
+        Q_pad,
+        K_cmp,
+        V_cmp,
+        causal=False,
+        softmax_scale=softmax_scale,
+        mask_mod=compressed_mask,
+    )
+    O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
+    del Q_pad, O_cmp_pad
+
+    # Branch 2: Selected attention (native varlen + block sparse)
+    O_slc, _ = _fa4_fwd(
+        Q,
+        K,
+        V,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        block_sparse_tensors=sparse_tensors,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=pad_N,
+        max_seqlen_k=pad_N,
+    )
+
+    # Branch 3: Sliding window (native varlen)
+    O_sld, _ = _fa4_fwd(
+        Q,
+        K,
+        V,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        window_size_left=window_size,
+        window_size_right=0,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+    )
+
+    # Gating (3D — Commit 1)
+    gates = compute_gates(Q, gate_proj_weight)
+    O = gate_and_combine(O_cmp, O_slc, O_sld, gates)
+
+    ctx.save_for_backward(
+        Q,
+        K,
+        V,
+        K_cmp,
+        V_cmp,
+        gates,
+        gate_proj_weight,
+        W_k_compress,
+        W_v_compress,
+        cu_seqlens,
+    )
+    ctx.sparse_tensors = sparse_tensors
+    ctx.compress_block_size = compress_block_size
+    ctx.window_size = window_size
+    ctx.causal = causal
+    ctx.softmax_scale = softmax_scale
+    ctx.q_tile_size = q_tile_size
+    ctx.n_block_size = n_block_size
+    ctx.cu_seqlens = cu_seqlens
+    ctx.max_seqlen = max_seqlen
+    ctx.varlen_meta = (seqlens, batch_size, pad_N)
+
+    return O
+
+
+def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
+    """Varlen backward: native varlen for selected + sliding, padded for compressed."""
+    (
+        Q,
+        K,
+        V,
+        K_cmp,
+        V_cmp,
+        gates,
+        gate_proj_weight,
+        W_k_compress,
+        W_v_compress,
+        cu_seqlens,
+    ) = ctx.saved_tensors
+
+    causal = ctx.causal
+    softmax_scale = ctx.softmax_scale
+    compress_block_size = ctx.compress_block_size
+    window_size = ctx.window_size
+    sparse_tensors = ctx.sparse_tensors
+    max_seqlen = ctx.max_seqlen
+    seqlens, batch_size, pad_N = ctx.varlen_meta
+
+    compressed_mask = (
+        _make_compressed_causal_mask(compress_block_size) if causal else None
+    )
+
+    dQ_gate = None
+    dgate_proj_weight = None
+
+    if gate_proj_weight is not None:
+        # Need all O_i for gating backward — recompute all three forwards
+        Q_pad = _pad_to_4d(Q, cu_seqlens, seqlens, batch_size, pad_N)
+        O_cmp_pad, _ = _fa4_fwd(
+            Q_pad,
+            K_cmp,
+            V_cmp,
+            causal=False,
+            softmax_scale=softmax_scale,
+            mask_mod=compressed_mask,
+        )
+        O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
+        del O_cmp_pad
+
+        O_slc, lse_slc = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            block_sparse_tensors=sparse_tensors,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=pad_N,
+            max_seqlen_k=pad_N,
+        )
+        O_sld, lse_sld = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            window_size_left=window_size,
+            window_size_right=0,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
+
+        dO_cmp, dO_slc, dO_sld, dQ_gate, dgate_proj_weight = fused_gating_backward(
+            Q,
+            dO,
+            O_cmp,
+            O_slc,
+            O_sld,
+            gates,
+            gate_proj_weight,
+        )
+        del O_cmp
+    else:
+        g = gates.float()
+        dO_f = dO.float()
+        dO_cmp = (g[..., 0:1] * dO_f).to(dO.dtype)
+        dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
+        dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
+        del g, dO_f
+        Q_pad = None
+        lse_slc = lse_sld = None
+        O_slc = O_sld = None
+
+    # --- Branch 1: Compressed attention (padded 4D) ---
+    if Q_pad is None:
+        Q_pad = _pad_to_4d(Q, cu_seqlens, seqlens, batch_size, pad_N)
+    O_cmp_pad, lse_cmp_pad = _fa4_fwd(
+        Q_pad,
+        K_cmp,
+        V_cmp,
+        causal=False,
+        softmax_scale=softmax_scale,
+        mask_mod=compressed_mask,
+    )
+    dO_cmp_pad = _pad_to_4d(dO_cmp, cu_seqlens, seqlens, batch_size, pad_N)
+    dQ_cmp_pad, dK_cmp, dV_cmp = _fa4_bwd(
+        Q_pad,
+        K_cmp,
+        V_cmp,
+        O_cmp_pad,
+        dO_cmp_pad,
+        lse_cmp_pad,
+        softmax_scale=softmax_scale,
+        causal=False,
+        mask_mod=compressed_mask,
+    )
+    dQ_cmp = _unpad_to_3d(dQ_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
+    del Q_pad, O_cmp_pad, lse_cmp_pad, dO_cmp_pad, dQ_cmp_pad, dO_cmp
+
+    # --- Branch 2: Selected attention (native varlen + block sparse) ---
+    if O_slc is None:
+        O_slc, lse_slc = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            block_sparse_tensors=sparse_tensors,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=pad_N,
+            max_seqlen_k=pad_N,
+        )
+    bwd_sparse = _transpose_block_sparse_for_bwd(
+        sparse_tensors,
+        seqlen_q=pad_N,
+        seqlen_k=pad_N,
+        n_block_size=ctx.n_block_size,
+    )
+    dQ_slc, dK_slc, dV_slc = _fa4_bwd(
+        Q,
+        K,
+        V,
+        O_slc,
+        dO_slc,
+        lse_slc,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        block_sparse_tensors=bwd_sparse,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=pad_N,
+        max_seqlen_k=pad_N,
+    )
+    del O_slc, lse_slc, dO_slc, bwd_sparse
+
+    # --- Branch 3: Sliding window (native varlen) ---
+    if O_sld is None:
+        O_sld, lse_sld = _fa4_fwd(
+            Q,
+            K,
+            V,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            window_size_left=window_size,
+            window_size_right=0,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
+    dQ_sld, dK_sld, dV_sld = _fa4_bwd(
+        Q,
+        K,
+        V,
+        O_sld,
+        dO_sld,
+        lse_sld,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size,
+        window_size_right=0,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+    )
+    del O_sld, lse_sld, dO_sld
+
+    # --- Compression backward (varlen: scatter to 3D directly) ---
+    dK_compress, dV_compress, dW_k, dW_v = fused_compress_kv_backward(
+        dK_cmp,
+        dV_cmp,
+        K,
+        V,
+        compress_block_size,
+        W_k_compress,
+        W_v_compress,
+        cu_seqlens=cu_seqlens,
+    )
+
+    # --- Gradient accumulation (all 3D) ---
+    dQ = dQ_cmp + dQ_slc + dQ_sld
+    if dQ_gate is not None:
+        dQ = dQ + dQ_gate
+    dK = dK_slc + dK_sld + dK_compress
+    dV = dV_slc + dV_sld + dV_compress
+
+    # Return gradients matching forward() args order
+    return (
+        dQ,
+        dK,
+        dV,
+        None,
+        None,  # K_cmp, V_cmp
+        dW_k,
+        dW_v,
+        dgate_proj_weight,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
 
 def nsa(
@@ -431,6 +799,10 @@ def nsa(
     Uses FA4 for both forward and backward passes, with activation checkpointing.
     Supports both fixed-length (4D) and variable-length (3D + cu_seqlens) inputs.
 
+    For varlen, the selected and sliding window branches use native FA4 varlen
+    (no padding on Q, K, V). Only the compressed branch uses padded Q for
+    mask_mod compatibility. Compress/select operate on 3D input directly.
+
     Args:
         Q: Query tensor, (B, N, H, D) or (total_tokens, H, D) for varlen.
         K: Key tensor, (B, N, H_kv, D) or (total_tokens, H_kv, D).
@@ -446,70 +818,63 @@ def nsa(
         q_tile_size: Query tile size for block selection.
         n_block_size: FA4 KV block size (128 for SM100).
         cu_seqlens: Cumulative sequence lengths for varlen, shape (B+1,) int32.
-        max_seqlen: Maximum sequence length for varlen padding.
+        max_seqlen: Maximum sequence length for varlen.
 
     Returns:
         Output tensor, same shape as Q.
     """
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(Q.shape[-1])
+
     is_varlen = cu_seqlens is not None
 
     if is_varlen:
-        # Varlen: pad 3D → 4D, run fixed-length NSA autograd, unpad
         assert Q.dim() == 3, f"Varlen requires 3D input, got {Q.dim()}D"
-        H = Q.shape[1]
-        H_kv = K.shape[1]
-        D_dim = Q.shape[2]
-        batch_size = cu_seqlens.shape[0] - 1
         seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-
         if max_seqlen is None:
             max_seqlen = max(seqlens)
         pad_N = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
 
-        Q_pad = Q.new_zeros(batch_size, pad_N, H, D_dim)
-        K_pad = K.new_zeros(batch_size, pad_N, H_kv, D_dim)
-        V_pad = V.new_zeros(batch_size, pad_N, H_kv, D_dim)
-        for i, slen in enumerate(seqlens):
-            s = cu_seqlens[i].item()
-            Q_pad[i, :slen] = Q[s : s + slen]
-            K_pad[i, :slen] = K[s : s + slen]
-            V_pad[i, :slen] = V[s : s + slen]
+    # Step 1: Compress KV (varlen-aware — reads 3D directly, no Q/K/V padding)
+    K_cmp, V_cmp = fused_compress_kv(
+        K,
+        V,
+        compress_block_size,
+        W_k_compress,
+        W_v_compress,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen if is_varlen else None,
+    )
 
-        # Enable gradients on padded tensors
-        if Q.requires_grad:
-            Q_pad.requires_grad_(True)
-        if K.requires_grad:
-            K_pad.requires_grad_(True)
-        if V.requires_grad:
-            V_pad.requires_grad_(True)
+    # Step 2: Score blocks and select top-k (varlen-aware Q_mean)
+    block_indices = fused_score_and_select_blocks(
+        Q,
+        K_cmp,
+        num_selected_blocks,
+        compress_block_size,
+        causal=causal,
+        q_tile_size=q_tile_size,
+        softmax_scale=softmax_scale,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen if is_varlen else None,
+    )
 
-        O_pad = nsa(
-            Q_pad, K_pad, V_pad,
-            compress_block_size=compress_block_size,
-            num_selected_blocks=num_selected_blocks,
-            window_size=window_size,
-            W_k_compress=W_k_compress,
-            W_v_compress=W_v_compress,
-            gate_proj_weight=gate_proj_weight,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            q_tile_size=q_tile_size,
-            n_block_size=n_block_size,
-        )
+    # Step 3: Build FA4 sparsity masks
+    seqlen_k = pad_N if is_varlen else Q.shape[1]
+    sparse_tensors = build_fa4_block_sparse_tensors(
+        block_indices,
+        compress_block_size,
+        n_block_size=n_block_size,
+        seqlen_k=seqlen_k,
+    )
 
-        # Unpad — use indexing that preserves autograd
-        O_parts = []
-        for i, slen in enumerate(seqlens):
-            O_parts.append(O_pad[i, :slen])
-        return torch.cat(O_parts, dim=0)
-
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(Q.shape[-1])
-
+    # Step 4: NSAFunction handles the three FA4 branches + gating
     return NSAFunction.apply(
         Q,
         K,
         V,
+        K_cmp,
+        V_cmp,
         W_k_compress,
         W_v_compress,
         gate_proj_weight,
@@ -520,4 +885,7 @@ def nsa(
         softmax_scale,
         q_tile_size,
         n_block_size,
+        cu_seqlens,
+        max_seqlen,
+        sparse_tensors,
     )
