@@ -108,6 +108,7 @@ def _fa4_bwd(
     window_size_right: int | None = None,
     block_sparse_tensors=None,
     mask_mod: Callable | None = None,
+    compress_factor: int = 1,
     cu_seqlens_q: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     max_seqlen_q: int | None = None,
@@ -115,7 +116,7 @@ def _fa4_bwd(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Call FA4's backward pass.
 
-    Supports block sparsity, mask_mod, and varlen (cu_seqlens).
+    Supports block sparsity, mask_mod, compress_factor, and varlen (cu_seqlens).
     Returns (dq, dk, dv).
     """
     from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_bwd
@@ -137,6 +138,7 @@ def _fa4_bwd(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        compress_factor=compress_factor,
     )
     return dq, dk, dv
 

@@ -25,11 +25,7 @@ from mslk.attention.sparse_attn.gating import (
     fused_gating_backward,
     gate_and_combine,
 )
-from mslk.attention.sparse_attn.nsa_forward import (
-    _fa4_bwd,
-    _fa4_fwd,
-    _make_compressed_causal_mask,
-)
+from mslk.attention.sparse_attn.nsa_forward import _fa4_bwd, _fa4_fwd
 from mslk.attention.sparse_attn.select import (
     fused_score_and_select_all,
     fused_score_and_select_blocks,
@@ -249,17 +245,14 @@ class NSAFunction(torch.autograd.Function):
 
         # Fixed-length 4D path (unchanged)
         B, N, H, D = Q.shape
-        compressed_mask = (
-            _make_compressed_causal_mask(compress_block_size) if causal else None
-        )
         if cmp_sparse_tensors is not None:
             O_cmp, _ = _fa4_fwd(
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
                 block_sparse_tensors=cmp_sparse_tensors,
             )
         else:
@@ -267,9 +260,9 @@ class NSAFunction(torch.autograd.Function):
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
             )
         O_slc, _ = _fa4_fwd(
             Q,
@@ -343,10 +336,6 @@ class NSAFunction(torch.autograd.Function):
         sparse_tensors = ctx.sparse_tensors
         cmp_sparse_tensors = ctx.cmp_sparse_tensors
 
-        compressed_mask = (
-            _make_compressed_causal_mask(compress_block_size) if causal else None
-        )
-
         dQ_gate = None
         dgate_proj_weight = None
 
@@ -355,9 +344,9 @@ class NSAFunction(torch.autograd.Function):
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
                 block_sparse_tensors=cmp_sparse_tensors,
             )
             O_slc, lse_slc = _fa4_fwd(
@@ -402,9 +391,9 @@ class NSAFunction(torch.autograd.Function):
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
                 block_sparse_tensors=cmp_sparse_tensors,
             )
         if cmp_sparse_tensors is not None:
@@ -413,7 +402,7 @@ class NSAFunction(torch.autograd.Function):
                 seqlen_q=Q.shape[1],
                 seqlen_k=K_cmp.shape[1],
                 n_block_size=cmp_sparse_tensors.block_size[1],
-                use_mask_blocks=True,
+                use_mask_blocks=False,
             )
         else:
             cmp_bwd_sparse = None
@@ -425,8 +414,8 @@ class NSAFunction(torch.autograd.Function):
             dO_cmp,
             lse_cmp,
             softmax_scale=softmax_scale,
-            causal=False,
-            mask_mod=compressed_mask,
+            causal=causal,
+            compress_factor=compress_block_size,
             block_sparse_tensors=cmp_bwd_sparse,
         )
         del O_cmp, lse_cmp, dO_cmp
@@ -575,10 +564,6 @@ def _nsa_forward_varlen(
         max_seqlen = max(seqlens)
     pad_N = ((max_seqlen + q_tile_size - 1) // q_tile_size) * q_tile_size
 
-    compressed_mask = (
-        _make_compressed_causal_mask(compress_block_size) if causal else None
-    )
-
     # Branch 1: Compressed attention (padded 4D — mask_mod blocks varlen)
     Q_pad = _pad_to_4d(Q, cu_seqlens, seqlens, batch_size, pad_N)
     if cmp_sparse_tensors is not None:
@@ -586,9 +571,9 @@ def _nsa_forward_varlen(
             Q_pad,
             K_cmp,
             V_cmp,
-            causal=False,
+            causal=causal,
             softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
+            compress_factor=compress_block_size,
             block_sparse_tensors=cmp_sparse_tensors,
         )
     else:
@@ -596,9 +581,9 @@ def _nsa_forward_varlen(
             Q_pad,
             K_cmp,
             V_cmp,
-            causal=False,
+            causal=causal,
             softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
+            compress_factor=compress_block_size,
         )
     O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
     del Q_pad, O_cmp_pad
@@ -687,10 +672,6 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
     max_seqlen = ctx.max_seqlen
     seqlens, batch_size, pad_N = ctx.varlen_meta
 
-    compressed_mask = (
-        _make_compressed_causal_mask(compress_block_size) if causal else None
-    )
-
     dQ_gate = None
     dgate_proj_weight = None
 
@@ -701,9 +682,9 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
             Q_pad,
             K_cmp,
             V_cmp,
-            causal=False,
+            causal=causal,
             softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
+            compress_factor=compress_block_size,
             block_sparse_tensors=cmp_sparse_tensors,
         )
         O_cmp = _unpad_to_3d(O_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
@@ -763,9 +744,9 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         Q_pad,
         K_cmp,
         V_cmp,
-        causal=False,
+        causal=causal,
         softmax_scale=softmax_scale,
-        mask_mod=compressed_mask,
+        compress_factor=compress_block_size,
         block_sparse_tensors=cmp_sparse_tensors,
     )
     dO_cmp_pad = _pad_to_4d(dO_cmp, cu_seqlens, seqlens, batch_size, pad_N)
@@ -787,8 +768,8 @@ def _nsa_backward_varlen(ctx, dO: Tensor) -> tuple:
         dO_cmp_pad,
         lse_cmp_pad,
         softmax_scale=softmax_scale,
-        causal=False,
-        mask_mod=compressed_mask,
+        causal=causal,
+        compress_factor=compress_block_size,
         block_sparse_tensors=cmp_bwd_sparse,
     )
     dQ_cmp = _unpad_to_3d(dQ_cmp_pad, cu_seqlens, seqlens, Q.shape[0])
