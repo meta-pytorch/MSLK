@@ -164,11 +164,6 @@ def fused_compress_kv(
             K, V, block_size, W_k, W_v, cu_seqlens, max_seqlen
         )
 
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
     B, N, H_kv, D = K.shape
     assert N % block_size == 0, (
         f"Sequence length {N} must be divisible by block_size {block_size}"
@@ -176,46 +171,11 @@ def fused_compress_kv(
 
     N_cmp = N // block_size
 
-    # Allocate outputs
-    K_cmp = torch.empty(B, N_cmp, H_kv, D, device=K.device, dtype=K.dtype)
-    V_cmp = torch.empty(B, N_cmp, H_kv, D, device=V.device, dtype=V.dtype)
+    # Mean-pool over block_size positions — pure PyTorch, no CuteDSL
+    K_cmp = K.reshape(B, N_cmp, block_size, H_kv, D).mean(dim=2)
+    V_cmp = V.reshape(B, N_cmp, block_size, H_kv, D).mean(dim=2)
 
-    # Reshape to 2D: (B*N*H_kv, D) and (B*N_cmp*H_kv, D)
-    K_2d = K.reshape(B * N * H_kv, D).contiguous()
-    V_2d = V.reshape(B * N * H_kv, D).contiguous()
-    K_out_2d = K_cmp.reshape(B * N_cmp * H_kv, D)
-    V_out_2d = V_cmp.reshape(B * N_cmp * H_kv, D)
-
-    torch2cute_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    cute_dtype = torch2cute_dtype[K.dtype]
-
-    def to_cute(tensor):
-        return from_dlpack(
-            tensor.detach(), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-
-    mK = to_cute(K_2d)
-    mV = to_cute(V_2d)
-    mK_out = to_cute(K_out_2d)
-    mV_out = to_cute(V_out_2d)
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (cute_dtype, D, block_size)
-    if compile_key not in _fused_compress_compile_cache:
-        kernel_op = _make_fused_compress_kernel(cute_dtype, D, block_size)
-        _fused_compress_compile_cache[compile_key] = cute.compile(
-            kernel_op, mK, mV, mK_out, mV_out, N_cmp, H_kv, N, current_stream
-        )
-    _fused_compress_compile_cache[compile_key](
-        mK, mV, mK_out, mV_out, N_cmp, H_kv, N, current_stream
-    )
-
-    # Apply optional projections in PyTorch (rare path)
+    # Apply optional projections
     if W_k is not None:
         K_cmp = torch.einsum("bnhd,hde->bnhe", K_cmp, W_k)
 
@@ -373,45 +333,15 @@ def fused_compress_kv_backward(
             dV_cmp.dtype
         )
 
-    # Mean-pool backward via CuteDSL scatter kernel
-    dK = torch.empty(B, N, H_kv, D, device=K.device, dtype=K.dtype)
-    dV = torch.empty(B, N, H_kv, D, device=V.device, dtype=V.dtype)
-
-    M_out = B * N * H_kv
-    M_in = B * N_cmp * H_kv
-
-    dK_cmp_2d = dK_cmp.reshape(M_in, D).contiguous()
-    dV_cmp_2d = dV_cmp.reshape(M_in, D).contiguous()
-    dK_2d = dK.reshape(M_out, D)
-    dV_2d = dV.reshape(M_out, D)
-
-    torch2cute_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    cute_dtype = torch2cute_dtype[K.dtype]
-
-    def to_cute(tensor):
-        return from_dlpack(
-            tensor.detach(), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-
-    mDK_cmp = to_cute(dK_cmp_2d)
-    mDV_cmp = to_cute(dV_cmp_2d)
-    mDK = to_cute(dK_2d)
-    mDV = to_cute(dV_2d)
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (cute_dtype, D, block_size)
-    if compile_key not in _fused_compress_bwd_compile_cache:
-        kernel_op = _make_fused_compress_bwd_kernel(cute_dtype, D, block_size)
-        _fused_compress_bwd_compile_cache[compile_key] = cute.compile(
-            kernel_op, mDK_cmp, mDV_cmp, mDK, mDV, N, H_kv, current_stream
-        )
-    _fused_compress_bwd_compile_cache[compile_key](
-        mDK_cmp, mDV_cmp, mDK, mDV, N, H_kv, current_stream
+    # Mean-pool backward: scatter gradient — pure PyTorch
+    # dK[b, i, h, d] = dK_cmp[b, i // block_size, h, d] / block_size
+    dK = (
+        dK_cmp.unsqueeze(2).expand(B, N_cmp, block_size, H_kv, D).reshape(B, N, H_kv, D)
+        / block_size
+    )
+    dV = (
+        dV_cmp.unsqueeze(2).expand(B, N_cmp, block_size, H_kv, D).reshape(B, N, H_kv, D)
+        / block_size
     )
 
     return dK, dV, dW_k, dW_v

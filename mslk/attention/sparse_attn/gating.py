@@ -105,11 +105,10 @@ def fused_gate_and_combine(
     O_sld: Tensor,  # same shape as Q
     gate_proj_weight: Tensor | None = None,  # (H, 3, D)
 ) -> Tensor:
-    """Fused gate computation and branch combination using a CuteDSL kernel.
+    """Gate computation and branch combination — pure PyTorch.
 
-    Replaces the two-step compute_gates() + gate_and_combine() with a single
-    kernel launch. Eliminates the intermediate gates tensor and reduces memory
-    traffic by fusing the dot-product gate computation with the weighted sum.
+    Computes per-head sigmoid gates from Q and gate_proj_weight, then
+    combines the three branch outputs with the gate weights.
 
     Args:
         Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
@@ -122,67 +121,8 @@ def fused_gate_and_combine(
     Returns:
         Combined output, same shape as Q.
     """
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    if Q.dim() == 3:
-        T, H, D = Q.shape
-        M = T * H
-    else:
-        B, N, H, D = Q.shape
-        M = B * N * H
-    assert D % 32 == 0, f"D={D} must be divisible by 32"
-
-    out = torch.empty_like(O_cmp)
-    has_gate_weight = gate_proj_weight is not None
-
-    # Reshape to 2D: (M, D)
-    Q_2d = Q.reshape(M, D)
-    O_cmp_2d = O_cmp.reshape(M, D)
-    O_slc_2d = O_slc.reshape(M, D)
-    O_sld_2d = O_sld.reshape(M, D)
-    out_2d = out.reshape(M, D)
-
-    # Gate weights: (H, 3, D) -> (H, 3*D)
-    if has_gate_weight:
-        W_2d = gate_proj_weight.reshape(H, 3 * D).contiguous()
-    else:
-        W_2d = torch.empty(1, 1, device=Q.device, dtype=Q.dtype)
-
-    torch2cute_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    cute_dtype = torch2cute_dtype[Q.dtype]
-
-    def to_cute(tensor):
-        return from_dlpack(
-            tensor.detach(), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-
-    mQ = to_cute(Q_2d)
-    mO_cmp = to_cute(O_cmp_2d)
-    mO_slc = to_cute(O_slc_2d)
-    mO_sld = to_cute(O_sld_2d)
-    mW = to_cute(W_2d)
-    mOut = to_cute(out_2d)
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (cute_dtype, D, has_gate_weight)
-    if compile_key not in _fused_gating_compile_cache:
-        kernel_op = _make_fused_gating_kernel(cute_dtype, D, has_gate_weight)
-        _fused_gating_compile_cache[compile_key] = cute.compile(
-            kernel_op, mQ, mO_cmp, mO_slc, mO_sld, mW, mOut, H, current_stream
-        )
-    _fused_gating_compile_cache[compile_key](
-        mQ, mO_cmp, mO_slc, mO_sld, mW, mOut, H, current_stream
-    )
-
-    return out
+    gates = compute_gates(Q, gate_proj_weight)
+    return gate_and_combine(O_cmp, O_slc, O_sld, gates)
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +272,10 @@ def fused_gating_backward(
     gates: Tensor,  # (..., H, 3) matching leading dims of Q
     gate_proj_weight: Tensor,  # (H, 3, D)
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Fused gating backward using CuteDSL kernel + PyTorch for dW_gate.
+    """Gating backward — pure PyTorch.
 
-    The CuteDSL kernel computes dO_cmp, dO_slc, dO_sld, dQ_gate in one launch.
-    dW_gate is computed via PyTorch einsum (cross-row reduction).
+    Computes dO_cmp, dO_slc, dO_sld (gradient routing through gates),
+    dQ_gate (query gradient from gate computation), and dW_gate (weight gradient).
 
     Args:
         Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
@@ -347,105 +287,33 @@ def fused_gating_backward(
     Returns:
         (dO_cmp, dO_slc, dO_sld, dQ_gate, dW_gate)
     """
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
+    H = Q.shape[-2]
+    D = Q.shape[-1]
 
-    if Q.dim() == 3:
-        T, H, D = Q.shape
-        M = T * H
-    else:
-        B, N, H, D = Q.shape
-        M = B * N * H
-    assert D % 32 == 0, f"D={D} must be divisible by 32"
-    dO_cmp = torch.empty_like(dO)
-    dO_slc = torch.empty_like(dO)
-    dO_sld = torch.empty_like(dO)
-    dQ_gate = torch.empty_like(Q)
-
-    # Reshape to 2D
-    Q_2d = Q.reshape(M, D).contiguous()
-    dO_2d = dO.reshape(M, D).contiguous()
-    O_cmp_2d = O_cmp.reshape(M, D).contiguous()
-    O_slc_2d = O_slc.reshape(M, D).contiguous()
-    O_sld_2d = O_sld.reshape(M, D).contiguous()
-    gates_2d = gates.reshape(M, 3).contiguous()
-    W_2d = gate_proj_weight.reshape(H, 3 * D).contiguous()
-    dO_cmp_2d = dO_cmp.reshape(M, D)
-    dO_slc_2d = dO_slc.reshape(M, D)
-    dO_sld_2d = dO_sld.reshape(M, D)
-    dQ_gate_2d = dQ_gate.reshape(M, D)
-
-    torch2cute_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    cute_dtype = torch2cute_dtype[Q.dtype]
-
-    def to_cute(tensor):
-        return from_dlpack(
-            tensor.detach(), assumed_align=16
-        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
-
-    mQ = to_cute(Q_2d)
-    mdO = to_cute(dO_2d)
-    mO_cmp = to_cute(O_cmp_2d)
-    mO_slc = to_cute(O_slc_2d)
-    mO_sld = to_cute(O_sld_2d)
-    mW = to_cute(W_2d)
-    mGates = to_cute(gates_2d)
-    m_dO_cmp = to_cute(dO_cmp_2d)
-    m_dO_slc = to_cute(dO_slc_2d)
-    m_dO_sld = to_cute(dO_sld_2d)
-    m_dQ_gate = to_cute(dQ_gate_2d)
-
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compile_key = (cute_dtype, D)
-    if compile_key not in _fused_gating_bwd_compile_cache:
-        kernel_op = _make_fused_gating_bwd_kernel(cute_dtype, D)
-        _fused_gating_bwd_compile_cache[compile_key] = cute.compile(
-            kernel_op,
-            mQ,
-            mdO,
-            mO_cmp,
-            mO_slc,
-            mO_sld,
-            mW,
-            mGates,
-            m_dO_cmp,
-            m_dO_slc,
-            m_dO_sld,
-            m_dQ_gate,
-            H,
-            current_stream,
-        )
-    _fused_gating_bwd_compile_cache[compile_key](
-        mQ,
-        mdO,
-        mO_cmp,
-        mO_slc,
-        mO_sld,
-        mW,
-        mGates,
-        m_dO_cmp,
-        m_dO_slc,
-        m_dO_sld,
-        m_dQ_gate,
-        H,
-        current_stream,
-    )
-
-    # dW_gate via PyTorch einsum: d_logit (...,H,3) @ Q (...,H,D) -> (H,3,D)
-    # Recompute d_logit from gates and dO·O products
+    # dO_i = g_i * dO (gradient routing)
     g = gates.float()
     dO_f = dO.float()
+    dO_cmp = (g[..., 0:1] * dO_f).to(dO.dtype)
+    dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
+    dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
+
+    # Sigmoid derivative: d_logit_i = (dO · O_i) * g_i * (1 - g_i)
     O_branches = torch.stack([O_cmp.float(), O_slc.float(), O_sld.float()], dim=-1)
     dg = (dO_f.unsqueeze(-1) * O_branches).sum(dim=-2)  # (..., H, 3)
     d_logit = dg * g * (1 - g)
-    # Reshape to (M, H, ...) for einsum — works for both 3D and 4D
+
+    # dQ_gate = d_logit @ W (query gradient from gate computation)
+    dQ_gate = (
+        torch.einsum(
+            "mhg,hgd->mhd",
+            d_logit.reshape(-1, H, 3),
+            gate_proj_weight.float(),
+        )
+        .reshape(Q.shape)
+        .to(Q.dtype)
+    )
+
+    # dW_gate = d_logit.T @ Q (weight gradient)
     dW_gate = torch.einsum(
         "mhg,mhd->hgd",
         d_logit.reshape(-1, H, 3),
