@@ -5,9 +5,8 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor
-
 from mslk.attention.flash_attn.block_sparsity import BlockSparseTensorsTorch
+from torch import Tensor
 
 
 def build_fa4_block_sparse_tensors(
@@ -56,7 +55,9 @@ def build_fa4_block_sparse_tensors(
         base_indices = block_indices.long() * fa4_blocks_per_nsa_block
         offsets = torch.arange(fa4_blocks_per_nsa_block, device=device)
         expanded_indices = base_indices.unsqueeze(-1) + offsets
-        fa4_indices = expanded_indices.reshape(B, H, N_q_tiles, k * fa4_blocks_per_nsa_block)
+        fa4_indices = expanded_indices.reshape(
+            B, H, N_q_tiles, k * fa4_blocks_per_nsa_block
+        )
         k_fa4 = k * fa4_blocks_per_nsa_block
     else:
         # Multiple NSA blocks map to a single FA4 block
@@ -86,6 +87,12 @@ def build_fa4_block_sparse_tensors(
         fa4_indices = fa4_block_indices
         k_fa4 = k  # max possible, actual counts may be smaller
 
+    # Compute the full number of KV blocks for FA4
+    if seqlen_k is not None:
+        n_blocks_k = (seqlen_k + n_block_size - 1) // n_block_size
+    else:
+        n_blocks_k = fa4_indices.max().item() + 1
+
     # full_block_cnt: (B, H, N_q_tiles)
     if compress_block_size >= n_block_size:
         full_block_cnt = torch.full(
@@ -94,24 +101,36 @@ def build_fa4_block_sparse_tensors(
     else:
         full_block_cnt = counts.to(torch.int32)
 
-    # full_block_idx: use compact shape (B, H, N_q_tiles, k_fa4) instead of
-    # (B, H, N_q_tiles, N/n_block_size). FA4 only accesses indices 0..cnt-1,
-    # so the last dimension only needs to be k_fa4. This reduces memory from
-    # O(N²) to O(N * k_fa4) — e.g. 8 MB vs 8.6 GB at N=1M.
-    full_block_idx = fa4_indices[:, :, :, :k_fa4].to(torch.int32)
-
-    # mask_block_cnt/idx: no partial masking needed. Use shape (B,H,N_q_tiles,1)
-    # for mask_block_idx since count is always 0.
-    mask_block_cnt = torch.zeros(
-        (B, H, N_q_tiles), dtype=torch.int32, device=device
+    # full_block_idx: use dense shape (B, H, N_q_tiles, n_blocks_k) so that
+    # FA4's backward can transpose to Q-direction indexing. The compact format
+    # (k_fa4 << n_blocks_k) saves memory but is incompatible with backward.
+    full_block_idx_dense = torch.zeros(
+        (B, H, N_q_tiles, n_blocks_k), dtype=torch.int32, device=device
     )
+    # Copy compact indices into the dense tensor
+    copy_len = min(k_fa4, n_blocks_k)
+    full_block_idx_dense[:, :, :, :copy_len] = fa4_indices[:, :, :, :copy_len].to(
+        torch.int32
+    )
+
+    # mask_block_cnt/idx: no partial masking needed.
+    mask_block_cnt = torch.zeros((B, H, N_q_tiles), dtype=torch.int32, device=device)
     mask_block_idx = torch.zeros(
-        (B, H, N_q_tiles, 1), dtype=torch.int32, device=device
+        (B, H, N_q_tiles, n_blocks_k), dtype=torch.int32, device=device
+    )
+
+    # Determine the Q-direction block size. With q_tile_size positions per query tile
+    # and N_q_tiles tiles, each m-block covers q_tile_size positions.
+    # For the contraction case (compress_block_size < n_block_size), the Q block size
+    # is inferred from the tensor shapes.
+    q_block_size = (
+        seqlen_k // N_q_tiles if seqlen_k is not None else compress_block_size
     )
 
     return BlockSparseTensorsTorch(
         mask_block_cnt=mask_block_cnt,
         mask_block_idx=mask_block_idx,
         full_block_cnt=full_block_cnt,
-        full_block_idx=full_block_idx,
+        full_block_idx=full_block_idx_dense,
+        block_size=(q_block_size, n_block_size),
     )
