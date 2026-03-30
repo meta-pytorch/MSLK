@@ -101,7 +101,7 @@ def _transpose_block_sparse_for_bwd(
     )
 
 
-def _fa4_bwd(
+def _attn_bwd_pytorch(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -112,44 +112,93 @@ def _fa4_bwd(
     causal: bool = False,
     window_size_left: int | None = None,
     window_size_right: int | None = None,
-    block_sparse_tensors=None,
-    mask_mod: Callable | None = None,
-    aux_tensors: list[Tensor] | None = None,
+    mask: Tensor | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Call FA4's backward pass (low-level, supports block sparsity and mask_mod).
+    """Attention backward using PyTorch ops (torch.matmul + cuBLAS). No CUTLASS JIT.
 
     All inputs are (B, N, H, D) layout.
     Returns (dq, dk, dv).
+
+    Uses the saved output and log-sum-exp to recompute attention weights
+    without materializing the full N×N score matrix where possible.
     """
-    from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_bwd
+    B, N_q, H, D = q.shape
+    H_kv = k.shape[2]
+    N_kv = k.shape[1]
+    groups = H // H_kv
 
-    # Workaround: FA4 backward doesn't disable 2-CTA for block sparsity,
-    # but does for mask_mod. Pass a trivial mask to force 1-CTA mode.
-    if block_sparse_tensors is not None and mask_mod is None:
-        import cutlass.cute as cute
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(D)
 
-        @cute.jit
-        def _trivial_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-            return True
+    # Transpose to (B, H, N, D) for matmul
+    q_t = q.transpose(1, 2).float()  # (B, H, N_q, D)
+    k_t = k.transpose(1, 2).float()  # (B, H_kv, N_kv, D)
+    v_t = v.transpose(1, 2).float()  # (B, H_kv, N_kv, D)
+    dout_t = dout.transpose(1, 2).float()  # (B, H, N_q, D)
 
-        mask_mod = _trivial_mask
+    # Expand K, V for GQA
+    if groups > 1:
+        k_t = k_t.repeat_interleave(groups, dim=1)  # (B, H, N_kv, D)
+        v_t = v_t.repeat_interleave(groups, dim=1)
 
-    dq, dk, dv = _flash_attn_bwd(
-        q,
-        k,
-        v,
-        out,
-        dout,
-        lse,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        block_sparse_tensors=block_sparse_tensors,
-        mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
+    # Recompute attention scores and weights from LSE
+    scores = (
+        torch.matmul(q_t, k_t.transpose(-2, -1)) * softmax_scale
+    )  # (B, H, N_q, N_kv)
+
+    # Apply masks
+    if causal and N_q == N_kv:
+        q_pos = torch.arange(N_q, device=q.device).unsqueeze(1)
+        kv_pos = torch.arange(N_kv, device=q.device).unsqueeze(0)
+        causal_mask = kv_pos > q_pos
+        if window_size_left is not None:
+            causal_mask = causal_mask | (kv_pos < q_pos - window_size_left + 1)
+        scores = scores.masked_fill(
+            causal_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+        )
+    elif window_size_left is not None and N_q == N_kv:
+        q_pos = torch.arange(N_q, device=q.device).unsqueeze(1)
+        kv_pos = torch.arange(N_kv, device=q.device).unsqueeze(0)
+        window_mask = (kv_pos > q_pos) | (kv_pos < q_pos - window_size_left + 1)
+        scores = scores.masked_fill(
+            window_mask.unsqueeze(0).unsqueeze(0), float("-inf")
+        )
+
+    if mask is not None:
+        scores = scores.masked_fill(mask, float("-inf"))
+
+    # Softmax (recompute from scores, not from LSE, for simplicity)
+    attn = torch.softmax(scores, dim=-1)
+
+    # Standard attention backward:
+    # dV = P^T @ dO
+    dv_t = torch.matmul(attn.transpose(-2, -1), dout_t)  # (B, H, N_kv, D)
+
+    # dP = dO @ V^T
+    dp = torch.matmul(dout_t, v_t.transpose(-2, -1))  # (B, H, N_q, N_kv)
+
+    # dS = P * (dP - (dP * P).sum(-1, keepdim=True))
+    # Equivalently: dS = P * (dP - rowsum), where rowsum = (dO * O).sum(D)
+    rowsum = (dout_t * (torch.matmul(attn, v_t))).sum(dim=-1, keepdim=True)
+    ds = attn * (dp - rowsum) * softmax_scale
+
+    # dQ = dS @ K
+    dq_t = torch.matmul(ds, k_t)  # (B, H, N_q, D)
+
+    # dK = dS^T @ Q
+    dk_t = torch.matmul(ds.transpose(-2, -1), q_t)  # (B, H, N_kv, D)
+
+    # Handle GQA: sum dK, dV across head groups
+    if groups > 1:
+        dk_t = dk_t.reshape(B, H_kv, groups, N_kv, D).sum(dim=2)
+        dv_t = dv_t.reshape(B, H_kv, groups, N_kv, D).sum(dim=2)
+
+    # Transpose back to (B, N, H, D)
+    return (
+        dq_t.transpose(1, 2).to(q.dtype),
+        dk_t.transpose(1, 2).to(k.dtype),
+        dv_t.transpose(1, 2).to(v.dtype),
     )
-    return dq, dk, dv
 
 
 class NSAFunction(torch.autograd.Function):
@@ -356,8 +405,19 @@ class NSAFunction(torch.autograd.Function):
             dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
             dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
 
-        # --- Stage 2: Three FA4 backward passes ---
-        dQ_cmp, dK_cmp, dV_cmp = _fa4_bwd(
+        # --- Stage 2: Three attention backward passes (PyTorch/cuBLAS, no CUTLASS JIT) ---
+
+        # Branch 1: Compressed attention backward
+        # Build compressed causal mask: kv_block_start > q_pos
+        B_size, N_size, H_size = Q.shape[:3]
+        N_cmp = K_cmp.shape[1]
+        cmp_mask = None
+        if causal:
+            q_pos = torch.arange(N_size, device=Q.device).unsqueeze(1)
+            kv_block_start = torch.arange(N_cmp, device=Q.device) * compress_block_size
+            cmp_mask = (kv_block_start.unsqueeze(0) > q_pos).unsqueeze(0).unsqueeze(0)
+
+        dQ_cmp, dK_cmp, dV_cmp = _attn_bwd_pytorch(
             Q,
             K_cmp,
             V_cmp,
@@ -365,73 +425,113 @@ class NSAFunction(torch.autograd.Function):
             dO_cmp,
             lse_cmp,
             softmax_scale=softmax_scale,
-            causal=False,
-            mask_mod=compressed_mask,
+            mask=cmp_mask,
         )
 
-        # For the selected branch backward, transpose block sparse tensors
-        # to Q-direction format for FA4 backward. Falls back to mask_mod if
-        # block sparsity backward fails.
-        B_size, N_size = Q.shape[:2]
-        bwd_sparse_tensors = _transpose_block_sparse_for_bwd(
-            sparse_tensors,
-            seqlen_q=N_size,
-            seqlen_k=N_size,
-            n_block_size=ctx.n_block_size,
-            q_tile_size=ctx.q_tile_size,
+        # Branch 2: Selected attention backward via gather/scatter
+        # Gather selected K/V blocks, run attention backward on gathered subset,
+        # then scatter dK/dV gradients back to full KV positions.
+        block_indices = ctx.block_indices
+        q_tile_size = ctx.q_tile_size
+        num_sel = ctx.num_selected_blocks
+        block_size = compress_block_size
+
+        N_blocks = N_size // block_size
+        N_q_tiles = N_size // q_tile_size
+        k_actual = min(num_sel, N_blocks)
+
+        # Expand block indices to position indices
+        offsets = torch.arange(block_size, device=Q.device)
+        pos_indices = block_indices.unsqueeze(-1) * block_size + offsets
+        kv_len = k_actual * block_size
+        pos_indices = pos_indices.reshape(B_size, H_size, N_q_tiles, kv_len)
+
+        # Gather K, V at selected positions: (B, H, N_q_tiles, kv_len, D)
+        H_kv = K.shape[2]
+        groups = H_size // H_kv
+        k_t = K.transpose(1, 2).float()
+        v_t = V.transpose(1, 2).float()
+        if groups > 1:
+            k_t = k_t.repeat_interleave(groups, dim=1)
+            v_t = v_t.repeat_interleave(groups, dim=1)
+
+        D = Q.shape[-1]
+        gather_idx = pos_indices.unsqueeze(-1).expand(
+            B_size, H_size, N_q_tiles, kv_len, D
+        )
+        k_exp = k_t.unsqueeze(2).expand(B_size, H_size, N_q_tiles, N_size, D)
+        v_exp = v_t.unsqueeze(2).expand(B_size, H_size, N_q_tiles, N_size, D)
+        sel_k = torch.gather(k_exp, 3, gather_idx)
+        sel_v = torch.gather(v_exp, 3, gather_idx)
+
+        # Reshape Q and dO into tiles
+        q_tiles = (
+            Q.transpose(1, 2).float().reshape(B_size, H_size, N_q_tiles, q_tile_size, D)
+        )
+        dO_slc_tiles = (
+            dO_slc.transpose(1, 2)
+            .float()
+            .reshape(B_size, H_size, N_q_tiles, q_tile_size, D)
         )
 
-        try:
-            dQ_slc, dK_slc, dV_slc = _fa4_bwd(
-                Q,
-                K,
-                V,
-                O_slc,
-                dO_slc,
-                lse_slc,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                block_sparse_tensors=bwd_sparse_tensors,
+        # Attention scores on gathered KV
+        scores_slc = torch.matmul(q_tiles, sel_k.transpose(-2, -1)) * softmax_scale
+
+        # Causal mask on gathered positions
+        if causal:
+            q_tile_starts = torch.arange(N_q_tiles, device=Q.device) * q_tile_size
+            q_offsets_t = torch.arange(q_tile_size, device=Q.device)
+            q_positions = q_tile_starts.unsqueeze(1) + q_offsets_t.unsqueeze(0)
+            c_mask = pos_indices.unsqueeze(3) > q_positions.reshape(
+                1, 1, N_q_tiles, q_tile_size, 1
             )
-        except Exception:
-            # Fallback: use mask_mod with aux_tensors for block selection
-            block_indices = ctx.block_indices
-            q_tile_size = ctx.q_tile_size
-            num_sel = ctx.num_selected_blocks
+            scores_slc = scores_slc.masked_fill(c_mask, float("-inf"))
 
-            import cutlass
-            import cutlass.cute as cute
+        attn_slc = torch.softmax(scores_slc, dim=-1)
 
-            @cute.jit
-            def _selected_block_mask(
-                batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
-            ):
-                indices = aux_tensors[0]
-                q_tile = q_idx[0] // cutlass.const_expr(q_tile_size)
-                kv_block = kv_idx[0] // cutlass.const_expr(compress_block_size)
+        # dV_sel = attn^T @ dO_slc_tiles
+        dv_sel = torch.matmul(attn_slc.transpose(-2, -1), dO_slc_tiles)
 
-                found = cutlass.Boolean(False)
-                for i in cutlass.range_constexpr(num_sel):
-                    sel_block = indices[batch_idx[0], head_idx[0], q_tile, i]
-                    found = found | (sel_block == kv_block)
-                if cutlass.const_expr(causal):
-                    found = found & (kv_idx <= q_idx)
-                return found
+        # dP = dO @ V^T
+        dp_slc = torch.matmul(dO_slc_tiles, sel_v.transpose(-2, -1))
+        rowsum_slc = (dO_slc_tiles * torch.matmul(attn_slc, sel_v)).sum(
+            dim=-1, keepdim=True
+        )
+        ds_slc = attn_slc * (dp_slc - rowsum_slc) * softmax_scale
 
-            dQ_slc, dK_slc, dV_slc = _fa4_bwd(
-                Q,
-                K,
-                V,
-                O_slc,
-                dO_slc,
-                lse_slc,
-                softmax_scale=softmax_scale,
-                causal=False,
-                mask_mod=_selected_block_mask,
-                aux_tensors=[block_indices],
+        # dQ_slc_tiles = dS @ sel_K
+        dq_slc_tiles = torch.matmul(ds_slc, sel_k)
+        dQ_slc = (
+            dq_slc_tiles.reshape(B_size, H_size, N_size, D).transpose(1, 2).to(Q.dtype)
+        )
+
+        # dK_sel = dS^T @ Q_tiles
+        dk_sel = torch.matmul(ds_slc.transpose(-2, -1), q_tiles)
+
+        # Scatter dK_sel and dV_sel back to full KV
+        dK_slc_full = torch.zeros(
+            B_size, H_size, N_size, D, device=Q.device, dtype=torch.float32
+        )
+        dV_slc_full = torch.zeros_like(dK_slc_full)
+        scatter_idx = gather_idx  # (B, H, N_q_tiles, kv_len, D)
+        # Sum across query tiles that share the same KV position
+        for qt in range(N_q_tiles):
+            dK_slc_full.scatter_add_(2, gather_idx[:, :, qt], dk_sel[:, :, qt])
+            dV_slc_full.scatter_add_(2, gather_idx[:, :, qt], dv_sel[:, :, qt])
+
+        # Handle GQA: sum across head groups
+        if groups > 1:
+            dK_slc_full = dK_slc_full.reshape(B_size, H_kv, groups, N_size, D).sum(
+                dim=2
             )
+            dV_slc_full = dV_slc_full.reshape(B_size, H_kv, groups, N_size, D).sum(
+                dim=2
+            )
+        dK_slc = dK_slc_full.transpose(1, 2).to(K.dtype)
+        dV_slc = dV_slc_full.transpose(1, 2).to(V.dtype)
 
-        dQ_sld, dK_sld, dV_sld = _fa4_bwd(
+        # Branch 3: Sliding window backward
+        dQ_sld, dK_sld, dV_sld = _attn_bwd_pytorch(
             Q,
             K,
             V,
@@ -441,7 +541,6 @@ class NSAFunction(torch.autograd.Function):
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size,
-            window_size_right=0,
         )
 
         # --- Stage 3: Compression backward ---
