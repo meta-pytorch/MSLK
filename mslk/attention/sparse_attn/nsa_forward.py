@@ -138,27 +138,6 @@ def _fa4_bwd(
     return dq, dk, dv
 
 
-def _fa4_fwd_simple(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    causal: bool = False,
-    softmax_scale: float | None = None,
-    window_size: tuple[int, int] | None = None,
-) -> Tuple[Tensor, Tensor]:
-    """Call FA4 via the autograd interface (for branches without block sparsity)."""
-    from mslk.fb.mslk.attention.flash_attn.autograd_interface import flash_attn_func
-
-    return flash_attn_func(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-    )
-
-
 def nsa_forward(
     Q: Tensor,  # (B, N, H, D) or (total_tokens, H, D) for varlen
     K: Tensor,  # (B, N, H_kv, D) or (total_tokens, H_kv, D)
