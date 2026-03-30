@@ -80,6 +80,47 @@ def _fa4_fwd(
     return out, lse
 
 
+def _fa4_bwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    dout: Tensor,
+    lse: Tensor,
+    causal: bool = False,
+    softmax_scale: float | None = None,
+    window_size_left: int | None = None,
+    window_size_right: int | None = None,
+    block_sparse_tensors=None,
+    mask_mod: Callable | None = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Call FA4's backward pass (low-level, supports block sparsity and mask_mod).
+
+    Uses _flash_attn_bwd from the fb interface which supports block_sparse_tensors
+    and mask_mod.
+
+    All inputs are (B, N, H, D) layout.
+    Returns (dq, dk, dv).
+    """
+    from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_bwd
+
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        block_sparse_tensors=block_sparse_tensors,
+        mask_mod=mask_mod,
+    )
+    return dq, dk, dv
+
+
 def _fa4_fwd_simple(
     q: Tensor,
     k: Tensor,
@@ -148,7 +189,9 @@ def nsa_forward(
         softmax_scale = 1.0 / math.sqrt(D)
 
     # Step 1: Compress KV
-    K_cmp, V_cmp = fused_compress_kv(K, V, compress_block_size, W_k_compress, W_v_compress)
+    K_cmp, V_cmp = fused_compress_kv(
+        K, V, compress_block_size, W_k_compress, W_v_compress
+    )
     # K_cmp, V_cmp: (B, N_cmp, H_kv, D) where N_cmp = N // compress_block_size
 
     # Step 2: Score blocks and select top-k

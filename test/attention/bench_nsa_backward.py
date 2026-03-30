@@ -22,13 +22,21 @@ def benchmark_nsa_fwd_bwd(
 ):
     from mslk.attention.sparse_attn import nsa
 
-    Q = torch.randn(B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward)
-    K = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward)
-    V = torch.randn(B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward)
+    Q = torch.randn(
+        B, N, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward
+    )
+    K = torch.randn(
+        B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward
+    )
+    V = torch.randn(
+        B, N, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=backward
+    )
 
     def run():
         out = nsa(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=compress_block_size,
             num_selected_blocks=num_selected_blocks,
             window_size=window_size,
@@ -56,8 +64,8 @@ def benchmark_nsa_fwd_bwd(
     tflops_fwd = 2 * B * H * N * N * D / 1e12  # approximate (ignoring sparsity)
     mode = "fwd+bwd" if backward else "fwd"
     print(
-        f"N={N:>7d} | {mode} | {elapsed*1000:>8.2f} ms | "
-        f"~{tflops_fwd/elapsed/1e3:.1f} TFLOPS (dense equiv)"
+        f"N={N:>7d} | {mode} | {elapsed * 1000:>8.2f} ms | "
+        f"~{tflops_fwd / elapsed / 1e3:.1f} TFLOPS (dense equiv)"
     )
     return elapsed
 
@@ -68,14 +76,42 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name()}")
     print()
 
-    for N in [1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for N in [
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576,
+        2097152,
+        3145728,
+    ]:
         try:
             benchmark_nsa_fwd_bwd(N, backward=False)
         except Exception as e:
             print(f"N={N:>7d} | fwd     | FAILED: {e}")
 
     print()
-    for N in [1024, 2048, 4096, 8192, 16384, 32768, 65536]:
+    for N in [
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576,
+        2097152,
+        3145728,
+    ]:
         try:
             benchmark_nsa_fwd_bwd(N, backward=True)
         except Exception as e:

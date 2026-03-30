@@ -731,3 +731,154 @@ class TestNSAAutograd:
 
         for name, param in [("Q", Q), ("K", K), ("V", V), ("gate", gate)]:
             assert torch.isfinite(param.grad).all(), f"{name}.grad contains NaN or Inf"
+
+
+class TestNSABackwardMatchesReference:
+    """Compare FA4-based backward gradient values against reference backward.
+
+    This validates that the optimized backward (using FA4 CuteDSL kernels)
+    produces numerically similar gradients to the pure PyTorch reference.
+    """
+
+    B, N, H, D = 1, 1024, 4, 128
+    H_kv = 4
+    compress_block_size = 64
+    num_selected_blocks = 8
+    window_size = 256
+    q_tile_size = 256
+
+    def _compare_grads(
+        self,
+        with_gate: bool = False,
+        with_W_k: bool = False,
+        with_W_v: bool = False,
+        causal: bool = True,
+        max_atol: float = 0.5,
+        mean_atol: float = 0.05,
+    ) -> None:
+        from mslk.attention.sparse_attn import nsa
+        from mslk.attention.sparse_attn.reference import nsa_backward_reference
+
+        torch.manual_seed(42)
+
+        Q = torch.randn(
+            self.B, self.N, self.H, self.D, device="cuda", dtype=torch.bfloat16
+        )
+        K = torch.randn(
+            self.B, self.N, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16
+        )
+        V = torch.randn(
+            self.B, self.N, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16
+        )
+        dO = torch.randn_like(Q)
+
+        kwargs = {
+            "compress_block_size": self.compress_block_size,
+            "num_selected_blocks": self.num_selected_blocks,
+            "window_size": self.window_size,
+            "causal": causal,
+            "q_tile_size": self.q_tile_size,
+        }
+
+        W_k = None
+        W_v = None
+        gate = None
+        if with_W_k:
+            W_k = (
+                torch.randn(
+                    self.H_kv, self.D, self.D, device="cuda", dtype=torch.bfloat16
+                )
+                * 0.02
+            )
+            kwargs["W_k_compress"] = W_k
+        if with_W_v:
+            W_v = (
+                torch.randn(
+                    self.H_kv, self.D, self.D, device="cuda", dtype=torch.bfloat16
+                )
+                * 0.02
+            )
+            kwargs["W_v_compress"] = W_v
+        if with_gate:
+            gate = (
+                torch.randn(self.H, 3, self.D, device="cuda", dtype=torch.bfloat16)
+                * 0.1
+            )
+            kwargs["gate_proj_weight"] = gate
+
+        # --- Reference backward ---
+        ref_grads = nsa_backward_reference(Q, K, V, dO, **kwargs)
+
+        # --- Optimized backward (FA4-based) ---
+        Q_opt = Q.clone().requires_grad_(True)
+        K_opt = K.clone().requires_grad_(True)
+        V_opt = V.clone().requires_grad_(True)
+
+        opt_kwargs = dict(kwargs)
+        if with_W_k:
+            W_k_opt = W_k.clone().requires_grad_(True)
+            opt_kwargs["W_k_compress"] = W_k_opt
+        if with_W_v:
+            W_v_opt = W_v.clone().requires_grad_(True)
+            opt_kwargs["W_v_compress"] = W_v_opt
+        if with_gate:
+            gate_opt = gate.clone().requires_grad_(True)
+            opt_kwargs["gate_proj_weight"] = gate_opt
+
+        out = nsa(Q_opt, K_opt, V_opt, **opt_kwargs)
+        out.backward(dO)
+
+        # --- Compare ---
+        pairs = [
+            ("dQ", Q_opt.grad, ref_grads["dQ"]),
+            ("dK", K_opt.grad, ref_grads["dK"]),
+            ("dV", V_opt.grad, ref_grads["dV"]),
+        ]
+        if with_W_k:
+            pairs.append(("dW_k", W_k_opt.grad, ref_grads["dW_k_compress"]))
+        if with_W_v:
+            pairs.append(("dW_v", W_v_opt.grad, ref_grads["dW_v_compress"]))
+        if with_gate:
+            pairs.append(("dgate", gate_opt.grad, ref_grads["dgate_proj_weight"]))
+
+        for name, opt_grad, ref_grad in pairs:
+            assert opt_grad is not None, f"{name} is None"
+            ref_grad = ref_grad.to(opt_grad.dtype)
+            diff = (opt_grad - ref_grad).abs()
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+            # Gate gradients use fused CuteDSL kernel vs float32 reference,
+            # so max outliers can be large; check mean only for gates.
+            if name == "dgate":
+                assert mean_diff < 1.0, f"{name}: mean_diff={mean_diff:.6f} exceeds 1.0"
+            else:
+                assert max_diff < max_atol, (
+                    f"{name}: max_diff={max_diff:.4f} exceeds {max_atol}"
+                )
+                assert mean_diff < mean_atol, (
+                    f"{name}: mean_diff={mean_diff:.6f} exceeds {mean_atol}"
+                )
+
+    def test_basic(self) -> None:
+        """Q, K, V gradients match reference."""
+        self._compare_grads()
+
+    def test_with_gate_weights(self) -> None:
+        """Gradients match with gate projection weights."""
+        self._compare_grads(with_gate=True)
+
+    def test_with_compression_weights(self) -> None:
+        """Gradients match with compression projection weights."""
+        self._compare_grads(with_W_k=True, with_W_v=True)
+
+    def test_all_weights(self) -> None:
+        """Gradients match with all optional weights."""
+        self._compare_grads(with_gate=True, with_W_k=True, with_W_v=True)
+
+    def test_noncausal(self) -> None:
+        """Gradients match in non-causal mode.
+
+        Non-causal has larger bf16 diffs (no causal mask to stabilize softmax),
+        so we only check mean diff.
+        """
+        self._compare_grads(causal=False, max_atol=5.0, mean_atol=0.1)
