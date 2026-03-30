@@ -57,6 +57,7 @@ def _fa4_fwd(
     window_size_right: int | None = None,
     block_sparse_tensors=None,
     mask_mod: Callable | None = None,
+    compress_factor: int = 1,
     cu_seqlens_q: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     max_seqlen_q: int | None = None,
@@ -64,7 +65,7 @@ def _fa4_fwd(
 ) -> Tuple[Tensor, Tensor]:
     """Call FA4's forward pass.
 
-    Supports block sparsity, mask_mod, and varlen (cu_seqlens).
+    Supports block sparsity, mask_mod, compress_factor, and varlen (cu_seqlens).
     Inputs are (B, N, H, D) for fixed-length or (total_tokens, H, D) for varlen.
     Returns (output, lse).
     """
@@ -89,6 +90,7 @@ def _fa4_fwd(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        compress_factor=compress_factor,
     )
     return out, lse
 
@@ -247,10 +249,7 @@ def nsa_forward(
         # Compressed branch uses padded 4D (mask_mod not supported with varlen in FA4).
         # Selected and sliding window use native varlen.
 
-        # Branch 1: Compressed attention (padded 4D — mask_mod not supported with varlen)
-        compressed_mask = (
-            _make_compressed_causal_mask(compress_block_size) if causal else None
-        )
+        # Branch 1: Compressed attention — uses compress_factor for native causal masking
 
         if num_cmp_selected_blocks is not None:
             N_cmp_pad = K_cmp_pad.shape[1]
@@ -267,9 +266,9 @@ def nsa_forward(
                     Q_pad,
                     K_cmp_pad,
                     V_cmp_pad,
-                    causal=False,
+                    causal=causal,
                     softmax_scale=softmax_scale,
-                    mask_mod=compressed_mask,
+                    compress_factor=compress_block_size,
                     block_sparse_tensors=cmp_sparse,
                 )
             else:
@@ -277,18 +276,18 @@ def nsa_forward(
                     Q_pad,
                     K_cmp_pad,
                     V_cmp_pad,
-                    causal=False,
+                    causal=causal,
                     softmax_scale=softmax_scale,
-                    mask_mod=compressed_mask,
+                    compress_factor=compress_block_size,
                 )
         else:
             O_cmp_pad, _ = _fa4_fwd(
                 Q_pad,
                 K_cmp_pad,
                 V_cmp_pad,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
             )
         # Unpad compressed output to 3D
         O_cmp = Q.new_zeros(Q.shape[0], H, D_dim)
@@ -368,12 +367,8 @@ def nsa_forward(
 
     # Step 4: Run three FA4 branches
 
-    # Branch 1: Compressed attention — block-aware causal masking on short KV
-    # Standard causal=True gives wrong masking for compressed KV since N_cmp << N:
-    # it masks based on kv_j > q_i, but we need kv_j * compress_block_size > q_i.
-    compressed_mask = (
-        _make_compressed_causal_mask(compress_block_size) if causal else None
-    )
+    # Branch 1: Compressed attention — uses compress_factor for native causal masking
+    # instead of mask_mod. This enables tile skipping, R2P masking, and pack_gqa.
 
     if num_cmp_selected_blocks is not None:
         # Block-sparse compressed attention: select top-k FA4 blocks of K_cmp
@@ -391,9 +386,9 @@ def nsa_forward(
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
                 block_sparse_tensors=cmp_sparse,
             )
         else:
@@ -401,18 +396,18 @@ def nsa_forward(
                 Q,
                 K_cmp,
                 V_cmp,
-                causal=False,
+                causal=causal,
                 softmax_scale=softmax_scale,
-                mask_mod=compressed_mask,
+                compress_factor=compress_block_size,
             )
     else:
         O_cmp, lse_cmp = _fa4_fwd(
             Q,
             K_cmp,
             V_cmp,
-            causal=False,
+            causal=causal,
             softmax_scale=softmax_scale,
-            mask_mod=compressed_mask,
+            compress_factor=compress_block_size,
         )
 
     # Branch 2: Selected attention — block-sparse attention on full KV
