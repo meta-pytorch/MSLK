@@ -51,11 +51,14 @@ def _transpose_block_sparse_for_bwd(
 ):
     """Transpose forward block-sparse tensors for the backward pass.
 
-    Forward: (B, H, n_q_tiles, max_kv_per_tile) — for each Q-tile, which KV-blocks
-    Backward: (B, H, n_kv_blocks, n_q_tiles) — for each KV-block, which Q-tiles
+    Forward: (B, H, n_q_tiles, k) — for each Q-tile, which KV-blocks
+    Backward: (B, H, n_kv_blocks, max_q_per_kv) — for each KV-block, which Q-tiles
 
     The backward kernel iterates over KV-blocks and needs to know which Q-tiles
     contribute gradients to each KV-block.
+
+    Uses a sparse inverted-index construction: O(total_entries) time and memory,
+    no dense (n_q_tiles x n_kv_blocks) intermediate.
 
     Args:
         use_mask_blocks: If True, read from mask_block_cnt/idx instead of
@@ -69,33 +72,62 @@ def _transpose_block_sparse_for_bwd(
         fwd_idx = fwd_tensors.mask_block_idx
     else:
         fwd_cnt = fwd_tensors.full_block_cnt  # (B, H, n_q_tiles)
-        fwd_idx = fwd_tensors.full_block_idx  # (B, H, n_q_tiles, max_kv_per_tile)
+        fwd_idx = fwd_tensors.full_block_idx  # (B, H, n_q_tiles, k)
     q_block_size, _ = fwd_tensors.block_size
 
     B, H, n_q_tiles = fwd_cnt.shape
+    k = fwd_idx.shape[3]
     n_kv_blocks = (seqlen_k + n_block_size - 1) // n_block_size
     device = fwd_cnt.device
 
-    # Build dense attendance: (B, H, n_q_tiles, n_kv_blocks)
-    attendance = torch.zeros(
-        B, H, n_q_tiles, n_kv_blocks, dtype=torch.bool, device=device
+    # --- Sparse transpose: inverted index construction ---
+    # Step 1: Count how many Q-tiles reference each KV-block
+    # Build validity mask: (B, H, n_q_tiles, k) — which entries are valid
+    idx_range = torch.arange(k, device=device)
+    valid_mask = idx_range < fwd_cnt.unsqueeze(-1)  # (B, H, n_q_tiles, k)
+
+    # Flatten valid KV-block indices and scatter-count
+    kv_indices = fwd_idx.long().clamp(0, n_kv_blocks - 1)  # (B, H, n_q_tiles, k)
+
+    # Count per KV-block: scatter_add ones at each kv_index
+    bwd_cnt = torch.zeros(B, H, n_kv_blocks, dtype=torch.int32, device=device)
+    ones = valid_mask.int()
+    # Reshape for scatter_add: (B, H, n_q_tiles * k)
+    flat_kv = kv_indices.reshape(B, H, -1)
+    flat_ones = ones.reshape(B, H, -1)
+    bwd_cnt.scatter_add_(2, flat_kv, flat_ones)
+
+    max_q_per_kv = bwd_cnt.max().item()
+    if max_q_per_kv == 0:
+        max_q_per_kv = 1
+
+    # Step 2: Build compact backward index
+    # For each valid (q_tile, kv_block) pair, store q_tile at the next
+    # available position for that kv_block in bwd_idx.
+    bwd_idx = torch.zeros(
+        B, H, n_kv_blocks, max_q_per_kv, dtype=torch.int32, device=device
     )
-    max_kv = fwd_idx.shape[3]
-    idx_range = torch.arange(max_kv, device=device)
-    valid_mask = idx_range < fwd_cnt.unsqueeze(-1)
-    valid_indices = fwd_idx.long().clamp(0, n_kv_blocks - 1)
-    attendance.scatter_(3, valid_indices, valid_mask)
 
-    # Transpose and pack
-    bwd_attendance = attendance.transpose(2, 3).contiguous()
-    bwd_cnt = bwd_attendance.sum(dim=-1).to(torch.int32)
-    _, sort_indices = bwd_attendance.int().sort(dim=-1, descending=True, stable=True)
-    bwd_idx = sort_indices.to(torch.int32)
+    # Use a simple per-batch-head Python loop. B*H is small (typically 1*32=32)
+    # and k is small (typically 16), so this is fast.
+    for b in range(B):
+        for h in range(H):
+            cnt_bh = fwd_cnt[b, h]  # (n_q_tiles,)
+            idx_bh = fwd_idx[b, h]  # (n_q_tiles, k)
+            write_offsets = torch.zeros(n_kv_blocks, dtype=torch.long, device=device)
+            for t in range(n_q_tiles):
+                n_valid = cnt_bh[t].item()
+                for ki in range(min(n_valid, k)):
+                    kv_blk = idx_bh[t, ki].item()
+                    if 0 <= kv_blk < n_kv_blocks:
+                        off = write_offsets[kv_blk].item()
+                        if off < max_q_per_kv:
+                            bwd_idx[b, h, kv_blk, off] = t
+                            write_offsets[kv_blk] += 1
 
+    # bwd_idx is already compact: (B, H, n_kv_blocks, max_q_per_kv)
     bwd_mask_cnt = torch.zeros(B, H, n_kv_blocks, dtype=torch.int32, device=device)
-    bwd_mask_idx = torch.zeros(
-        B, H, n_kv_blocks, n_q_tiles, dtype=torch.int32, device=device
-    )
+    bwd_mask_idx = torch.zeros(B, H, n_kv_blocks, 1, dtype=torch.int32, device=device)
 
     if use_mask_blocks:
         return BlockSparseTensorsTorch(

@@ -55,8 +55,8 @@ class TestBuildFA4BlockSparseTensors:
         )
 
         assert result.full_block_cnt.shape == (B, H, N_q_tiles)
-        # full_block_idx uses dense shape (n_blocks_k) for backward transpose compatibility
-        assert result.full_block_idx.shape == (B, H, N_q_tiles, n_blocks_k)
+        # full_block_idx uses compact shape (k_fa4) — FA4 only accesses 0..cnt-1
+        assert result.full_block_idx.shape == (B, H, N_q_tiles, k)
         assert result.mask_block_cnt.shape == (B, H, N_q_tiles)
 
     def test_full_block_count(self) -> None:
