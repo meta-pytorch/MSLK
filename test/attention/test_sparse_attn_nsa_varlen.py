@@ -29,7 +29,9 @@ class TestNSAForwardVarlen:
         V = torch.randn(total, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16)
 
         O = nsa_forward(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -58,7 +60,9 @@ class TestNSAForwardVarlen:
 
         # Varlen forward
         O_varlen = nsa_forward(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -74,7 +78,9 @@ class TestNSAForwardVarlen:
             V_seq = V[start : start + slen].unsqueeze(0)
 
             O_seq = nsa_forward(
-                Q_seq, K_seq, V_seq,
+                Q_seq,
+                K_seq,
+                V_seq,
                 compress_block_size=self.compress_block_size,
                 num_selected_blocks=self.num_selected_blocks,
                 window_size=self.window_size,
@@ -86,9 +92,7 @@ class TestNSAForwardVarlen:
 
             max_diff = (O_varlen_seq - O_fixed_seq).abs().max().item()
             mean_diff = (O_varlen_seq - O_fixed_seq).abs().mean().item()
-            assert max_diff < 0.01, (
-                f"Seq {i}: max_diff={max_diff:.6f} exceeds 0.01"
-            )
+            assert max_diff < 0.01, f"Seq {i}: max_diff={max_diff:.6f} exceeds 0.01"
             assert mean_diff < 0.001, (
                 f"Seq {i}: mean_diff={mean_diff:.6f} exceeds 0.001"
             )
@@ -106,7 +110,9 @@ class TestNSAForwardVarlen:
         V = torch.randn(N, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16)
 
         O_varlen = nsa_forward(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -115,7 +121,9 @@ class TestNSAForwardVarlen:
         )
 
         O_fixed = nsa_forward(
-            Q.unsqueeze(0), K.unsqueeze(0), V.unsqueeze(0),
+            Q.unsqueeze(0),
+            K.unsqueeze(0),
+            V.unsqueeze(0),
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -136,20 +144,34 @@ class TestNSAForwardVarlen:
         )
 
         Q = torch.randn(
-            total, self.H, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         K = torch.randn(
-            total, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         V = torch.randn(
-            total, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
 
         O = nsa(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -178,20 +200,34 @@ class TestNSAForwardVarlen:
         )
 
         Q = torch.randn(
-            total, self.H, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         K = torch.randn(
-            total, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         V = torch.randn(
-            total, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            total,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
 
         O = nsa(
-            Q, K, V,
+            Q,
+            K,
+            V,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -225,20 +261,34 @@ class TestNSAForwardVarlen:
         cu_seqlens = torch.tensor([0, N], dtype=torch.int32, device="cuda")
 
         Q_3d = torch.randn(
-            N, self.H, self.D, device="cuda", dtype=torch.bfloat16,
+            N,
+            self.H,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         K_3d = torch.randn(
-            N, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            N,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
         V_3d = torch.randn(
-            N, self.H_kv, self.D, device="cuda", dtype=torch.bfloat16,
+            N,
+            self.H_kv,
+            self.D,
+            device="cuda",
+            dtype=torch.bfloat16,
             requires_grad=True,
         )
 
         O_3d = nsa(
-            Q_3d, K_3d, V_3d,
+            Q_3d,
+            K_3d,
+            V_3d,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
@@ -252,7 +302,9 @@ class TestNSAForwardVarlen:
         V_4d = V_3d.data.unsqueeze(0).clone().requires_grad_(True)
 
         O_4d = nsa(
-            Q_4d, K_4d, V_4d,
+            Q_4d,
+            K_4d,
+            V_4d,
             compress_block_size=self.compress_block_size,
             num_selected_blocks=self.num_selected_blocks,
             window_size=self.window_size,
