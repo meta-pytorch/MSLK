@@ -278,14 +278,6 @@ struct TensorAccessorBuilder {
       TensorAccessorBuilder<T, N, INDEX_NBITS, true, at::RestrictPtrTraits>( \
           #TENSOR, TENSOR)
 
-#define PTA_ACC_B(TENSOR, T, N, INDEX_NBITS) \
-  mslk::utils::TensorAccessorBuilder<        \
-      at::acc_type<T, true>,                 \
-      N,                                     \
-      INDEX_NBITS,                           \
-      true,                                  \
-      at::RestrictPtrTraits>(#TENSOR, TENSOR)
-
 //////////////////////////////////////////////////////////////////////////////
 // [LEGACY] (Packed) Tensor Accessor Builder Macros
 //
@@ -296,24 +288,12 @@ struct TensorAccessorBuilder {
 
 #ifdef MSLK_MEMCHECK
 
-#define MAKE_TA_WITH_NAME(FUNC_NAME, TENSOR, T, N) \
-  TA_B(TENSOR, T, N, 64).build(FUNC_NAME)
-
 #define MAKE_PTA_WITH_NAME(FUNC_NAME, TENSOR, T, N, INDEX_NBITS) \
   PTA_B(TENSOR, T, N, INDEX_NBITS).build(FUNC_NAME)
 
-#define MAKE_PTA_ACC_WITH_NAME(FUNC_NAME, TENSOR, T, N, INDEX_NBITS) \
-  PTA_ACC_B(TENSOR, T, N, INDEX_NBITS).build(FUNC_NAME)
-
 #else
-
-#define MAKE_TA_WITH_NAME(FUNC_NAME, TENSOR, T, N) \
-  TA_B(TENSOR, T, N, 64).build(#TENSOR)
 
 #define MAKE_PTA_WITH_NAME(FUNC_NAME, TENSOR, T, N, INDEX_NBITS) \
   PTA_B(TENSOR, T, N, INDEX_NBITS).build(#TENSOR)
-
-#define MAKE_PTA_ACC_WITH_NAME(FUNC_NAME, TENSOR, T, N, INDEX_NBITS) \
-  PTA_ACC_B(TENSOR, T, N, INDEX_NBITS).build(#TENSOR)
 
 #endif

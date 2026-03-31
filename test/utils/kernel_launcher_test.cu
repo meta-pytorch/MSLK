@@ -16,7 +16,6 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDADeviceAssertion.h>
 #include <cuda.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -44,9 +43,6 @@ constexpr auto TemplateSourceFileReference = "FOO/BAR/BAZ-123.cpp";
 __global__ void zero_args_kernel() {
   return;
 }
-__global__ void zero_args_dsa_kernel(TORCH_DSA_KERNEL_ARGS) {
-  return;
-}
 
 template <typename T>
 __global__ void array_sum_kernel(T* C, const T* A, const T* B, size_t size) {
@@ -57,24 +53,10 @@ __global__ void array_sum_kernel(T* C, const T* A, const T* B, size_t size) {
 }
 
 template <typename T>
-__global__ void array_sum_dsa_kernel(
-    T* C,
-    const T* A,
-    const T* B,
-    size_t size,
-    TORCH_DSA_KERNEL_ARGS) {
-  const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < size) {
-    C[idx] = A[idx] + B[idx];
-  }
-}
-
-template <typename T>
 __global__ void tensor_sum_kernel(
     pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> C,
     const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> A,
-    const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> B,
-    TORCH_DSA_KERNEL_ARGS) {
+    const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> B) {
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < C.size(0)) {
     C[idx] = A[idx] + B[idx];
@@ -93,8 +75,7 @@ template <typename T>
 __global__ void tensor_sum_kernel_bad_output(
     pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> C,
     const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> A,
-    const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> B,
-    TORCH_DSA_KERNEL_ARGS) {
+    const pta::PackedTensorAccessor64<T, 1, at::RestrictPtrTraits> B) {
   const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
   auto seed = xor128_rand_int(42);
 
@@ -117,12 +98,6 @@ __global__ void tensor_sum_kernel_bad_output(
       }
     }
   }
-}
-
-__global__ void always_fail_assertion_kernel(
-    const int a,
-    TORCH_DSA_KERNEL_ARGS) {
-  CUDA_KERNEL_ASSERT2((a != a) && "This assertion should always fail");
 }
 
 auto sample_tensors(const long size) {
@@ -175,11 +150,6 @@ TEST(KernelLauncherTest, template_source_file) {
 TEST(KernelLauncherTest, zero_args_launch) {
   MSLK_LAUNCH_KERNEL(
       zero_args_kernel, 8, 1024, 0, at::cuda::getCurrentCUDAStream());
-}
-
-TEST(KernelLauncherTest, zero_args_dsa_launch) {
-  MSLK_LAUNCH_DSA_KERNEL(
-      zero_args_dsa_kernel, 8, 1024, 0, at::cuda::getCurrentCUDAStream());
 }
 
 TEST(KernelLauncherTest, array_kernel_launch) {
@@ -266,49 +236,6 @@ TEST(KernelLauncherTest, array_kernel_launch) {
   });
 }
 
-TEST(KernelLauncherTest, array_kernel_launch_dsa) {
-  constexpr auto size = 1024;
-  auto A = at::full(
-      {size}, 2, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  auto B = at::full(
-      {size}, 3, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-  auto C = at::full(
-      {size}, -1, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-
-  EXPECT_NO_THROW({
-    MSLK_LAUNCH_DSA_KERNEL(
-        array_sum_dsa_kernel<float>,
-        8,
-        1024,
-        0,
-        at::cuda::getCurrentCUDAStream(),
-        C.data_ptr<float>(),
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        size);
-
-    EXPECT_TRUE(at::allclose(C, at::full_like(C, 5.0f), 1e-5f, 1e-8f));
-  });
-
-  EXPECT_NO_THROW({
-    C = at::full(
-        {size}, -1, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
-
-    MSLK_LAUNCH_COOPERATIVE_DSA_KERNEL(
-        array_sum_dsa_kernel<float>,
-        8,
-        1024,
-        0,
-        at::cuda::getCurrentCUDAStream(),
-        C.data_ptr<float>(),
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        size);
-
-    EXPECT_TRUE(at::allclose(C, at::full_like(C, 5.0f), 1e-5f, 1e-8f));
-  });
-}
-
 TEST(KernelLauncherTest, tensor_kernel_launch) {
   const auto size = 1024;
   // Not using structured bindings bc it fails on ROCm with:
@@ -318,7 +245,7 @@ TEST(KernelLauncherTest, tensor_kernel_launch) {
 
   // Test normal kernel launch succeeds
   EXPECT_NO_THROW({
-    MSLK_LAUNCH_DSA_KERNEL(
+    MSLK_LAUNCH_KERNEL(
         tensor_sum_kernel<float>,
         8,
         1024,
@@ -341,7 +268,7 @@ TEST(KernelLauncherTest, tensor_kernel_launch) {
   EXPECT_NO_THROW({
     std::tie(A, B, C) = sample_tensors(size);
 
-    MSLK_LAUNCH_COOPERATIVE_DSA_KERNEL(
+    MSLK_LAUNCH_COOPERATIVE_KERNEL(
         tensor_sum_kernel<float>,
         8,
         1024,
@@ -377,7 +304,7 @@ TEST(KernelLauncherTest, kernel_launch_checks) {
   // Test grid size bounds checking
   EXPECT_THROW(
       {
-        MSLK_LAUNCH_DSA_KERNEL(
+        MSLK_LAUNCH_KERNEL(
             tensor_sum_kernel<float>,
             // grid dims are too large
             grid_max[0] + 1,
@@ -393,7 +320,7 @@ TEST(KernelLauncherTest, kernel_launch_checks) {
   // Test block size bounds checking
   EXPECT_THROW(
       {
-        MSLK_LAUNCH_DSA_KERNEL(
+        MSLK_LAUNCH_KERNEL(
             tensor_sum_kernel<float>,
             8,
             // block dims are too large
@@ -411,7 +338,7 @@ TEST(KernelLauncherTest, kernel_launch_checks) {
   // Test max thread count
   EXPECT_THROW(
       {
-        MSLK_LAUNCH_DSA_KERNEL(
+        MSLK_LAUNCH_KERNEL(
             tensor_sum_kernel<float>,
             // Both grid and block dims conform, but the total number of
             // threads exceeds the max
@@ -429,7 +356,7 @@ TEST(KernelLauncherTest, kernel_launch_checks) {
   // Test shared memory size bounds checking
   EXPECT_THROW(
       {
-        MSLK_LAUNCH_DSA_KERNEL(
+        MSLK_LAUNCH_KERNEL(
             tensor_sum_kernel<float>,
             8,
             1024,
@@ -469,7 +396,7 @@ TEST(KernelLauncherTest, tensor_value_checks) {
 
       EXPECT_THROW(
           {
-            MSLK_LAUNCH_DSA_KERNEL(
+            MSLK_LAUNCH_KERNEL(
                 tensor_sum_kernel<float>,
                 8,
                 1024,
@@ -492,7 +419,7 @@ TEST(KernelLauncherTest, tensor_value_checks) {
 
       EXPECT_THROW(
           {
-            MSLK_LAUNCH_DSA_KERNEL(
+            MSLK_LAUNCH_KERNEL(
                 tensor_sum_kernel<float>,
                 8,
                 1024,
@@ -513,7 +440,7 @@ TEST(KernelLauncherTest, tensor_value_checks) {
     // Test for bad OUTPUT tensors
     EXPECT_THROW(
         {
-          MSLK_LAUNCH_DSA_KERNEL(
+          MSLK_LAUNCH_KERNEL(
               tensor_sum_kernel_bad_output<float>,
               8,
               1024,
@@ -526,56 +453,5 @@ TEST(KernelLauncherTest, tensor_value_checks) {
         std::exception);
   }
 }
-
-// NOTE: This test currently fails in fbcode CI for HIP with the following
-// error (but runs without issues on both NVIDIA and AMD machines):
-//
-// void mslk::utils::always_fail_assertion_kernel(const int,
-// c10::hip::DeviceAssertionsData *const, uint32_t): Device-side assertion `(a
-// != a) && "This assertion should always fail"' failed. :0:rocdevice.cpp :2984:
-// 1311044151769 us: [pid:1082329 tid:0x7fc06c9ff640] Callback: Queue
-// 0x7fc06b500000 aborting with error : HSA_STATUS_ERROR_EXCEPTION: An HSAIL
-// operation resulted in a hardware exception. code: 0x1016
-//
-// Disabled for now until we can figure out why this is happening.
-#ifndef __HIPCC__
-
-TEST(KernelLauncherTest, throws_dsa_exception) {
-  MSLK_LAUNCH_DSA_KERNEL(
-      always_fail_assertion_kernel,
-      1,
-      1,
-      0,
-      at::cuda::getCurrentCUDAStream(),
-      42);
-
-  EXPECT_NO_THROW({
-    try {
-      c10::cuda::device_synchronize();
-      throw std::runtime_error("Test didn't fail, but should have.");
-
-    } catch (const c10::Error& err) {
-      const auto err_str = std::string(err.what());
-
-      ASSERT_THAT(
-          err_str,
-          HasSubstr(
-              "CUDA device-side assertion failures were found on GPU #0!"));
-
-      ASSERT_THAT(
-          err_str,
-          HasSubstr(
-              "File containing kernel launch = [" __TEMPLATE_SOURCE_FILE__
-              "] " __FILE__));
-
-      ASSERT_THAT(
-          err_str,
-          HasSubstr(
-              "Name of kernel launched that led to failure = always_fail_assertion_kernel"));
-    }
-  });
-}
-
-#endif // __HIPCC__
 
 } // namespace mslk::utils
