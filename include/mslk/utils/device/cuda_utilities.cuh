@@ -16,32 +16,8 @@
 
 namespace mslk::utils::device {
 
-// Based on the empirical study, max grid size that is 64x larger than the
-// number of SMs gives good performance across the board
-constexpr int32_t MAX_THREAD_BLOCKS_FACTOR = 64;
-
 template <class...>
 constexpr bool dependent_false_v = false;
-
-inline auto get_max_thread_blocks(const c10::cuda::CUDAStream& stream) {
-  const auto device = stream.device_index();
-  return MAX_THREAD_BLOCKS_FACTOR *
-      at::cuda::getDeviceProperties(device)->multiProcessorCount;
-}
-
-inline auto get_compute_versions() {
-  static const auto versions = [] {
-    int runtime_version = 0;
-    cudaRuntimeGetVersion(&runtime_version);
-
-    int driver_version = 0;
-    cudaDriverGetVersion(&driver_version);
-
-    return std::make_tuple(runtime_version, driver_version);
-  }();
-
-  return versions;
-}
 
 inline auto get_device_for_stream(const cudaStream_t& stream) {
   // Keep as thread local to avoid race conditions
