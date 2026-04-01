@@ -17,7 +17,7 @@ from typing import Callable, Tuple
 
 from mslk.attention.sparse_attn.compress import compress_kv
 from mslk.attention.sparse_attn.gating import fused_gate_and_combine
-from mslk.attention.sparse_attn.select import score_and_select_blocks
+from mslk.attention.sparse_attn.select import fused_score_and_select_blocks
 from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
 from torch import Tensor
 
@@ -120,7 +120,8 @@ def nsa_forward(
     K_cmp, V_cmp = compress_kv(K, V, compress_block_size, W_k_compress, W_v_compress)
 
     # Step 2: Score blocks and select top-k
-    block_indices = score_and_select_blocks(
+    # Uses Q_mean optimization: mean(Q @ K) = mean(Q) @ K (256x fewer FLOPs)
+    block_indices = fused_score_and_select_blocks(
         Q,
         K_cmp,
         num_selected_blocks,

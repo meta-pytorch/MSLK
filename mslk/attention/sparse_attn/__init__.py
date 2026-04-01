@@ -11,7 +11,11 @@ from mslk.attention.sparse_attn.reference import (
     nsa_backward_reference,
     nsa_forward_reference,
 )
-from mslk.attention.sparse_attn.select import score_and_select_blocks
+from mslk.attention.sparse_attn.select import (
+    fused_score_and_select_all,
+    fused_score_and_select_blocks,
+    score_and_select_blocks,
+)
 from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
 
 __all__ = [
@@ -20,6 +24,8 @@ __all__ = [
     "nsa_backward_reference",
     "compress_kv",
     "score_and_select_blocks",
+    "fused_score_and_select_blocks",
+    "fused_score_and_select_all",
     "build_fa4_block_sparse_tensors",
     "compute_gates",
     "fused_gate_and_combine",
