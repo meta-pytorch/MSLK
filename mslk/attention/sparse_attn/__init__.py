@@ -11,6 +11,7 @@ from mslk.attention.sparse_attn.gating import (
     fused_gating_backward,
     gate_and_combine,
 )
+from mslk.attention.sparse_attn.nsa_autograd import nsa
 from mslk.attention.sparse_attn.nsa_forward import nsa_forward
 from mslk.attention.sparse_attn.reference import (
     nsa_backward_reference,
