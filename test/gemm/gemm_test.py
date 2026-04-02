@@ -320,24 +320,6 @@ class ExportCompileTests(unittest.TestCase):
     def test_compile_f8f8bf16(self) -> None:
         torch.compile(torch.ops.mslk.f8f8bf16)(self.XQ, self.WQ, self.tensor_scale)
 
-    # Broken on trunk
-    # @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
-    # def test_compile_cublas(self) -> None:
-    #     torch.compile(torch.ops.mslk.f8f8bf16_cublas)(
-    #         self.XQ,
-    #         self.WQ,
-    #     )
-
-    # Broken on trunk
-    # @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
-    # def test_compile_f8f8bf16_rowwise_batched(self) -> None:
-    #     torch.compile(torch.ops.mslk.f8f8bf16_rowwise_batched)(
-    #         self.XQ.view(1, self.M, self.K),
-    #         self.WQ.view(1, self.N, self.K),
-    #         self.row_scale.view(1, self.M),
-    #         self.col_scale.view(1, self.N),
-    #     )
-
     @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_f8i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8i4bf16_rowwise)(
