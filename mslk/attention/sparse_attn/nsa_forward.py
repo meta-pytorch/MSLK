@@ -70,6 +70,54 @@ def _fa4_fwd(
     return out, lse
 
 
+def _fa4_bwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    dout: Tensor,
+    lse: Tensor,
+    causal: bool = False,
+    softmax_scale: float | None = None,
+    window_size_left: int | None = None,
+    window_size_right: int | None = None,
+    block_sparse_tensors=None,
+    mask_mod: Callable | None = None,
+    compress_factor: int = 1,
+    cu_seqlens_q: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Call FA4's backward pass.
+
+    Supports block sparsity, mask_mod, compress_factor, and varlen (cu_seqlens).
+    Returns (dq, dk, dv).
+    """
+    from mslk.attention.flash_attn.interface import _flash_attn_bwd
+
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        block_sparse_tensors=block_sparse_tensors,
+        mask_mod=mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        compress_factor=compress_factor,
+    )
+    return dq, dk, dv
+
+
 def nsa_forward(
     Q: Tensor,  # (B, N, H, D)
     K: Tensor,  # (B, N, H_kv, D)
