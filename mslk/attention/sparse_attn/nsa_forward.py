@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from typing import Callable, Tuple
 
-from mslk.attention.sparse_attn.compress import compress_kv
+from mslk.attention.sparse_attn.compress import fused_compress_kv
 from mslk.attention.sparse_attn.gating import fused_gate_and_combine
 from mslk.attention.sparse_attn.select import fused_score_and_select_blocks
 from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
@@ -44,7 +44,7 @@ def _fa4_fwd(
     Inputs are (B, N, H, D) for fixed-length or (total_tokens, H, D) for varlen.
     Returns (output, lse).
     """
-    from mslk.attention.flash_attn.interface import _flash_attn_fwd
+    from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_fwd
 
     # mask_mod is not compatible with pack_gqa=True in FA4, so disable it
     pack_gqa = False if mask_mod is not None else None
@@ -116,8 +116,10 @@ def nsa_forward(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(D)
 
-    # Step 1: Compress KV
-    K_cmp, V_cmp = compress_kv(K, V, compress_block_size, W_k_compress, W_v_compress)
+    # Step 1: Compress KV (fused CuteDSL kernel for fixed-length, PyTorch for varlen)
+    K_cmp, V_cmp = fused_compress_kv(
+        K, V, compress_block_size, W_k_compress, W_v_compress
+    )
 
     # Step 2: Score blocks and select top-k
     # Uses Q_mean optimization: mean(Q @ K) = mean(Q) @ K (256x fewer FLOPs)
