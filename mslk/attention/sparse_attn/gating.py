@@ -201,6 +201,67 @@ def fused_gate_and_combine(
     return out, gates
 
 
+def fused_gating_backward(
+    Q: Tensor,  # (B, N, H, D) or (T, H, D) for varlen
+    dO: Tensor,  # same shape as Q
+    O_cmp: Tensor,  # same shape as Q
+    O_slc: Tensor,  # same shape as Q
+    O_sld: Tensor,  # same shape as Q
+    gates: Tensor,  # (..., H, 3) matching leading dims of Q
+    gate_proj_weight: Tensor,  # (H, 3, D)
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Gating backward — pure PyTorch (cuBLAS einsum for cross-row reductions).
+
+    Computes dO_cmp, dO_slc, dO_sld (gradient routing through gates),
+    dQ_gate (query gradient from gate computation), and dW_gate (weight gradient).
+    All computation in fp32 for numerical stability.
+
+    Args:
+        Q: Query tensor, shape (B, N, H, D) or (T, H, D) for varlen.
+        dO: Upstream gradient, same shape as Q.
+        O_cmp, O_slc, O_sld: Branch outputs, same shape as Q.
+        gates: Sigmoid gate values, (..., H, 3) matching leading dims of Q.
+        gate_proj_weight: Gate weights, shape (H, 3, D).
+
+    Returns:
+        (dO_cmp, dO_slc, dO_sld, dQ_gate, dW_gate)
+    """
+    H = Q.shape[-2]
+    D = Q.shape[-1]
+
+    # fp32 gradient routing: dO_i = g_i * dO
+    g = gates.float()
+    dO_f = dO.float()
+    dO_cmp = (g[..., 0:1] * dO_f).to(dO.dtype)
+    dO_slc = (g[..., 1:2] * dO_f).to(dO.dtype)
+    dO_sld = (g[..., 2:3] * dO_f).to(dO.dtype)
+
+    # Sigmoid derivative: d_logit_i = (dO · O_i) * g_i * (1 - g_i)
+    O_branches = torch.stack([O_cmp.float(), O_slc.float(), O_sld.float()], dim=-1)
+    dg = (dO_f.unsqueeze(-1) * O_branches).sum(dim=-2)  # (..., H, 3)
+    d_logit = dg * g * (1 - g)
+
+    # dQ_gate = d_logit @ W (cuBLAS GEMM — query gradient from gate computation)
+    dQ_gate = (
+        torch.einsum(
+            "mhg,hgd->mhd",
+            d_logit.reshape(-1, H, 3),
+            gate_proj_weight.float(),
+        )
+        .reshape(Q.shape)
+        .to(Q.dtype)
+    )
+
+    # dW_gate = d_logit.T @ Q (cuBLAS GEMM — weight gradient)
+    dW_gate = torch.einsum(
+        "mhg,mhd->hgd",
+        d_logit.reshape(-1, H, 3),
+        Q.float().reshape(-1, H, D),
+    ).to(gate_proj_weight.dtype)
+
+    return dO_cmp, dO_slc, dO_sld, dQ_gate, dW_gate
+
+
 # ---------------------------------------------------------------------------
 # PyTorch reference implementations (kept for testing and fallback)
 # ---------------------------------------------------------------------------
