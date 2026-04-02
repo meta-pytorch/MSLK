@@ -1,0 +1,112 @@
+# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+
+"""Convert top-k block indices into FA4's BlockSparseTensorsTorch format.
+
+Uses compact index tensors where the last dimension is the max number of
+selected blocks per Q-tile (k), not the total number of KV blocks (n_blocks_k).
+FA4 kernels only access indices 0..cnt-1 per Q-tile, so the compact format
+is fully compatible with both forward and backward.
+"""
+
+from __future__ import annotations
+
+import torch
+from mslk.attention.flash_attn.block_sparsity import BlockSparseTensorsTorch
+from torch import Tensor
+
+
+def build_fa4_block_sparse_tensors(
+    block_indices: Tensor,  # (B, H, N_q_tiles, k) int32
+    compress_block_size: int,
+    n_block_size: int = 128,
+    seqlen_k: int | None = None,
+) -> BlockSparseTensorsTorch:
+    """Convert selected KV block indices into FA4's block sparsity format.
+
+    FA4 block sparsity uses two pairs of tensors:
+    - full_block_cnt/full_block_idx: KV blocks that need NO masking (fully attended).
+    - mask_block_cnt/mask_block_idx: KV blocks that need masking (partially attended).
+
+    Handles two cases:
+    - compress_block_size >= n_block_size: Each NSA block expands to multiple FA4 blocks.
+    - compress_block_size < n_block_size: Multiple NSA blocks contract to one FA4 block
+      (duplicates are removed via sort + consecutive dedup).
+
+    All selected blocks are "full" blocks (no partial masking needed).
+
+    Uses compact index tensors: last dim = k_fa4 (not n_blocks_k).
+
+    Args:
+        block_indices: Selected KV block indices, shape (B, H, N_q_tiles, k).
+        compress_block_size: Size of each NSA KV block.
+        n_block_size: FA4's KV tile size (default 128 for SM100).
+        seqlen_k: Total KV sequence length (for computing q_block_size).
+
+    Returns:
+        BlockSparseTensorsTorch with full_block_cnt, full_block_idx,
+        mask_block_cnt, mask_block_idx.
+    """
+    B, H, N_q_tiles, k = block_indices.shape
+    device = block_indices.device
+
+    if compress_block_size >= n_block_size:
+        # Expansion: each NSA block maps to one or more FA4 blocks
+        assert compress_block_size % n_block_size == 0, (
+            f"compress_block_size ({compress_block_size}) must be divisible by "
+            f"n_block_size ({n_block_size})"
+        )
+        fa4_blocks_per_nsa_block = compress_block_size // n_block_size
+
+        base_indices = block_indices.long() * fa4_blocks_per_nsa_block
+        offsets = torch.arange(fa4_blocks_per_nsa_block, device=device)
+        expanded_indices = base_indices.unsqueeze(-1) + offsets
+        fa4_indices = expanded_indices.reshape(
+            B, H, N_q_tiles, k * fa4_blocks_per_nsa_block
+        )
+        k_fa4 = k * fa4_blocks_per_nsa_block
+
+        full_block_cnt = torch.full(
+            (B, H, N_q_tiles), k_fa4, dtype=torch.int32, device=device
+        )
+    else:
+        # Contraction: multiple NSA blocks map to a single FA4 block.
+        # Dedup by sorting and removing consecutive duplicates.
+        assert n_block_size % compress_block_size == 0, (
+            f"n_block_size ({n_block_size}) must be divisible by "
+            f"compress_block_size ({compress_block_size})"
+        )
+        fa4_block_indices = (block_indices.long() * compress_block_size) // n_block_size
+
+        sorted_idx, _ = fa4_block_indices.sort(dim=-1)
+        is_new = torch.ones_like(sorted_idx, dtype=torch.bool)
+        is_new[..., 1:] = sorted_idx[..., 1:] != sorted_idx[..., :-1]
+
+        counts = is_new.sum(dim=-1)
+        max_unique = counts.max().item()
+
+        dest_positions = is_new.long().cumsum(dim=-1) - 1
+        fa4_indices = torch.zeros(
+            B, H, N_q_tiles, max_unique, dtype=torch.int64, device=device
+        )
+        fa4_indices.scatter_(3, dest_positions.clamp(max=max_unique - 1), sorted_idx)
+
+        full_block_cnt = counts.to(torch.int32)
+        k_fa4 = max_unique
+
+    full_block_idx = fa4_indices[:, :, :, :k_fa4].to(torch.int32)
+
+    # No partial masking needed — use minimal last dim
+    mask_block_cnt = torch.zeros((B, H, N_q_tiles), dtype=torch.int32, device=device)
+    mask_block_idx = torch.zeros((B, H, N_q_tiles, 1), dtype=torch.int32, device=device)
+
+    q_block_size = (
+        seqlen_k // N_q_tiles if seqlen_k is not None else compress_block_size
+    )
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_block_size, n_block_size),
+    )
