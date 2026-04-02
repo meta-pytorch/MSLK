@@ -16,7 +16,7 @@ import math
 from typing import Callable, Tuple
 
 from mslk.attention.sparse_attn.compress import compress_kv
-from mslk.attention.sparse_attn.gating import compute_gates, gate_and_combine
+from mslk.attention.sparse_attn.gating import fused_gate_and_combine
 from mslk.attention.sparse_attn.select import score_and_select_blocks
 from mslk.attention.sparse_attn.sparsity_masks import build_fa4_block_sparse_tensors
 from torch import Tensor
@@ -173,14 +173,6 @@ def nsa_forward(
     )
 
     # Step 5: Gate and combine branch outputs
-    # Use chunked gating for long sequences to avoid materializing
-    # 3 full (B,N,H,D) float32 tensors simultaneously.
-    gate_chunk = 4096 if N > 32768 else None
-    gates = compute_gates(Q, gate_proj_weight, chunk_size=gate_chunk)
-    if gate_proj_weight is not None:
-        O = gate_and_combine(O_cmp, O_slc, O_sld, gates, chunk_size=gate_chunk)
-    else:
-        # No gate weights — uniform 1/3 gates
-        O = (O_cmp + O_slc + O_sld) * (1.0 / 3.0)
+    O, gates = fused_gate_and_combine(Q, O_cmp, O_slc, O_sld, gate_proj_weight)
 
     return O
