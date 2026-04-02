@@ -110,3 +110,48 @@ def build_fa4_block_sparse_tensors(
         full_block_idx=full_block_idx,
         block_size=(q_block_size, n_block_size),
     )
+
+
+def build_compressed_block_sparse_tensors(
+    cmp_block_indices: Tensor,  # (B, H, N_q_tiles, k_cmp) int32
+    n_kv_blocks: int,
+    q_tile_size: int = 256,
+    cmp_n_block_size: int = 128,
+) -> "BlockSparseTensorsTorch":
+    """Build block-sparse tensors for block-sparse compressed attention.
+
+    All selected blocks go into full_block (not mask_block) because causal
+    masking is handled by compress_factor in FA4, not mask_mod.
+
+    Uses compact index tensors: last dim = k_cmp (not n_kv_blocks).
+
+    Args:
+        cmp_block_indices: FA4 block indices in the compressed KV sequence,
+            shape (B, H, N_q_tiles, k_cmp). Values in [0, n_kv_blocks).
+        n_kv_blocks: Total number of FA4 KV blocks in the compressed sequence.
+        q_tile_size: Q tile size (256 for SM100).
+        cmp_n_block_size: FA4 KV block size for the compressed branch (128).
+
+    Returns:
+        BlockSparseTensorsTorch with selected blocks in full_block.
+    """
+    B, H, N_q_tiles, k_cmp = cmp_block_indices.shape
+    device = cmp_block_indices.device
+
+    # All blocks in full_block (causal masking via compress_factor, not mask_mod)
+    full_block_cnt = torch.full(
+        (B, H, N_q_tiles), k_cmp, dtype=torch.int32, device=device
+    )
+    full_block_idx = cmp_block_indices.to(torch.int32).contiguous()
+
+    # No mask blocks — use minimal last dim
+    mask_block_cnt = torch.zeros((B, H, N_q_tiles), dtype=torch.int32, device=device)
+    mask_block_idx = torch.zeros((B, H, N_q_tiles, 1), dtype=torch.int32, device=device)
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_idx=full_block_idx,
+        block_size=(q_tile_size, cmp_n_block_size),
+    )
