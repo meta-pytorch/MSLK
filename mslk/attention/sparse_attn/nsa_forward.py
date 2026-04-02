@@ -52,24 +52,45 @@ def _fa4_fwd(
     # mask_mod is not compatible with pack_gqa=True in FA4, so disable it
     pack_gqa = False if mask_mod is not None else None
 
-    out, lse = _flash_attn_fwd(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size_left,
-        window_size_right=window_size_right,
-        block_sparse_tensors=block_sparse_tensors,
-        mask_mod=mask_mod,
-        pack_gqa=pack_gqa,
-        return_lse=True,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        compress_factor=compress_factor,
-    )
+    # Try with compress_factor first (PR#2418); fall back without it
+    try:
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            block_sparse_tensors=block_sparse_tensors,
+            mask_mod=mask_mod,
+            pack_gqa=pack_gqa,
+            return_lse=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            compress_factor=compress_factor,
+        )
+    except TypeError:
+        # compress_factor not supported in this FA4 build — omit it
+        out, lse = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            block_sparse_tensors=block_sparse_tensors,
+            mask_mod=mask_mod,
+            pack_gqa=pack_gqa,
+            return_lse=True,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
     return out, lse
 
 
@@ -97,7 +118,7 @@ def _fa4_bwd(
     Supports block sparsity, mask_mod, compress_factor, and varlen (cu_seqlens).
     Returns (dq, dk, dv).
     """
-    from mslk.attention.flash_attn.interface import _flash_attn_bwd
+    from mslk.fb.mslk.attention.flash_attn.interface import _flash_attn_bwd
 
     dq, dk, dv = _flash_attn_bwd(
         q,
