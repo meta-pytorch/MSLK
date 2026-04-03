@@ -413,20 +413,6 @@ def dequantize_fp8_asymmetric(
     return x.to(scale.dtype) * scale[..., None] + shift[..., None]
 
 
-def dequantize_fp8_symmetric(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """
-    Dequantize a symmetrically quantized FP8 tensor.
-
-    Args:
-        x: Quantized tensor
-        scale: Scale factor used during quantization
-
-    Returns:
-        Dequantized tensor
-    """
-    return x.to(scale.dtype) * scale[..., None]
-
-
 def add_q_fp8_to_inputs(
     inp: InputsFp8,
 ) -> InputsFp8:
@@ -478,10 +464,6 @@ def add_q_fp8_to_inputs(
 compute_capability = (0, 0)
 if torch.cuda.is_available():
     compute_capability = torch.cuda.get_device_capability("cuda")
-sm70_or_better_only = wrong_hardware(
-    torch.version.cuda is not None and compute_capability < (7, 0),
-    reason="requires sm70+",
-)
 sm75_or_better_only = wrong_hardware(
     torch.version.cuda is not None and compute_capability < (7, 5),
     reason="requires sm75+",
