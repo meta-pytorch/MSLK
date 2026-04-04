@@ -8,6 +8,10 @@
 # CUDA Setup
 ################################################################################
 
+if(NOT MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+
 BLOCK_PRINT(
   "CMAKE CUDA Flags"
   ""

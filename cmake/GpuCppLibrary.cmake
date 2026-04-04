@@ -289,6 +289,12 @@ function(gpu_cpp_library)
         ${CUDA_DRIVER_LIBRARIES}
         ${args_DEPS})
 
+    if(NOT MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+        list(APPEND library_dependencies
+            CUDA::cublas
+            CUDA::cublasLt)
+    endif()
+
     BLOCK_PRINT(
         "Library Dependencies:"
         ""
