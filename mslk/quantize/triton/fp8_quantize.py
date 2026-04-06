@@ -33,16 +33,6 @@ except ModuleNotFoundError:
         yield None
 
 
-@triton.autotune(
-    configs=[
-        Config({"BLOCK_SIZE": 512}),
-        Config({"BLOCK_SIZE": 1024}),
-        Config({"BLOCK_SIZE": 2048}),
-        Config({"BLOCK_SIZE": 4096}),
-        Config({"BLOCK_SIZE": 8192}),
-    ],
-    key=["K"],
-)
 @triton.jit
 def _kernel_quantize_fp8_row(
     A,
@@ -273,6 +263,7 @@ def triton_quantize_fp8_row(
     # If input tensor is sufficiently large, we need to use int64 indexing.
     use_int64 = a.numel() > (2**31 - 1)
     grid = (num_rows,)
+    BLOCK_SIZE = min(triton.next_power_of_2(a_fp8.shape[3]), 8192)
     # Pick a conservative value for inference shapes for disabling BufferOps.
     should_disable_bufferops = torch.version.hip is not None and a_shape[0] < 32
     with disable_bufferops(should_disable_bufferops):
@@ -311,6 +302,7 @@ def triton_quantize_fp8_row(
                 EPS=eps,
                 CLAMP_MAX=scale_ub is not None,
                 JAGGED=zero_start_index_M is not None,
+                BLOCK_SIZE=BLOCK_SIZE,
                 USE_INT64=use_int64,
             )
 
