@@ -53,6 +53,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, Tensor? global_scale=None, int mxfp4_block_size=32) -> Tensor");
   m.def(
+      "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
+  m.def(
       "f4f4bf16_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes, Tensor? global_scale=None, Tensor? starting_row_after_padding=None, bool use_mx=True) -> Tensor");
   m.def(
       "mx8mx8bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, int? actual_num_tokens=None) -> Tensor");
@@ -114,6 +116,7 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
+  m.impl("mx8mx4bf16", mx8mx4bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
@@ -161,6 +164,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
+  m.impl("mx8mx4bf16", mx8mx4bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
@@ -199,6 +203,30 @@ at::Tensor f4f4bf16_meta(
     std::optional<at::Tensor> /* output = std::nullopt */,
     std::optional<at::Tensor> /* global_scale = std::nullopt */,
     int64_t /* mxfp4_block_size = 32 */) {
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  return Y;
+}
+
+at::Tensor mx8mx4bf16_meta(
+    at::Tensor XQ, // MX FP8
+    at::Tensor WQ, // MX FP4
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */,
+    std::optional<at::Tensor> /* output = std::nullopt */) {
+  const at::SymInt M = XQ.sym_size(0);
+  const at::SymInt N = WQ.sym_size(0);
+  auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
+  return Y;
+}
+
+at::Tensor mx8mx8bf16_meta(
+    at::Tensor XQ, // MX FP8
+    at::Tensor WQ, // MX FP8
+    at::Tensor /* x_scale */,
+    at::Tensor /* w_scale */,
+    std::optional<at::Tensor> /* output = std::nullopt */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
   auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
@@ -528,6 +556,7 @@ TORCH_LIBRARY_IMPL(mslk, Meta, m) {
 #else
   m.impl("i8i8bf16", i8i8bf16_meta);
   m.impl("f4f4bf16", f4f4bf16_meta);
+  m.impl("mx8mx4bf16", mx8mx4bf16_meta);
   m.impl("f8f8bf16", f8f8bf16_meta);
   m.impl("f8f8bf16_cublas", f8f8bf16_cublas_meta);
   m.impl("bf16x9_gemm", bf16x9_gemm_meta);

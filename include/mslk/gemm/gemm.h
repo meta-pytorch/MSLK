@@ -231,4 +231,13 @@ std::tuple<at::Tensor, at::Tensor> preshuffle_i4(
     at::Tensor WQ,
     at::Tensor w_scale);
 
+// Mixed MX8 x MX4 GEMM using mxf8f6f4 block-scaled tensor core instruction
+// ElementA = mx_float8_t<float_e4m3_t>, ElementB = mx_float4_t<float_e2m1_t>
+at::Tensor mx8mx4bf16(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    std::optional<at::Tensor> output = std::nullopt);
+
 } // namespace mslk::gemm
