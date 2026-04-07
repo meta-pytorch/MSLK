@@ -2198,7 +2198,8 @@ def _nvfp4_quantize_stacked_kernel(
     N,
     NUM_GROUPS: tl.constexpr,
     PREFIX_NUM: tl.constexpr,
-    M_PER_BLOCK: tl.constexpr = 64,  # type: ignore[Incompatible variable type]
+    BSEARCH_ITERS: tl.constexpr,
+    M_PER_BLOCK: tl.constexpr = 128,  # type: ignore[Incompatible variable type]
 ):
     """Quantize concatenated MoE activations to NVFP4 with per-expert global scales.
 
@@ -2246,7 +2247,9 @@ def _nvfp4_quantize_stacked_kernel(
     # Binary search: find largest seg_idx such that cumsum_exc[seg_idx] <= row
     lo = tl.zeros([M_PER_BLOCK], dtype=tl.int32)
     hi = tl.full([M_PER_BLOCK], NUM_GROUPS - 1, dtype=tl.int32)
-    for _ in range(10):  # log2(1024) = 10 iterations
+
+    # Optimized by KernelAgent: Use ceil(log2(NUM_GROUPS)) iterations
+    for _ in range(BSEARCH_ITERS):
         mid = (lo + hi + 1) // 2
         mid_val = tl.gather(cumsum_exc, mid, 0)
         lo = tl.where(mid_val <= rows, mid, lo)
@@ -2366,6 +2369,16 @@ def nvfp4_quantize_stacked(
         triton.cdiv(M, META["M_PER_BLOCK"]),
     )
 
+    # Optimized by KernelAgent: use larger tiles and software pipelining
+    # for M >= 256 where there are enough blocks to saturate SMs.
+    # For small M, keep defaults to avoid SM underutilization.
+    if M >= 256:
+        m_per_block = 128
+        n_stages = 3
+    else:
+        m_per_block = 64
+        n_stages = 1
+
     _nvfp4_quantize_stacked_kernel[grid](
         input,
         global_scale,
@@ -2379,6 +2392,9 @@ def nvfp4_quantize_stacked(
         # pyre-ignore[6]
         NUM_GROUPS=num_segments,
         PREFIX_NUM=triton.next_power_of_2(num_segments),
+        BSEARCH_ITERS=max(1, (num_segments - 1).bit_length()),
+        M_PER_BLOCK=m_per_block,  # pyre-ignore[6]
+        num_stages=n_stages,  # pyre-ignore[28]
     )
 
     return xq.view(torch.float4_e2m1fn_x2), scale.view(torch.float8_e4m3fn)
