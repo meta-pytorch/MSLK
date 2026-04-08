@@ -2781,3 +2781,43 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MX8MX4Tests(unittest.TestCase):
+    """Tests for the mixed MX8 x MX4 CUTLASS GEMM kernel (mx8mx4bf16)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 64, 256]),
+        N=st.sampled_from([256, 1024]),
+        K=st.sampled_from([2048, 4096]),
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize A to MX8 with blocked scale layout
+        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
+            torch.uint8
+        )
+
+        # Quantize B to MX4
+        bq, b_scale = triton_quantize_mx4_unpack(B)
+        bq = bq.view(torch.float4_e2m1fn_x2)
+
+        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16(aq, bq, a_scale, b_scale)
+        out_bf16 = A @ B.t()
+
+        # No NaN or Inf
+        self.assertFalse(out_mx8mx4.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out_mx8mx4.isinf().any().item(), "Output contains Inf")
+
+        # Mixed MX8xMX4 has higher tolerance than MX4xMX4 due to mixed precision
+        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=1.0e-1, rtol=1.0e-1)
