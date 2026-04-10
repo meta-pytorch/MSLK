@@ -1,4 +1,3 @@
-# @nolint # fbcode
 """Flash Attention CUTE (CUDA Template Engine) implementation."""
 
 __version__ = "0.1.0"
