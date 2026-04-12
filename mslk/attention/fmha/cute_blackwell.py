@@ -175,37 +175,24 @@ def _convert_input_format(
         # Reshape Q/K/V to the 4D layout the kernel expects:
         # Q: (1, B, Hq, K) → (B, 1, Hq, K)
         _, B, Hq, K = query.shape
+        Mkv_padded = key.shape[1] // B
+        Hkv = key.shape[2]
         query = query.squeeze(0).unsqueeze(1).reshape(B, 1, Hq, K).contiguous()
-        if page_table is None:
-            Mkv_padded = key.shape[1] // B
-            Hkv = key.shape[2]
-            key = (
-                key.contiguous()
-                .view(torch.float8_e4m3fn)
-                .reshape(B, Mkv_padded, Hkv, K)
-            )
-            value = (
-                value.contiguous()
-                .view(torch.float8_e4m3fn)
-                .reshape(B, Mkv_padded, Hkv, K)
-            )
-        else:
-            # For paged: key/value are (1, total_len, Hkv_merged, K_int32) — squeeze leading 1
-            Hkv = key.shape[2]
-            key = key.squeeze(0).contiguous().view(torch.float8_e4m3fn)
-            value = value.squeeze(0).contiguous().view(torch.float8_e4m3fn)
+        key = key.contiguous().view(torch.float8_e4m3fn).reshape(B, Mkv_padded, Hkv, K)
+        value = (
+            value.contiguous().view(torch.float8_e4m3fn).reshape(B, Mkv_padded, Hkv, K)
+        )
 
     # For paged attention or varlen, fold 4D to 3D
     should_fold = (
-        (cu_seqlen_k is not None or page_table is not None)
-        and query.ndim == 4
-        and not is_qkv_mxfp8
-    )
+        cu_seqlen_k is not None or page_table is not None
+    ) and query.ndim == 4
     if should_fold:
         # Fold to 3D when using varlen or paged attention
         query, _ = bmhk2bhk(query)
-        key, key_scale = bmhk2bhk(key, key_scale)
-        value, value_scale = bmhk2bhk(value, value_scale)
+        if not is_qkv_mxfp8:
+            key, key_scale = bmhk2bhk(key, key_scale)
+            value, value_scale = bmhk2bhk(value, value_scale)
 
     # For paged attention, K/V have shape (num_pages, page_size, heads, dim) - view to that shape
     if isinstance(
