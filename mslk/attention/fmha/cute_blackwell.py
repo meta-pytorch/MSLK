@@ -144,44 +144,17 @@ def _convert_input_format(
     if isinstance(inp, InputsFp8):
         key_scale = inp.k_fp8_scale_shift
         value_scale = inp.v_fp8_scale_shift
-        query_scale = None
     elif isinstance(inp, InputsMXFp8):
         key_scale = inp.k_fp8_scale
         value_scale = inp.v_fp8_scale
-        query_scale = inp.q_fp8_scale
     else:
         key_scale = None
         value_scale = None
-        query_scale = None
-
-    is_qkv_mxfp8 = isinstance(inp, InputsMXFp8) and inp.q_fp8_scale is not None
-
-    # For full MXFP8: don't fold to 3D, kernel needs 4D with seqused_k
-    if is_qkv_mxfp8:
-        cu_seqlen_k = None
-        cu_seqlen_q = None
 
     if query.ndim == 5:  # GQA
         query, _ = bmghk2bmhk(query, None, handle_rep_heads=True)
-        if not is_qkv_mxfp8:
-            key, key_scale = bmghk2bmhk(key, key_scale, handle_rep_heads=True)
-            value, value_scale = bmghk2bmhk(value, value_scale, handle_rep_heads=True)
-        else:
-            # For full MXFP8: drop G broadcast dim, skip the relayout for scales (already atom-tiled)
-            key, _ = bmghk2bmhk(key, None, handle_rep_heads=True)
-            value, _ = bmghk2bmhk(value, None, handle_rep_heads=True)
-
-    if is_qkv_mxfp8 and query.ndim == 4:
-        # Reshape Q/K/V to the 4D layout the kernel expects:
-        # Q: (1, B, Hq, K) → (B, 1, Hq, K)
-        _, B, Hq, K = query.shape
-        Mkv_padded = key.shape[1] // B
-        Hkv = key.shape[2]
-        query = query.squeeze(0).unsqueeze(1).reshape(B, 1, Hq, K).contiguous()
-        key = key.contiguous().view(torch.float8_e4m3fn).reshape(B, Mkv_padded, Hkv, K)
-        value = (
-            value.contiguous().view(torch.float8_e4m3fn).reshape(B, Mkv_padded, Hkv, K)
-        )
+        key, key_scale = bmghk2bmhk(key, key_scale, handle_rep_heads=True)
+        value, value_scale = bmghk2bmhk(value, value_scale, handle_rep_heads=True)
 
     # For paged attention or varlen, fold 4D to 3D
     should_fold = (
@@ -190,9 +163,8 @@ def _convert_input_format(
     if should_fold:
         # Fold to 3D when using varlen or paged attention
         query, _ = bmhk2bhk(query)
-        if not is_qkv_mxfp8:
-            key, key_scale = bmhk2bhk(key, key_scale)
-            value, value_scale = bmhk2bhk(value, value_scale)
+        key, key_scale = bmhk2bhk(key, key_scale)
+        value, value_scale = bmhk2bhk(value, value_scale)
 
     # For paged attention, K/V have shape (num_pages, page_size, heads, dim) - view to that shape
     if isinstance(
@@ -219,43 +191,25 @@ def _convert_input_format(
             use_fp32_scales=inp.use_fp32_scales,
         )
     elif isinstance(inp, InputsMXFp8):  # MXFP8 input
-        if is_qkv_mxfp8:
-            # Full MXFP8: Q/K/V are already 4D fp8, scales are already atom-tiled.
-            new_inp = InputsMXFp8(
-                query=query,
-                key=key,
-                value=value,
-                attn_bias=attn_bias,
-                p=inp.p,
-                scale=inp.scale,
-                output_dtype=inp.output_dtype,
-                is_partial=inp.is_partial,
-                k_fp8_scale=key_scale,
-                v_fp8_scale=value_scale,
-                q_fp8_scale=query_scale,
-            )
-        else:
-            key = key.view(torch.float8_e4m3fn)
-            value = value.view(torch.float8_e4m3fn)
-            key_scale = key_scale.view(torch.float8_e8m0fnu)
-            key_scale = key_scale.view(*key.shape[:-1], key.shape[-1] // 32)
+        key = key.view(torch.float8_e4m3fn)
+        value = value.view(torch.float8_e4m3fn)
+        key_scale = key_scale.view(torch.float8_e8m0fnu)
+        value_scale = value_scale.view(torch.float8_e8m0fnu)
+        key_scale = key_scale.view(*key.shape[:-1], key.shape[-1] // 32)
+        value_scale = value_scale.view(*value.shape[:-1], value.shape[-1] // 32)
 
-            value_scale = value_scale.view(torch.float8_e8m0fnu)
-            value_scale = value_scale.view(*value.shape[:-1], value.shape[-1] // 32)
-
-            new_inp = InputsMXFp8(
-                query=query,
-                key=key,
-                value=value,
-                attn_bias=attn_bias,
-                p=inp.p,
-                scale=inp.scale,
-                output_dtype=inp.output_dtype,
-                is_partial=inp.is_partial,
-                k_fp8_scale=key_scale,
-                v_fp8_scale=value_scale,
-                q_fp8_scale=None,
-            )
+        new_inp = InputsMXFp8(
+            query=query,
+            key=key,
+            value=value,
+            attn_bias=attn_bias,
+            p=inp.p,
+            scale=inp.scale,
+            output_dtype=inp.output_dtype,
+            is_partial=inp.is_partial,
+            k_fp8_scale=key_scale,
+            v_fp8_scale=value_scale,
+        )
     else:
         new_inp = Inputs(
             query=query,
@@ -526,11 +480,7 @@ class FwOpDecode(AttentionFwOpBase):
 
     OPERATOR = _get_operator("_flash_attn_decode")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    SUPPORTED_DTYPES: Set[torch.dtype] = {
-        torch.bfloat16,
-        torch.float16,
-        torch.float8_e4m3fn,
-    }
+    SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
     SUPPORTED_MAX_K = 128
     SUPPORTED_MIN_K = 64
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
@@ -614,18 +564,16 @@ class FwOpDecode(AttentionFwOpBase):
             )
             k_fp8_scale = inp.k_fp8_scale_shift
             v_fp8_scale = inp.v_fp8_scale_shift
-            q_fp8_scale = None
+
         elif isinstance(inp, InputsMXFp8):
             assert inp.k_fp8_scale is not None and inp.v_fp8_scale is not None, (
                 "k_fp8_scale and v_fp8_scale must be provided when inp is InputsMxfp8"
             )
             k_fp8_scale = inp.k_fp8_scale
             v_fp8_scale = inp.v_fp8_scale
-            q_fp8_scale = inp.q_fp8_scale
         else:
             k_fp8_scale = None
             v_fp8_scale = None
-            q_fp8_scale = None
 
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, _ = cls.OPERATOR(
@@ -634,7 +582,6 @@ class FwOpDecode(AttentionFwOpBase):
                 v=inp.value,
                 k_scale_shift=k_fp8_scale,  # Rowwise fp8: scale_shift; MXFP8: scale
                 v_scale_shift=v_fp8_scale,  # Rowwise fp8: scale_shift; MXFP8: scale
-                q_scale_shift=q_fp8_scale,  # QKV MXFP8: Q scale; None otherwise
                 cu_seqlens_q=cu_seqlens_q,  # not used
                 cu_seqlens_k=cu_seqlens_k,  # not used
                 seqlen_kv=seqused_k,
