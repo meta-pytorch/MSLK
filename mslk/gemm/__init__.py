@@ -10,6 +10,8 @@ from mslk.utils.torch.library import load_library_buck
 
 load_library_buck("//mslk/csrc/gemm:gemm_ops")
 
+from . import _meta  # noqa: F401
+
 gemm_ops = [
     "//mslk/csrc/gemm/cutlass:cutlass_bf16bf16bf16_grouped_grad",
     "//mslk/csrc/gemm/cutlass:cutlass_bf16bf16bf16_grouped_wgrad",
