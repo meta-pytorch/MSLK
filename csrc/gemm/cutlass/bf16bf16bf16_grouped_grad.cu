@@ -882,29 +882,9 @@ throw std::runtime_error(
 
 #endif
 
-at::Tensor bf16bf16bf16_grouped_grad_meta(
-    at::Tensor X,
-    at::Tensor W,
-    at::Tensor /* M_sizes */,
-    std::optional<at::Tensor> out,
-    std::optional<int64_t> /* num_sms */) {
-  const at::SymInt total_M = X.sym_size(0);
-  const at::SymInt N = W.sym_size(1);
-
-  if (out.has_value()) {
-    return out.value();
-  } else {
-    at::Tensor output = at::empty_symint({total_M, N}, X.options());
-    return output;
-  }
-}
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("bf16bf16bf16_grouped_grad", bf16bf16bf16_grouped_grad);
-}
-
-TORCH_LIBRARY_IMPL(mslk, Meta, m) {
-  m.impl("bf16bf16bf16_grouped_grad", bf16bf16bf16_grouped_grad_meta);
 }
 
 TORCH_LIBRARY_FRAGMENT(mslk, m) {
