@@ -8,15 +8,16 @@
 
 from mslk.utils.torch.library import load_library_buck
 
-from . import cutlass_blackwell_fmha_custom_op  # noqa: F401
-from .cutlass_blackwell_fmha_interface import (  # noqa: F401
+load_library_buck(
+    "//mslk/csrc/attention/cuda/cutlass_blackwell_fmha:blackwell_attention_ops_gpu"
+)
+
+from . import _meta  # noqa: F401, E402
+from . import cutlass_blackwell_fmha_custom_op  # noqa: F401, E402
+from .cutlass_blackwell_fmha_interface import (  # noqa: F401, E402
     _cutlass_blackwell_fmha_forward,
     cutlass_blackwell_fmha_decode_forward,
     cutlass_blackwell_fmha_func,
-)
-
-load_library_buck(
-    "//mslk/csrc/attention/cuda/cutlass_blackwell_fmha:blackwell_attention_ops_gpu"
 )
 
 # Note: _cutlass_blackwell_fmha_forward is an internal function (indicated by leading underscore)

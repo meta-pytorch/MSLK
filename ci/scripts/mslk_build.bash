@@ -595,7 +595,9 @@ __verify_library_symbols () {
   if [ "${mslk_build_target}" == "default" ]; then
     local lib_symbols_to_check=(
       mslk::gemm::f8f8bf16_rowwise
-      mslk::moe::index_shuffling_torch
+      # NOTE: mslk::moe::index_shuffling_torch is now in mslk_stable.so
+      # and registered via TORCH_BOX (stable ABI). Boxed symbols are not
+      # exported in the dynamic symbol table, so we cannot check for them here.
     )
   fi
 
