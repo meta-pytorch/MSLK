@@ -1,9 +1,9 @@
+.claude
+.hypothesis
 _skbuild/
 *.egg-info/
 dist/
 mslk/bench
 mslk/version.py
 **/__pycache__
-.claude
-.hypothesis
 **/*.so
