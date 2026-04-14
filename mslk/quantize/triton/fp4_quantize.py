@@ -2379,6 +2379,7 @@ def nvfp4_quantize_stacked(
         m_per_block = 64
         n_stages = 1
 
+    # pyre-ignore[28]
     _nvfp4_quantize_stacked_kernel[grid](
         input,
         global_scale,
@@ -2394,7 +2395,7 @@ def nvfp4_quantize_stacked(
         PREFIX_NUM=triton.next_power_of_2(num_segments),
         BSEARCH_ITERS=max(1, (num_segments - 1).bit_length()),
         M_PER_BLOCK=m_per_block,  # pyre-ignore[6]
-        num_stages=n_stages,  # pyre-ignore[28]
+        num_stages=n_stages,
     )
 
     return xq.view(torch.float4_e2m1fn_x2), scale.view(torch.float8_e4m3fn)
