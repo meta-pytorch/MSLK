@@ -2779,10 +2779,7 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
 class MX8MX4Tests(unittest.TestCase):
     """Tests for the mixed MX8 x MX4 CUTLASS GEMM kernel (mx8mx4bf16)."""
 
@@ -2821,3 +2818,7 @@ class MX8MX4Tests(unittest.TestCase):
 
         # Mixed MX8xMX4 has higher tolerance than MX4xMX4 due to mixed precision
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=1.0e-1, rtol=1.0e-1)
+
+
+if __name__ == "__main__":
+    unittest.main()
