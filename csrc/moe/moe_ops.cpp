@@ -6,15 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <ATen/ATen.h>
 #include <mslk/moe/moe.h> // @manual
-#include <torch/library.h>
+#include <torch/csrc/stable/library.h>
 #include <cstdint>
 #include <optional>
 
 namespace mslk::moe {
 
-TORCH_LIBRARY_FRAGMENT(mslk, m) {
+STABLE_TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "index_shuffling(Tensor routing_scores,             "
       "                int? expert_index_start=None,      "
@@ -28,10 +27,10 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #endif
 }
 
-TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
-  m.impl("index_shuffling", index_shuffling_torch);
+STABLE_TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
+  m.impl("index_shuffling", TORCH_BOX(&index_shuffling_torch));
 #ifndef USE_ROCM
-  m.impl("scatter_add_along_first_dim", scatter_add_along_first_dim);
+  m.impl("scatter_add_along_first_dim", TORCH_BOX(&scatter_add_along_first_dim));
 #endif
 }
 
