@@ -204,8 +204,9 @@ def _convert_input_format(
     if should_fold:
         # Fold to 3D when using varlen or paged attention
         query, _ = bmhk2bhk(query)
-        key, key_scale = bmhk2bhk(key, key_scale)
-        value, value_scale = bmhk2bhk(value, value_scale)
+        if not is_qkv_mxfp8:
+            key, key_scale = bmhk2bhk(key, key_scale)
+            value, value_scale = bmhk2bhk(value, value_scale)
 
     # For paged attention, K/V have shape (num_pages, page_size, heads, dim) - view to that shape
     if isinstance(
