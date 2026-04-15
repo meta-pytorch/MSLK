@@ -117,6 +117,12 @@ class MSLKBuild:
         )
 
         setup_py_args, other_args = parser.parse_known_args(argv)
+
+        # Allow env var to enable FB code build (useful when build system
+        # cannot pass CLI flags, e.g. uv / pip with no-build-isolation).
+        if os.environ.get("MSLK_BUILD_FB_CODE", "0") == "1":
+            setup_py_args.build_fb_code = True
+
         print(f"[SETUP.PY] Parsed setup.py arguments: {setup_py_args}")
         print(f"[SETUP.PY] Other arguments: {other_args}")
         return MSLKBuild(setup_py_args, other_args)
@@ -163,6 +169,12 @@ class MSLKBuild:
             pkg_name: str = "mslk"
         else:
             pkg_name: str = f"mslk-{self.target()}"
+
+        # Allow overriding the package name via env var for local workspace
+        # builds (e.g. uv) where the name must match the dependency exactly.
+        env_name = os.environ.get("MSLK_PACKAGE_NAME")
+        if env_name:
+            return env_name
 
         if self.nova_flag() is None:
             if self.package_channel() != "release":
@@ -636,6 +648,16 @@ def main(argv: List[str]) -> None:
         "flash3": ["flash-attn-3"],
     }
 
+    packages = setuptools.find_packages()
+
+    # When building with FB code in python-only mode, include fb/ packages
+    # under the mslk.fb namespace so they are importable as mslk.fb.*.
+    # In cmake mode, the CMake install(DIRECTORY ...) handles this instead.
+    if _PYTHON_ONLY and os.environ.get("MSLK_BUILD_FB_CODE", "0") == "1":
+        fb_pkgs = setuptools.find_namespace_packages(where="fb")
+        packages.extend(["mslk.fb"] + [f"mslk.fb.{p}" for p in fb_pkgs])
+        extra_kwargs["package_dir"] = {"mslk.fb": "fb"}
+
     _setup_fn(
         name=package_name,
         version=package_version,
@@ -653,7 +675,7 @@ def main(argv: List[str]) -> None:
             "CUDA",
             "ROCm",
         ],
-        packages=setuptools.find_packages(),
+        packages=packages,
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
             # release version of torch, which is not what we want for the
