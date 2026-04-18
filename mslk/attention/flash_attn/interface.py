@@ -13,6 +13,7 @@ try:
     from mslk.fb.mslk.attention.flash_attn import flash_attn_func as _flash_attn_func
     from mslk.fb.mslk.attention.flash_attn.interface import (
         flash_attn_combine,
+        FlashAttnFunc,
         mslk_flash_attn_bwd as _flash_attn_bwd,
         mslk_flash_attn_decode as _flash_attn_decode,
         mslk_flash_attn_fwd as _flash_attn_fwd,
@@ -23,6 +24,7 @@ except ImportError:
         _flash_attn_fwd,
         flash_attn_combine,
         flash_attn_func as _flash_attn_func,
+        FlashAttnFunc,
     )
 
     _flash_attn_decode = not_implemented
