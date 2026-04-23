@@ -8,8 +8,13 @@
 
 #ifndef USE_ROCM
 
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/stableivalue_conversions.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
+
 #include <cute/algorithm/functional.hpp>
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -20,9 +25,13 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cluster_launch.hpp>
 #include <cutlass/device_kernel.h>
+#include <cuda_runtime.h>
+
 #include <mslk/moe/moe.h> // @manual
 
 namespace mslk::moe {
+
+using torch::stable::Tensor;
 
 namespace {
 
@@ -185,21 +194,21 @@ struct TorchDTypeTrait {};
 template <>
 struct TorchDTypeTrait<cutlass::bfloat16_t> {
   static auto dtype() {
-    return at::kBFloat16;
+    return torch::headeronly::ScalarType::BFloat16;
   };
 };
 
 template <>
 struct TorchDTypeTrait<int32_t> {
   static auto dtype() {
-    return at::kInt;
+    return torch::headeronly::ScalarType::Int;
   };
 };
 
 template <>
 struct TorchDTypeTrait<int64_t> {
   static auto dtype() {
-    return at::kLong;
+    return torch::headeronly::ScalarType::Long;
   };
 };
 
@@ -209,15 +218,17 @@ template <
     class IndexType,
     class TMAStoreInst = cute::SM90_TMA_STORE>
 void gather_or_scatter_along_first_dim(
-    at::Tensor src,
-    at::Tensor index,
-    at::Tensor dst) {
-  TORCH_CHECK(
-      src.dtype() == TorchDTypeTrait<DataType>::dtype(), "src dtype mismatch");
-  TORCH_CHECK(
-      dst.dtype() == TorchDTypeTrait<DataType>::dtype(), "dst dtype mismatch");
-  TORCH_CHECK(
-      index.dtype() == TorchDTypeTrait<IndexType>::dtype(),
+    Tensor src,
+    Tensor index,
+    Tensor dst) {
+  STD_TORCH_CHECK(
+      src.scalar_type() == TorchDTypeTrait<DataType>::dtype(),
+      "src dtype mismatch");
+  STD_TORCH_CHECK(
+      dst.scalar_type() == TorchDTypeTrait<DataType>::dtype(),
+      "dst dtype mismatch");
+  STD_TORCH_CHECK(
+      index.scalar_type() == TorchDTypeTrait<IndexType>::dtype(),
       "index dtype mismatch");
 
   constexpr int L = kL;
@@ -274,7 +285,13 @@ void gather_or_scatter_along_first_dim(
   dim3 block_dims(32, 1, 1);
   dim3 cluster_dims(1, 1, 1);
   int smem_size = sizeof(SmemT);
-  auto stream = c10::cuda::getCurrentCUDAStream();
+
+  // Get CUDA stream via stable ABI
+  void* stream_ptr = nullptr;
+  TORCH_ERROR_CODE_CHECK(
+      aoti_torch_get_current_cuda_stream(
+          src.get_device_index(), &stream_ptr));
+  cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
 
   cutlass::ClusterLaunchParams launch_params{
       grid_dims, block_dims, cluster_dims, smem_size, stream};
@@ -310,32 +327,33 @@ void gather_or_scatter_along_first_dim(
 } // namespace
 
 void scatter_add_along_first_dim(
-    at::Tensor dst,
-    at::Tensor src,
-    at::Tensor index) {
+    Tensor dst,
+    Tensor src,
+    Tensor index) {
   const int M = src.size(0);
   const int K = src.size(1);
   const int N = index.size(0);
   if (N == 0 || M == 0) {
-    TORCH_CHECK(M == 0, "M must be 0 when N == 0 || M == 0");
+    STD_TORCH_CHECK(M == 0, "M must be 0 when N == 0 || M == 0");
     return;
   }
   if (dst.is_contiguous() && dst.dim() == 2 && src.is_contiguous() &&
       src.dim() == 2 && index.is_contiguous() && index.dim() == 1) {
     using T = cutlass::bfloat16_t;
 
-    TORCH_CHECK(dst.size(1) == K, "dst.size(1) must equal K");
+    STD_TORCH_CHECK(dst.size(1) == K, "dst.size(1) must equal K");
     // TODO(shikaili): Make it supports more configurations.
-    if (dst.dtype() == at::kBFloat16 && src.dtype() == at::kBFloat16 &&
+    if (dst.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
+        src.scalar_type() == torch::headeronly::ScalarType::BFloat16 &&
         (K * sizeof(T) % kTmaGmemAlignment == 0) && (K % kL == 0)) {
-      if (index.dtype() == at::kInt) {
+      if (index.scalar_type() == torch::headeronly::ScalarType::Int) {
         gather_or_scatter_along_first_dim<
             false,
             T,
             int32_t,
             cute::SM90_TMA_REDUCE_ADD>(src, index, dst);
         return;
-      } else if (index.dtype() == at::kLong) {
+      } else if (index.scalar_type() == torch::headeronly::ScalarType::Long) {
         gather_or_scatter_along_first_dim<
             false,
             T,
@@ -346,7 +364,38 @@ void scatter_add_along_first_dim(
     }
   }
 
-  dst.scatter_add_(0, index.to(at::kLong).unsqueeze(1).expand({-1, K}), src);
+  // Fallback: use dispatcher calls for unsupported configurations.
+  // Chain: index.to(kLong) -> unsqueeze(1) -> expand({-1, K}) -> scatter_add_
+  namespace detail = torch::stable::detail;
+
+  // index.to(kLong)
+  auto index_long = torch::stable::to(index, torch::headeronly::ScalarType::Long);
+
+  // unsqueeze(1)
+  auto index_unsqueezed = torch::stable::unsqueeze(index_long, 1);
+
+  // expand({-1, K})
+  {
+    std::vector<int64_t> expand_size = {-1, static_cast<int64_t>(K)};
+    const auto num_args = 3;
+    std::array<StableIValue, num_args> stack{
+        detail::from(index_unsqueezed),
+        detail::from(expand_size),
+        detail::from(false)};
+    TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(
+        "aten::expand", "", stack.data(), TORCH_ABI_VERSION));
+    auto index_expanded = detail::to<Tensor>(stack[0]);
+
+    // scatter_add_(0, index_expanded, src)
+    const auto sa_num_args = 4;
+    std::array<StableIValue, sa_num_args> sa_stack{
+        detail::from(dst),
+        detail::from(static_cast<int64_t>(0)),
+        detail::from(index_expanded),
+        detail::from(src)};
+    TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(
+        "aten::scatter_add_", "", sa_stack.data(), TORCH_ABI_VERSION));
+  }
 }
 
 } // namespace mslk::moe

@@ -12,11 +12,12 @@ glob_files_nohip(mslk_cpp_source_files_cpu
   csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cpp
   csrc/conv/*.cpp
   csrc/gemm/*.cpp
-  csrc/moe/*.cpp
+  # NOTE: csrc/moe/*.cpp moved to MslkStable.cmake
   csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
-  csrc/moe/*.cu)
+  # NOTE: csrc/moe/*.cu moved to MslkStable.cmake
+)
 
 # Include FB-internal sources into the build
 if(BUILD_FB_CODE

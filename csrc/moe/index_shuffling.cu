@@ -6,25 +6,29 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <ATen/ATen.h>
-#include <ATen/Dispatch.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/core/Dispatch.h>
+#include <torch/headeronly/util/Exception.h>
+
 #ifdef USE_ROCM
 #include <hip/hip_fp16.h>
 #else
 #include <cuda_bf16.h>
 #endif
+#include <cuda_runtime.h>
+
 #include <mslk/moe/moe.h> // @manual
-#include <torch/torch.h>
-
-#include <mslk/utils/device/cuda_utilities.cuh>
-#include <mslk/utils/kernel_launcher.cuh>
-
-#define DISPATCH_CASE_FLOATING_TYPES(...)              \
-  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+#include <mslk/utils/device/cuda_utilities_stable.cuh>
+#include <mslk/utils/kernel_launcher_stable.cuh>
 
 namespace mslk::moe {
+
+using torch::stable::Tensor;
+namespace tsa = torch::stable::accelerator;
 
 namespace {
 
@@ -470,67 +474,110 @@ __global__ void index_shuffling_kernel(Params<DataType, IndexType> params) {
     params.token_count_per_expert[NumExperts + 1] = num_selected_tokens;
   }
 }
+
 } // namespace
 
-using mslk::utils::device::set_gpu_max_dynamic_shared_memory;
+#define DISPATCH_CASE_FLOATING_TYPES(...)                                       \
+  THO_DISPATCH_CASE(torch::headeronly::ScalarType::Float, __VA_ARGS__)          \
+  THO_DISPATCH_CASE(torch::headeronly::ScalarType::BFloat16, __VA_ARGS__)
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
-    const at::Tensor& routing_scores,
+// Kernel template dispatch macros — defined at file scope so they work
+// inside THO_DISPATCH_SWITCH's lambda.
+#ifndef USE_ROCM
+#define DISPATCH(E, B, K, S)          \
+  if (S <= 128) {                     \
+    DISPATCH_K(E, B, K);              \
+  } else if (storage_factor <= 256) { \
+    DISPATCH_K(E, B / 2, K);          \
+  } else if (storage_factor <= 512) { \
+    DISPATCH_K(E, B / 4, K);          \
+  } else {                            \
+    DISPATCH_K(E, B / 8, K);          \
+  }
+#else
+#define DISPATCH(E, B, K, S) \
+  STD_TORCH_CHECK(K == 1);   \
+  DISPATCH_EB(E, 8, 1)
+#endif
+
+#define DISPATCH_K(E, B, K) \
+  if (K == 1) {             \
+    DISPATCH_EB(E, B, 1)    \
+  } else if (K == 2) {      \
+    DISPATCH_EB(E, B, 2)    \
+  } else {                  \
+    STD_TORCH_CHECK(K == 4); \
+    DISPATCH_EB(E, B, 4)    \
+  }
+
+#define DISPATCH_EB(E, B, K)                                             \
+  kernel_ = (void*)index_shuffling_kernel<DataType, IndexType, E, B, K>; \
+  smem_size = sizeof(SharedStorage<DataType, IndexType, E, B, K>);
+
+std::tuple<Tensor, Tensor, Tensor> index_shuffling_torch(
+    const Tensor& routing_scores,
     const std::optional<int64_t>& expert_index_start,
     const std::optional<int64_t>& expert_index_end,
-    const std::optional<at::Tensor>& valid_token_count,
+    const std::optional<Tensor>& valid_token_count,
     const int64_t top_k = 1) {
-  TORCH_CHECK(
-      routing_scores.dtype() == torch::kBFloat16 ||
-          routing_scores.dtype() == torch::kFloat,
+  STD_TORCH_CHECK(
+      routing_scores.scalar_type() ==
+              torch::headeronly::ScalarType::BFloat16 ||
+          routing_scores.scalar_type() ==
+              torch::headeronly::ScalarType::Float,
       "routing_scores must be either BFloat16 or Float");
 
   using IndexType = int32_t;
 
   // Declare tensors outside the dispatch to ensure they're accessible for the
   // return statement
-  at::Tensor token_count_per_expert;
-  at::Tensor shuffled_expert_indices;
-  at::Tensor shuffled_token_indices;
+  Tensor token_count_per_expert;
+  Tensor shuffled_expert_indices;
+  Tensor shuffled_token_indices;
 
-  AT_DISPATCH_SWITCH(
+  THO_DISPATCH_SWITCH(
       routing_scores.scalar_type(),
       "index_shuffling_params",
       DISPATCH_CASE_FLOATING_TYPES([&] {
         using DataType = scalar_t;
 
-        TORCH_CHECK(routing_scores.dim() == 2);
+        STD_TORCH_CHECK(routing_scores.dim() == 2);
         const int num_tokens = routing_scores.size(0);
         const int num_experts = routing_scores.size(1);
-        TORCH_CHECK(
+        STD_TORCH_CHECK(
             num_experts == 16 || num_experts == 32 || num_experts == 128 ||
             num_experts == 320);
 
-        TORCH_CHECK(top_k == 1 || top_k == 2 || top_k == 4);
+        STD_TORCH_CHECK(top_k == 1 || top_k == 2 || top_k == 4);
 
         auto allocate_index_tensor = [&](int size) {
-          return at::empty(
-              {size},
-              at::TensorOptions().dtype(at::kInt).device(
-                  routing_scores.device()));
+          return torch::stable::new_empty(
+              routing_scores, {size}, torch::headeronly::ScalarType::Int);
         };
         token_count_per_expert = allocate_index_tensor(num_experts + 2);
         shuffled_expert_indices = allocate_index_tensor(num_tokens * top_k);
         shuffled_token_indices = allocate_index_tensor(num_tokens * top_k);
-        at::Tensor buffered_expert_indices =
+        Tensor buffered_expert_indices =
             allocate_index_tensor(num_tokens * top_k);
-        at::Tensor buffered_token_indices =
+        Tensor buffered_token_indices =
             allocate_index_tensor(num_tokens * top_k);
 #ifdef USE_ROCM
-        // TODO(shikaili): hipMetsetAsync is more expensive than ATen set zero.
-        token_count_per_expert.zero_();
+        // TODO(shikaili): hipMemsetAsync is more expensive than ATen set zero.
+        torch::stable::zero_(token_count_per_expert);
 #else
+        // Get CUDA stream from device index
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(
+            aoti_torch_get_current_cuda_stream(
+                routing_scores.get_device_index(), &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
+
         cudaMemsetAsync(
             token_count_per_expert.data_ptr(),
             0,
             token_count_per_expert.numel() *
-                token_count_per_expert.dtype().itemsize(),
-            at::cuda::getCurrentCUDAStream());
+                token_count_per_expert.element_size(),
+            stream);
 #endif
 
         // Avoid expensive `cudaGetDeviceProperties` call.
@@ -550,40 +597,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
         void* kernel_;
         int smem_size;
 
-// Reducing tile size as problem size increases to avoid
-// cudaErrorCooperativeLaunchTooLarge.
-// TopK > 1 is not supported on AMD yet.
-#ifndef USE_ROCM
-#define DISPATCH(E, B, K, S)          \
-  if (S <= 128) {                     \
-    DISPATCH_K(E, B, K);              \
-  } else if (storage_factor <= 256) { \
-    DISPATCH_K(E, B / 2, K);          \
-  } else if (storage_factor <= 512) { \
-    DISPATCH_K(E, B / 4, K);          \
-  } else {                            \
-    DISPATCH_K(E, B / 8, K);          \
-  }
-#else
-#define DISPATCH(E, B, K, S) \
-  TORCH_CHECK(K == 1);       \
-  DISPATCH_EB(E, 8, 1)
-#endif
-
-#define DISPATCH_K(E, B, K) \
-  if (K == 1) {             \
-    DISPATCH_EB(E, B, 1)    \
-  } else if (K == 2) {      \
-    DISPATCH_EB(E, B, 2)    \
-  } else {                  \
-    TORCH_CHECK(K == 4);    \
-    DISPATCH_EB(E, B, 4)    \
-  }
-
-#define DISPATCH_EB(E, B, K)                                             \
-  kernel_ = (void*)index_shuffling_kernel<DataType, IndexType, E, B, K>; \
-  smem_size = sizeof(SharedStorage<DataType, IndexType, E, B, K>);
-
         int storage_factor = top_k * num_experts;
 
         if (num_experts == 16) {
@@ -593,7 +606,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
         } else if (num_experts == 128) {
           DISPATCH(128, kNumTokensPerTileFewExperts, top_k, storage_factor)
         } else {
-          TORCH_CHECK(num_experts == 320);
+          STD_TORCH_CHECK(num_experts == 320);
           DISPATCH(320, kNumTokensPerTileFewExperts, top_k, storage_factor)
         }
     // This is to avoid build errors (divisibility asserts and local memory
@@ -621,7 +634,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
         Params<DataType, IndexType> params = {
             // Inputs
             .routing_scores =
-                reinterpret_cast<DataType*>(routing_scores.data_ptr()),
+                static_cast<const DataType*>(routing_scores.const_data_ptr()),
             .stride_t = static_cast<int>(routing_scores.stride(0)),
             .stride_e = static_cast<int>(routing_scores.stride(1)),
             .expert_index_start =
@@ -650,26 +663,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch(
         const int num_threads = kNumThreadsPerWarp * num_warps;
         dim3 grids(num_ctas);
         dim3 blocks(num_threads);
-        void* args[] = {(void*)&params};
-        auto stream = at::cuda::getCurrentCUDAStream();
 
 #ifdef USE_ROCM
         // hipLaunchCooperativeKernel seems to cause incorrect memory order
         // across kernel launches.
-        C10_CUDA_CHECK(hipLaunchKernel(
-            (void*)kernel_, grids, blocks, args, smem_size, stream));
+        void* args[] = {(void*)&params};
+        hipError_t err = hipLaunchKernel(
+            (void*)kernel_, grids, blocks, args, smem_size, stream);
+        STD_TORCH_CHECK(
+            err == hipSuccess,
+            "hipLaunchKernel failed: ", hipGetErrorString(err));
 #else
-        if (smem_size >= 48 * 1024) {
-          set_gpu_max_dynamic_shared_memory(kernel_, smem_size);
-        }
-
-        MSLK_LAUNCH_COOPERATIVE_KERNEL(
-            kernel_, grids, blocks, smem_size, stream, params);
+        mslk::utils::launch_cooperative_kernel(
+            kernel_, grids, blocks, smem_size, stream,
+            routing_scores.get_device_index(), params);
 #endif
       }));
 
   return std::make_tuple(
       token_count_per_expert, shuffled_expert_indices, shuffled_token_indices);
 }
+
+#undef DISPATCH
+#undef DISPATCH_K
+#undef DISPATCH_EB
 
 } // namespace mslk::moe

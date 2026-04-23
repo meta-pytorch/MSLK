@@ -24,3 +24,5 @@ from .gather_scatter import (  # noqa F401
     scatter_add_padded_tokens,
 )
 from .shuffling import combine_shuffling, split_shuffling  # noqa F401
+
+from . import _meta  # noqa: F401
