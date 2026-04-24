@@ -2224,6 +2224,8 @@ def _nvfp4_quantize_stacked_kernel(
     """
     tl.static_assert(M_PER_BLOCK <= 128)
     E4M3_EPS: tl.constexpr = 1.5258789e-05  # type: ignore[Incompatible variable type]
+    FP8_E4M3_MAX = 448.0  # type: ignore[Incompatible variable type]
+    FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
 
     NUM_ELEM_PER_LAYOUT: tl.constexpr = 128 * 4  # type: ignore[Incompatible variable type]
     NUM_N_BLOCKS = tl.cdiv(N, 64)
