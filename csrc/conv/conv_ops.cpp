@@ -18,11 +18,13 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #endif
 }
 
+#if !defined(USE_MTIA)
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
 #ifndef USE_ROCM
   m.impl("f8f8bf16_conv", f8f8bf16_conv);
 #endif
 }
+#endif // !defined(USE_MTIA)
 
 at::Tensor f8f8bf16_conv_meta(
     at::Tensor activation,
