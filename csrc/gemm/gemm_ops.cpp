@@ -91,6 +91,7 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #endif
 }
 
+#if !defined(USE_MTIA)
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_blockwise", f8f8bf16_blockwise);
   m.impl("f8f8bf16_tensorwise", f8f8bf16_tensorwise);
@@ -135,7 +136,9 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("preshuffle_i4", preshuffle_i4);
 #endif
 }
+#endif // !defined(USE_MTIA)
 
+#if !defined(USE_MTIA)
 // Unfortunately there's broken code in production sometimes calling these ops
 // on CPU for silly reasons. To prevent breaking the models, we need to keep the
 // ops registered on CPU.
@@ -183,6 +186,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("preshuffle_i4", preshuffle_i4);
 #endif
 }
+#endif // !defined(USE_MTIA)
 
 at::Tensor i8i8bf16_meta(
     at::Tensor XQ, // INT8
