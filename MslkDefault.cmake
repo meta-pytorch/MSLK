@@ -30,6 +30,12 @@ if(BUILD_FB_CODE
   glob_files_nohip(fb_only_sources_gpu
       fb/csrc/*/*.cu)
 
+  # natten is a BUCK-only kernel. Its vendor headers, defines, and .cu sources
+  # are not wired into this cmake build, so exclude the wrapper .cpp that would
+  # otherwise be picked up by the fb/csrc/*/*.cpp glob above.
+  list(FILTER fb_only_sources_cpu EXCLUDE REGEX "fb/csrc/natten/")
+  list(FILTER fb_only_sources_gpu EXCLUDE REGEX "fb/csrc/natten/")
+
   if(MSLK_FBPKG_BUILD)
     BLOCK_PRINT("[FBPKG] MSLK_FBPKG_BUILD is set.")
 
