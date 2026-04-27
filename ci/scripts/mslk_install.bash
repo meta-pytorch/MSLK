@@ -196,7 +196,6 @@ install_mslk_pip () {
   if [ "$mslk_variant_type_version" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME MSLK_CHANNEL[/VERSION] MSLK_VARIANT_TYPE[/VARIANT_VERSION]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env 0.8.0 cpu                  # Install the CPU variant, specific version from release channel"
     echo "    ${FUNCNAME[0]} build_env release cuda/13.0.0        # Install the CUDA 13.0 variant, latest version from release channel"
     echo "    ${FUNCNAME[0]} build_env test/0.8.0 cuda/13.0.0     # Install the CUDA 13.0 variant, specific version from test channel"
     echo "    ${FUNCNAME[0]} build_env nightly rocm/6.2           # Install the ROCM 6.2 variant, latest version from nightly channel"

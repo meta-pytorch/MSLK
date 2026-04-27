@@ -138,7 +138,6 @@ integration_mslk_pip_install_matrix_run () {
   if [ "$mslk_channel_version" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME PYTORCH_CHANNEL[/VERSION] MSLK_CHANNEL[/VERSION]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} test_env cpu test/2.2.0 test/0.8.0     # Run tests against all Python versions with PyTorch test/2.2.0 and MSLK test/0.8.0 (CPU-only)"
     echo "    ${FUNCNAME[0]} test_env cuda test/2.3.0 test/0.8.0    # Run tests against all Python versions with PyTorch test/2.3.0 and MSLK test/0.8.0 (all CUDA versions)"
     return 1
   else
@@ -207,10 +206,6 @@ integration_mslk_pip_install_matrix_run () {
     local variant_versions=(
       6.3
       6.4
-    )
-  elif [ "$variant_type" == "cpu" ]; then
-    local variant_versions=(
-      "none"
     )
   else
     echo "[TEST] Invalid variant type: ${variant_type}"

@@ -102,7 +102,8 @@ install_triton_pip () {
     install_from_pytorch_pip "${env_name}" pytorch-triton-rocm "${triton_version}" || return 1
 
   else
-    return 0
+    echo "[BUILD] Unknown BUILD_VARIANT '${BUILD_VARIANT}' for Triton installation; expected 'cuda' or 'rocm'"
+    return 1
   fi
 
   # shellcheck disable=SC2086
