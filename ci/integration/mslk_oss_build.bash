@@ -22,10 +22,8 @@ if [[ "$BUILD_VARIANT" == "rocm" ]]; then
   BUILD_VARIANT_VERSION=${BUILD_ROCM_VERSION}
 elif [[ "$BUILD_VARIANT" == "cuda" ]]; then
   BUILD_VARIANT_VERSION=${BUILD_CUDA_VERSION}
-elif [[ "$BUILD_VARIANT" == "cpu" ]]; then
-  BUILD_VARIANT_VERSION=none
 else
-  echo "[MSLK CI] Invalid build variant: $BUILD_VARIANT"
+  echo "[MSLK CI] Invalid build variant: $BUILD_VARIANT (must be cuda or rocm)"
   exit 1
 fi
 BUILD_ENV=${BUILD_ENV:-"build-py${PYTHON_VERSION}-torch${PYTORCH_VERSION//\//-}-${BUILD_VARIANT}${BUILD_VARIANT_VERSION}"}
