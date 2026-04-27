@@ -41,7 +41,7 @@ __export_package_channel_info () {
 __export_package_variant_info () {
   local package_variant_type_version="$1"
 
-  local FALLBACK_VERSION_CUDA="12.6.3"
+  local FALLBACK_VERSION_CUDA="13.0.0"
   local FALLBACK_VERSION_ROCM="6.3"
 
   if [ "$package_variant_type_version" == "cuda" ]; then

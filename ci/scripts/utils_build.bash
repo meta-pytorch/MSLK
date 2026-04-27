@@ -148,15 +148,15 @@ __remove_gcc_activation_scripts () {
   #   https://github.com/conda-forge/ctng-compiler-activation-feedstock/blob/main/recipe/activate-g%2B%2B.sh
   #
   # When we build under CUDA + Clang, we have to set NVCC_PREPEND_FLAGS to point
-  # out Clang as the host compiler.  But CUDA, as of 12.6+, also comes with its
-  # own activation scripts, where NVCC_PREPEND_FLAGS is appended to point out
-  # CXX as the host compiler.  See
+  # out Clang as the host compiler.  But CUDA also comes with its own activation
+  # scripts, where NVCC_PREPEND_FLAGS is appended to point out CXX as the host
+  # compiler.  See
   #   https://github.com/conda-forge/cuda-nvcc-feedstock/issues/20
   #   https://github.com/conda-forge/cuda-nvcc-feedstock/blob/main/recipe/activate.sh
   #
   # When -ccbin is added twice to NVCC_PREPEND_FLAGS, the last entry wins, and
   # so combining these two phenomenon, it becomes impossible to actually set
-  # Clang as the host compiler in CUDA 12.6+.
+  # Clang as the host compiler.
   #
   # The workaround for this issue is to delete the activation scripts for gcc,
   # since we only need gcc for the presence of libstdc++ when we build using
@@ -164,13 +164,11 @@ __remove_gcc_activation_scripts () {
   #   https://stackoverflow.com/questions/64289376/how-to-circumvent-anaconda-gcc-compiler
   #
   # shellcheck disable=SC2155,SC2086
-  if [[ "$BUILD_CUDA_VERSION" =~ ^12.6.*$ ]]; then
-      echo "[INSTALL] Removing GCC package activation scripts ..."
-      local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
-      print_exec ls -la ${conda_prefix}/etc/conda/activate.d
-      print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gcc_linux-${COMPILER_ARCHNAME}.sh
-      print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gxx_linux-${COMPILER_ARCHNAME}.sh
-  fi
+  echo "[INSTALL] Removing GCC package activation scripts ..."
+  local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
+  print_exec ls -la ${conda_prefix}/etc/conda/activate.d
+  print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gcc_linux-${COMPILER_ARCHNAME}.sh
+  print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gxx_linux-${COMPILER_ARCHNAME}.sh
 }
 
 __conda_install_clang () {
