@@ -121,15 +121,10 @@ __configure_mslk_build_nvcc () {
     -diag-suppress 20012
   )
 
-  # NOTE: This check covers both Nova and non-Nova builds, as we set
-  # BUILD_CUDA_VERSION to be CU_VERSION in the Nova build case
-  if ! [[ "$BUILD_CUDA_VERSION" =~ ^12.6.*$ ]] && [[ "$BUILD_CUDA_VERSION" != "cu126" ]]; then
-    # NOTE: This flag is only supported in NVCC 12.8+
-    nvcc_prepend_flags+=(
-      -diag-suppress 20280
-      -diag-suppress 20281
-    )
-  fi
+  nvcc_prepend_flags+=(
+    -diag-suppress 20280
+    -diag-suppress 20281
+  )
 
   if print_exec "conda run ${env_prefix} c++ --version | grep -i clang"; then
     echo "[BUILD] Host compiler is clang; setting stdlib to libstdc++..."
@@ -300,18 +295,11 @@ __configure_mslk_build_cuda () {
     # NOTE: It turns out that the order of the arch_list matters, and that
     # appending 7.0/7.5 to the back of the list mysteriously results in
     # undefined symbol errors on .SO loads
-    if  [[ $cuda_version_nvcc == *"V13.0"* ]] ||
-          [[ $cuda_version_nvcc == *"V12.9"* ]] ||
-          [[ $cuda_version_nvcc == *"V12.8"* ]]; then
+    if  [[ $cuda_version_nvcc == *"V13.0"* ]]; then
       local arch_list="8.0;9.0a;10.0a;12.0a"
 
-    elif  [[ $cuda_version_nvcc == *"V12.6"* ]] ||
-          [[ $cuda_version_nvcc == *"V12.4"* ]] ||
-          [[ $cuda_version_nvcc == *"V12.1"* ]]; then
-      local arch_list="8.0;9.0a"
-
     else
-      local arch_list="8.0;9.0a"
+      local arch_list="8.0;9.0a;10.0a;12.0a"
       echo "[BUILD] Unknown NVCC version $cuda_version_nvcc - setting TORCH_CUDA_ARCH_LIST to: ${arch_list}"
     fi
   fi
@@ -344,7 +332,7 @@ __configure_mslk_build_cuda () {
     -DTORCH_CUDA_ARCH_LIST="'${arch_list}'"
   )
 
-  # Explicitly set CUDA_HOME (for CUDA 12.6+)
+  # Explicitly set CUDA_HOME
   __configure_mslk_cuda_home
 
   # Set NVCC flags

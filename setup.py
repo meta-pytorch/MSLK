@@ -642,8 +642,8 @@ def main(argv: List[str]) -> None:
 
     # Flash Attention 3 package is optional.
     # Install with:
-    # pip install mslk[flash3] --extra-index-url https://download.pytorch.org/whl/cu126
-    # where cu126 changes to match the cuda version..
+    # pip install mslk[flash3] --extra-index-url https://download.pytorch.org/whl/cu130
+    # where cu130 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
     }

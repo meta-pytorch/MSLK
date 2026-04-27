@@ -18,27 +18,19 @@ __set_cuda_symlinks_envvars () {
   local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
   local new_cuda_home="${conda_prefix}/targets/${MACHINE_NAME_LC}-linux"
 
-  if  [[ "$BUILD_CUDA_VERSION" =~ ^11.*$ ]] ||
-      [[ "$BUILD_CUDA_VERSION" =~ ^12.1.*$ ]] ||
-      [[ "$BUILD_CUDA_VERSION" =~ ^12.4.*$ ]]; then
-    echo "[INSTALL] Target CUDA version is ${BUILD_CUDA_VERSION}, no need to add extra symlinks and env vars ..."
+  # NVTX has been moved in CUDA 12.6+ package layout, which causes PyTorch
+  # CMake scripts to complain.
+  echo "[INSTALL] Fixing file placements for CUDA ${BUILD_CUDA_VERSION} ..."
 
-  else
-    # CUDA 12.6 installation has a very different package layout than previous
-    # CUDA versions - notably, NVTX has been moved elsewhere, which causes
-    # PyTorch CMake scripts to complain.
-    echo "[INSTALL] Fixing file placements for CUDA ${BUILD_CUDA_VERSION}+ ..."
+  echo "[INSTALL] Creating symlinks: libnvToolsExt.so"
+  print_exec ln -sf "${conda_prefix}/lib/libnvToolsExt.so.1" "${conda_prefix}/lib/libnvToolsExt.so"
+  print_exec ln -sf "${new_cuda_home}/lib/libnvToolsExt.so.1" "${new_cuda_home}/lib/libnvToolsExt.so"
 
-    echo "[INSTALL] Creating symlinks: libnvToolsExt.so"
-    print_exec ln -sf "${conda_prefix}/lib/libnvToolsExt.so.1" "${conda_prefix}/lib/libnvToolsExt.so"
-    print_exec ln -sf "${new_cuda_home}/lib/libnvToolsExt.so.1" "${new_cuda_home}/lib/libnvToolsExt.so"
-
-    echo "[INSTALL] Copying nvtx3 headers ..."
-    # shellcheck disable=SC2086
-    print_exec cp -r ${conda_prefix}/nsight-compute*/host/*/nvtx/include/nvtx3/* ${conda_prefix}/include/
-    # shellcheck disable=SC2086
-    print_exec cp -r ${conda_prefix}/nsight-compute*/host/*/nvtx/include/nvtx3/* ${new_cuda_home}/include/
-  fi
+  echo "[INSTALL] Copying nvtx3 headers ..."
+  # shellcheck disable=SC2086
+  print_exec cp -r ${conda_prefix}/nsight-compute*/host/*/nvtx/include/nvtx3/* ${conda_prefix}/include/
+  # shellcheck disable=SC2086
+  print_exec cp -r ${conda_prefix}/nsight-compute*/host/*/nvtx/include/nvtx3/* ${new_cuda_home}/include/
 
   echo "[INSTALL] Appending libcuda.so path to LD_LIBRARY_PATH ..."
   # shellcheck disable=SC2155
@@ -191,24 +183,8 @@ install_cuda () {
   local env_prefix=$(env_name_or_prefix "${env_name}")
   echo "[INSTALL] Installing CUDA ${cuda_version} ..."
 
-  # NOTE: Currently, CUDA 12.6 and later cannot be installed using the
-  # nvidia/label/cuda-* conda channels, because we run into the following error:
-  #
-  #   LibMambaUnsatisfiableError: Encountered problems while solving:
-  #     - nothing provides __win needed by cuda-12.6.3-0
-  #
-  # As such, we use conda-forge for installing all CUDA versions, except for
-  # versions 12.4 and below, which are only available through
-  # nvidia/label/cuda-*)
-  if  [[ "$BUILD_CUDA_VERSION" =~ ^11.*$ ]] ||
-      [[ "$BUILD_CUDA_VERSION" =~ ^12.1.*$ ]] ||
-      [[ "$BUILD_CUDA_VERSION" =~ ^12.4.*$ ]]; then
-    # shellcheck disable=SC2086
-    (exec_with_retries 3 conda install --force-reinstall ${env_prefix} -c "nvidia/label/cuda-${cuda_version}" -y \
-      cuda) || return 1
-  else
-    # shellcheck disable=SC2086
-    (exec_with_retries 3 conda install ${env_prefix} -c conda-forge --override-channels -y \
+  # shellcheck disable=SC2086
+  (exec_with_retries 3 conda install ${env_prefix} -c conda-forge --override-channels -y \
       "cuda-version=${cuda_version%.*}" \
       cuda-compiler \
       cuda-libraries-dev \
@@ -222,7 +198,6 @@ install_cuda () {
       cuda-profiler-api \
       cuda-opencl-dev \
       nsight-compute) || return 1
-  fi
 
   # Set the symlinks and environment variables not covered by conda install
   __set_cuda_symlinks_envvars
