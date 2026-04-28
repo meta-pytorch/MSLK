@@ -283,8 +283,8 @@ class BuildConfigScheme:
 
     def cuda_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
-            return ["12.8.1"]
-        return ["12.6.3", "12.8.1", "12.9.1", "13.0.2"]
+            return ["13.0.2"]
+        return ["13.0.2"]
 
     def rocm_versions(self) -> List[str]:
         if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:

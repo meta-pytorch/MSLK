@@ -73,9 +73,9 @@ install_pytorch_pip () {
 
   # Install the main dependencies
   #
-  # NOTE: Since CUDA 12.6, the conda channels information after CUDA installation
-  # gets messed up, and adding the --override-channels flag is needed to get
-  # packages to be installed correctly.  See:
+  # NOTE: The conda channels information after CUDA installation gets messed up,
+  # and adding the --override-channels flag is needed to get packages to be
+  # installed correctly.  See:
   #   https://github.com/conda/conda/issues/14063#issuecomment-2244508044
   #
   # shellcheck disable=SC2086

@@ -11,11 +11,11 @@ primitives for GenAI training and inference.
 
 ```bash
 # Install MSLK for CUDA
-pip install mslk-cuda==1.0.0
+pip install mslk --index-url https://download.pytorch.org/whl/cu130
 # Install MSLK for ROCm
-pip install mslk-rocm==1.0.0
+pip install mslk --index-url https://download.pytorch.org/whl/rocm7.1/
 # Install a nightly CUDA version
-pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu130
 # Install a nightly ROCm version
 pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
 ```
