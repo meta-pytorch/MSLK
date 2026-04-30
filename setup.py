@@ -246,12 +246,19 @@ class MSLKBuild:
         )
 
         if self.package_channel() == "nightly":
-            # Use date stamp for nightly versions
-            logging.debug(
-                "[SETUP.PY] Package is for NIGHTLY; using timestamp for the versioning"
-            )
-            today = date.today()
-            pkg_version = f"{today.year}.{today.month}.{today.day}"
+            # Use date stamp for nightly versions unless overridden
+            version_override = os.environ.get("MSLK_VERSION_OVERRIDE", "")
+            if version_override:
+                logging.debug(
+                    f"[SETUP.PY] Using MSLK_VERSION_OVERRIDE={version_override}"
+                )
+                pkg_version = version_override
+            else:
+                logging.debug(
+                    "[SETUP.PY] Package is for NIGHTLY; using timestamp for the versioning"
+                )
+                today = date.today()
+                pkg_version = f"{today.year}.{today.month}.{today.day}"
 
         elif self.nova_flag() is not None:
             # For Nova workflow contexts, we want to strip out the `rcN` suffix
@@ -642,8 +649,8 @@ def main(argv: List[str]) -> None:
 
     # Flash Attention 3 package is optional.
     # Install with:
-    # pip install mslk[flash3] --extra-index-url https://download.pytorch.org/whl/cu130
-    # where cu130 changes to match the cuda version..
+    # pip install mslk[flash3] --extra-index-url https://download.pytorch.org/whl/cu126
+    # where cu126 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
     }

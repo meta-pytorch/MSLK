@@ -56,8 +56,13 @@ else:
         #
         # To work around this problem, we introduce a fake build variant called
         # `docs` and we only throw a library load error when the variant is not
-        # `docs`.  For more information, see:
+        # `docs`.  We also suppress load failures when CUDA is not available
+        # (e.g. CPU-only CI) so that ``import mslk`` succeeds for availability
+        # checks by downstream packages like torchao.
+        #
+        # For more information, see:
         #
         #   https://github.com/pytorch/FBGEMM/pull/3477
         #   https://github.com/pytorch/FBGEMM/pull/3717
-        _load_library(f"{library}.so", __version__, __variant__ == "docs")
+        _no_throw = __variant__ == "docs" or not torch.cuda.is_available()
+        _load_library(f"{library}.so", __version__, _no_throw)
