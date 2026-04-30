@@ -3125,5 +3125,155 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
 
+def _supports_int8_triton() -> bool:
+    """True on ROCm (any CDNA GPU) or CUDA SM80+."""
+    if not torch.cuda.is_available():
+        return False
+    if torch.version.hip:
+        return True
+    return evaluate_cuda_compute_capability(8)
+
+
+@unittest.skipIf(not _supports_int8_triton(), "Requires CUDA SM80+ or ROCm")
+class RocmInt8GemmTests(unittest.TestCase):
+    """Correctness tests for the Triton INT8 GEMM kernel (BACKLOG-G1 / MSLK-G1).
+
+    On CUDA the tests verify parity with the existing CUTLASS i8i8bf16 path.
+    On ROCm they serve as the primary correctness gate since there is no
+    CUTLASS reference — output is compared against a float32 reference computed
+    with torch.mm.
+    """
+
+    device: torch.device
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = torch.device("cuda")
+        # Import Triton kernels only when the test class is actually instantiated.
+        from mslk.gemm.triton.int8_gemm import (  # noqa: F401
+            i8i8bf16_triton,
+            i8i8bf16_dynamic_triton,
+        )
+        cls.i8i8bf16_triton = staticmethod(i8i8bf16_triton)
+        cls.i8i8bf16_dynamic_triton = staticmethod(i8i8bf16_dynamic_triton)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_int8_pair(
+        M: int, N: int, K: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        XQ = torch.randint(-128, 128, (M, K), dtype=torch.int8, device=device)
+        WQ = torch.randint(-128, 128, (N, K), dtype=torch.int8, device=device)
+        return XQ, WQ
+
+    @staticmethod
+    def _reference_bf16(
+        XQ: torch.Tensor, WQ: torch.Tensor, scale: float
+    ) -> torch.Tensor:
+        """Float32 reference: cast to float, matmul, scale, cast to bf16."""
+        return (XQ.float() @ WQ.float().T * scale).bfloat16()
+
+    # ------------------------------------------------------------------
+    # Static-scale variant (i8i8bf16)
+    # ------------------------------------------------------------------
+
+    def _run_static(self, M: int, N: int, K: int, scale: float = 0.01) -> None:
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        ref = self._reference_bf16(XQ, WQ, scale)
+        out = self.i8i8bf16_triton(XQ, WQ, scale)
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+    def test_static_scale_small(self) -> None:
+        self._run_static(M=1, N=1024, K=1024)
+
+    def test_static_scale_decode(self) -> None:
+        self._run_static(M=128, N=4096, K=1024)
+
+    def test_static_scale_prefill(self) -> None:
+        self._run_static(M=256, N=4096, K=8192)
+
+    def test_static_scale_large(self) -> None:
+        self._run_static(M=256, N=8192, K=8192)
+
+    def test_static_scale_non_power_of_two_K(self) -> None:
+        # K not a multiple of BLOCK_K → boundary masking must be correct.
+        self._run_static(M=64, N=512, K=384)
+
+    # ------------------------------------------------------------------
+    # Dynamic-scale variant (i8i8bf16_dynamic)
+    # ------------------------------------------------------------------
+
+    def _run_dynamic(self, M: int, N: int, K: int, scale: float = 0.01) -> None:
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        scale_tensor = torch.tensor(scale, dtype=torch.float32, device=self.device)
+        ref = self._reference_bf16(XQ, WQ, scale)
+        out = self.i8i8bf16_dynamic_triton(XQ, WQ, scale_tensor)
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+    def test_dynamic_scale_small(self) -> None:
+        self._run_dynamic(M=1, N=1024, K=1024)
+
+    def test_dynamic_scale_decode(self) -> None:
+        self._run_dynamic(M=128, N=4096, K=1024)
+
+    def test_dynamic_scale_prefill(self) -> None:
+        self._run_dynamic(M=256, N=4096, K=8192)
+
+    # ------------------------------------------------------------------
+    # Parity with CUDA CUTLASS path (CUDA only)
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    def test_parity_with_cutlass_static(self) -> None:
+        M, N, K = 128, 2048, 4096
+        scale = 0.01
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        cutlass_out = torch.ops.mslk.i8i8bf16(XQ, WQ, scale, 1)
+        triton_out = self.i8i8bf16_triton(XQ, WQ, scale)
+        torch.testing.assert_close(cutlass_out, triton_out, atol=1e-2, rtol=1e-2)
+
+    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    def test_parity_with_cutlass_dynamic(self) -> None:
+        M, N, K = 128, 2048, 4096
+        scale = 0.01
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        scale_tensor = torch.tensor(scale, dtype=torch.float32, device=self.device)
+        cutlass_out = torch.ops.mslk.i8i8bf16_dynamic(XQ, WQ, scale_tensor, 1)
+        triton_out = self.i8i8bf16_dynamic_triton(XQ, WQ, scale_tensor)
+        torch.testing.assert_close(cutlass_out, triton_out, atol=1e-2, rtol=1e-2)
+
+    # ------------------------------------------------------------------
+    # torch.ops.mslk dispatch on ROCm
+    # ------------------------------------------------------------------
+
+    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    def test_ops_dispatch_static(self) -> None:
+        M, N, K = 128, 1024, 1024
+        scale = 0.01
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        out = torch.ops.mslk.i8i8bf16(XQ, WQ, scale, 1)
+        ref = self._reference_bf16(XQ, WQ, scale)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    def test_ops_dispatch_dynamic(self) -> None:
+        M, N, K = 128, 1024, 1024
+        scale = 0.01
+        XQ, WQ = self._make_int8_pair(M, N, K, self.device)
+        scale_tensor = torch.tensor(scale, dtype=torch.float32, device=self.device)
+        out = torch.ops.mslk.i8i8bf16_dynamic(XQ, WQ, scale_tensor, 1)
+        ref = self._reference_bf16(XQ, WQ, scale)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+
 if __name__ == "__main__":
     unittest.main()
