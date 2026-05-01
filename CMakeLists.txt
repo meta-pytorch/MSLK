@@ -183,4 +183,6 @@ endif()
 if(MSLK_BUILD_TARGET STREQUAL BUILD_TARGET_DEFAULT)
   # Build MSLK
   include(MslkDefault.cmake)
+  # Build MSLK Stable ABI library
+  include(MslkStable.cmake)
 endif()

@@ -8,6 +8,7 @@
 
 from mslk.utils.torch.library import load_library_buck
 
+from . import _meta  # noqa: F401
 from . import cutlass_blackwell_fmha_custom_op  # noqa: F401
 from .cutlass_blackwell_fmha_interface import (  # noqa: F401
     _cutlass_blackwell_fmha_forward,

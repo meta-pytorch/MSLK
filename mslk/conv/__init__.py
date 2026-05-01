@@ -9,3 +9,5 @@
 from mslk.utils.torch.library import load_library_buck
 
 load_library_buck("//mslk/csrc/conv:conv_ops")
+
+from . import _meta  # noqa: F401

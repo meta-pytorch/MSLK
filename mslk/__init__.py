@@ -36,6 +36,7 @@ except Exception:
 
 _default_libraries = [
     "mslk",
+    "mslk_stable",
 ]
 
 libraries_to_load = {
