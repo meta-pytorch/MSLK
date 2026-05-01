@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <style>
+      .title { font-size: 18px; font-weight: 600; fill: #1a1a2e; }
+      .subtitle { font-size: 12px; fill: #666; }
+      .axis-label { font-size: 12px; fill: #444; }
+      .tick-label { font-size: 11px; fill: #555; }
+      .legend-text { font-size: 12px; fill: #333; }
+      .grid { stroke: #e0e0e0; stroke-width: 0.5; }
+      .annotation { font-size: 10px; fill: #888; }
+      .speedup-label { font-size: 10px; font-weight: 600; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="#fafafa" rx="8"/>
+
+  <!-- Title -->
+  <text x="400" y="32" text-anchor="middle" class="title">NSA vs Dense Flash Attention (FA4) — NVIDIA B200</text>
+  <text x="400" y="50" text-anchor="middle" class="subtitle">B=2, H=32, H_kv=32, D=128, block_size=64, k=16, window=512 | Fused compress, select, gating kernels</text>
+
+  <!-- Chart area: x=100..720, y=70..400 -->
+  <!-- Y axis: 0 to 18ms -->
+  <!-- X axis: sequence lengths 1024, 2048, 4096, 8192, 16384, 32768 -->
+
+  <!-- Grid lines -->
+  <line x1="100" y1="400" x2="720" y2="400" class="grid"/>
+  <line x1="100" y1="363" x2="720" y2="363" class="grid"/>
+  <line x1="100" y1="327" x2="720" y2="327" class="grid"/>
+  <line x1="100" y1="290" x2="720" y2="290" class="grid"/>
+  <line x1="100" y1="253" x2="720" y2="253" class="grid"/>
+  <line x1="100" y1="217" x2="720" y2="217" class="grid"/>
+  <line x1="100" y1="180" x2="720" y2="180" class="grid"/>
+  <line x1="100" y1="143" x2="720" y2="143" class="grid"/>
+  <line x1="100" y1="107" x2="720" y2="107" class="grid"/>
+  <line x1="100" y1="70" x2="720" y2="70" class="grid"/>
+
+  <!-- Y axis labels (0 to 18ms, step 2) -->
+  <text x="90" y="404" text-anchor="end" class="tick-label">0</text>
+  <text x="90" y="367" text-anchor="end" class="tick-label">2</text>
+  <text x="90" y="330" text-anchor="end" class="tick-label">4</text>
+  <text x="90" y="294" text-anchor="end" class="tick-label">6</text>
+  <text x="90" y="257" text-anchor="end" class="tick-label">8</text>
+  <text x="90" y="220" text-anchor="end" class="tick-label">10</text>
+  <text x="90" y="184" text-anchor="end" class="tick-label">12</text>
+  <text x="90" y="147" text-anchor="end" class="tick-label">14</text>
+  <text x="90" y="110" text-anchor="end" class="tick-label">16</text>
+  <text x="90" y="74" text-anchor="end" class="tick-label">18</text>
+
+  <!-- Y axis title -->
+  <text x="30" y="235" text-anchor="middle" class="axis-label" transform="rotate(-90, 30, 235)">Latency (ms)</text>
+
+  <!-- X axis labels -->
+  <text x="130" y="420" text-anchor="middle" class="tick-label">1K</text>
+  <text x="248" y="420" text-anchor="middle" class="tick-label">2K</text>
+  <text x="366" y="420" text-anchor="middle" class="tick-label">4K</text>
+  <text x="484" y="420" text-anchor="middle" class="tick-label">8K</text>
+  <text x="602" y="420" text-anchor="middle" class="tick-label">16K</text>
+  <text x="720" y="420" text-anchor="middle" class="tick-label">32K</text>
+
+  <!-- X axis title -->
+  <text x="410" y="445" text-anchor="middle" class="axis-label">Sequence Length</text>
+
+  <!-- Axes -->
+  <line x1="100" y1="400" x2="720" y2="400" stroke="#333" stroke-width="1.5"/>
+  <line x1="100" y1="70" x2="100" y2="400" stroke="#333" stroke-width="1.5"/>
+
+  <!-- Scale: 18ms = 330px, so 1ms = 18.33px. y = 400 - (ms * 330/18) -->
+  <!--
+    MEASURED DATA (B200, B=2, H=32, H_kv=32, D=128, l=64, k=16, w=512, bf16):
+    Fused compress, fused select, fused gating kernels active.
+
+    Dense FA4:          NSA (fused):
+    1024:  0.08ms       1024:  1.05ms  (k=8, limited by N_cmp)
+    2048:  0.12ms       2048:  1.12ms
+    4096:  0.28ms       4096:  1.20ms
+    8192:  0.96ms       8192:  1.69ms
+    16384: 3.48ms       16384: 3.43ms
+    32768: 15.67ms      32768: 5.88ms
+
+    y = 400 - ms * 18.33
+  -->
+
+  <!-- Dense FA4 line (blue) -->
+  <polyline points="130,398.5 248,397.8 366,394.9 484,382.4 602,336.2 720,112.7"
+            fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Dense FA4 dots -->
+  <circle cx="130" cy="398.5" r="4" fill="#2563eb"/>
+  <circle cx="248" cy="397.8" r="4" fill="#2563eb"/>
+  <circle cx="366" cy="394.9" r="4" fill="#2563eb"/>
+  <circle cx="484" cy="382.4" r="4" fill="#2563eb"/>
+  <circle cx="602" cy="336.2" r="4" fill="#2563eb"/>
+  <circle cx="720" cy="112.7" r="4" fill="#2563eb"/>
+
+  <!-- NSA line (green — fused kernels) -->
+  <polyline points="130,380.8 248,379.5 366,378.0 484,369.0 602,337.1 720,292.2"
+            fill="none" stroke="#059669" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- NSA dots -->
+  <circle cx="130" cy="380.8" r="4" fill="#059669"/>
+  <circle cx="248" cy="379.5" r="4" fill="#059669"/>
+  <circle cx="366" cy="378.0" r="4" fill="#059669"/>
+  <circle cx="484" cy="369.0" r="4" fill="#059669"/>
+  <circle cx="602" cy="337.1" r="4" fill="#059669"/>
+  <circle cx="720" cy="292.2" r="4" fill="#059669"/>
+
+  <!-- Speedup annotation at 32K -->
+  <line x1="720" y1="292.2" x2="720" y2="112.7" stroke="#059669" stroke-width="1.5" stroke-dasharray="3,2"/>
+  <text x="730" y="200" class="speedup-label" fill="#059669">2.66x</text>
+
+  <!-- Speedup annotations at each point -->
+  <text x="130" y="375" class="speedup-label" fill="#059669">0.07x</text>
+  <text x="248" y="373" class="speedup-label" fill="#059669">0.11x</text>
+  <text x="366" y="372" class="speedup-label" fill="#059669">0.23x</text>
+  <text x="484" y="363" class="speedup-label" fill="#059669">0.57x</text>
+  <text x="602" y="330" class="speedup-label" fill="#059669">1.01x</text>
+  <text x="726" y="306" class="speedup-label" fill="#059669">2.66x</text>
+
+  <!-- Crossover line at ~16K (vertical dashed) -->
+  <line x1="600" y1="400" x2="600" y2="70" stroke="#059669" stroke-width="1" stroke-dasharray="4,3" opacity="0.4"/>
+
+  <!-- Legend -->
+  <rect x="140" y="70" width="240" height="52" fill="white" stroke="#ddd" rx="4"/>
+  <line x1="152" y1="85" x2="180" y2="85" stroke="#2563eb" stroke-width="2.5"/>
+  <circle cx="166" cy="85" r="3.5" fill="#2563eb"/>
+  <text x="186" y="89" class="legend-text">Dense FA4 (Flash Attention)</text>
+  <line x1="152" y1="107" x2="180" y2="107" stroke="#059669" stroke-width="2.5"/>
+  <circle cx="166" cy="107" r="3.5" fill="#059669"/>
+  <text x="186" y="111" class="legend-text">NSA (Fused CuteDSL kernels)</text>
+
+  <!-- Bottom annotations -->
+  <text x="400" y="472" text-anchor="middle" class="annotation">Dense FA4 scales as O(N²). NSA scales as O(N · (N/l + k·l + w)) where l=64, k=16, w=512.</text>
+  <text x="400" y="487" text-anchor="middle" class="annotation">NSA breaks even at ~16K and is 2.66x faster at 32K. Fused compress, select, and gating kernels. Measured on B200.</text>
+</svg>
