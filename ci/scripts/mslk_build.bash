@@ -182,22 +182,6 @@ __configure_mslk_cuda_home () {
   fi
 }
 
-__configure_mslk_build_cpu () {
-  # Update the package name and build args depending on if CUDA is specified
-  echo "[BUILD] Setting CPU-only build args ..."
-  build_args+=(
-    --build-variant=cpu
-  )
-}
-
-__configure_mslk_build_docs () {
-  # Update the package name and build args depending on if CUDA is specified
-  echo "[BUILD] Setting CPU-only (docs) build args ..."
-  build_args+=(
-    --build-variant=docs
-  )
-}
-
 __configure_mslk_build_rocm () {
   local mslk_variant_targets="$1"
 
@@ -363,15 +347,7 @@ __configure_mslk_build () {
   )
 
   # Append build args based on the build variant
-  if [ "$mslk_build_variant" == "cpu" ]; then
-    echo "[BUILD] Configuring build as CPU variant ..."
-    __configure_mslk_build_cpu || return 1
-
-  elif [ "$mslk_build_variant" == "docs" ]; then
-    echo "[BUILD] Configuring build as CPU (docs) variant ..."
-    __configure_mslk_build_docs || return 1
-
-  elif [ "$mslk_build_variant" == "rocm" ]; then
+  if [ "$mslk_build_variant" == "rocm" ]; then
     echo "[BUILD] Configuring build as ROCm variant ..."
     __configure_mslk_build_rocm "${mslk_variant_targets}" || return 1
 
@@ -412,9 +388,7 @@ __export_target_variant_info () {
   local mslk_build_target_variant="$1"
 
   # Extract the package channel and version from the tuple-string
-  if  [ "$mslk_build_target_variant" == "docs" ] ||
-      [ "$mslk_build_target_variant" == "cpu" ] ||
-      [ "$mslk_build_target_variant" == "cuda" ] ||
+  if  [ "$mslk_build_target_variant" == "cuda" ] ||
       [ "$mslk_build_target_variant" == "rocm" ]; then
     export mslk_build_target="default"
     export mslk_build_variant="${mslk_build_target_variant}"
@@ -522,7 +496,7 @@ __build_mslk_common_pre_steps () {
 
   # Set the default the MSLK build variant to be CUDA
   # shellcheck disable=SC2076
-  if [[ ! " docs cpu cuda rocm " =~ " $mslk_build_variant " ]]; then
+  if [[ ! " cuda rocm " =~ " $mslk_build_variant " ]]; then
     echo "################################################################################"
     echo "[BUILD] Unknown MSLK build VARIANT: ${mslk_build_variant}"
     echo "[BUILD] Exiting ..."
@@ -612,7 +586,7 @@ __run_audit_wheel () {
   if [ "$mslk_wheel" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} MSLK_WHEEL_PATH"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} dist/mslk_nightly_cpu-2024.12.20-cp39-cp39-manylinux_2_28_x86_64.whl"
+    echo "    ${FUNCNAME[0]} dist/mslk_nightly_cuda-2024.12.20-cp39-cp39-manylinux_2_28_x86_64.whl"
     return 1
   fi
 
@@ -638,7 +612,6 @@ build_mslk_package () {
   if [ "$mslk_build_target_variant" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME RELEASE_CHANNEL TARGET/VARIANT [VARIANT_TARGETS]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env release docs                             # Default build target, CPU-only (docs) build variant"
     echo "    ${FUNCNAME[0]} build_env nightly default/cuda                     # Default build target, CUDA build variant, default variant target(s)"
     echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                      # Default build target, CUDA build variant, custom variant target(s)"
     echo "    ${FUNCNAME[0]} build_env test rocm                                # Default build target, ROCm build variant, default variant target(s)"
@@ -711,8 +684,6 @@ build_mslk_install () {
   if [ "$mslk_build_target_variant" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME TARGET/VARIANT [TARGETS]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env release cpu                              # Default build target, CPU-only build variant"
-    echo "    ${FUNCNAME[0]} build_env release docs                             # Default build target, CPU-only (docs) build variant"
     echo "    ${FUNCNAME[0]} build_env nightly default/cuda                     # Default build target, CUDA build variant, default variant target(s)"
     echo "    ${FUNCNAME[0]} build_env test cuda '7.0;8.0'                      # Default build target, CUDA build variant, custom variant target(s)"
     echo "    ${FUNCNAME[0]} build_env test rocm                                # Default build target, ROCm build variant, default variant target(s)"
