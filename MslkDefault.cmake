@@ -30,6 +30,10 @@ if(BUILD_FB_CODE
   glob_files_nohip(fb_only_sources_gpu
       fb/csrc/*/*.cu)
 
+  # natten has its own build infrastructure and is not part of the conda build.
+  list(FILTER fb_only_sources_cpu EXCLUDE REGEX "fb/csrc/natten/")
+  list(FILTER fb_only_sources_gpu EXCLUDE REGEX "fb/csrc/natten/")
+
   if(MSLK_FBPKG_BUILD)
     BLOCK_PRINT("[FBPKG] MSLK_FBPKG_BUILD is set.")
 
