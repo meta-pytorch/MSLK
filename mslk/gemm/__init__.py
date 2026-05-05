@@ -16,3 +16,5 @@ gemm_ops = [
 ]
 for op in gemm_ops:
     load_library_buck(op)
+
+from . import _meta  # noqa: F401, E402
