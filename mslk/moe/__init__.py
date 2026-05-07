@@ -16,6 +16,13 @@ index_shuffling = None
 if torch.cuda.is_available():
     index_shuffling = torch.ops.mslk.index_shuffling  # noqa F401
 
+# Bypass set_python_module checks for internal; this check is disabled
+# by default in OSS PyTorch.
+import torch._utils_internal  # noqa: E402
+
+torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
+
+from . import _meta  # noqa: F401, E402
 from .activation import silu_mul, silu_mul_quant  # noqa F401
 from .gather_scatter import (  # noqa F401
     gather_scale_dense_tokens,

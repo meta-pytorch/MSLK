@@ -7,3 +7,4 @@ mslk/bench
 mslk/version.py
 **/__pycache__
 **/*.so
+*.profraw

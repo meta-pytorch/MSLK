@@ -16,3 +16,11 @@ gemm_ops = [
 ]
 for op in gemm_ops:
     load_library_buck(op)
+
+# Bypass set_python_module checks for internal; this check is disabled
+# by default in OSS PyTorch.
+import torch._utils_internal  # noqa: E402
+
+torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
+
+from . import _meta  # noqa: F401, E402

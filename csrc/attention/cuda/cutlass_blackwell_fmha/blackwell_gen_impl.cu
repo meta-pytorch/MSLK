@@ -414,29 +414,6 @@ std::tuple<at::Tensor, at::Tensor> dispatch_fmha_gen_fwd(
   });
 }
 
-std::tuple<at::Tensor, at::Tensor> dispatch_fmha_gen_fwd_meta(
-    const at::Tensor& q,
-    const at::Tensor& k,
-    const at::Tensor& v,
-    const at::Tensor& seqlen_kv,
-    const std::optional<at::Tensor>& batch_idx,
-    int64_t kernel_type,
-    int64_t window_left,
-    int64_t window_right,
-    int64_t split_k_size
-  ) {
-  // Return tuple matching the operator signature: (output, lse)
-  at::Tensor output = at::empty_like(q);
-  // LSE should have shape [B, num_splits, H]
-  int b = q.size(0);
-  int h = q.size(2);
-  // For meta, just create a dummy LSE with single split
-  at::Tensor lse = at::empty(
-      {b, 1, h},
-      at::TensorOptions().dtype(at::kFloat).device(at::kMeta));
-  return std::make_tuple(output, lse);
-}
-
 // -------------------------------------------------------------------------------------------------
 // Op registration
 // -------------------------------------------------------------------------------------------------
@@ -456,8 +433,5 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("fmha_gen_fwd", dispatch_fmha_gen_fwd);
-}
-TORCH_LIBRARY_IMPL(mslk, Meta, m) {
-  m.impl("fmha_gen_fwd", dispatch_fmha_gen_fwd_meta);
 }
 #endif // CUTLASS_ARCH_MMA_SM100_SUPPORTED

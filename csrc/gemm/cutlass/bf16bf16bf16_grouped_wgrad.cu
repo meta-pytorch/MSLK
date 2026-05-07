@@ -1111,26 +1111,8 @@ at::Tensor bf16bf16bf16_grouped_wgrad(
 
 #endif
 
-at::Tensor bf16bf16bf16_grouped_wgrad_meta(
-    at::Tensor X,
-    at::Tensor W,
-    at::Tensor M_sizes,
-    std::optional<at::Tensor> /* output = std::nullopt */,
-    bool /* output_accum = false */,
-    std::optional<int64_t> /* num_sms */) {
-  const at::SymInt G = M_sizes.size(0);
-  const at::SymInt N = X.sym_size(1);
-  const at::SymInt K = W.sym_size(1);
-  at::Tensor Y = at::empty_symint({G, N, K}, X.options());
-  return Y;
-}
-
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("bf16bf16bf16_grouped_wgrad", bf16bf16bf16_grouped_wgrad);
-}
-
-TORCH_LIBRARY_IMPL(mslk, Meta, m) {
-  m.impl("bf16bf16bf16_grouped_wgrad", bf16bf16bf16_grouped_wgrad_meta);
 }
 
 TORCH_LIBRARY_FRAGMENT(mslk, m) {

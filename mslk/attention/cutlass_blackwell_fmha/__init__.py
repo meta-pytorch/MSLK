@@ -8,15 +8,21 @@
 
 from mslk.utils.torch.library import load_library_buck
 
-from . import cutlass_blackwell_fmha_custom_op  # noqa: F401
-from .cutlass_blackwell_fmha_interface import (  # noqa: F401
+load_library_buck(
+    "//mslk/csrc/attention/cuda/cutlass_blackwell_fmha:blackwell_attention_ops_gpu"
+)
+
+# Bypass set_python_module checks for internal; this check is disabled
+# by default in OSS PyTorch.
+import torch._utils_internal  # noqa: E402
+
+torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
+
+from . import _meta, cutlass_blackwell_fmha_custom_op  # noqa: F401, E402
+from .cutlass_blackwell_fmha_interface import (  # noqa: F401, E402
     _cutlass_blackwell_fmha_forward,
     cutlass_blackwell_fmha_decode_forward,
     cutlass_blackwell_fmha_func,
-)
-
-load_library_buck(
-    "//mslk/csrc/attention/cuda/cutlass_blackwell_fmha:blackwell_attention_ops_gpu"
 )
 
 # Note: _cutlass_blackwell_fmha_forward is an internal function (indicated by leading underscore)

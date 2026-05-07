@@ -15,7 +15,6 @@
 namespace mslk::moe {
 
 TORCH_LIBRARY_FRAGMENT(mslk, m) {
-  m.set_python_module("mslk.moe");
   m.def(
       "index_shuffling(Tensor routing_scores,             "
       "                int? expert_index_start=None,      "
@@ -33,37 +32,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("index_shuffling", index_shuffling_torch);
 #ifndef USE_ROCM
   m.impl("scatter_add_along_first_dim", scatter_add_along_first_dim);
-#endif
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor> index_shuffling_torch_meta(
-    const at::Tensor& routing_scores,
-    const std::optional<int64_t>& expert_index_start,
-    const std::optional<int64_t>& expert_index_end,
-    const std::optional<at::Tensor>& valid_token_count,
-    const int64_t top_k = 1) {
-  auto T = routing_scores.sym_size(0);
-  auto E = routing_scores.sym_size(1);
-  at::Tensor token_counts_per_expert =
-      at::empty_symint({E + 2}, routing_scores.options().dtype(at::kInt));
-  at::Tensor expert_indices =
-      at::empty_symint({T * top_k}, routing_scores.options().dtype(at::kInt));
-  at::Tensor token_indices =
-      at::empty_symint({T * top_k}, routing_scores.options().dtype(at::kInt));
-  return {token_counts_per_expert, expert_indices, token_indices};
-}
-
-void scatter_add_along_first_dim_meta(
-    at::Tensor /*dst*/,
-    at::Tensor /*src*/,
-    at::Tensor /*index*/) {
-  return;
-}
-
-TORCH_LIBRARY_IMPL(mslk, Meta, m) {
-  m.impl("index_shuffling", index_shuffling_torch_meta);
-#ifndef USE_ROCM
-  m.impl("scatter_add_along_first_dim", scatter_add_along_first_dim_meta);
 #endif
 }
 
