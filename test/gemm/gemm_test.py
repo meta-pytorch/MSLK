@@ -16,7 +16,10 @@ import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
 from mslk.quantize.triton.fp4_quantize import (
+    calculate_group_max,
     get_nvfp4_global_scales_naive,
+    nvfp4_quantize_stacked,
+    nvfp4_quantize_stacked_with_token_scale,
     quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
 )
@@ -115,6 +118,14 @@ def supports_nvfp4():
     return False
 
 
+def supports_nvfp4_ultra():
+    if not torch.cuda.is_available() or not torch.version.cuda:
+        return False
+    cuda_major = int(torch.version.cuda.split(".")[0])
+    major, minor = torch.cuda.get_device_capability()
+    return cuda_major >= 13 and (major, minor) >= (10, 3)
+
+
 def supports_mxfp4():
     if torch.cuda.is_available():
         if torch.version.cuda:
@@ -129,6 +140,7 @@ SUPPORTS_MXFP8 = supports_mxfp8()
 SUPPORTS_FP8_INT4 = support_fp8_int4()
 SUPPORTS_BF16_INT4 = supports_bf16_int4()
 SUPPORTS_NVFP4 = supports_nvfp4()
+SUPPORTS_NVFP4_ULTRA = supports_nvfp4_ultra()
 SUPPORTS_MXFP4 = supports_mxfp4()
 
 if torch.cuda.is_available() and supports_float8_fnuz(
@@ -2448,6 +2460,94 @@ class NVFP4Tests(unittest.TestCase):
         self.assertTrue(out_nvfp4.isfinite().all(), "output contains non-finite values")
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
+
+    @unittest.skipIf(
+        not SUPPORTS_NVFP4_ULTRA,
+        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
+    )
+    def test_ultra_grouped_gemm_2d_3d(self) -> None:
+        G = 2
+        N = 512
+        K = 1024
+        m_sizes_list = [128, 256]
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        offsets = torch.cumsum(m_sizes, dim=0).to(torch.int32)
+
+        M = sum(m_sizes_list)
+        X = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        w_cat = W.reshape(G * N, K).contiguous()
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        wq, w_scale_2d = nvfp4_quantize_stacked(
+            w_m_sizes,
+            w_cat,
+            w_global_scale,
+        )
+        wq = wq.view(G, N, K // 2)
+        padded_N = ((N + 127) // 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        w_global_scale_inv = torch.reciprocal(w_global_scale)
+
+        xq, x_scale, x_token_scale_inv = nvfp4_quantize_stacked_with_token_scale(
+            m_sizes,
+            X,
+        )
+
+        out_nvfp4 = torch.ops.mslk.f4f4bf16_ultra_grouped_mm(
+            xq,
+            wq.transpose(-2, -1),
+            x_scale,
+            w_scale,
+            offsets,
+            x_token_scale_inv,
+            w_global_scale_inv,
+        )
+        self.assertTrue(out_nvfp4.isfinite().all(), "output contains non-finite values")
+
+        refs = []
+        start = 0
+        for group_idx, m_size in enumerate(m_sizes_list):
+            end = start + m_size
+            refs.append(X[start:end] @ W[group_idx].t())
+            start = end
+        out_bf16 = torch.cat(refs, dim=0).to(torch.bfloat16)
+
+        torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
+
+    @unittest.skipIf(
+        not SUPPORTS_NVFP4_ULTRA,
+        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
+    )
+    def test_ultra_grouped_gemm_meta(self) -> None:
+        G = 2
+        M = 384
+        N = 512
+        K = 1024
+        xq = torch.empty((M, K // 2), dtype=torch.float4_e2m1fn_x2, device="meta")
+        wq = torch.empty((G, K // 2, N), dtype=torch.float4_e2m1fn_x2, device="meta")
+        x_scale = torch.empty(
+            (M + G * 127, K // 16), dtype=torch.float8_e4m3fn, device="meta"
+        )
+        w_scale = torch.empty((G, N, K // 16), dtype=torch.float8_e4m3fn, device="meta")
+        offsets = torch.empty((G,), dtype=torch.int32, device="meta")
+        x_global_scale = torch.empty((M,), dtype=torch.float32, device="meta")
+        w_global_scale = torch.empty((G,), dtype=torch.float32, device="meta")
+
+        out = torch.ops.mslk.f4f4bf16_ultra_grouped_mm(
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            offsets,
+            x_global_scale,
+            w_global_scale,
+        )
+
+        self.assertEqual(out.shape, (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertEqual(out.device.type, "meta")
 
 
 @unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")

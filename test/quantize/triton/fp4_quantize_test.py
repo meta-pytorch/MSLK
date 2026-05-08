@@ -22,6 +22,7 @@ from mslk.quantize.triton.fp4_quantize import (
     FP4_MBITS,
     FP8_E4M3_MAX,
     nvfp4_quantize_stacked,
+    nvfp4_quantize_stacked_with_token_scale,
     RoundingMode,
     triton_fake_quantize_nvfp4_per_tensor,
     triton_quantize_mx4_unpack,
@@ -460,6 +461,63 @@ MOE_SHAPES = [
 ]
 
 
+TOKEN_SCALE_MOE_SHAPES = [
+    # Small K exercises scale-column padding.
+    (3, [1, 3, 2], 64),
+    # Non-power-of-two K exercises the fused kernel's chunked path.
+    (3, [1, 2, 3], 5120),
+    # Power-of-two K exercises the fused kernel's full-row path.
+    (2, [2, 1], 8192),
+]
+
+
+def _padded_cumsum(m_sizes_list: list[int]) -> list[int]:
+    padded_cumsum = [0]
+    for m in m_sizes_list:
+        padded_cumsum.append(padded_cumsum[-1] + ((m + 127) // 128) * 128)
+    return padded_cumsum
+
+
+def _cumsum(m_sizes_list: list[int]) -> list[int]:
+    cumsum = [0]
+    for m in m_sizes_list:
+        cumsum.append(cumsum[-1] + m)
+    return cumsum
+
+
+def _extract_stacked_scale_for_expert(
+    scale: torch.Tensor,
+    m_sizes_list: list[int],
+    expert_idx: int,
+    K: int,
+) -> torch.Tensor:
+    padded_cumsum = _padded_cumsum(m_sizes_list)
+    num_scales_per_row = K // 16
+    padded_cols = ((num_scales_per_row + 3) // 4) * 4
+    row_slice = slice(padded_cumsum[expert_idx], padded_cumsum[expert_idx + 1])
+    return scale[
+        row_slice,
+        :padded_cols,
+    ]
+
+
+def _dequantize_nvfp4_with_token_scale(
+    input_quantized: torch.Tensor,
+    scale: torch.Tensor,
+    token_scale_inv: torch.Tensor,
+    group_size: int = 16,
+) -> torch.Tensor:
+    M = input_quantized.shape[0]
+    N = input_quantized.shape[1] * 2
+    scale = _from_blocked(scale, (M, math.ceil(N / group_size)))
+    input_quantized_float = fp4_to_float(input_quantized)
+    true_scale = scale.to(torch.float32) * token_scale_inv.to(torch.float32)[:, None]
+    output = input_quantized_float.view(
+        -1, N // group_size, group_size
+    ) * true_scale.view(M, -1, 1)
+    return output.view(M, N).to(torch.bfloat16)
+
+
 @pytest.mark.skipif(
     not SUPPORTS_NVFP4,
     reason="Skip if TestNVFP4QuantizeStacked is not supported on this device.",
@@ -602,3 +660,112 @@ class TestNVFP4QuantizeStacked:
 
             expert_dequant = dequantize_nvfp4(expert_xq, expert_scale, global_scales[i])
             torch.testing.assert_close(expert_dequant, x[start:end], atol=1, rtol=1)
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", TOKEN_SCALE_MOE_SHAPES)
+    def test_token_scale_inv_matches_row_amax(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify reciprocal token scales are computed from per-row amax."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        x[0].zero_()
+
+        _, _, token_scale_inv = nvfp4_quantize_stacked_with_token_scale(m_sizes, x)
+
+        row_amax = torch.amax(torch.abs(x.to(torch.float32)), dim=1)
+        expected = torch.clamp(row_amax, min=1.0e-8) / (FP8_E4M3_MAX * FP4_E2M1_MAX)
+        torch.testing.assert_close(token_scale_inv, expected, atol=1e-12, rtol=1e-6)
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", TOKEN_SCALE_MOE_SHAPES)
+    def test_token_scale_matches_per_row_reference(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify packed values and local scales match per-row NVFP4 quantization."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+        x[0].zero_()
+
+        xq, scale, token_scale_inv = nvfp4_quantize_stacked_with_token_scale(m_sizes, x)
+        xq_u8 = xq.view(torch.uint8)
+
+        cumsum = _cumsum(m_sizes_list)
+        for expert_idx in range(num_experts):
+            start = cumsum[expert_idx]
+            end = cumsum[expert_idx + 1]
+            expert_scale = _extract_stacked_scale_for_expert(
+                scale,
+                m_sizes_list,
+                expert_idx,
+                K,
+            )
+            expert_scale_unblocked = _from_blocked(
+                expert_scale,
+                (end - start, K // 16),
+            ).view(torch.uint8)
+
+            for row in range(start, end):
+                row_global_scale = token_scale_inv[row].reciprocal()
+                input_row = x.narrow(0, row, 1)
+                xq_ref, scale_ref = triton_quantize_nvfp4(
+                    input_row,
+                    row_global_scale,
+                )
+                scale_ref_unblocked = _from_blocked(scale_ref, (1, K // 16)).view(
+                    torch.uint8
+                )
+
+                torch.testing.assert_close(
+                    xq_u8.narrow(0, row, 1),
+                    xq_ref.view(torch.uint8),
+                )
+                torch.testing.assert_close(
+                    expert_scale_unblocked.narrow(0, row - start, 1),
+                    scale_ref_unblocked,
+                )
+
+    @pytest.mark.parametrize("num_experts,m_sizes_list,K", TOKEN_SCALE_MOE_SHAPES)
+    def test_token_scale_dequant_roundtrip(
+        self,
+        num_experts: int,
+        m_sizes_list: list[int],
+        K: int,
+    ) -> None:
+        """Verify quantize-then-dequantize quality with per-token scales."""
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        M = sum(m_sizes_list)
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device)
+
+        xq, scale, token_scale_inv = nvfp4_quantize_stacked_with_token_scale(m_sizes, x)
+        xq_u8 = xq.view(torch.uint8)
+
+        cumsum = _cumsum(m_sizes_list)
+        for expert_idx in range(num_experts):
+            start = cumsum[expert_idx]
+            end = cumsum[expert_idx + 1]
+            expert_scale = _extract_stacked_scale_for_expert(
+                scale,
+                m_sizes_list,
+                expert_idx,
+                K,
+            )
+            expert_dequant = _dequantize_nvfp4_with_token_scale(
+                xq_u8[start:end],
+                expert_scale,
+                token_scale_inv[start:end],
+            )
+            torch.testing.assert_close(expert_dequant, x[start:end], atol=1, rtol=1)
+
+    def test_token_scale_invalid_inputs(self) -> None:
+        m_sizes = torch.tensor([4], dtype=torch.int64, device=self.device)
+        x = torch.randn(4, 18, dtype=torch.bfloat16, device=self.device)
+
+        with pytest.raises(AssertionError, match="K must be divisible by 16"):
+            nvfp4_quantize_stacked_with_token_scale(m_sizes, x)

@@ -254,6 +254,26 @@ if hasattr(torch.ops.mslk, "f4f4bf16"):
         return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
+if hasattr(torch.ops.mslk, "f4f4bf16_ultra_grouped_mm"):
+
+    @torch.library.register_fake("mslk::f4f4bf16_ultra_grouped_mm")
+    def f4f4bf16_ultra_grouped_mm_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        offsets: torch.Tensor,
+        x_global_scale: torch.Tensor,
+        w_global_scale: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if output is not None:
+            return output
+        total_M = XQ.shape[0]
+        N = WQ.shape[-1]
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
 if hasattr(torch.ops.mslk, "mx8mx4bf16"):
 
     @torch.library.register_fake("mslk::mx8mx4bf16")

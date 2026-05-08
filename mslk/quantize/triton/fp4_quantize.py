@@ -2227,7 +2227,9 @@ def _nvfp4_quantize_stacked_kernel(
     FP8_E4M3_MAX = 448.0  # type: ignore[Incompatible variable type]
     FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
 
-    NUM_ELEM_PER_LAYOUT: tl.constexpr = 128 * 4  # type: ignore[Incompatible variable type]
+    NUM_ELEM_PER_LAYOUT: tl.constexpr = (  # type: ignore[Incompatible variable type]
+        128 * 4
+    )
     NUM_N_BLOCKS = tl.cdiv(N, 64)
 
     pid_m = tl.program_id(1)
@@ -2317,6 +2319,152 @@ def _nvfp4_quantize_stacked_kernel(
     tl.store(s_ptr + scale_offs, scales.to(tl.uint8, bitcast=True), mask=store_mask)
 
 
+@triton.jit
+def _nvfp4_quantize_stacked_token_scale_fused_row_kernel(
+    x_ptr,
+    q_ptr,
+    s_ptr,
+    token_scale_inv_ptr,
+    m_sizes_ptr,
+    stride_xm,
+    stride_xn,
+    M,
+    N,
+    NUM_GROUPS: tl.constexpr,
+    PREFIX_NUM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_BLOCKS: tl.constexpr,
+    USE_FULL_ROW_QUANT: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    CHUNK_SCALE_BLOCKS: tl.constexpr,
+):
+    E4M3_EPS: tl.constexpr = 1.5258789e-05  # type: ignore[Incompatible variable type]
+    FP8_E4M3_MAX = 448.0  # type: ignore[Incompatible variable type]
+    FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
+    MIN_NORMAL: tl.constexpr = 1.0e-8  # type: ignore[Incompatible variable type]
+
+    NUM_ELEM_PER_LAYOUT: tl.constexpr = 128 * 4  # type: ignore[Incompatible variable type]
+    NUM_N_BLOCKS = tl.cdiv(N, 64)
+
+    row = tl.program_id(0)
+    reduce_offs_n = tl.arange(0, BLOCK_K)
+    reduce_mask = (row < M) & (reduce_offs_n < N)
+    x = tl.load(
+        x_ptr + row * stride_xm + reduce_offs_n * stride_xn,
+        mask=reduce_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    row_amax = tl.max(tl.abs(x), axis=0)
+    token_scale_inv = tl.maximum(row_amax, MIN_NORMAL) / (448.0 * 6.0)
+    row_scale = tl.div_rn(1.0, token_scale_inv)
+    tl.store(token_scale_inv_ptr + row, token_scale_inv, mask=row < M)
+
+    seg_offs = tl.arange(0, PREFIX_NUM)
+    seg_mask = seg_offs < NUM_GROUPS
+    m_vals = tl.load(m_sizes_ptr + seg_offs, mask=seg_mask, other=0)
+    cumsum_inc = tl.cumsum(m_vals, axis=0)
+    padded_vals = ((m_vals + 127) // 128) * 128
+    padded_cumsum_inc = tl.cumsum(padded_vals, axis=0)
+    cumsum_exc = cumsum_inc - m_vals
+    padded_cumsum_exc = padded_cumsum_inc - padded_vals
+
+    seg_idx = tl.max(tl.where(cumsum_exc <= row, seg_offs, 0), axis=0)
+    seg_cumsum = tl.max(tl.where(seg_offs == seg_idx, cumsum_exc, 0), axis=0)
+    seg_padded_cumsum = tl.max(
+        tl.where(seg_offs == seg_idx, padded_cumsum_exc, 0), axis=0
+    )
+    padded_r = seg_padded_cumsum + (row.to(tl.int64) - seg_cumsum)
+
+    if USE_FULL_ROW_QUANT:
+        x_blocks = x.reshape(SCALE_BLOCKS, 16)
+        block_amax = tl.max(tl.abs(x_blocks), axis=1)
+        scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * row_scale
+        scales = tl.clamp(scales, E4M3_EPS, FP8_E4M3_MAX)
+        scales_fp8 = scales.to(tl.float8e4nv)
+
+        total_scale = tl.div_rn(row_scale, scales_fp8.to(tl.float32)[:, None])
+        x_blocks = x_blocks * total_scale
+
+        x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(BLOCK_K // 2, 2).split())
+        fp4_offs_n = tl.arange(0, BLOCK_K // 2)
+        fp4_mask = (row < M) & (fp4_offs_n < N // 2)
+        tl.store(q_ptr + row * (N // 2) + fp4_offs_n, x_fp4x2, mask=fp4_mask)
+
+        scale_col = tl.arange(0, SCALE_BLOCKS)
+        col_block = scale_col // 4
+        col_in_block = scale_col % 4
+        offs_m_in_layout = (padded_r % 128).to(tl.int32)
+        sub_layout_idx = offs_m_in_layout % 32
+        sub_layout_row = offs_m_in_layout // 32
+        scale_offs = (
+            (padded_r // 128) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT
+            + col_block * NUM_ELEM_PER_LAYOUT
+            + sub_layout_idx * 16
+            + sub_layout_row * 4
+            + col_in_block
+        )
+        scale_mask = (row < M) & (scale_col < (N // 16))
+        tl.store(
+            s_ptr + scale_offs,
+            scales_fp8.to(tl.uint8, bitcast=True),
+            mask=scale_mask,
+        )
+    else:
+        chunk_offs = tl.arange(0, CHUNK_SIZE)
+        scale_offs_in_chunk = tl.arange(0, CHUNK_SCALE_BLOCKS)
+        fp4_offs_in_chunk = tl.arange(0, CHUNK_SIZE // 2)
+
+        for k_start in range(0, N, CHUNK_SIZE):
+            chunk_offs_n = k_start + chunk_offs
+            chunk_mask = (row < M) & (chunk_offs_n < N)
+            x_chunk = tl.load(
+                x_ptr + row * stride_xm + chunk_offs_n * stride_xn,
+                mask=chunk_mask,
+                other=0.0,
+            ).to(tl.float32)
+            x_blocks = x_chunk.reshape(CHUNK_SCALE_BLOCKS, 16)
+
+            block_amax = tl.max(tl.abs(x_blocks), axis=1)
+            scales = tl.div_rn(block_amax, FP4_E2M1_MAX) * row_scale
+            scales = tl.clamp(scales, E4M3_EPS, FP8_E4M3_MAX)
+            scales_fp8 = scales.to(tl.float8e4nv)
+
+            total_scale = tl.div_rn(row_scale, scales_fp8.to(tl.float32)[:, None])
+            x_blocks = x_blocks * total_scale
+
+            x_fp4x2 = convert_fp32_to_fp4_packed(
+                x_blocks.reshape(CHUNK_SIZE // 2, 2).split()
+            )
+            fp4_offs_n = k_start // 2 + fp4_offs_in_chunk
+            fp4_mask = (row < M) & (fp4_offs_n < N // 2)
+            tl.store(
+                q_ptr + row * (N // 2) + fp4_offs_n,
+                x_fp4x2,
+                mask=fp4_mask,
+            )
+
+            scale_col = k_start // 16 + scale_offs_in_chunk
+            col_block = scale_col // 4
+            col_in_block = scale_col % 4
+            offs_m_in_layout = (padded_r % 128).to(tl.int32)
+            sub_layout_idx = offs_m_in_layout % 32
+            sub_layout_row = offs_m_in_layout // 32
+            scale_offs = (
+                (padded_r // 128) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT
+                + col_block * NUM_ELEM_PER_LAYOUT
+                + sub_layout_idx * 16
+                + sub_layout_row * 4
+                + col_in_block
+            )
+            scale_mask = (row < M) & (scale_col < (N // 16))
+            tl.store(
+                s_ptr + scale_offs,
+                scales_fp8.to(tl.uint8, bitcast=True),
+                mask=scale_mask,
+            )
+
+
 def nvfp4_quantize_stacked(
     m_sizes: torch.Tensor,
     input: torch.Tensor,
@@ -2401,6 +2549,70 @@ def nvfp4_quantize_stacked(
     )
 
     return xq.view(torch.float4_e2m1fn_x2), scale.view(torch.float8_e4m3fn)
+
+
+def nvfp4_quantize_stacked_with_token_scale(
+    m_sizes: torch.Tensor,
+    input: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize concatenated MoE activations with reciprocal per-token scales.
+
+    Returns:
+        Tuple of (xq, scale, token_scale_inv):
+            xq: [M, K//2] packed FP4 data.
+            scale: Flattened uint8 scale buffer in padded+swizzled CUTLASS layout.
+            token_scale_inv: [M] fp32 reciprocal per-token scales.
+    """
+    assert input.ndim >= 1, f"input.ndim needs to be >= 1, but got {input.ndim}."
+    input = input.reshape(-1, input.shape[-1])
+    M, K = input.shape
+    num_segments = m_sizes.shape[0]
+    device = input.device
+
+    assert K % 16 == 0, f"K must be divisible by 16, but got {K}."
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
+
+    padded_total_M_ub = M + num_segments * 127
+    xq = torch.empty((M, K // 2), device=device, dtype=torch.uint8)
+    x_token_scale_inv = torch.empty((M,), device=device, dtype=torch.float32)
+
+    num_scales_per_row = K // 16
+    n_col_blocks = triton.cdiv(num_scales_per_row, 4)
+    padded_cols = n_col_blocks * 4
+    scale = torch.empty(
+        (padded_total_M_ub, padded_cols), device=device, dtype=torch.uint8
+    )
+
+    block_k = triton.next_power_of_2(K)
+    # pyre-ignore[28]
+    _nvfp4_quantize_stacked_token_scale_fused_row_kernel[(M,)](
+        input,
+        xq,
+        scale,
+        x_token_scale_inv,
+        m_sizes,
+        input.stride(0),
+        input.stride(1),
+        M,
+        K,
+        NUM_GROUPS=num_segments,  # pyre-ignore[6]
+        PREFIX_NUM=triton.next_power_of_2(num_segments),
+        BLOCK_K=block_k,  # pyre-ignore[6]
+        SCALE_BLOCKS=block_k // 16,  # pyre-ignore[6]
+        USE_FULL_ROW_QUANT=block_k == K and K <= 8192,
+        CHUNK_SIZE=2048,
+        CHUNK_SCALE_BLOCKS=2048 // 16,
+        num_warps=8,
+    )
+
+    return (
+        xq.view(torch.float4_e2m1fn_x2),
+        scale.view(torch.float8_e4m3fn),
+        x_token_scale_inv,
+    )
 
 
 @triton.jit

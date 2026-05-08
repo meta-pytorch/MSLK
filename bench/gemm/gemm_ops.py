@@ -20,6 +20,7 @@ from mslk.quantize.triton.fp4_quantize import (
     mega_fp4_quantize_kernel,
     mega_fp4_unpack,
     nvfp4_quantize_stacked,
+    nvfp4_quantize_stacked_with_token_scale,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
 )
@@ -2627,6 +2628,110 @@ class CutlassNVFP4TorchGrouped(GemmOpBase):
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
+
+@register_gemm_op
+class NVFP4UltraGroupwise(GemmOpBase):
+    """
+    NVFP4 ultra grouped GEMM (SM103) with per-token activation scaling
+    and per-expert weight scaling, applied separately in the EVT epilogue.
+    """
+
+    def preprocess(self, x, w):
+        m_values = [i.shape[0] for i in x]
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
+        x_cat = torch.concat(x, dim=0).contiguous()
+
+        G = m_sizes.numel()
+        N_per_expert = w[0].shape[0]
+        K = w[0].shape[1]
+
+        # Per-expert weight quantization.
+        w_cat = torch.cat(w, dim=0).contiguous()
+        w_m_sizes = torch.full(
+            (G,), N_per_expert, dtype=torch.int64, device=w_cat.device
+        )
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+
+        wq = wq.view(G, N_per_expert, K // 2)
+        padded_N = (N_per_expert + 127) // 128 * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+
+        offsets = torch.cumsum(m_sizes, dim=0).to(torch.int32)
+
+        w_global_scale_inv = torch.reciprocal(w_global_scale)
+
+        return x_cat, wq, w_scale, w_global_scale_inv, m_sizes, offsets
+
+    def quantize(self, x, wq, w_scale, w_global_scale_inv, m_sizes, offsets):
+        xq, x_scale, x_token_scale_inv = nvfp4_quantize_stacked_with_token_scale(
+            m_sizes, x
+        )
+
+        return (
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            x_token_scale_inv,
+            w_global_scale_inv,
+            offsets,
+        )
+
+    def compute(
+        self,
+        xq,
+        wq,
+        x_scale,
+        w_scale,
+        x_global_scale_inv,
+        w_global_scale_inv,
+        offsets,
+    ):
+        return torch.ops.mslk.f4f4bf16_ultra_grouped_mm(
+            xq,
+            wq.transpose(-2, -1),
+            x_scale,
+            w_scale,
+            offsets,
+            x_global_scale_inv,
+            w_global_scale_inv,
+        )
+
+    def quantize_and_compute(
+        self, x, wq, w_scale, w_global_scale_inv, m_sizes, offsets
+    ):
+        (
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            x_global_scale_inv,
+            w_global_scale_inv,
+            offsets,
+        ) = self.quantize(x, wq, w_scale, w_global_scale_inv, m_sizes, offsets)
+        return self.compute(
+            xq,
+            wq,
+            x_scale,
+            w_scale,
+            x_global_scale_inv,
+            w_global_scale_inv,
+            offsets,
+        )
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:

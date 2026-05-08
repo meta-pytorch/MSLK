@@ -45,6 +45,17 @@ at::Tensor f4f4bf16_grouped_mm(
     std::optional<at::Tensor> output = std::nullopt,
     std::optional<at::Tensor> global_scale = std::nullopt);
 
+// FP4 ultra grouped GEMM (SM103) with per-token activation scaling.
+at::Tensor f4f4bf16_ultra_grouped_mm(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor offsets,
+    at::Tensor x_global_scale,
+    at::Tensor w_global_scale,
+    std::optional<at::Tensor> output = std::nullopt);
+
 // FP4 GEMM supporting NVFP4, MXFP4 (1x32 block), and MXFP4_16 (1x16 block)
 //
 // Format selection:
