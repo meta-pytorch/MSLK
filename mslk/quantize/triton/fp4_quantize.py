@@ -295,12 +295,16 @@ def _kernel_quantize_mx4_unpack(
             pack=1,
         )
 
+        row = exp_offset // GROUPS_PER_ROW
+        col = exp_offset % GROUPS_PER_ROW
+        padded_exp_offset = row * SCALE_K + col
+
         n_col_blocks = SCALE_K // 4
-        first_dim = exp_offset // (512 * n_col_blocks)
-        second_dim = (exp_offset % (512 * n_col_blocks)) // (128 * n_col_blocks)
-        third_dim = (exp_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
-        fourth_dim = (exp_offset % (4 * n_col_blocks)) // 4
-        fifth_dim = exp_offset % 4
+        first_dim = padded_exp_offset // (512 * n_col_blocks)
+        second_dim = (padded_exp_offset % (512 * n_col_blocks)) // (128 * n_col_blocks)
+        third_dim = (padded_exp_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
+        fourth_dim = (padded_exp_offset % (4 * n_col_blocks)) // 4
+        fifth_dim = padded_exp_offset % 4
         actual_offset = (
             first_dim * (512 * n_col_blocks)
             + fourth_dim * (512)
@@ -460,7 +464,13 @@ def triton_quantize_mx4_unpack(
     rounded_M = round_up(M, 128)
     scale_K = K // block_size
     rounded_K = round_up(scale_K, 4)
-    scale = torch.empty((rounded_M, rounded_K), device=device, dtype=torch.int8)
+    # E8M0 scale byte 127 is 2^0, the neutral scale for rounded tail slots.
+    scale = torch.full(
+        (rounded_M, rounded_K),
+        127,
+        device=device,
+        dtype=torch.int8,
+    )
 
     # In this kernel, we want each row to be divisible by group_size.
     # If the rows are not, then we will pad them. Find the number of

@@ -92,7 +92,16 @@ class TestFp4Quantize:
     def setup(self):
         torch.manual_seed(0)
 
-    @pytest.mark.parametrize("shape", [(1, 128), (3, 512), (128, 1024), (4096, 10240)])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 128),
+            (129, 192),
+            (3, 512),
+            (128, 1024),
+            (4096, 10240),
+        ],
+    )
     def test_quantize_fp4(self, shape: Tuple[int, int]) -> None:
         device = "cuda"
         M, N = shape
