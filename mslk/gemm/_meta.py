@@ -20,164 +20,181 @@ import torch
 
 
 # ---------------------------------------------------------------------------
-# Common ops (always defined, all platforms)
+# Common ops (defined for all platforms when the gemm schema loads)
 # ---------------------------------------------------------------------------
 
+if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
 
-@torch.library.register_fake("mslk::f8f8bf16_rowwise")
-def f8f8bf16_rowwise_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    use_fast_accum: bool = True,
-) -> torch.Tensor:
-    x_dims = XQ.dim()
-    w_dims = WQ.dim()
-    assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
-        "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
-    )
-    if x_dims == 2:
-        M = XQ.shape[0]
-        N = WQ.shape[0]
-        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-    else:
+    @torch.library.register_fake("mslk::f8f8bf16_rowwise")
+    def f8f8bf16_rowwise_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_fast_accum: bool = True,
+    ) -> torch.Tensor:
+        x_dims = XQ.dim()
+        w_dims = WQ.dim()
+        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
+            "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
+        )
+        if x_dims == 2:
+            M = XQ.shape[0]
+            N = WQ.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+        else:
+            B = XQ.shape[0]
+            M = XQ.shape[1]
+            N = WQ.shape[0]
+            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
+if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_out"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_rowwise_out")
+    def f8f8bf16_rowwise_out_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_fast_accum: bool = True,
+    ) -> None:
+        pass
+
+
+if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_rowwise_batched")
+    def f8f8bf16_rowwise_batched_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        use_fast_accum: bool = True,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B = XQ.shape[0]
         M = XQ.shape[1]
-        N = WQ.shape[0]
+        N = WQ.shape[1]
         return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-@torch.library.register_fake("mslk::f8f8bf16_rowwise_out")
-def f8f8bf16_rowwise_out_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    output: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    use_fast_accum: bool = True,
-) -> None:
-    pass
+if hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_blockwise")
+    def f8f8bf16_blockwise_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        block_m: int = 128,
+        block_n: int = 128,
+        block_k: int = 128,
+    ) -> torch.Tensor:
+        x_dims = XQ.dim()
+        w_dims = WQ.dim()
+        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
+            "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
+        )
+        if x_dims == 2:
+            M = XQ.shape[0]
+            N = WQ.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+        else:
+            B = XQ.shape[0]
+            M = XQ.shape[1]
+            N = WQ.shape[0]
+            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-@torch.library.register_fake("mslk::f8f8bf16_rowwise_batched")
-def f8f8bf16_rowwise_batched_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    use_fast_accum: bool = True,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    B = XQ.shape[0]
-    M = XQ.shape[1]
-    N = WQ.shape[1]
-    return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+if hasattr(torch.ops.mslk, "f8f8bf16_tensorwise"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_tensorwise")
+    def f8f8bf16_tensorwise_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        scale: float,
+        use_fast_accum: bool = True,
+    ) -> torch.Tensor:
+        x_dims = XQ.dim()
+        w_dims = WQ.dim()
+        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
+            "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
+        )
+        if x_dims == 2:
+            M = XQ.shape[0]
+            N = WQ.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+        else:
+            B = XQ.shape[0]
+            M = XQ.shape[1]
+            N = WQ.shape[0]
+            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-@torch.library.register_fake("mslk::f8f8bf16_blockwise")
-def f8f8bf16_blockwise_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    block_m: int = 128,
-    block_n: int = 128,
-    block_k: int = 128,
-) -> torch.Tensor:
-    x_dims = XQ.dim()
-    w_dims = WQ.dim()
-    assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
-        "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
-    )
-    if x_dims == 2:
-        M = XQ.shape[0]
-        N = WQ.shape[0]
-        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-    else:
-        B = XQ.shape[0]
-        M = XQ.shape[1]
-        N = WQ.shape[0]
-        return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_stacked"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_rowwise_grouped_stacked")
+    def f8f8bf16_rowwise_grouped_stacked_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        M_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        total_M = XQ.shape[0]
+        N = WQ.shape[1]
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-@torch.library.register_fake("mslk::f8f8bf16_tensorwise")
-def f8f8bf16_tensorwise_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    scale: float,
-    use_fast_accum: bool = True,
-) -> torch.Tensor:
-    x_dims = XQ.dim()
-    w_dims = WQ.dim()
-    assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
-        "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
-    )
-    if x_dims == 2:
-        M = XQ.shape[0]
-        N = WQ.shape[0]
-        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-    else:
-        B = XQ.shape[0]
-        M = XQ.shape[1]
-        N = WQ.shape[0]
-        return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+if hasattr(torch.ops.mslk, "bf16bf16bf16_grouped"):
+
+    @torch.library.register_fake("mslk::bf16bf16bf16_grouped")
+    def bf16bf16bf16_grouped_meta(
+        X: list[torch.Tensor],
+        W: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        Y = []
+        for i in range(len(X)):
+            M = X[i].shape[0]
+            N = W[i].shape[0]
+            Y.append(torch.empty((M, N), dtype=torch.bfloat16, device=X[i].device))
+        return Y
 
 
-@torch.library.register_fake("mslk::f8f8bf16_rowwise_grouped_stacked")
-def f8f8bf16_rowwise_grouped_stacked_meta(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    M_sizes: torch.Tensor,
-) -> torch.Tensor:
-    total_M = XQ.shape[0]
-    N = WQ.shape[1]
-    return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+if hasattr(torch.ops.mslk, "bf16bf16bf16_grouped_dynamic"):
+
+    @torch.library.register_fake("mslk::bf16bf16bf16_grouped_dynamic")
+    def bf16bf16bf16_grouped_dynamic_meta(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        zero_start_index_M: torch.Tensor,
+    ) -> torch.Tensor:
+        G = X.shape[0]
+        M = X.shape[1]
+        N = W.shape[1]
+        return torch.empty((G, M, N), dtype=torch.bfloat16, device=X.device)
 
 
-@torch.library.register_fake("mslk::bf16bf16bf16_grouped")
-def bf16bf16bf16_grouped_meta(
-    X: list[torch.Tensor],
-    W: list[torch.Tensor],
-) -> list[torch.Tensor]:
-    Y = []
-    for i in range(len(X)):
-        M = X[i].shape[0]
-        N = W[i].shape[0]
-        Y.append(torch.empty((M, N), dtype=torch.bfloat16, device=X[i].device))
-    return Y
+if hasattr(torch.ops.mslk, "bf16bf16bf16_grouped_stacked"):
 
-
-@torch.library.register_fake("mslk::bf16bf16bf16_grouped_dynamic")
-def bf16bf16bf16_grouped_dynamic_meta(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    zero_start_index_M: torch.Tensor,
-) -> torch.Tensor:
-    G = X.shape[0]
-    M = X.shape[1]
-    N = W.shape[1]
-    return torch.empty((G, M, N), dtype=torch.bfloat16, device=X.device)
-
-
-@torch.library.register_fake("mslk::bf16bf16bf16_grouped_stacked")
-def bf16bf16bf16_grouped_stacked_meta(
-    X: torch.Tensor,
-    W: torch.Tensor,
-    M_sizes: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    num_sms: Optional[int] = None,
-) -> torch.Tensor:
-    if out is not None:
-        return out
-    total_M = X.shape[0]
-    N = W.shape[1]
-    return torch.empty((total_M, N), dtype=torch.bfloat16, device=X.device)
+    @torch.library.register_fake("mslk::bf16bf16bf16_grouped_stacked")
+    def bf16bf16bf16_grouped_stacked_meta(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        M_sizes: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        num_sms: Optional[int] = None,
+    ) -> torch.Tensor:
+        if out is not None:
+            return out
+        total_M = X.shape[0]
+        N = W.shape[1]
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=X.device)
 
 
 # bf16bf16bf16_grouped_grad and bf16bf16bf16_grouped_wgrad are registered via
