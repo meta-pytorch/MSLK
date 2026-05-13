@@ -48,6 +48,13 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
+  // BF16xINT4 rowwise GEMMs: schema only on ROCm; implementations are
+  // registered by mslk.gemm.triton.int4_gemm via torch.library.impl at
+  // Python import time.
+  m.def(
+      "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
+  m.def(
+      "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
 #else
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
