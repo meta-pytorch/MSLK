@@ -1436,8 +1436,8 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
             matmul_bf16i4_rowwise,
             matmul_bf16i4_rowwise_batched,
         )
-        cls.matmul_rowwise = matmul_bf16i4_rowwise
-        cls.matmul_rowwise_batched = matmul_bf16i4_rowwise_batched
+        cls.matmul_rowwise = staticmethod(matmul_bf16i4_rowwise)
+        cls.matmul_rowwise_batched = staticmethod(matmul_bf16i4_rowwise_batched)
 
     @settings(deadline=None)
     @given(
