@@ -54,11 +54,6 @@ __export_package_variant_info () {
     local variant_type="rocm"
     local variant_version="$FALLBACK_VERSION_ROCM"
 
-  elif [ "$package_variant_type_version" == "cpu" ]; then
-    # If "cpu", default to latest cpu
-    local variant_type="cpu"
-    local variant_version=""
-
   else
     # Split along '/', e.g. cuda/12.4.0
     # shellcheck disable=SC2207
@@ -95,9 +90,8 @@ __export_package_variant_info () {
       fi
 
     else
-      echo "[INSTALL] Package variant type '$variant_type' is neither CUDA nor ROCm variant, falling back to cpu"
-      local variant_type="cpu"
-      local variant_version=""
+      echo "[INSTALL] Package variant type '$variant_type' is neither CUDA nor ROCm variant"
+      return 1
     fi
   fi
 
@@ -180,8 +174,7 @@ __check_package_variant () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
-  # Check applies to installation of packages with variants, and only to non-CPU variants
-  if [ "$package_variant_type_version" != "" ] && [ "$package_variant_type" != "cpu" ]; then
+  if [ "$package_variant_type_version" != "" ]; then
     # Ensure that the package build is of the correct variant
     # This test usually applies to the nightly builds
     # shellcheck disable=SC2086
@@ -212,8 +205,6 @@ install_from_pytorch_pip () {
   if [ "$package_channel_version" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME PACKAGE_NAME PACKAGE_CHANNEL[/VERSION] [PACKAGE_VARIANT_TYPE[/VARIANT_VERSION]]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env torch 1.11.0 cpu                 # Install the CPU variant, specific version from release channel"
-    echo "    ${FUNCNAME[0]} build_env torch release cpu                # Install the CPU variant, latest version from release channel"
     echo "    ${FUNCNAME[0]} build_env mslk test/0.8.0 cuda/12.4.0      # Install the CUDA 12.4 variant, specific version from test channel"
     echo "    ${FUNCNAME[0]} build_env mslk nightly rocm/6.2            # Install the ROCM 6.2 variant, latest version from nightly channel"
     echo "    ${FUNCNAME[0]} build_env pytorch_triton 1.11.0            # Install specific version from release channel"
@@ -291,8 +282,6 @@ download_from_pytorch_pip () {
   if [ "$package_variant_type_version" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME PACKAGE_NAME PACKAGE_CHANNEL[/VERSION] PACKAGE_VARIANT_TYPE[/VARIANT_VERSION]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env torch 1.11.0 cpu                 # Download the CPU variant, specific version from release channel"
-    echo "    ${FUNCNAME[0]} build_env torch release cpu                # Download the CPU variant, latest version from release channel"
     echo "    ${FUNCNAME[0]} build_env mslk test/0.8.0 cuda/12.4.0      # Download the CUDA 12.4 variant, specific version from test channel"
     echo "    ${FUNCNAME[0]} build_env mslk nightly rocm/6.2            # Download the ROCM 6.2 variant, latest version from nightly channel"
     return 1

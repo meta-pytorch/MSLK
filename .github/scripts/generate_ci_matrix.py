@@ -166,7 +166,7 @@ class BuildConfigScheme:
             "--variant",
             required=True,
             choices=ALL_VARIANTS,
-            help="Build variant: cpu, cuda, or rocm",
+            help="Build variant: cuda or rocm",
         )
         parser.add_argument(
             "--jobtype",
@@ -255,12 +255,6 @@ class BuildConfigScheme:
         if self.jobtype not in ALL_JOB_TYPES:
             raise ValueError(f"Invalid job type: {self.jobtype}")
 
-        if self.variant not in [
-            VARIANT_CUDA,
-            VARIANT_ROCM,
-        ]:
-            raise ValueError("Target must be CUDA or ROCM")
-
         return self
 
     def python_versions(self) -> List[str]:
@@ -316,9 +310,8 @@ class BuildConfigScheme:
                 return [{"arch": "x86", "instance": "linux.24xlarge.memory"}]
             else:
                 return [{"arch": "x86", "instance": "amd-mi350-runner"}]
-
         else:
-            return []
+            raise ValueError(f"Unsupported build variant: {self.variant}")
 
     def generate(self) -> List[Dict[str, Any]]:
         # Build a table of dimensions to values for each dimension

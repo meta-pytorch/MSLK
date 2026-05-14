@@ -101,19 +101,6 @@ run_python_test () {
   fi
 }
 
-__configure_mslk_test_cpu () {
-  # shellcheck disable=SC2155
-  local env_prefix=$(env_name_or_prefix "${env_name}")
-  echo "[TEST] Set environment variables for CPU-only testing ..."
-
-  # Prevent automatically running CUDA-enabled tests on a GPU-capable machine
-  # shellcheck disable=SC2086
-  print_exec conda env config vars set ${env_prefix} CUDA_VISIBLE_DEVICES=-1
-
-  export ignored_tests=(
-  )
-}
-
 __configure_mslk_test_cuda () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
@@ -195,11 +182,7 @@ __setup_mslk_test () {
 
   # Configure the environment for ignored test suites for each MSLK
   # variant
-  if [ "$mslk_build_variant" == "cpu" ]; then
-    echo "[TEST] Configuring for CPU-based testing ..."
-    __configure_mslk_test_cpu
-
-  elif [ "$mslk_build_variant" == "rocm" ]; then
+  if [ "$mslk_build_variant" == "rocm" ]; then
     echo "[TEST] Configuring for ROCm-based testing ..."
     __configure_mslk_test_rocm
 
