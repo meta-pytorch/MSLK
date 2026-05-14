@@ -23,6 +23,16 @@ Dequantisation formula (matches int4_row_quantize + pack_int4 in gemm_test.py):
     signed = (nibble XOR 8) - 8
   nibble ∈ [0,7]  → signed ∈ [0,7]   (positive; bit3 of nibble is clear)
   nibble ∈ [8,15] → signed ∈ [-8,-1] (negative; bit3 of nibble is set)
+
+Activation pre-split strategy (avoids LDS bank conflicts):
+  The packed INT4 format stores even-K and odd-K weight values interleaved in
+  each byte.  Separating them inside the Triton kernel requires a cross-lane
+  data movement that ROCm Triton lowers through LDS, causing severe bank
+  conflicts.  Instead, the Python wrapper splits the activation matrix X into
+  two contiguous [M, K//2] tensors (even and odd K columns) before kernel
+  launch using optimised PyTorch/HIP strided copies.  The kernel then issues
+  two tl.dot calls — one against the lo nibbles, one against the hi nibbles —
+  with fully coalesced loads and no LDS involvement.
 """
 
 from typing import List
@@ -41,7 +51,11 @@ def _get_configs() -> List[Config]:
     configs = []
     for bm in [16, 32, 64, 128]:
         for bn in [64, 128, 256]:
-            for bk in [64, 128]:
+            # BLOCK_K is the tile size over the K2 = K//2 dimension, which is
+            # also the inner-dot K for each tl.dot call.  Must divide
+            # group_size // 2 (so 2*BLOCK_K divides group_size).  With the
+            # common group_size=128, BLOCK_K <= 64.
+            for bk in [32, 64]:
                 for nw in [4, 8]:
                     for ns in [2, 3]:
                         configs.append(
@@ -58,37 +72,40 @@ def _get_configs() -> List[Config]:
 # Core Triton kernel
 # ---------------------------------------------------------------------------
 
-@triton.autotune(configs=_get_configs(), key=["M", "N", "K", "group_size"])
+@triton.autotune(configs=_get_configs(), key=["M", "N", "K2", "group_size"])
 @triton.jit
 def _bf16i4_rowwise_kernel(
-    X_ptr,
-    W_ptr,
-    Y_ptr,
-    scale_ptr,
-    zero_ptr,
+    X_even_ptr,   # [M, K//2]  bfloat16 — even K columns of activations
+    X_odd_ptr,    # [M, K//2]  bfloat16 — odd  K columns of activations
+    W_ptr,        # [N, K//2]  int8 packed (lo nibble = even K, hi = odd K)
+    Y_ptr,        # [M, N]     bfloat16
+    scale_ptr,    # [num_groups, N]
+    zero_ptr,     # [num_groups, N]
     M,
     N,
-    K,
-    group_size,
+    K2,           # K // 2
+    group_size,   # original group_size over full K
     stride_xm,
-    stride_xk,
+    stride_xk,    # strides for x_even / x_odd (same shape [M, K2])
     stride_wn,
-    stride_wk,  # stride over packed bytes, not elements
+    stride_wk,
     stride_ym,
     stride_yn,
-    stride_sg,  # stride over groups (= N for contiguous [num_groups, N])
-    stride_sn,  # stride over N columns (= 1 for contiguous)
+    stride_sg,
+    stride_sn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,  # tile size over K2; inner-dot K for each tl.dot
 ) -> None:
     """
-    Computes Y[M, N] = X[M, K] @ dequant(W)[K, N]  (i.e. X @ W.T after dequant).
+    Computes Y[M, N] = X[M, K] @ dequant(W)[K, N].
 
-    Each program instance handles a [BLOCK_M, BLOCK_N] output tile.
-    The K loop iterates over BLOCK_K activation elements at a time (= BLOCK_K//2 packed bytes).
+    X has been pre-split into x_even [M, K//2] (even K columns) and
+    x_odd [M, K//2] (odd K columns) by the Python wrapper.  Each kernel
+    iteration loads BLOCK_K elements from each and issues two tl.dot calls
+    against the unpacked lo/hi weight halves — no interleave, no LDS.
 
-    Constraint: BLOCK_K must divide group_size (both are powers-of-2 in practice).
+    Constraint: 2 * BLOCK_K must divide group_size.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -98,76 +115,60 @@ def _bf16i4_rowwise_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    for k_idx in tl.range(0, tl.cdiv(K, BLOCK_K)):
-        k_start = k_idx * BLOCK_K
+    for k2_idx in tl.range(0, tl.cdiv(K2, BLOCK_K)):
+        k2_start = k2_idx * BLOCK_K
+        offs_k2 = k2_start + tl.arange(0, BLOCK_K)
 
-        # ---- activation tile [BLOCK_M, BLOCK_K] ----
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        x_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        x = tl.load(
-            X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-            mask=x_mask,
+        # ---- activation tiles [BLOCK_M, BLOCK_K] — fully coalesced ----
+        xk_mask = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
+        x_even = tl.load(
+            X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
+            mask=xk_mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+        x_odd = tl.load(
+            X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
+            mask=xk_mask,
             other=0.0,
         ).to(tl.bfloat16)
 
-        # ---- packed weight tile [BLOCK_N, BLOCK_K//2] ----
-        offs_k2 = k_start // 2 + tl.arange(0, BLOCK_K // 2)
-        w_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K // 2)
+        # ---- packed weight tile [BLOCK_N, BLOCK_K] ----
+        wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
-            mask=w_mask,
+            mask=wk_mask,
             other=0,
         ).to(tl.int32)
 
         # ---- unpack nibbles ----
-        # lo nibble (bits 0-3) -> even K positions (W[n, 2i])
-        # hi nibble (bits 4-7) -> odd K positions  (W[n, 2i+1])
-        # Values are 4-bit two's-complement stored in pack_int4 convention:
-        #   signed int4 in [-8, 7] is stored as its 4 LSBs (unsigned nibble [0,15]).
-        #   Positive values [0,7] map directly; negative [-8,-1] map to nibbles [8,15].
-        w_lo = w_q & 0x0F            # [BLOCK_N, BLOCK_K//2], unsigned nibble [0,15]
-        w_hi = (w_q >> 4) & 0x0F    # [BLOCK_N, BLOCK_K//2], unsigned nibble [0,15]
+        # lo nibble (bits 0-3) -> even K weight values
+        # hi nibble (bits 4-7) -> odd  K weight values
+        w_lo = w_q & 0x0F            # [BLOCK_N, BLOCK_K]
+        w_hi = (w_q >> 4) & 0x0F    # [BLOCK_N, BLOCK_K]
 
         # ---- per-group scale and zero ----
-        group_idx = k_start // group_size
+        # k2_start indexes K//2; the corresponding full-K position is 2*k2_start.
+        group_idx = (k2_start * 2) // group_size
         s = tl.load(
             scale_ptr + group_idx * stride_sg + offs_n * stride_sn,
             mask=offs_n < N,
-        ).to(tl.float32)  # [BLOCK_N]
+        ).to(tl.float32)
         z = tl.load(
             zero_ptr + group_idx * stride_sg + offs_n * stride_sn,
             mask=offs_n < N,
-        ).to(tl.float32)  # [BLOCK_N]
+        ).to(tl.float32)
+        s_col = s[:, None]
+        z_col = z[:, None]
 
-        # ---- dequantise: w_float = w_signed * scale + zero ----
-        # Recover signed int4 from unsigned nibble via two's-complement:
-        #   signed = (nibble XOR 8) - 8
-        #   nibble 0..7  -> signed  0..7  (positive range, bit3 clear)
-        #   nibble 8..15 -> signed -8..-1 (negative range, bit3 set)
-        # Then: w_float = signed * scale + zero
-        #              = ((nibble ^ 8) - 8) * scale + zero
-        s_col = s[:, None]  # [BLOCK_N, 1]
-        z_col = z[:, None]  # [BLOCK_N, 1]
-        w_lo_s = (w_lo ^ 8) - 8  # signed int4, [BLOCK_N, BLOCK_K//2]
-        w_hi_s = (w_hi ^ 8) - 8
-        w_lo_dq = w_lo_s.to(tl.float32) * s_col + z_col  # [BLOCK_N, BLOCK_K//2]
-        w_hi_dq = w_hi_s.to(tl.float32) * s_col + z_col  # [BLOCK_N, BLOCK_K//2]
+        # ---- dequantise: signed = (nibble ^ 8) - 8, w_float = signed * scale + zero ----
+        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s_col + z_col  # [BLOCK_N, BLOCK_K]
+        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s_col + z_col  # [BLOCK_N, BLOCK_K]
 
-        # ---- interleave lo/hi into [BLOCK_N, BLOCK_K] ----
-        # w_full[n, 2i]   = lo_dq[n, i]  (even K)
-        # w_full[n, 2i+1] = hi_dq[n, i]  (odd  K)
-        #
-        # Reshape each to [BLOCK_N, BLOCK_K//2, 1] then broadcast-select
-        # along a new trailing axis of size 2, then reshape to [BLOCK_N, BLOCK_K].
-        w_lo_3d = tl.reshape(w_lo_dq, [BLOCK_N, BLOCK_K // 2, 1])
-        w_hi_3d = tl.reshape(w_hi_dq, [BLOCK_N, BLOCK_K // 2, 1])
-        # selector[0] == True -> take lo, selector[1] == True -> take hi
-        selector = tl.arange(0, 2)[None, None, :] == 0  # [1, 1, 2]
-        w_interleaved = tl.where(selector, w_lo_3d, w_hi_3d)  # [BLOCK_N, BLOCK_K//2, 2]
-        w_full = tl.reshape(w_interleaved, [BLOCK_N, BLOCK_K]).to(tl.bfloat16)
-
-        # ---- GEMM accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] ----
-        acc = tl.dot(x, tl.trans(w_full), acc, out_dtype=tl.float32)
+        # ---- two dot products, no interleave, no LDS ----
+        # x_even [BLOCK_M, BLOCK_K] @ w_lo_dq.T [BLOCK_K, BLOCK_N]  (even K)
+        # x_odd  [BLOCK_M, BLOCK_K] @ w_hi_dq.T [BLOCK_K, BLOCK_N]  (odd  K)
+        acc = tl.dot(x_even, tl.trans(w_lo_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
+        acc = tl.dot(x_odd,  tl.trans(w_hi_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
 
     # ---- store output ----
     y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -205,8 +206,9 @@ def matmul_bf16i4_rowwise(
     M = X.numel() // K
     N = W.shape[0]
     num_groups = w_scale_group.shape[0]
+    K2 = K // 2
 
-    assert W.shape == (N, K // 2), f"W must be [N, K//2], got {W.shape}"
+    assert W.shape == (N, K2), f"W must be [N, K//2], got {W.shape}"
     assert w_scale_group.shape == (num_groups, N), (
         f"w_scale_group must be [num_groups, N]={num_groups, N}, got {w_scale_group.shape}"
     )
@@ -215,11 +217,18 @@ def matmul_bf16i4_rowwise(
     )
     group_size = K // num_groups
     assert group_size % 64 == 0, (
-        f"group_size={group_size} must be divisible by 64 (BLOCK_K min); "
+        f"group_size={group_size} must be divisible by 64 (2 * BLOCK_K_min=32); "
         "common values are 64, 128, 256."
     )
 
-    X_2d = X.reshape(M, K).contiguous()
+    X_2d = X.reshape(M, K)
+
+    # Split activations into even/odd K columns outside the kernel.
+    # .contiguous() issues an optimised HIP strided copy, which is far cheaper
+    # than the LDS bank-conflict path the kernel would take doing this internally.
+    x_even = X_2d[:, 0::2].contiguous()  # [M, K//2]
+    x_odd  = X_2d[:, 1::2].contiguous()  # [M, K//2]
+
     Y = torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
 
     grid = lambda meta: (  # noqa: E731
@@ -227,11 +236,11 @@ def matmul_bf16i4_rowwise(
         triton.cdiv(N, meta["BLOCK_N"]),
     )
     _bf16i4_rowwise_kernel[grid](
-        X_2d, W, Y,
+        x_even, x_odd, W, Y,
         w_scale_group, w_zero_group,
-        M, N, K,
+        M, N, K2,
         group_size,
-        X_2d.stride(0), X_2d.stride(1),
+        x_even.stride(0), x_even.stride(1),
         W.stride(0), W.stride(1),
         Y.stride(0), Y.stride(1),
         w_scale_group.stride(0), w_scale_group.stride(1),
