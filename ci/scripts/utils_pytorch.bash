@@ -54,8 +54,6 @@ install_pytorch_pip () {
   if [ "$pytorch_variant_type_version" == "" ]; then
     echo "Usage: ${FUNCNAME[0]} ENV_NAME PYTORCH_CHANNEL[/VERSION] PYTORCH_VARIANT_TYPE[/VARIANT_VERSION]"
     echo "Example(s):"
-    echo "    ${FUNCNAME[0]} build_env test/2.1.0 cpu     # Install the CPU variant for a specific version"
-    echo "    ${FUNCNAME[0]} build_env release cpu        # Install the CPU variant, latest release version"
     echo "    ${FUNCNAME[0]} build_env test cuda/12.4.0   # Install the CUDA 12.4 variant, latest test version"
     echo "    ${FUNCNAME[0]} build_env nightly rocm/6.2   # Install the ROCM 6.2 variant, latest nightly version"
     return 1

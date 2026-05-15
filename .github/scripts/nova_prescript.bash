@@ -115,8 +115,8 @@ elif [[ $CU_VERSION = rocm* ]]; then
   export BUILD_ROCM_VERSION="${CU_VERSION:4}"
 
 else
-  echo "[NOVA] Setting the MSLK build variant: cpu ..."
-  export mslk_build_variant="cpu"
+  echo "[NOVA] ERROR: Unrecognized CU_VERSION: ${CU_VERSION}. Expected cu* or rocm*."
+  exit 1
 fi
 
 # Install the necessary Python eggs for building
