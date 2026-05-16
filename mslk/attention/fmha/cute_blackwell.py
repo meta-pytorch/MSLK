@@ -173,9 +173,16 @@ def _convert_input_format(
 
     if is_qkv_mxfp8 and query.ndim == 4:
         # Reshape Q/K/V to the 4D layout the kernel expects:
-        # Q: (1, B, Hq, K) → (B, 1, Hq, K)
-        _, B, Hq, K = query.shape
-        query = query.squeeze(0).unsqueeze(1).reshape(B, 1, Hq, K).contiguous()
+        # Q: (1, B*Mq, Hq, K) → (B, Mq, Hq, K)
+        _, BxMq, Hq, K = query.shape
+        # Determine B from K/V shape: K is (1, B*Mkv, Hkv, K_int32)
+        # For non-paged: seqused_k gives per-batch kv lengths
+        if seqused_k is not None:
+            B = seqused_k.shape[0]
+        else:
+            B = 1
+        Mq = BxMq // B
+        query = query.reshape(B, Mq, Hq, K).contiguous()
         if page_table is None:
             Mkv_padded = key.shape[1] // B
             Hkv = key.shape[2]
@@ -393,7 +400,11 @@ def _window_size(
 class FwOp(AttentionFwOpBase):
     OPERATOR = _get_operator("_flash_attn_fwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
+    SUPPORTED_DTYPES: Set[torch.dtype] = {
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+    }
     SUPPORTED_MAX_K = 128
     SUPPORTED_MIN_K = 64
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
@@ -481,6 +492,7 @@ class FwOp(AttentionFwOpBase):
         window_left, window_right = _window_size(inp.attn_bias)
 
         fp8_inp = inp if isinstance(inp, InputsFp8) else None
+        mxfp8_inp = inp if isinstance(inp, InputsMXFp8) else None
         if fp8_inp is not None:
             assert (
                 fp8_inp.k_fp8_scale_shift is not None
@@ -489,17 +501,28 @@ class FwOp(AttentionFwOpBase):
                 "k_fp8_scale_shift and v_fp8_scale_shift must be provided when inp is InputsFp8"
             )
 
+        # Determine scale tensors for the operator
+        if mxfp8_inp is not None:
+            k_scale = mxfp8_inp.k_fp8_scale
+            v_scale = mxfp8_inp.v_fp8_scale
+            q_scale = mxfp8_inp.q_fp8_scale
+        elif fp8_inp is not None:
+            k_scale = fp8_inp.k_fp8_scale_shift
+            v_scale = fp8_inp.v_fp8_scale_shift
+            q_scale = None
+        else:
+            k_scale = None
+            v_scale = None
+            q_scale = None
+
         if inp.query.numel() > 0 and inp.key.numel() > 0:
             out, lse = cls.OPERATOR(
                 q=inp.query,
                 k=inp.key,
                 v=inp.value,
-                k_scale_shift=fp8_inp.k_fp8_scale_shift
-                if fp8_inp is not None
-                else None,
-                v_scale_shift=fp8_inp.v_fp8_scale_shift
-                if fp8_inp is not None
-                else None,
+                k_scale_shift=k_scale,
+                v_scale_shift=v_scale,
+                q_scale_shift=q_scale,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 seqlen_kv=seqused_k,
