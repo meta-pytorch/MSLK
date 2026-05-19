@@ -27,6 +27,6 @@ def load_library_buck(buck_target: str) -> None:
         if open_source:
             pass
         else:
-            logging.error(
+            logging.debug(
                 f"Failed to load buck target {buck_target}, ops will not be available via torch.ops! Error: {e}"
             )
