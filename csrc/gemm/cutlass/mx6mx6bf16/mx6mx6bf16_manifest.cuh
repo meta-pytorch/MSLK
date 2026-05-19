@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include <ATen/ATen.h>
+
+namespace mslk::gemm {
+
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+
+at::Tensor mx6mx6bf16_128_128_1_1_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_128_128_2_2_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_256_128_2_1_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_256_128_2_2_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_256_256_2_1_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_256_256_2_4_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_256_128_4_1_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+at::Tensor mx6mx6bf16_128_128_4_1_1(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output);
+
+using Kernel_mx6mx6bf16 =
+    at::Tensor (*)(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor);
+
+#endif
+} // namespace mslk::gemm
