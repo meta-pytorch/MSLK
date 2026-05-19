@@ -5967,6 +5967,10 @@ def triton_fake_quantize_nvfp4_per_tensor(
     assert input.numel() != 0
     assert input.dim() >= 2
     assert input.dtype == torch.bfloat16
+    if scale_ub is not None and scale_ub.numel() != 1:
+        raise AssertionError(
+            f"scale_ub must be a scalar (numel == 1); got shape {tuple(scale_ub.shape)}"
+        )
 
     output = torch.empty_like(input)
 
