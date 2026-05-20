@@ -2965,5 +2965,48 @@ class MX8MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx8mx6.shape, (M, N))
 
 
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if block-scaled GEMM is not supported")
+class MX6MX6Tests(unittest.TestCase):
+    """Tests for the symmetric MX6 x MX6 CUTLASS GEMM kernel (mx6mx6bf16)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 64, 256]),
+        N=st.sampled_from([256, 1024]),
+        K=st.sampled_from([2048, 4096]),
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        # Both A and B are random uint8 bytes packed at 6 bits/element. The
+        # mx6mx6bf16 kernel derives K = XQ.size(1) * 4 / 3 from packed bytes,
+        # so passing unpacked (M, K)-shape uint8 (e.g. via to_mxfp8(...) & 0x3F
+        # like the asymmetric mx8mx6 test) would silently corrupt K. No Python
+        # MX6 quantizer is wired up, so this test only validates dispatch +
+        # kernel execution (no NaN/Inf, correct shape/dtype).
+        A_bf16 = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B_bf16 = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # MX6 packed weights for A and B: K elements at 6 bits each = K*6/8 bytes.
+        aq_6 = torch.randint(
+            0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        bq_6 = torch.randint(
+            0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        # Reuse MX4 block-scale layout (E8M0, block size 32) for both operands.
+        _, a_scale = triton_quantize_mx4_unpack(A_bf16)
+        _, b_scale = triton_quantize_mx4_unpack(B_bf16)
+
+        out_mx6mx6 = torch.ops.mslk.mx6mx6bf16(aq_6, bq_6, a_scale, b_scale)
+
+        self.assertFalse(out_mx6mx6.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out_mx6mx6.isinf().any().item(), "Output contains Inf")
+        self.assertEqual(out_mx6mx6.shape, torch.Size([M, N]))
+        self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
+
+
 if __name__ == "__main__":
     unittest.main()
