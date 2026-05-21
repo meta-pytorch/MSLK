@@ -2342,6 +2342,116 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
 
 @register_gemm_op
+class CutlassMX8MX4Groupwise(GemmOpBase):
+    """
+    MX8 activation x MX4 weight matmul with groupwise scaling.
+    """
+
+    def quantize(self, x, w):
+        x_scale, xq = to_mxfp8(x)
+        x_scale = _to_blocked(x_scale.view(torch.int8).reshape(x.shape[0], -1)).view(
+            torch.uint8
+        )
+        wq, w_scale = triton_quantize_mx4_unpack(w)
+        wq = wq.view(torch.float4_e2m1fn_x2)
+        return xq, wq, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return torch.ops.mslk.mx8mx4bf16(xq, wq, x_scale, w_scale)
+
+    def quantize_and_compute(self, x, w):
+        xq, wq, x_scale, w_scale = self.quantize(x, w)
+        return self.compute(xq, wq, x_scale, w_scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+
+@register_gemm_op
+class CutlassMX8MX6Groupwise(GemmOpBase):
+    """
+    MX8 activation x MX6 weight matmul with groupwise scaling.
+    No Python MX6 quantizer exists yet, so weights are random packed uint8
+    and SQNR is not meaningful.
+    """
+
+    def quantize(self, x, w):
+        x_scale, xq = to_mxfp8(x)
+        x_scale = _to_blocked(x_scale.view(torch.int8).reshape(x.shape[0], -1)).view(
+            torch.uint8
+        )
+        N, K = w.shape
+        wq = torch.randint(0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=w.device)
+        _, w_scale = triton_quantize_mx4_unpack(w)
+        return xq, wq, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return torch.ops.mslk.mx8mx6bf16(xq, wq, x_scale, w_scale)
+
+    def quantize_and_compute(self, x, w):
+        xq, wq, x_scale, w_scale = self.quantize(x, w)
+        return self.compute(xq, wq, x_scale, w_scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+
+@register_gemm_op
+class CutlassMX6MX6Groupwise(GemmOpBase):
+    """
+    Symmetric MX6 x MX6 matmul with groupwise scaling.
+    No Python MX6 quantizer exists yet, so both operands are random packed
+    uint8 and SQNR is not meaningful.
+    """
+
+    def quantize(self, x, w):
+        M, K = x.shape
+        N = w.shape[0]
+        xq = torch.randint(0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=x.device)
+        wq = torch.randint(0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=w.device)
+        _, x_scale = triton_quantize_mx4_unpack(x)
+        _, w_scale = triton_quantize_mx4_unpack(w)
+        return xq, wq, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return torch.ops.mslk.mx6mx6bf16(xq, wq, x_scale, w_scale)
+
+    def quantize_and_compute(self, x, w):
+        xq, wq, x_scale, w_scale = self.quantize(x, w)
+        return self.compute(xq, wq, x_scale, w_scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+
+@register_gemm_op
 class CutlassMXFP4GroupwiseGrouped(GemmOpBase):
     """
     MXFP4 grouped matmul with groupwise scaling.

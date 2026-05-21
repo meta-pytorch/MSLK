@@ -212,6 +212,7 @@ class Metrics:
     shape_mode: ShapeMode = ShapeMode.REGULAR
 
     sim: float = 0.0
+    sqnr: float = 0.0
     ms: float = 0.0
     tflops: float = 0.0
     gbps: float = 0.0
@@ -237,7 +238,7 @@ class Metrics:
         group_col = f"{'G':<6}" if is_grouped else ""
         header = (
             f"{'OpName':<30} {group_col} {shape_col:<25} "
-            f"{'Sim':<10} {'Ms':<10} {'TFLOPS':<10} "
+            f"{'Sim':<10} {'SQNR(dB)':<10} {'Ms':<10} {'TFLOPS':<10} "
             f"{'GB/s':<10} {'Mem BW Util %':<14} {'Compute Util %':<10}"
         )
         divider = "-" * len(header)
@@ -262,9 +263,10 @@ class Metrics:
         compute_util_str = (
             f"{self.compute_util:<10.2f}" if self.compute_util > 0 else "N/A"
         )
+        sqnr_str = f"{self.sqnr:<10.2f}" if self.sqnr > 0 else f"{'N/A':<10}"
         return (
             f"{self.op:<30} {group_col} {shape:<25} "
-            f"{self.sim:<10.3f} {self.ms:<10.3f} "
+            f"{self.sim:<10.3f} {sqnr_str} {self.ms:<10.3f} "
             f"{self.tflops:<10.2f} {self.gbps:<10.2f} "
             f"{self.mem_bw_util:<14.2f} {compute_util_str}"
         )
@@ -275,6 +277,7 @@ class Metrics:
             "N": self.N,
             "K": self.K,
             f"{self.op}_sim": self.sim,
+            f"{self.op}_sqnr": self.sqnr,
             f"{self.op}_ms": self.ms,
             f"{self.op}_tflops": self.tflops,
             f"{self.op}_gb/s": self.gbps,
@@ -359,11 +362,19 @@ def benchmark_grouped(
             # Otherwise output may be padded or require unbinding.
             output = [o[: m[i]] for i, o in enumerate(output)]
         # Compare the quantize op output to reference as a sanity check.
+        signal_power = 0.0
+        noise_power = 0.0
         for i in range(num_groups):
             if m[i] > 0:
                 metrics.sim += float(
                     torch.mean(torch.pow(output[i] - out_ref[i], 2)).item()
                 )
+                signal_power += (out_ref[i].float() ** 2).sum().item()
+                noise_power += (
+                    ((out_ref[i].float() - output[i].float()) ** 2).sum().item()
+                )
+        if noise_power > 0:
+            metrics.sqnr = float(10 * np.log10(signal_power / noise_power))
         for _ in range(opts.num_iters):
             # Now perform benchmark.
             if bench_quantize:
@@ -461,6 +472,10 @@ def benchmark(
         # Compare the quantize op output to reference as a sanity check.
         # TODO(shikaili): This calculation is incorrect for scatter add fusion.
         metrics.sim = torch.mean(torch.pow(output - out_ref, 2)).item()
+        signal_power = (out_ref.float() ** 2).sum()
+        noise_power = ((out_ref.float() - output.float()) ** 2).sum()
+        if noise_power > 0:
+            metrics.sqnr = (10 * torch.log10(signal_power / noise_power)).item()
 
         for _ in range(opts.num_iters):
             # Now perform benchmark.
