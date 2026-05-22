@@ -9,20 +9,48 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 #include "f4f4bf16_ultra_grouped/f4f4bf16_ultra_grouped_manifest.cuh"
 #endif
 
 namespace mslk::gemm {
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+
+namespace {
+
+// Returns the compute capability of the current device as major*10 + minor
+// (e.g. 100 for B200 / sm_100, 103 for B300 / sm_103). Cached on first call.
+int get_device_sm_version() {
+  static int sm = []() {
+    auto* props = at::cuda::getDeviceProperties(at::cuda::current_device());
+    return props->major * 10 + props->minor;
+  }();
+  return sm;
+}
+
+} // namespace
 
 Kernel_f4f4bf16_ultra_grouped
 get_ultra_kernel_via_heuristics(int M, int N, int K) {
-  if (M <= 128) {
-    return f4f4bf16_ultra_grouped_256_128_768_2_1_1;
+  const int sm = get_device_sm_version();
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+  // B300 (SM 10.3) ultra NVFP4 path.
+  if (sm >= 103) {
+    if (M <= 128) {
+      return f4f4bf16_ultra_grouped_256_128_768_2_1_1;
+    }
+    return f4f4bf16_ultra_grouped_256_256_768_2_1_1;
   }
-  return f4f4bf16_ultra_grouped_256_256_768_2_1_1;
+#endif
+  // B200 (SM 10.0) NVFP4 path.
+  TORCH_CHECK(
+      sm >= 100,
+      "f4f4bf16_ultra_grouped_mm requires a Blackwell (sm_100+) GPU.");
+  if (M <= 128) {
+    return f4f4bf16_ultra_grouped_256_128_256_2_1_1;
+  }
+  return f4f4bf16_ultra_grouped_256_256_256_2_1_1;
 }
 
 at::Tensor f4f4bf16_ultra_grouped_mm(
@@ -102,7 +130,7 @@ at::Tensor f4f4bf16_ultra_grouped_mm(
     at::Tensor w_global_scale,
     std::optional<at::Tensor> output) {
   throw std::runtime_error(
-      "f4f4bf16_ultra_grouped_mm requires CUDA 13.0+ (SM103/B300)");
+      "f4f4bf16_ultra_grouped_mm requires CUDA 12.8+ and a Blackwell GPU");
 }
 
 #endif

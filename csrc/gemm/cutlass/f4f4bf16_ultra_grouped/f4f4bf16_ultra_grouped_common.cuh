@@ -23,16 +23,20 @@
 #include <cutlass/epilogue/collective/collective_builder.hpp> // @manual
 // clang-format on
 
-#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
 namespace mslk::gemm {
 
 namespace cutlass = cutlass_mslk;
 
-// SM103 ultra builder requires cute::tuple element types, not nv_float4_t.
+// Underlying element types (same for both Sm100 NVFP4 and Sm103 ultra NVFP4).
 using ElementData = cutlass::float_e2m1_t;
 using ElementScale = cutlass::float_ue4m3_t;
+// Sm103 ultra CollectiveBuilder expects the (data, scale) pair as a
+// cute::tuple, while the Sm100 NVFP4 CollectiveBuilder takes nv_float4_t
+// directly.
 using ElementPair = cute::tuple<ElementData, ElementScale>;
+using ElementNvf4 = cutlass::nv_float4_t<ElementData>;
 
 inline int64_t _byte_align(int64_t offset) {
   int64_t remainder = offset % 16;
@@ -134,7 +138,25 @@ __global__ void set_ultra_grouped_args_kernel(
   w_global_scale_ptr[group_index] = w_global_scale + group_index;
 }
 
+// Sm103 ultra schedules require CUDA 13+. Alias them to Sm100 NVFP4 schedules
+// on older toolkits so that template instantiation with UseUltra=false still
+// resolves to valid types when those CUDA 12.8 builds reach the conditional.
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+using _UltraArchTag = cutlass::arch::Sm103;
+using _UltraSchedule2Sm = cutlass::gemm::
+    KernelPtrArrayTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103;
+using _UltraSchedule1Sm = cutlass::gemm::
+    KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103;
+#else
+using _UltraArchTag = cutlass::arch::Sm100;
+using _UltraSchedule2Sm =
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100;
+using _UltraSchedule1Sm =
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100;
+#endif
+
 template <
+    bool UseUltra,
     int TB_M,
     int TB_N,
     int TB_K,
@@ -172,19 +194,30 @@ at::Tensor f4f4bf16_ultra_grouped_impl(
 
   using ElementAccumulator = float;
   using ElementComputeEpilogue = float;
-  using ArchTag = cutlass::arch::Sm103;
+  using ArchTag =
+      cute::conditional_t<UseUltra, _UltraArchTag, cutlass::arch::Sm100>;
   using TileShape =
       cute::Shape<cute::Int<TB_M>, cute::Int<TB_N>, cute::Int<TB_K>>;
   using ClusterShape =
       cute::Shape<cute::Int<TBS_M>, cute::Int<TBS_N>, cute::Int<TBS_K>>;
 
-  // SM103 ultra grouped GEMM schedules for NVFP4.
+  // Sm103 ultra path uses cute::tuple<data, scale>; Sm100 NVFP4 path takes
+  // nv_float4_t directly.
+  using ElementForBuilder =
+      cute::conditional_t<UseUltra, ElementPair, ElementNvf4>;
+
+  // Kernel schedule: ultra uses BlockScaledMxNvf4UltraVs16Sm103, Sm100 uses the
+  // standard Nvf4 ptr-array schedule (matching f4f4bf16_grouped).
   using KernelSchedule = cute::conditional_t<
-      (TB_M == 256) && (TBS_M % 2 == 0),
-      cutlass::gemm::
-          KernelPtrArrayTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103,
-      cutlass::gemm::
-          KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103>;
+      UseUltra,
+      cute::conditional_t<
+          (TB_M == 256) && (TBS_M % 2 == 0),
+          _UltraSchedule2Sm,
+          _UltraSchedule1Sm>,
+      cute::conditional_t<
+          (TB_M == 256) && (TBS_M % 2 == 0),
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100>>;
   using EpilogueSchedule = cute::conditional_t<
       (TB_M == 256) && (TBS_M % 2 == 0),
       cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
@@ -226,18 +259,37 @@ at::Tensor f4f4bf16_ultra_grouped_impl(
 
   using EpilogueEVT = EVTCompute1;
 
+  // Ultra (Sm103) uses OpClassBlockScaledTensorOp for the epilogue; Sm100
+  // NVFP4 uses OpClassTensorOp (matches f4f4bf16_grouped_common.cuh).
+  using EpilogueOpClass = cute::conditional_t<
+      UseUltra,
+      cutlass::arch::OpClassBlockScaledTensorOp,
+      cutlass::arch::OpClassTensorOp>;
+
+  // On Sm100, Sm90ScalarBroadcastPtrArray (used by WGlobalScale above) needs a
+  // non-void C type so its pointer-array stride layout is set up correctly.
+  // On Sm103 ultra, void C performs better, so keep the original behavior
+  // there. Source C is unused (nullptr passed in arguments, no beta) in both
+  // cases — this only affects internal stride bookkeeping.
+  using EpilogueElementC = cute::conditional_t<UseUltra, void, ElementC>;
+  using EpilogueLayoutC = cute::conditional_t<
+      UseUltra,
+      void,
+      typename cutlass::layout::LayoutTranspose<LayoutC>::type*>;
+  static constexpr int EpilogueAlignmentC = UseUltra ? 0 : AlignmentC;
+
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           ArchTag,
-          cutlass::arch::OpClassBlockScaledTensorOp,
+          EpilogueOpClass,
           TileShape,
           ClusterShape,
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          void, // No source C matrix (no beta scaling).
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
-          AlignmentC,
+          EpilogueElementC,
+          EpilogueLayoutC,
+          EpilogueAlignmentC,
           ElementC,
           typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
           AlignmentC,
@@ -248,10 +300,10 @@ at::Tensor f4f4bf16_ultra_grouped_impl(
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           cutlass::arch::OpClassBlockScaledTensorOp,
-          ElementPair, // cute::tuple<float_e2m1_t, float_ue4m3_t>
+          ElementForBuilder,
           LayoutB_Transpose*,
           AlignmentB,
-          ElementPair, // cute::tuple<float_e2m1_t, float_ue4m3_t>
+          ElementForBuilder,
           LayoutA_Transpose*,
           AlignmentA,
           ElementAccumulator,
