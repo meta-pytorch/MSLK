@@ -2751,8 +2751,10 @@ class CutlassNVFP4TorchGrouped(GemmOpBase):
 @register_gemm_op
 class NVFP4UltraGroupwise(GemmOpBase):
     """
-    NVFP4 ultra grouped GEMM (SM103) with per-token activation scaling
-    and per-expert weight scaling, applied separately in the EVT epilogue.
+    NVFP4 grouped GEMM with per-token activation scaling and per-expert
+    weight scaling, applied separately in the EVT epilogue. Uses the SM103
+    ultra NVFP4 schedules on B300 and the standard SM100 NVFP4 schedules
+    on B200; the appropriate kernel is selected at runtime.
     """
 
     def preprocess(self, x, w):
@@ -2841,7 +2843,7 @@ class NVFP4UltraGroupwise(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM103}
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
