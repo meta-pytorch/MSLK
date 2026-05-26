@@ -55,6 +55,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
   m.def(
+      "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
+  m.def(
       "mx8mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
   m.def(
       "mx6mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
@@ -124,6 +126,7 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
   m.impl("mx8mx4bf16", mx8mx4bf16);
+  m.impl("mx8mx4bf16_grouped_mm", mx8mx4bf16_grouped_mm);
   m.impl("mx8mx6bf16", mx8mx6bf16);
   m.impl("mx6mx6bf16", mx6mx6bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);
@@ -177,6 +180,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("i8i8bf16", i8i8bf16);
   m.impl("f4f4bf16", f4f4bf16);
   m.impl("mx8mx4bf16", mx8mx4bf16);
+  m.impl("mx8mx4bf16_grouped_mm", mx8mx4bf16_grouped_mm);
   m.impl("mx8mx6bf16", mx8mx6bf16);
   m.impl("mx6mx6bf16", mx6mx6bf16);
   m.impl("f4f4bf16_grouped_stacked", f4f4bf16_grouped_stacked);

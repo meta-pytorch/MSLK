@@ -56,6 +56,17 @@ at::Tensor f4f4bf16_ultra_grouped_mm(
     at::Tensor w_global_scale,
     std::optional<at::Tensor> output = std::nullopt);
 
+// Torch compliant MXFP8 activation x MXFP4 weight grouped GEMM.
+// Supports 2D-3D MoE forward inputs:
+//   XQ: [total_M, K], WQ: [G, K / 2, N], offsets: [G].
+at::Tensor mx8mx4bf16_grouped_mm(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor offsets,
+    std::optional<at::Tensor> output = std::nullopt);
+
 // FP4 GEMM supporting NVFP4, MXFP4 (1x32 block), and MXFP4_16 (1x16 block)
 //
 // Format selection:

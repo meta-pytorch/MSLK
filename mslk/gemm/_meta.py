@@ -306,6 +306,24 @@ if hasattr(torch.ops.mslk, "mx8mx4bf16"):
         return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
+if hasattr(torch.ops.mslk, "mx8mx4bf16_grouped_mm"):
+
+    @torch.library.register_fake("mslk::mx8mx4bf16_grouped_mm")
+    def mx8mx4bf16_grouped_mm_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        offsets: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if output is not None:
+            return output
+        total_M = XQ.shape[0]
+        N = WQ.shape[-1]
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
 if hasattr(torch.ops.mslk, "mx6mx6bf16"):
 
     @torch.library.register_fake("mslk::mx6mx6bf16")
