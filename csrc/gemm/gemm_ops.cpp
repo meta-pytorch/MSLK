@@ -48,7 +48,7 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
-  // INT8 GEMM via Triton (BACKLOG-G1 / MSLK-G1) — static and dynamic scale variants.
+  // INT8 GEMM via Triton — static and dynamic scale variants.
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
       "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");

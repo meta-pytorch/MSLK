@@ -3136,7 +3136,7 @@ def _supports_int8_triton() -> bool:
 
 @unittest.skipIf(not _supports_int8_triton(), "Requires CUDA SM80+ or ROCm")
 class RocmInt8GemmTests(unittest.TestCase):
-    """Correctness tests for the Triton INT8 GEMM kernel (BACKLOG-G1 / MSLK-G1).
+    """Correctness tests for the Triton INT8 GEMM kernel.
 
     On CUDA the tests verify parity with the existing CUTLASS i8i8bf16 path.
     On ROCm they serve as the primary correctness gate since there is no
