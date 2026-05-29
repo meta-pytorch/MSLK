@@ -7,16 +7,15 @@
 # pyre-strict
 # pyre-ignore-all-errors[53]
 
+import itertools
 import unittest
 
 import torch
-from hypothesis import given, settings, strategies as st, Verbosity
+from parameterized import parameterized
 
 if torch.cuda.is_available():
     from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_row
-
-_MAX_SAMPLES = 32
 
 
 @unittest.skipIf(
@@ -27,19 +26,18 @@ class TestGroupedGEMM(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)
 
-    @given(
-        G=st.sampled_from([1, 4, 16, 128]),
-        M=st.sampled_from([0, 128, 2048, 16384]),
-        N=st.sampled_from([256]),
-        K=st.sampled_from([256]),
-        fast_accumulation=st.sampled_from([True, False]),
-        warp_specialization=st.sampled_from(
-            [False]
+    @parameterized.expand(
+        itertools.product(
+            [1, 4, 16, 128],  # G
+            [0, 128, 2048, 16384],  # M
+            [256],  # N
+            [256],  # K
+            [True, False],  # fast_accumulation
             # TODO(T224502057): Re-enable the test after fixing WS hanging issue.
-        ),
-        fuse_scatter_add=st.sampled_from([True, False]),
+            [False],  # warp_specialization
+            [True, False],  # fuse_scatter_add
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     @unittest.skipIf(  # pyre-ignore [56]
         (not torch.cuda.is_available())
         or (torch.version.hip is None)
@@ -146,15 +144,16 @@ class TestGroupedGEMM(unittest.TestCase):
                 msg=msg,
             )
 
-    @given(
-        G=st.sampled_from([1, 4, 16, 128]),
-        M=st.sampled_from([0, 128, 2048, 16384]),
-        N=st.sampled_from([256, 451]),
-        K=st.sampled_from([100, 256, 257]),
-        warp_specialization=st.sampled_from([False]),
-        fuse_scatter_add=st.sampled_from([True, False]),
+    @parameterized.expand(
+        itertools.product(
+            [1, 4, 16, 128],  # G
+            [0, 128, 2048, 16384],  # M
+            [256, 451],  # N
+            [100, 256, 257],  # K
+            [False],  # warp_specialization
+            [True, False],  # fuse_scatter_add
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     # TODO(shikaili): Re-enable the test for SM80 after fixing TMA issues.
     @unittest.skipIf(  # pyre-ignore [56]
         (not torch.cuda.is_available())
@@ -247,19 +246,16 @@ class TestGroupedGEMM(unittest.TestCase):
                 result, expected_result, atol=1e-5, rtol=1.6e-2, msg=msg
             )
 
-    @given(
-        G=st.sampled_from([1, 4, 16, 128]),
-        M=st.sampled_from([0, 128, 2048, 16384]),
-        N=st.sampled_from([256, 451]),
-        K=st.sampled_from([100, 256, 257]),
-        warp_specialization=st.sampled_from([False]),
-        has_bias=st.sampled_from([True, False]),
-        has_token_weights=st.sampled_from([True, False]),
-    )
-    @settings(
-        verbosity=Verbosity.verbose,
-        max_examples=_MAX_SAMPLES,
-        deadline=None,
+    @parameterized.expand(
+        itertools.product(
+            [1, 4, 16, 128],  # G
+            [0, 128, 2048, 16384],  # M
+            [256, 451],  # N
+            [100, 256, 257],  # K
+            [False],  # warp_specialization
+            [True, False],  # has_bias
+            [True, False],  # has_token_weights
+        )
     )
     @unittest.skipIf(  # pyre-ignore [56]
         (not torch.cuda.is_available())
@@ -353,18 +349,15 @@ class TestGroupedGEMM(unittest.TestCase):
             result, expected_result, atol=1e-5, rtol=1.6e-2, msg=msg
         )
 
-    @given(
-        G=st.sampled_from([1, 4, 16, 128]),
-        M=st.sampled_from([0, 128, 2048, 16384]),
-        K=st.sampled_from([100, 256, 257]),
-        warp_specialization=st.sampled_from([False]),
-        has_bias=st.sampled_from([True, False]),
-        has_token_weights=st.sampled_from([True, False]),
-    )
-    @settings(
-        verbosity=Verbosity.verbose,
-        max_examples=_MAX_SAMPLES,
-        deadline=None,
+    @parameterized.expand(
+        itertools.product(
+            [1, 4, 16, 128],  # G
+            [0, 128, 2048, 16384],  # M
+            [100, 256, 257],  # K
+            [False],  # warp_specialization
+            [True, False],  # has_bias
+            [True, False],  # has_token_weights
+        )
     )
     @unittest.skipIf(  # pyre-ignore [56]
         (not torch.cuda.is_available())

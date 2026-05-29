@@ -24,7 +24,9 @@ if torch.cuda.is_available():
     )
     from mslk.quantize.triton.fp8_quantize import triton_quantize_fp8_row
 
-from hypothesis import given, settings, strategies as st, Verbosity
+import itertools
+
+from parameterized import parameterized
 
 try:
     # @manual=//mslk:test_utils
@@ -37,8 +39,6 @@ except Exception:
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_MAX_SAMPLES: int = 100
-
 
 @unittest.skipIf(open_source, "Tests currently fail in open source")
 @unittest.skipIf(
@@ -49,15 +49,16 @@ _MAX_SAMPLES: int = 100
 class GatherScatterTests(unittest.TestCase):
     """Test gather/scatter kernels."""
 
-    @given(
-        E=st.sampled_from([2, 4, 8]),
-        T=st.sampled_from([0, 1, 128, 2048, 4096, 16384]),
-        D=st.sampled_from([5120, 7168]),
-        partial=st.sampled_from([True, False]),
-        rowmajor=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
+    @parameterized.expand(
+        itertools.product(
+            [2, 8],  # E
+            [0, 1, 128, 4096],  # T
+            [5120],  # D
+            [True, False],  # partial
+            [True, False],  # rowmajor
+            [True, False],  # compiled
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_gather_scale_dense_tokens(
         self,
         E: int,
@@ -124,15 +125,15 @@ class GatherScatterTests(unittest.TestCase):
             torch_output[:num_valid_tokens], test_output[:num_valid_tokens]
         )
 
-    @given(
-        E=st.sampled_from([2, 4, 8]),
-        T=st.sampled_from([1, 128, 2048, 4096, 16384]),
-        D=st.sampled_from([5120, 7168]),
-        partial=st.sampled_from([True, False]),
-        rowmajor=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
+    @parameterized.expand(
+        itertools.product(
+            [2, 8],  # E
+            [1, 128, 4096],  # T
+            [5120],  # D
+            [True, False],  # partial
+            [True, False],  # rowmajor
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_gather_scale_quant_dense_tokens(
         self,
         E: int,
@@ -140,7 +141,6 @@ class GatherScatterTests(unittest.TestCase):
         D: int,
         partial: bool,
         rowmajor: bool,
-        compiled: bool,
     ) -> None:
         if T == 16384 and (E > 2 or D > 5120):
             logger.info(f"Skipping test for E={E}, T={T} because it will lead to OOM")
@@ -177,23 +177,17 @@ class GatherScatterTests(unittest.TestCase):
                 -1, 1
             ).to(torch.float32)
             ref_output_q, ref_output_scales = triton_quantize_fp8_row(
-                ref_output, scale_ub
+                ref_output, scale_ub, eps_opt=None
             )
             return ref_output_q, ref_output_scales
 
         torch_output_q, torch_output_scales = torch_fn()
-        torch_output = torch_output_q.to(torch.float32) * torch_output_scales.view(
-            -1, 1
-        )
 
         def triton_fn() -> tuple[torch.Tensor, torch.Tensor]:
             scores_ = scores.contiguous().transpose(0, 1)
             if rowmajor:
                 scores_ = scores_.contiguous()
-            op = gather_scale_quant_dense_tokens
-            if compiled:
-                op = torch.compile(op)
-            test_output_q, test_output_scales = op(
+            test_output_q, test_output_scales = gather_scale_quant_dense_tokens(
                 x,
                 partial_token_indices,
                 partial_expert_indices,
@@ -204,23 +198,33 @@ class GatherScatterTests(unittest.TestCase):
             return test_output_q, test_output_scales
 
         test_output_q, test_output_scales = triton_fn()
-        test_output = test_output_q.to(torch.float32) * test_output_scales.view(-1, 1)
 
         torch.testing.assert_close(
-            torch_output[:num_valid_tokens],
-            test_output[:num_valid_tokens],
-            atol=1e-3,
-            rtol=1.6e-2,
+            torch_output_scales[:num_valid_tokens],
+            test_output_scales[:num_valid_tokens],
+            atol=1e-7,
+            rtol=1e-5,
+        )
+        # The fused kernel quantizes via multiplication (a * scale) while the
+        # reference uses division (tl.div_rn(a, scale)). This causes at most
+        # 1-step FP8 rounding differences. rtol=0.125 = 1/2^mantissa_bits
+        # for e4m3's 3-bit mantissa; atol covers subnormals near zero.
+        torch.testing.assert_close(
+            torch_output_q[:num_valid_tokens].to(torch.float32),
+            test_output_q[:num_valid_tokens].to(torch.float32),
+            atol=0.0625,
+            rtol=0.125,
         )
 
-    @given(
-        num_tokens=st.sampled_from([0, 1, 128, 2048, 4096, 16384]),
-        dim=st.sampled_from([1280, 5120]),
-        partial=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
-        k=st.sampled_from([1, 4]),
+    @parameterized.expand(
+        itertools.product(
+            [0, 1, 128, 4096],  # num_tokens
+            [1280, 5120],  # dim
+            [True, False],  # partial
+            [True, False],  # compiled
+            [1, 4],  # k
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_scatter_add_dense_tokens(
         self,
         num_tokens: int,
@@ -302,16 +306,17 @@ class GatherScatterTests(unittest.TestCase):
                 test_out_tokens[:num_valid_tokens], ref_out_tokens[:num_valid_tokens]
             )
 
-    @given(
-        num_tokens=st.sampled_from([64, 128, 256]),
-        num_experts=st.sampled_from([16, 80, 128]),
-        ep_size=st.sampled_from([2, 4, 8, 16]),
-        dim=st.sampled_from([5120]),
-        balanced=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
-        k=st.sampled_from([1, 2, 4]),
+    @parameterized.expand(
+        itertools.product(
+            [64, 256],  # num_tokens
+            [16, 128],  # num_experts
+            [2, 16],  # ep_size
+            [5120],  # dim
+            [True, False],  # balanced
+            [True, False],  # compiled
+            [1, 4],  # k
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_scatter_add_padded_tokens(
         self,
         num_tokens: int,

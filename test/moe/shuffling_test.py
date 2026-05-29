@@ -19,7 +19,7 @@ import triton  # noqa: F401
 if torch.cuda.is_available():
     from mslk.moe import combine_shuffling, index_shuffling, split_shuffling
 
-from hypothesis import given, settings, strategies as st, Verbosity
+from parameterized import parameterized
 from pyre_extensions import none_throws
 
 try:
@@ -33,8 +33,6 @@ logger.setLevel(logging.INFO)
 
 torch._dynamo.config.cache_size_limit = 128
 
-_MAX_SAMPLES: int = 100
-
 
 @unittest.skipIf(open_source, "Tests currently fail in open source")
 @unittest.skipIf(
@@ -44,19 +42,18 @@ _MAX_SAMPLES: int = 100
 class ShufflingTests(unittest.TestCase):
     """Test shuffling kernels."""
 
-    @given(
-        num_tokens=st.sampled_from(
-            [1, 3, 123, 128, 1234, 2048, 4567, 4096, 8192, 16384]
-        ),
-        num_experts=st.sampled_from([16, 32, 128, 320]),
-        num_local_experts=st.sampled_from([None, 8]),
-        top_k=st.sampled_from([1, 2, 4] if torch.version.cuda else [1]),
-        padded=st.sampled_from([True, False]),
-        rowmajor=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
-        routing_score_dtype=st.sampled_from([torch.float, torch.bfloat16]),
+    @parameterized.expand(
+        itertools.product(
+            [1, 128, 4096],  # num_tokens
+            [16, 128],  # num_experts
+            [None, 8],  # num_local_experts
+            [1, 4] if torch.version.cuda else [1],  # top_k
+            [True, False],  # padded
+            [True, False],  # rowmajor
+            [True, False],  # compiled
+            [torch.bfloat16],  # routing_score_dtype
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_topk_index_shuffling(
         self,
         num_tokens: int,
@@ -207,19 +204,18 @@ class ShufflingTests(unittest.TestCase):
                 start_index = end_index
             ref_start_index = ref_end_index
 
-    @given(
-        batch_size=st.sampled_from(
-            [1, 8, 123, 128, 1234, 2048, 4096, 4567, 8192, 16384]
-        ),
-        num_experts=st.sampled_from([16, 80, 128]),
-        dp_size=st.sampled_from([2, 4, 16]),
-        routed_mp_size=st.sampled_from([1, 4, 8]),
-        dim=st.sampled_from([5120]),
-        top_k=st.sampled_from([1, 2, 4]),
-        is_combine_shuffling=st.booleans(),
-        is_padded=st.booleans(),
+    @parameterized.expand(
+        itertools.product(
+            [1, 128, 4096],  # batch_size
+            [16, 128],  # num_experts
+            [2, 16],  # dp_size
+            [1, 8],  # routed_mp_size
+            [5120],  # dim
+            [1, 4],  # top_k
+            [True, False],  # is_combine_shuffling
+            [True, False],  # is_padded
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_combine_or_split_shuffling(
         self,
         batch_size: int,

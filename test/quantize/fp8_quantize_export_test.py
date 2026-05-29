@@ -7,21 +7,25 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import itertools
 import unittest
 from typing import Any, Callable, List
 
 import torch
-from hypothesis import given, settings, strategies as st
 from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
     quantize_fp8_row,
     quantize_fp8_tensor,
 )
+from parameterized import parameterized
 
 
 @unittest.skipIf(
     not torch.cuda.is_available(),
     "Operators are only available on CUDA enabled machines",
+)
+@unittest.skipIf(
+    torch.cuda.get_device_capability("cuda") < (9, 0), "Only support sm90+"
 )
 class Fp8QuantizeExportTest(unittest.TestCase):
     """Check that FP8 ops can be compiled and exported properly."""
@@ -44,22 +48,18 @@ class Fp8QuantizeExportTest(unittest.TestCase):
             self.assertTrue(torch.allclose(e_o.to(torch.float), c_o.to(torch.float)))
             self.assertTrue(torch.allclose(e_o.to(torch.float), x_o.to(torch.float)))
 
-    @unittest.skipIf(
-        torch.cuda.get_device_capability("cuda") < (9, 0), "Only support sm90+"
-    )
-    @given(
-        input_shape=st.sampled_from([[32, 32]]),
-        quantize_op=st.sampled_from(
+    @parameterized.expand(
+        itertools.product(
+            [[32, 32]],  # input_shape
             [
                 quantize_fp8_row,
                 quantize_fp8_block,
                 quantize_fp8_tensor,
-            ]
-        ),
+            ],  # quantize_op
+        )
     )
-    @settings(deadline=None)
     def test_compile_and_export(
-        self, quantize_op: Callable[..., Any], input_shape: List[int]
+        self, input_shape: List[int], quantize_op: Callable[..., Any]
     ) -> None:
         test_input = torch.randn(input_shape, device="cuda", dtype=torch.bfloat16)
         self.compile_quantize_op(quantize_op, test_input)
