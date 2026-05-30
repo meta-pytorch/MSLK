@@ -1424,6 +1424,132 @@ class BF16Int4Tests(unittest.TestCase):
             )
 
 
+@unittest.skipIf(torch.version.hip is None, "ROCm-only: BF16xINT4 Triton rowwise GEMM")
+class BF16Int4TritonROCmTests(unittest.TestCase):
+    """
+    Tests for the Triton BF16xINT4 rowwise GEMM running on AMD GPUs.
+
+    Imports the Triton kernel module, which also registers the torch op
+    implementations via torch.library.impl for the mslk:: namespace.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = "cuda"
+        from mslk.gemm.triton.int4_gemm import (  # noqa: F401
+            matmul_bf16i4_rowwise,
+            matmul_bf16i4_rowwise_batched,
+        )
+
+        cls.matmul_rowwise = staticmethod(matmul_bf16i4_rowwise)
+        cls.matmul_rowwise_batched = staticmethod(matmul_bf16i4_rowwise_batched)
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 16, 64, 512, 2048]),
+        N=st.sampled_from([256, 512, 1024, 4096]),
+        K=st.sampled_from([256, 512, 1024]),
+        group_size=st.sampled_from([128]),
+    )
+    def test_rowwise_accuracy(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        """
+        Checks that the Triton kernel output is close to a float32 reference.
+        The tolerance (1e-1 / 8e-2) matches the existing CUDA CUTLASS test.
+        """
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+        w_scale = w_scale.contiguous().to(device=self.device)
+        w_zp = w_zp.contiguous().to(device=self.device)
+
+        y = self.matmul_rowwise(x, wq, w_scale, w_zp)
+        y_ref = (x.float() @ w.float().T).to(torch.bfloat16)
+
+        torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+    @settings(deadline=None)
+    @given(
+        B=st.sampled_from([1, 4]),
+        M=st.sampled_from([64, 512, 2048]),
+        N=st.sampled_from([256, 512, 1024]),
+        K=st.sampled_from([256, 512]),
+        group_size=st.sampled_from([128]),
+    )
+    def test_rowwise_batched_accuracy(
+        self,
+        B: int,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        """
+        Checks the batched variant (loop-over-batch prototype) against float32 bmm.
+        """
+        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        wq_list, scale_list, zp_list = [], [], []
+        for b in range(B):
+            wq_b, s_b, z_b = int4_row_quantize(w[b], group_size)
+            wq_list.append(pack_int4(wq_b))
+            scale_list.append(s_b)
+            zp_list.append(z_b)
+
+        wq = torch.stack(wq_list).contiguous().to(device=self.device)
+        w_scale = torch.cat(scale_list, dim=0).contiguous().to(device=self.device)
+        w_zp = torch.cat(zp_list, dim=0).contiguous().to(device=self.device)
+
+        y = self.matmul_rowwise_batched(x, wq, w_scale, w_zp)
+        y_ref = torch.bmm(x.float(), w.float().transpose(1, 2)).to(torch.bfloat16)
+
+        torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 16, 128, 2048]),
+        N=st.sampled_from([256, 1024, 4096]),
+        K=st.sampled_from([256, 1024]),
+        group_size=st.sampled_from([128]),
+    )
+    def test_torch_op_dispatch(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        """
+        Verifies that torch.ops.mslk.bf16i4bf16_rowwise dispatches to the
+        Triton kernel on ROCm (requires mslk C++ library and int4_gemm.py
+        both to be loaded).
+        """
+        if not hasattr(torch.ops, "mslk") or not hasattr(
+            torch.ops.mslk, "bf16i4bf16_rowwise"
+        ):
+            self.skipTest("mslk:: ops not loaded; skipping dispatch test")
+
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+        w_scale = w_scale.contiguous().to(device=self.device)
+        w_zp = w_zp.contiguous().to(device=self.device)
+
+        y_op = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
+        y_direct = self.matmul_rowwise(x, wq, w_scale, w_zp)
+        torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
+
+
 @unittest.skipIf(
     not SUPPORTS_FP8_INT4, "Skip if FP8Int4Tests is not supported on this device."
 )

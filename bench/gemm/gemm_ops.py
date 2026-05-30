@@ -2147,6 +2147,24 @@ class CutlassBF16Int4Rowwise(CutlassFP8Int4Rowwise):
 
 
 @register_gemm_op
+class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
+    """ROCm Triton BF16xINT4 rowwise GEMM."""
+
+    def compute(self, x, wq, w_scale, w_zp):
+        from mslk.gemm.triton.int4_gemm import matmul_bf16i4_rowwise
+
+        return matmul_bf16i4_rowwise(x, wq, w_scale, w_zp)
+
+    def quantize_and_compute(self, x, w):
+        x, wq, w_scale, w_zp = self.quantize(x, w)
+        return self.compute(x, wq, w_scale, w_zp)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X}
+
+
+@register_gemm_op
 class TinyGemmBF16Int4Groupwise(GemmOpBase):
     """
     Mixed Precision BF16 Activations with Int4 Weights using tinygemm.
