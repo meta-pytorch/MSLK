@@ -334,8 +334,8 @@ install_build_tools () {
     auditwheel \
     'bazel<=7.6.1' \
     'cmake>=3.30' \
+    click \
     'dill>=0.4.0' \
-    hypothesis \
     jinja2 \
     make \
     ncurses \
@@ -378,7 +378,7 @@ install_build_tools () {
   (test_binpath "${env_name}" ninja) || return 1
 
   # Check Python packages are importable
-  local import_tests=( click hypothesis jinja2 skbuild wheel )
+  local import_tests=( click jinja2 skbuild wheel )
   for p in "${import_tests[@]}"; do
     (test_python_import_package "${env_name}" "${p}") || return 1
   done

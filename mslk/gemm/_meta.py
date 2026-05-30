@@ -348,9 +348,20 @@ if hasattr(torch.ops.mslk, "f8f8bf16"):
         scale: torch.Tensor,
         use_fast_accum: bool = True,
     ) -> torch.Tensor:
-        M = X.shape[0]
-        N = W.shape[0]
-        return torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
+        x_dims = X.dim()
+        w_dims = W.dim()
+        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
+            "The dim of X must be 2 or 3, and dim of W must be 2"
+        )
+        if x_dims == 2:
+            M = X.shape[0]
+            N = W.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
+        else:
+            B = X.shape[0]
+            M = X.shape[1]
+            N = W.shape[0]
+            return torch.empty((B, M, N), dtype=torch.bfloat16, device=X.device)
 
 
 if hasattr(torch.ops.mslk, "f8f8bf16_groupwise"):

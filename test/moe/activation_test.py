@@ -19,14 +19,14 @@ if torch.cuda.is_available():
     from mslk.moe import silu_mul, silu_mul_quant
     from mslk.quantize.triton.fp8_quantize import triton_quantize_fp8_row
 
-from hypothesis import given, settings, strategies as st, Verbosity
+import itertools
+
+from parameterized import parameterized
 
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-_MAX_SAMPLES: int = 100
 
 
 @unittest.skipIf(
@@ -40,14 +40,15 @@ _MAX_SAMPLES: int = 100
 class ActivationTests(unittest.TestCase):
     """Test activation kernels."""
 
-    @given(
-        T=st.sampled_from([0, 1, 128, 2048, 4096, 16384]),
-        D=st.sampled_from([5120, 7168]),
-        contiguous=st.sampled_from([True, False]),
-        partial=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
+    @parameterized.expand(
+        itertools.product(
+            [0, 1, 128, 2048, 4096, 16384],  # T
+            [5120, 7168],  # D
+            [True, False],  # contiguous
+            [True, False],  # partial
+            [True, False],  # compiled
+        )
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_silu_mul(
         self,
         T: int,
@@ -93,20 +94,21 @@ class ActivationTests(unittest.TestCase):
             y[:num_valid_tokens], y_ref[:num_valid_tokens], rtol=1.6e-2, atol=1e-3
         )
 
+    @parameterized.expand(
+        itertools.product(
+            [0, 1, 128, 2048, 4096, 16384],  # T
+            [5120, 7168],  # D
+            [None, 1200.00],  # scale_ub
+            [True, False],  # contiguous
+            [True, False],  # partial
+            [True, False],  # compiled
+        )
+    )
     @unittest.skipIf(
         not torch.cuda.is_available()
         or torch.cuda.get_device_properties(torch.cuda.current_device()).major < 9,
         "Skip when H100 is not available",
     )
-    @given(
-        T=st.sampled_from([0, 1, 128, 2048, 4096, 16384]),
-        D=st.sampled_from([5120, 7168]),
-        scale_ub=st.sampled_from([None, 1200.00]),
-        contiguous=st.sampled_from([True, False]),
-        partial=st.sampled_from([True, False]),
-        compiled=st.sampled_from([True, False]),
-    )
-    @settings(verbosity=Verbosity.verbose, max_examples=_MAX_SAMPLES, deadline=None)
     def test_silu_mul_quant(
         self,
         T: int,
