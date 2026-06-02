@@ -221,6 +221,21 @@ at::Tensor bf16bf16bf16_grouped_impl(
     int sm_count,
     std::optional<at::Tensor> zero_start_index_M,
     std::optional<at::Tensor> M_sizes) {
+#ifdef MSLK_DISABLE_SM90_CUTLASS
+  // Blackwell-only build: this SM90 grouped-GEMM is never dispatched (the
+  // runtime arch selector uses the SM100 path). Skip the CUTLASS SM90
+  // instantiation to cut build time; the symbol is preserved for linking.
+  (void)X;
+  (void)W;
+  (void)output;
+  (void)sm_count;
+  (void)zero_start_index_M;
+  (void)M_sizes;
+  TORCH_CHECK(
+      false,
+      "bf16bf16bf16_grouped SM90 kernel invoked in a Blackwell-only build");
+  return at::Tensor();
+#else
   int64_t G;
   at::TensorOptions options;
   at::ScalarType dtype;
@@ -518,6 +533,7 @@ at::Tensor bf16bf16bf16_grouped_impl(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return output;
+#endif // MSLK_DISABLE_SM90_CUTLASS
 }
 
 // Helper function to dispatch based on dtype

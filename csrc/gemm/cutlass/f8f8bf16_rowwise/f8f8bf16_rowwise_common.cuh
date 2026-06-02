@@ -48,281 +48,301 @@ at::Tensor f8f8bf16_rowwise_impl(
     at::Tensor w_scale,
     std::optional<at::Tensor> bias,
     std::optional<at::Tensor> output) {
-  c10::cuda::CUDAGuard deviceGuard(XQ.device());
-
-  // XQ: M x K
-  // WQ: N x K
-  // output: M x N
-  int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
-  int N = WQ.size(0);
-  int K = WQ.size(1);
-  // 1. If the input tensor is {M, K}, the output tensor is {M, N}.
-  // 2. If the input tensor is {b, M, K}, the output tensor is {b, M, N}.
-  auto out_sizes = XQ.sizes().vec();
-  out_sizes.back() = N;
-  // Handle case where there is a zero dimension, we simply return an empty
-  // tensor.
-  if (M == 0 || N == 0 || K == 0) {
-    // Use zeros instead of empty for special case where K=0.
-    return at::zeros(out_sizes, XQ.options().dtype(at::kBFloat16));
+#ifdef MSLK_DISABLE_SM90_CUTLASS
+  // Blackwell-only build: the SM90 instantiation (ARCH != 10) is never
+  // dispatched at runtime (the SM100 path is selected). Skip its CUTLASS body
+  // to cut build time; the function symbol is preserved for linking.
+  if constexpr (ARCH != 10) {
+    (void)XQ;
+    (void)WQ;
+    (void)x_scale;
+    (void)w_scale;
+    (void)bias;
+    (void)output;
+    TORCH_CHECK(
+        false,
+        "f8f8bf16_rowwise SM90 kernel invoked in a Blackwell-only build");
+    return at::Tensor();
   }
+  if constexpr (ARCH == 10)
+#endif
+  {
+    c10::cuda::CUDAGuard deviceGuard(XQ.device());
 
-  TORCH_CHECK(XQ.size(-1) == K);
-  TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
-  TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
+    // XQ: M x K
+    // WQ: N x K
+    // output: M x N
+    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int N = WQ.size(0);
+    int K = WQ.size(1);
+    // 1. If the input tensor is {M, K}, the output tensor is {M, N}.
+    // 2. If the input tensor is {b, M, K}, the output tensor is {b, M, N}.
+    auto out_sizes = XQ.sizes().vec();
+    out_sizes.back() = N;
+    // Handle case where there is a zero dimension, we simply return an empty
+    // tensor.
+    if (M == 0 || N == 0 || K == 0) {
+      // Use zeros instead of empty for special case where K=0.
+      return at::zeros(out_sizes, XQ.options().dtype(at::kBFloat16));
+    }
 
-  at::Tensor Y;
-  if (output.has_value()) {
-    Y = output.value();
-    // Make sure the provided output has the proper shape and dtype.
-    TORCH_CHECK(Y.sizes().vec() == out_sizes);
-    TORCH_CHECK(Y.dtype() == at::kBFloat16);
-  } else {
-    Y = at::empty(out_sizes, XQ.options().dtype(at::kBFloat16));
+    TORCH_CHECK(XQ.size(-1) == K);
+    TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
+    TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
+
+    at::Tensor Y;
+    if (output.has_value()) {
+      Y = output.value();
+      // Make sure the provided output has the proper shape and dtype.
+      TORCH_CHECK(Y.sizes().vec() == out_sizes);
+      TORCH_CHECK(Y.dtype() == at::kBFloat16);
+    } else {
+      Y = at::empty(out_sizes, XQ.options().dtype(at::kBFloat16));
+    }
+
+    using ElementA = cutlass::float_e4m3_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    constexpr int AlignmentInputA = 16 / sizeof(ElementA);
+
+    using ElementB = cutlass::float_e4m3_t;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    constexpr int AlignmentInputB = 16 / sizeof(ElementB);
+
+    // Use implicit transpose to enable more flexible configurations.
+    using LayoutA_Transpose =
+        typename cutlass::layout::LayoutTranspose<LayoutA>::type;
+    using LayoutB_Transpose =
+        typename cutlass::layout::LayoutTranspose<LayoutB>::type;
+
+    using ElementBias = BIAS_DTYPE;
+
+    using ElementOutput = cutlass::bfloat16_t;
+    using LayoutOutput = cutlass::layout::RowMajor;
+    constexpr int AlignmentOutput = 16 / sizeof(ElementOutput);
+
+    using ElementAccumulator = float;
+    using ElementComputeEpilogue = float;
+    using ArchTag = cute::conditional_t<
+        ARCH == 10,
+        cutlass::arch::Sm100,
+        cutlass::arch::Sm90>; // Tag indicating the minimum SM that
+                              // supports the intended feature
+    using OperatorClass = cutlass::arch::OpClassTensorOp;
+    using TileShape = cute::Shape<
+        cute::Int<TB_M>,
+        cute::Int<TB_N>,
+        cute::Int<TB_K>>; // Threadblock-level
+                          // tile size
+    using ClusterShape = cute::Shape<
+        cute::Int<TBS_M>,
+        cute::Int<TBS_N>,
+        cute::Int<TBS_K>>; // Shape of the
+                           // threadblocks in a
+                           // cluster
+    using StageCountType =
+        cutlass::gemm::collective::StageCountAuto; // Stage count maximized
+                                                   // based on the tile size
+    using KernelSchedule = cutlass::gemm::collective::
+        KernelScheduleAuto; // Kernel to launch based on the default setting in
+                            // the Collective Builder
+
+    // Implement rowwise scaling epilogue.
+    using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0,
+        TileShape,
+        ElementComputeEpilogue,
+        ElementComputeEpilogue,
+        cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+
+    using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        0,
+        TileShape,
+        ElementComputeEpilogue,
+        ElementComputeEpilogue,
+        cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+
+    using Bias = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        0,
+        TileShape,
+        ElementBias,
+        ElementBias,
+        cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+
+    using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+
+    using Compute0 = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies,
+        ElementComputeEpilogue, // First stage output type.
+        ElementComputeEpilogue, // First stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTCompute0 =
+        cutlass::epilogue::fusion::Sm90EVT<Compute0, WScale, Accum>;
+
+    using Compute1 = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies,
+        ElementBias, // Second stage output type.
+        ElementComputeEpilogue, // Second stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTCompute1 =
+        cutlass::epilogue::fusion::Sm90EVT<Compute1, XScale, EVTCompute0>;
+
+    using ComputeBias = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::plus,
+        ElementOutput, // Final (optional) stage output type.
+        ElementBias, // Final stage input types.
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EpilogueEVT =
+        cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
+
+    using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
+    using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+    using SlowAccum = cute::conditional_t<PONG, PongSchedule, DefaultSchedule>;
+    using FastAccum = cute::conditional_t<
+        COOP,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum,
+        cute::conditional_t<
+            PONG,
+            cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
+            cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum>>;
+
+    using MainLoopScheduleSM100 = cutlass::gemm::collective::KernelScheduleAuto;
+    using EpilogueScheduleSM100 =
+        cutlass::epilogue::collective::EpilogueScheduleAuto;
+
+    using MainLoopSchedule = cute::conditional_t<
+        ARCH == 10,
+        MainLoopScheduleSM100,
+        cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>>;
+    using EpilogueSchedule = cute::conditional_t<
+        ARCH == 10,
+        EpilogueScheduleSM100,
+        cute::conditional_t<
+            COOP,
+            cutlass::epilogue::TmaWarpSpecializedCooperative,
+            cutlass::epilogue::TmaWarpSpecialized>>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            ArchTag,
+            cutlass::arch::OpClassTensorOp,
+            TileShape,
+            ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAccumulator,
+            ElementComputeEpilogue,
+            void,
+            typename cutlass::layout::LayoutTranspose<LayoutOutput>::type,
+            AlignmentOutput,
+            ElementOutput,
+            typename cutlass::layout::LayoutTranspose<LayoutOutput>::type,
+            AlignmentOutput,
+            EpilogueSchedule,
+            EpilogueEVT>::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            ArchTag,
+            OperatorClass,
+            ElementB,
+            LayoutB_Transpose,
+            AlignmentInputA,
+            ElementA,
+            LayoutA_Transpose,
+            AlignmentInputB,
+            ElementAccumulator,
+            TileShape,
+            ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+                sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            MainLoopSchedule>::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideInputA = typename Gemm::GemmKernel::StrideA;
+    using StrideInputB = typename Gemm::GemmKernel::StrideB;
+    using StrideOutput = typename Gemm::GemmKernel::StrideC;
+
+    StrideInputA stride_a = cutlass::make_cute_packed_stride(
+        StrideInputA{}, cute::make_shape(M, K, 1));
+    StrideInputB stride_b = cutlass::make_cute_packed_stride(
+        StrideInputB{}, cute::make_shape(N, K, 1));
+    StrideOutput stride_output = cutlass::make_cute_packed_stride(
+        StrideOutput{}, cute::make_shape(N, M, 1));
+
+    typename Gemm::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {N, M, K},
+        {reinterpret_cast<ElementB*>(WQ.data_ptr()),
+         stride_b,
+         reinterpret_cast<ElementA*>(XQ.data_ptr()),
+         stride_a},
+        {{}, // Epilogue thread we populate below.
+         nullptr,
+         stride_output,
+         (ElementOutput*)Y.data_ptr<at::BFloat16>(),
+         stride_output}};
+
+    arguments.epilogue.thread = {
+        {bias.has_value()
+             ? reinterpret_cast<ElementBias*>(bias.value().data_ptr())
+             : nullptr}, // bias. Note Cutlass EVT will skip node if argument is
+                         // nullptr
+        // compute_1
+        {
+            {reinterpret_cast<ElementComputeEpilogue*>(
+                w_scale.data_ptr())}, // x_scale
+            // compute_0
+            {
+                {reinterpret_cast<ElementComputeEpilogue*>(
+                    x_scale.data_ptr())}, // w_scale
+                {}, // Accumulator
+                {} // Multiplies
+            },
+            {}, // Multiplies
+        },
+        {}, // Plus
+    };
+
+    Gemm gemm;
+
+    // Using the arguments, query for extra workspace required for matrix
+    // multiplication computation
+    size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+    // Allocate workspace memory
+    at::Tensor workspace =
+        at::empty(workspace_size, XQ.options().dtype(at::kByte));
+
+    // Check the problem size is supported or not
+    cutlass::Status status = gemm.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+      throw std::runtime_error("cutlass cannot implement");
+    }
+
+    // Initialize CUTLASS kernel with arguments and workspace pointer
+    status = gemm.initialize(arguments, workspace.data_ptr());
+    if (status != cutlass::Status::kSuccess) {
+      throw std::runtime_error("cutlass cannot initialize");
+    }
+
+    status = gemm(at::cuda::getCurrentCUDAStream());
+    if (status != cutlass::Status::kSuccess) {
+      throw std::runtime_error(
+          std::string("cutlass cannot run") +
+          cutlass::cutlassGetStatusString(status));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return Y;
   }
-
-  using ElementA = cutlass::float_e4m3_t;
-  using LayoutA = cutlass::layout::RowMajor;
-  constexpr int AlignmentInputA = 16 / sizeof(ElementA);
-
-  using ElementB = cutlass::float_e4m3_t;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  constexpr int AlignmentInputB = 16 / sizeof(ElementB);
-
-  // Use implicit transpose to enable more flexible configurations.
-  using LayoutA_Transpose =
-      typename cutlass::layout::LayoutTranspose<LayoutA>::type;
-  using LayoutB_Transpose =
-      typename cutlass::layout::LayoutTranspose<LayoutB>::type;
-
-  using ElementBias = BIAS_DTYPE;
-
-  using ElementOutput = cutlass::bfloat16_t;
-  using LayoutOutput = cutlass::layout::RowMajor;
-  constexpr int AlignmentOutput = 16 / sizeof(ElementOutput);
-
-  using ElementAccumulator = float;
-  using ElementComputeEpilogue = float;
-  using ArchTag = cute::conditional_t<
-      ARCH == 10,
-      cutlass::arch::Sm100,
-      cutlass::arch::Sm90>; // Tag indicating the minimum SM that
-                            // supports the intended feature
-  using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using TileShape = cute::Shape<
-      cute::Int<TB_M>,
-      cute::Int<TB_N>,
-      cute::Int<TB_K>>; // Threadblock-level
-                        // tile size
-  using ClusterShape = cute::Shape<
-      cute::Int<TBS_M>,
-      cute::Int<TBS_N>,
-      cute::Int<TBS_K>>; // Shape of the
-                         // threadblocks in a
-                         // cluster
-  using StageCountType =
-      cutlass::gemm::collective::StageCountAuto; // Stage count maximized
-                                                 // based on the tile size
-  using KernelSchedule = cutlass::gemm::collective::
-      KernelScheduleAuto; // Kernel to launch based on the default setting in
-                          // the Collective Builder
-
-  // Implement rowwise scaling epilogue.
-  using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0,
-      TileShape,
-      ElementComputeEpilogue,
-      ElementComputeEpilogue,
-      cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
-
-  using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<
-      0,
-      TileShape,
-      ElementComputeEpilogue,
-      ElementComputeEpilogue,
-      cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
-
-  using Bias = cutlass::epilogue::fusion::Sm90ColBroadcast<
-      0,
-      TileShape,
-      ElementBias,
-      ElementBias,
-      cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
-
-  using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-
-  using Compute0 = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies,
-      ElementComputeEpilogue, // First stage output type.
-      ElementComputeEpilogue, // First stage input types.
-      cutlass::FloatRoundStyle::round_to_nearest>;
-
-  using EVTCompute0 =
-      cutlass::epilogue::fusion::Sm90EVT<Compute0, WScale, Accum>;
-
-  using Compute1 = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies,
-      ElementBias, // Second stage output type.
-      ElementComputeEpilogue, // Second stage input types.
-      cutlass::FloatRoundStyle::round_to_nearest>;
-
-  using EVTCompute1 =
-      cutlass::epilogue::fusion::Sm90EVT<Compute1, XScale, EVTCompute0>;
-
-  using ComputeBias = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::plus,
-      ElementOutput, // Final (optional) stage output type.
-      ElementBias, // Final stage input types.
-      cutlass::FloatRoundStyle::round_to_nearest>;
-
-  using EpilogueEVT =
-      cutlass::epilogue::fusion::Sm90EVT<ComputeBias, Bias, EVTCompute1>;
-
-  using DefaultSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
-  using PongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
-  using SlowAccum = cute::conditional_t<PONG, PongSchedule, DefaultSchedule>;
-  using FastAccum = cute::conditional_t<
-      COOP,
-      cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum,
-      cute::conditional_t<
-          PONG,
-          cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum,
-          cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum>>;
-
-  using MainLoopScheduleSM100 = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueScheduleSM100 =
-      cutlass::epilogue::collective::EpilogueScheduleAuto;
-
-  using MainLoopSchedule = cute::conditional_t<
-      ARCH == 10,
-      MainLoopScheduleSM100,
-      cute::conditional_t<FAST_ACCUM, FastAccum, SlowAccum>>;
-  using EpilogueSchedule = cute::conditional_t<
-      ARCH == 10,
-      EpilogueScheduleSM100,
-      cute::conditional_t<
-          COOP,
-          cutlass::epilogue::TmaWarpSpecializedCooperative,
-          cutlass::epilogue::TmaWarpSpecialized>>;
-
-  using CollectiveEpilogue =
-      typename cutlass::epilogue::collective::CollectiveBuilder<
-          ArchTag,
-          cutlass::arch::OpClassTensorOp,
-          TileShape,
-          ClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto,
-          ElementAccumulator,
-          ElementComputeEpilogue,
-          void,
-          typename cutlass::layout::LayoutTranspose<LayoutOutput>::type,
-          AlignmentOutput,
-          ElementOutput,
-          typename cutlass::layout::LayoutTranspose<LayoutOutput>::type,
-          AlignmentOutput,
-          EpilogueSchedule,
-          EpilogueEVT>::CollectiveOp;
-
-  using CollectiveMainloop =
-      typename cutlass::gemm::collective::CollectiveBuilder<
-          ArchTag,
-          OperatorClass,
-          ElementB,
-          LayoutB_Transpose,
-          AlignmentInputA,
-          ElementA,
-          LayoutA_Transpose,
-          AlignmentInputB,
-          ElementAccumulator,
-          TileShape,
-          ClusterShape,
-          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-              sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          MainLoopSchedule>::CollectiveOp;
-
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      cute::Shape<int, int, int>,
-      CollectiveMainloop,
-      CollectiveEpilogue>;
-
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-  using StrideInputA = typename Gemm::GemmKernel::StrideA;
-  using StrideInputB = typename Gemm::GemmKernel::StrideB;
-  using StrideOutput = typename Gemm::GemmKernel::StrideC;
-
-  StrideInputA stride_a = cutlass::make_cute_packed_stride(
-      StrideInputA{}, cute::make_shape(M, K, 1));
-  StrideInputB stride_b = cutlass::make_cute_packed_stride(
-      StrideInputB{}, cute::make_shape(N, K, 1));
-  StrideOutput stride_output = cutlass::make_cute_packed_stride(
-      StrideOutput{}, cute::make_shape(N, M, 1));
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {N, M, K},
-      {reinterpret_cast<ElementB*>(WQ.data_ptr()),
-       stride_b,
-       reinterpret_cast<ElementA*>(XQ.data_ptr()),
-       stride_a},
-      {{}, // Epilogue thread we populate below.
-       nullptr,
-       stride_output,
-       (ElementOutput*)Y.data_ptr<at::BFloat16>(),
-       stride_output}};
-
-  arguments.epilogue.thread = {
-      {bias.has_value()
-           ? reinterpret_cast<ElementBias*>(bias.value().data_ptr())
-           : nullptr}, // bias. Note Cutlass EVT will skip node if argument is
-                       // nullptr
-      // compute_1
-      {
-          {reinterpret_cast<ElementComputeEpilogue*>(
-              w_scale.data_ptr())}, // x_scale
-          // compute_0
-          {
-              {reinterpret_cast<ElementComputeEpilogue*>(
-                  x_scale.data_ptr())}, // w_scale
-              {}, // Accumulator
-              {} // Multiplies
-          },
-          {}, // Multiplies
-      },
-      {}, // Plus
-  };
-
-  Gemm gemm;
-
-  // Using the arguments, query for extra workspace required for matrix
-  // multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // Allocate workspace memory
-  at::Tensor workspace =
-      at::empty(workspace_size, XQ.options().dtype(at::kByte));
-
-  // Check the problem size is supported or not
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    throw std::runtime_error("cutlass cannot implement");
-  }
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  status = gemm.initialize(arguments, workspace.data_ptr());
-  if (status != cutlass::Status::kSuccess) {
-    throw std::runtime_error("cutlass cannot initialize");
-  }
-
-  status = gemm(at::cuda::getCurrentCUDAStream());
-  if (status != cutlass::Status::kSuccess) {
-    throw std::runtime_error(
-        std::string("cutlass cannot run") +
-        cutlass::cutlassGetStatusString(status));
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  return Y;
 }
 
 template <
