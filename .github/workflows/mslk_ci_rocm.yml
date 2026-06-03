@@ -28,6 +28,10 @@ on:
       - 'external/composable_kernel.submodule.txt'
       # Python ROCm utilities
       - 'mslk/testing/rocm.py'
+      # GEMM tests
+      - 'test/gemm/gemm_test.py'
+      # AMD/ROCm Triton GEMM kernels
+      - 'mslk/gemm/triton/**'
       # HIP source files (AMD GPU kernels)
       - '**/*.hip'
       # Any file/folder with 'ck' in the path (Composable Kernel)
