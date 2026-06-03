@@ -13,12 +13,6 @@
 
 namespace mslk::gemm {
 
-at::Tensor f8f8bf16_tensorwise(
-    at::Tensor XQ,
-    at::Tensor WQ,
-    double scale,
-    bool use_fast_accum = true);
-
 at::Tensor f8f8bf16_blockwise(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -160,14 +154,6 @@ at::Tensor f8f8bf16(
     at::Tensor WQ,
     at::Tensor scale,
     bool use_fast_accum = true);
-
-at::Tensor f8f8bf16_cublas(
-    at::Tensor A,
-    at::Tensor B,
-    std::optional<at::Tensor> Ainvs = std::nullopt,
-    std::optional<at::Tensor> Binvs = std::nullopt,
-    bool use_fast_accum = true,
-    std::optional<at::Tensor> output = std::nullopt);
 
 at::Tensor bf16x9_gemm(
     at::Tensor A,

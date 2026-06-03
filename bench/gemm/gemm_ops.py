@@ -28,7 +28,6 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
     quantize_fp8_group,
     quantize_fp8_row,
-    scale_fp8_row,
     triton_quantize_fp8_tensor,
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
@@ -671,80 +670,6 @@ class CutlassFP8Tensorwise(GemmOpBase):
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP8
-
-
-@register_gemm_op
-class CublasFP8Rowwise(GemmOpBase):
-    """
-    FP8 cublas matmul with rowwise scaling.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = quantize_fp8_row(x)
-        wq, w_scale = quantize_fp8_row(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        out = torch.ops.mslk.f8f8bf16_cublas(xq, wq)
-        scaled_out = scale_fp8_row(out, x_scale, w_scale)
-        return scaled_out
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {
-            Accelerator.NVIDIA_SM90,
-            Accelerator.NVIDIA_SM100,
-            Accelerator.NVIDIA_SM103,
-        }
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP8
-
-
-@register_gemm_op
-class CublasFP8Tensorwise(GemmOpBase):
-    """
-    FP8 cublas matmul with tensorwise scaling.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = triton_quantize_fp8_tensor(x)
-        wq, w_scale = triton_quantize_fp8_tensor(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        return torch.ops.mslk.f8f8bf16_cublas(xq, wq, x_scale * w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale * w_scale)
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {
-            Accelerator.NVIDIA_SM90,
-            Accelerator.NVIDIA_SM100,
-            Accelerator.NVIDIA_SM103,
-        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:

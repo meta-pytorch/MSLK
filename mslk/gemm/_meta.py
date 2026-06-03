@@ -111,31 +111,6 @@ if hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
             return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-if hasattr(torch.ops.mslk, "f8f8bf16_tensorwise"):
-
-    @torch.library.register_fake("mslk::f8f8bf16_tensorwise")
-    def f8f8bf16_tensorwise_meta(
-        XQ: torch.Tensor,
-        WQ: torch.Tensor,
-        scale: float,
-        use_fast_accum: bool = True,
-    ) -> torch.Tensor:
-        x_dims = XQ.dim()
-        w_dims = WQ.dim()
-        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
-            "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
-        )
-        if x_dims == 2:
-            M = XQ.shape[0]
-            N = WQ.shape[0]
-            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-        else:
-            B = XQ.shape[0]
-            M = XQ.shape[1]
-            N = WQ.shape[0]
-            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
-
-
 if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_stacked"):
 
     @torch.library.register_fake("mslk::f8f8bf16_rowwise_grouped_stacked")
@@ -376,22 +351,6 @@ if hasattr(torch.ops.mslk, "f8f8bf16_groupwise"):
         M = XQ.shape[0]
         N = WQ.shape[0]
         return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-
-
-if hasattr(torch.ops.mslk, "f8f8bf16_cublas"):
-
-    @torch.library.register_fake("mslk::f8f8bf16_cublas")
-    def f8f8bf16_cublas_meta(
-        X: torch.Tensor,
-        W: torch.Tensor,
-        x_scale: Optional[torch.Tensor] = None,
-        w_scale: Optional[torch.Tensor] = None,
-        use_fast_accum: bool = True,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        M = X.shape[0]
-        N = W.shape[0]
-        return torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
 
 
 if hasattr(torch.ops.mslk, "bf16x9_gemm"):
