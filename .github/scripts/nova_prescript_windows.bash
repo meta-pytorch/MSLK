@@ -13,10 +13,18 @@
 ################################################################################
 
 echo "[NOVA] Current working directory: $(pwd)"
-cd "${MSLK_REPO}" || exit 1
 
-# Reset BUILD_FROM_NOVA to allow setup.py to run the build
+# Unlike Linux, the Windows workflow does not source the env-script before
+# running the pre-script, so we set all required variables here directly.
+export MSLK_PYTHON_ONLY=1
 export BUILD_FROM_NOVA=0
+
+# Persist env vars for subsequent workflow steps (build, post-script) so that
+# setup.py exits early in the build step and the post-script knows the variant.
+if [[ -n "${GITHUB_ENV}" ]]; then
+    echo "MSLK_PYTHON_ONLY=1" >> "${GITHUB_ENV}"
+    echo "BUILD_FROM_NOVA=1" >> "${GITHUB_ENV}"
+fi
 
 # Force the wheel platform tag to win_amd64 so it is only installable on
 # Windows and cannot accidentally become a fallback for Linux users whose
@@ -42,5 +50,9 @@ ls -lth dist/*.whl || exit 1
 
 echo "[NOVA] Enumerating the wheel SHAs ..."
 sha256sum dist/*.whl 2>/dev/null || certutil -hashfile dist/*.whl SHA256 2>/dev/null || true
+
+echo "[NOVA] Validating the built wheel ..."
+$CONDA_RUN pip install dist/*.whl
+$CONDA_RUN python -c "import mslk; print(f'MSLK {mslk.__version__} variant={mslk.__variant__}')"
 
 echo "[NOVA] MSLK python-only build completed"

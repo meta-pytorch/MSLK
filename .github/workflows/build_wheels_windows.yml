@@ -73,14 +73,14 @@ jobs:
       repository: meta-pytorch/MSLK
       ref: ""
       pre-script: .github/scripts/nova_prescript_windows.bash
-      post-script: .github/scripts/nova_postscript_windows.bash
+      post-script: ""
       smoke-test-script: ""
-      env-var-script: .github/scripts/nova_dir_windows.bash
+      env-script: .github/scripts/nova_dir_windows.bat
       package-name: mslk
-      build-target: default
       test-infra-repository: pytorch/test-infra
       test-infra-ref: main
       build-matrix: ${{ needs.filter-matrix.outputs.matrix }}
       trigger-event: ${{ github.event_name }}
+      submodules: ""
       # Python-only builds are fast; no C++ compilation needed
       timeout: 60
