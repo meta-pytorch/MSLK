@@ -284,7 +284,6 @@ class ExportCompileTests(unittest.TestCase):
                 col_scale = torch.randn(N).cuda()
                 block_scale = torch.randn(M // 128, K // 128).cuda()
                 _ = torch.ops.mslk.f8f8bf16_blockwise(xq, wq, block_scale, block_scale)
-                _ = torch.ops.mslk.f8f8bf16_tensorwise(xq, wq, 1.0)
                 o = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, row_scale, col_scale)
                 return o
 
@@ -301,9 +300,6 @@ class ExportCompileTests(unittest.TestCase):
         torch.compile(torch.ops.mslk.f8f8bf16_blockwise)(
             self.XQ, self.WQ, self.block_scale, self.block_scale
         )
-
-    def test_compile_f8f8bf16_tensorwise(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8bf16_tensorwise)(self.XQ, self.WQ, 1.0)
 
     def test_compile_f8f8bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8f8bf16_rowwise)(
@@ -371,7 +367,7 @@ class FP8Tests(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            ["cutlass", "cublas"],  # kernel
+            ["cutlass"],  # kernel
             [True, False],  # use_fast_accum
         )
     )
@@ -410,12 +406,7 @@ class FP8Tests(unittest.TestCase):
         xq = (x * fp8_max / x_max).to(fp8_e4m3)
         wq = (w * fp8_max / w_max).to(fp8_e4m3)
 
-        if kernel == "cutlass":
-            zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale, use_fast_accum)
-        else:
-            zq = torch.ops.mslk.f8f8bf16_cublas(
-                xq, wq, x_scale, w_scale, use_fast_accum
-            )
+        zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale, use_fast_accum)
 
         # Fake quant
         x = xq.bfloat16() * x_scale
@@ -437,7 +428,7 @@ class FP8Tests(unittest.TestCase):
                 else []
             )
             + (
-                ["tensorwise_broadcast", "tensorwise"]
+                ["tensorwise"]
                 if torch.version.cuda and evaluate_cuda_compute_capability(9, 9)
                 else []
             ),  # Mode
@@ -528,36 +519,6 @@ class FP8Tests(unittest.TestCase):
                 g.replay()
             else:
                 zq = f(x, w, bias)
-        elif Mode == "tensorwise_broadcast":
-
-            def f(
-                xq: torch.Tensor,
-                wq: torch.Tensor,
-                scale: float,
-                bias: Optional[torch.Tensor],
-            ) -> torch.Tensor:
-                zq = torch.ops.mslk.f8f8bf16_tensorwise(
-                    xq, wq, scale, use_fast_accum=UseFastAccum
-                )
-                if bias is not None:
-                    zq += bias
-                return zq
-
-            xq, x_scale = triton_quantize_fp8_tensor(x)
-            wq, w_scale = triton_quantize_fp8_tensor(w)
-            x_scale = x_scale.item()
-            w_scale = w_scale.item()
-
-            if CudaGraph:
-                # Warm-up to avoid capture issues
-                f(xq, wq, x_scale * w_scale, bias)
-
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    zq = f(xq, wq, x_scale * w_scale, bias)
-                g.replay()
-            else:
-                zq = f(xq, wq, x_scale * w_scale, bias)
         elif Mode == "rowwise":
 
             def f(

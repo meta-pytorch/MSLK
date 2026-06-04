@@ -605,9 +605,50 @@ def main(argv: List[str]) -> None:
 
     if _PYTHON_ONLY:
         print("[SETUP.PY] MSLK_PYTHON_ONLY=1 — skipping C++/CUDA build")
-        package_name = "mslk"
-        package_version = "0.0.0"
+
+        if str(os.environ.get("BUILD_FROM_NOVA", "")) == "1":
+            print(
+                "[SETUP.PY] Running under Nova workflow context"
+                " (non-prebuild step) ... exiting"
+            )
+            sys.exit(0)
+
+        package_name = os.environ.get("MSLK_PACKAGE_NAME", "mslk")
+
+        channel = os.environ.get("CHANNEL", "")
+        version_override = os.environ.get("MSLK_VERSION_OVERRIDE", "")
+
+        if version_override:
+            pkg_version = version_override
+        elif channel == "nightly":
+            today = date.today()
+            pkg_version = f"{today.year}.{today.month}.{today.day}"
+        elif channel in ("test", "release"):
+            import setuptools_git_versioning as gitversion
+
+            pkg_version = gitversion.version_from_git().base_version
+        else:
+            pkg_version = "0.0.0"
+
+        cu_version = os.environ.get("CU_VERSION", "")
+        if cu_version:
+            pkg_vver = f"+{cu_version}"
+        else:
+            pkg_vver = ""
+
+        package_version = f"{pkg_version}{pkg_vver}"
         _write_version_file(package_version, "default", "python_only")
+
+        python_only_plat = os.environ.get("MSLK_PYTHON_ONLY_PLAT", "")
+        if python_only_plat:
+            from wheel.bdist_wheel import bdist_wheel as _BdistWheel
+
+            class _PlatBdistWheel(_BdistWheel):
+                def get_tag(self):
+                    python, abi, _ = super().get_tag()
+                    return python, abi, python_only_plat
+
+            extra_kwargs["cmdclass"] = {"bdist_wheel": _PlatBdistWheel}
 
     else:
         # Handle command line args before passing to main setup() method.
