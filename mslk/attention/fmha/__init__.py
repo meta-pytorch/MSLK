@@ -21,6 +21,7 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    triton_gqa_decode,
     triton_splitk,
 )
 from .attn_bias import (
@@ -958,6 +959,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash.FwOp,
     flash_mtia.FwOp,
     flash3.FwOp,
+    triton_gqa_decode.FwOp,
     triton_splitk.FwOp,
 ]
 

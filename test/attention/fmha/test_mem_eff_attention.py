@@ -1049,6 +1049,56 @@ def test_decoder_ck(
     )
 
 
+@rocm_only
+@pytest.mark.parametrize("kv_heads", [1, 4, 8], ids=_kv_heads_label)
+@pytest.mark.parametrize("n_heads", [1, 4, 8])
+@pytest.mark.parametrize("padding", [32, 512])
+@pytest.mark.parametrize("bsz", [1, 4])
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+def test_triton_gqa_decode(
+    kv_heads: Optional[int],
+    n_heads: int,
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    _test_decoder(
+        fmha.triton_gqa_decode.FwOp,
+        kv_heads=kv_heads,
+        n_heads=n_heads,
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+        d=128,
+    )
+
+
+@rocm_only
+def test_dispatch_gqa_decode() -> None:
+    """HIP decode+GQA should prefer triton_gqa_decode over triton_splitk."""
+    torch.manual_seed(0)
+    bsz, padding, kv_heads, n_heads, d = 4, 256, 2, 4, 128
+    k_shape = (1, bsz * padding, kv_heads, n_heads, d)
+    q_shape = (1, bsz, kv_heads, n_heads, d)
+    k = torch.randn(
+        (1, bsz * padding, kv_heads, 1, d),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).expand(k_shape)
+    v = k.clone()
+    q = torch.randn(q_shape, dtype=torch.bfloat16, device="cuda")
+    attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * bsz,
+        kv_seqlen=[64, 128, 200, 256],
+        kv_padding=padding,
+    )
+    inp = fmha.Inputs(q, k, v, attn_bias)
+    if fmha.triton_gqa_decode.FwOp.not_supported_reasons(inp):
+        pytest.skip("triton_gqa_decode not supported for this shape")
+    dispatched = _dispatch_fw_priority_list(inp, False)[0]
+    assert dispatched is fmha.triton_gqa_decode.FwOp
+
+
 @sm100_or_better_only
 @pytest.mark.parametrize("kv_heads", [1, 2, 16], ids=_kv_heads_label)
 @pytest.mark.parametrize("n_heads", [1, 4, 16])

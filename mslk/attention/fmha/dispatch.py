@@ -12,7 +12,16 @@ from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import torch
 
-from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, triton_splitk
+from . import (
+    attn_bias,
+    ck,
+    cutlass,
+    flash,
+    flash3,
+    flash_mtia,
+    triton_gqa_decode,
+    triton_splitk,
+)
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
@@ -120,6 +129,8 @@ def _dispatch_fw_priority_list(
             ]
         )
     priority_list_ops.append(triton_splitk.FwOp)
+    if torch.version.hip is not None and not needs_gradient:
+        priority_list_ops.appendleft(triton_gqa_decode.FwOp)
     if not needs_gradient:
         mqa_or_gqa = (
             inp.key.ndim > 3 and inp.key.stride(-2) == 0 and inp.key.shape[-2] > 1
