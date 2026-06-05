@@ -56,6 +56,13 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
       "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");
+  // BF16 grouped GEMM grad / wgrad via Triton: schemas only on ROCm;
+  // implementations are registered by mslk.gemm.triton.grouped_gemm via
+  // torch.library.impl at Python import time.
+  m.def(
+      "bf16bf16bf16_grouped_grad(Tensor X, Tensor W, Tensor M_sizes, Tensor? out=None, int? num_sms=None) -> Tensor");
+  m.def(
+      "bf16bf16bf16_grouped_wgrad(Tensor X, Tensor W, Tensor M_sizes, Tensor(a!)? output=None, bool output_accum=False, int? num_sms=None) -> Tensor");
 #else
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
@@ -130,6 +137,9 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   // IMPORTANT: int8_gemm.py must be imported before these ops are called;
   // the Python-side @torch.library.impl("mslk::i8i8bf16_dynamic", "CUDA")
   // registration only takes effect after that import.
+  // bf16bf16bf16_grouped_grad / bf16bf16bf16_grouped_wgrad: same pattern —
+  // Python-side @torch.library.impl is registered in
+  // mslk/gemm/triton/grouped_gemm.py, imported by mslk/gemm/__init__.py.
 #else
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);

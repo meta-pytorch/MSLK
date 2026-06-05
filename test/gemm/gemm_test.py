@@ -2059,10 +2059,6 @@ class BF16Tests(unittest.TestCase):
             [True, False],  # output_accum
         )
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_wgrad not yet supported.",
-    )
     def test_grouped_gemm_wgrad(
         self,
         G: int,
@@ -2165,10 +2161,6 @@ class BF16Tests(unittest.TestCase):
             [128, 1024],  # K
             [torch.bfloat16, torch.float16],  # dtype
         )
-    )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_dgrad not yet supported.",
     )
     def test_grouped_gemm_dgrad(
         self,

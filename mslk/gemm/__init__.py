@@ -24,3 +24,12 @@ import torch._utils_internal  # noqa: E402
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 from . import _meta  # noqa: F401, E402
+
+# On ROCm/HIP builds, the CUDA-only CUTLASS kernels for
+# bf16bf16bf16_grouped_{grad,wgrad} are unavailable. Importing the Triton
+# port triggers its @torch.library.impl("mslk::...", "CUDA") registrations so
+# torch.ops.mslk.bf16bf16bf16_grouped_{grad,wgrad} work on AMD GPUs.
+import torch  # noqa: E402
+
+if torch.version.hip is not None:
+    from .triton import grouped_gemm as _grouped_gemm  # noqa: F401, E402
