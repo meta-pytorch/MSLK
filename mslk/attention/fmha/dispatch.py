@@ -129,8 +129,6 @@ def _dispatch_fw_priority_list(
             ]
         )
     priority_list_ops.append(triton_splitk.FwOp)
-    if torch.version.hip is not None and not needs_gradient:
-        priority_list_ops.appendleft(triton_gqa_decode.FwOp)
     if not needs_gradient:
         mqa_or_gqa = (
             inp.key.ndim > 3 and inp.key.stride(-2) == 0 and inp.key.shape[-2] > 1
@@ -161,6 +159,9 @@ def _dispatch_fw_priority_list(
                         priority_list_ops.remove(flash3.FwOp)
                     priority_list_ops.remove(flash.FwOp)
                     priority_list_ops.appendleft(flash.FwOp)
+
+    if torch.version.hip is not None and not needs_gradient:
+        priority_list_ops.appendleft(triton_gqa_decode.FwOp)
 
     # torch.mtia.is_available() cannot be called here because it isn't supported
     # when tracing with PT2, so we simply add flash_mtia to the end if the MTIA

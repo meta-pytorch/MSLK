@@ -923,14 +923,14 @@ def _test_decoder(
         k = k.expand(k_shape)
         v = v.expand(k_shape)
 
-    if skip_reasons := op.not_supported_reasons(fmha.Inputs(q, k, v)):
-        pytest.skip("; ".join(skip_reasons))
-
     attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
         q_seqlen=[num_queries] * bsz,
         kv_seqlen=k_seqlen,
         kv_padding=padding,
     )
+
+    if skip_reasons := op.not_supported_reasons(fmha.Inputs(q, k, v, attn_bias)):
+        pytest.skip("; ".join(skip_reasons))
 
     decoder_output = fmha.memory_efficient_attention_forward(
         q,

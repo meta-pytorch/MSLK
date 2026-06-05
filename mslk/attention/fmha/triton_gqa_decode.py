@@ -31,13 +31,27 @@ def _strides(x: Optional[torch.Tensor], *stride_names: str):
     return {f"stride_{name}": s for name, s in zip(stride_names, x.stride())}
 
 
-def _is_decode_inputs(inp: Inputs) -> bool:
+def _decode_query_seqlen(inp: Inputs) -> int:
     q = inp.query
-    if q.ndim == 5:
-        return q.shape[1] <= 1
-    if q.ndim == 4:
-        return q.shape[1] <= 1
-    return False
+    if q.ndim == 5 and q.shape[0] == 1:
+        attn_bias = inp.attn_bias
+        if isinstance(
+            attn_bias,
+            (
+                BlockDiagonalCausalWithOffsetPaddedKeysMask,
+                PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
+            ),
+        ):
+            bsz = len(attn_bias.k_seqinfo.seqlen)
+            if bsz > 0 and q.shape[1] % bsz == 0:
+                return q.shape[1] // bsz
+    if q.ndim in (4, 5):
+        return q.shape[1]
+    return q.shape[1] if q.ndim >= 2 else 0
+
+
+def _is_decode_inputs(inp: Inputs) -> bool:
+    return _decode_query_seqlen(inp) <= 1
 
 
 @register_operator
@@ -69,8 +83,6 @@ class FwOp(AttentionFwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        if Mq > 1:
-            reasons.append(f"decode kernel requires Mq<=1, got Mq={Mq}")
         if K not in {64, 128, 256}:
             reasons.append(f"head dim {K} not supported (supported: 64, 128, 256)")
         return reasons
@@ -91,7 +103,10 @@ class FwOp(AttentionFwOpBase):
         if q.ndim != 5:
             reasons.append("BMGHK (5D) query layout required")
         else:
-            _, Mq, G, Hq, Kq = q.shape
+            Mq = _decode_query_seqlen(d)
+            _, _, G, Hq, Kq = q.shape
+            if Mq > 1:
+                reasons.append(f"decode kernel requires Mq<=1, got Mq={Mq}")
             if Hq > cls.SUPPORTED_MAX_Q_HEADS_PER_GROUP:
                 reasons.append(
                     f"at most {cls.SUPPORTED_MAX_Q_HEADS_PER_GROUP} query heads per "
