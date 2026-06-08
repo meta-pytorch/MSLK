@@ -56,11 +56,42 @@ def _is_decode_inputs(inp: Inputs) -> bool:
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """
-    Triton decode kernel for Grouped Query Attention on ROCm (and CUDA).
+    """Triton decode-phase kernel for Grouped Query Attention (GQA), targeting ROCm (and CUDA).
 
-    Uses launch grid (batch, num_kv_head_groups) with native GQA head blocking
-    instead of the expand + head-swap path in triton_splitk.
+    Designed exclusively for single-token (Mq <= 1) decode steps, where each
+    query attends over the full KV context accumulated during prefill and prior
+    decode steps.
+
+    **GQA layout and launch grid.**
+    Inputs are expected in BMGHK layout (batch, seq, kv_groups, heads_per_group,
+    head_dim).  The kernel launches a 2-D grid of shape ``(B, G)`` — one program
+    per (batch element, KV-head group) — and processes all ``Hq`` query heads
+    that share a single KV head inside that program.  This avoids the
+    expand-and-head-swap trick used by ``triton_splitk.FwOp`` and keeps KV
+    traffic minimal.
+
+    **Padding and paged KV cache.**
+    Two attention-bias types are supported:
+
+    * ``BlockDiagonalCausalWithOffsetPaddedKeysMask`` — contiguous KV cache with
+      per-sequence padding.  The query tensor is expected with a single formal
+      batch dimension (``query.shape[0] == 1``); internally the operator reshapes
+      ``(1, B*Mq, G, Hq, D)`` → ``(B, Mq, G, Hq, D)`` and unfolds the key/value
+      blocks accordingly.  Key padding must not exceed 8 192 tokens.
+
+    * ``PagedBlockDiagonalCausalWithOffsetPaddedKeysMask`` — paged KV cache.
+      ``block_tables`` of shape ``[batch_size, max_num_pages]`` maps each batch
+      element to its physical pages; K/V have shape
+      ``[1, max_num_pages * page_size, G, H_kv, D]``.  Each Triton tile
+      (``BLOCK_N``) must fit within one page (enforced by a static assert).
+
+    **Shape constraints.**
+    * Head dimension ``D`` must be one of ``{64, 128, 256}``.
+    * At most ``SUPPORTED_MAX_Q_HEADS_PER_GROUP`` (32) query heads per KV group.
+    * Query, key, and value last-dim strides must be stride-1 and 8-element
+      aligned.
+    * No backward pass; no dropout; no int4/fp8 quantisation (use
+      ``triton_splitk.FwOp`` for those).
     """
 
     OPERATOR = get_gqa_decode_kernel
