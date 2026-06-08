@@ -6,7 +6,6 @@
 # pyre-unsafe
 # pyre-ignore-all-errors[29]
 
-import logging
 import random
 from typing import Any, Iterable, List, Optional, Sequence, Tuple, Type, Union
 
