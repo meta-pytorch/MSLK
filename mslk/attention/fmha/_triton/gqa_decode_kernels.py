@@ -63,7 +63,6 @@ def _fwd_gqa_decode_kernel(
     BLOCK_N: tl.constexpr,
     USE_PAGED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    KV_BLOCKS_PER_ROW: tl.constexpr,
 ):
     """
     Decode-phase causal attention for BMGHK layout.
@@ -71,6 +70,10 @@ def _fwd_gqa_decode_kernel(
     Launch grid: (batch Z, kv head group G). Each program handles all Hq query
     heads that share one KV head (typical GQA: H_kv=1, stored at head index 0).
     """
+    tl.static_assert(
+        not USE_PAGED or BLOCK_N <= PAGE_SIZE,
+        "BLOCK_N must be <= PAGE_SIZE for paged attention: each tile must fit within one page",
+    )
     off_b = tl.program_id(0)
     off_g = tl.program_id(1)
 
@@ -112,7 +115,7 @@ def _fwd_gqa_decode_kernel(
 
             for block_idx in range(num_kv_blocks):
                 start_n = block_idx * BLOCK_N
-                n_mask = (offs_n < kv_len - start_n) & (offs_n >= 0)
+                n_mask = offs_n < kv_len - start_n
 
                 if USE_PAGED:
                     n_idx = start_n + offs_n
@@ -189,8 +192,8 @@ def _fwd_gqa_decode_kernel(
 
 def _build_autotune_configs() -> List[triton.Config]:
     configs: List[triton.Config] = []
-    for block_n in (32, 64, 128):
-        for num_warps in (2, 4):
+    for block_n in (16, 32, 64, 128):
+        for num_warps in (1, 2, 4, 8):
             for num_stages in (1, 2):
                 configs.append(
                     triton.Config(
@@ -202,9 +205,17 @@ def _build_autotune_configs() -> List[triton.Config]:
     return configs
 
 
+def _early_config_prune(configs, named_args, **kwargs):
+    if kwargs.get("USE_PAGED", False):
+        page_size = kwargs["PAGE_SIZE"]
+        return [c for c in configs if page_size % c.kwargs["BLOCK_N"] == 0]
+    return configs
+
+
 _fwd_gqa_decode_autotune = triton.autotune(
     configs=_build_autotune_configs(),
     key=AUTOTUNER_KEY,
+    prune_configs_by={"early_config_prune": _early_config_prune},
 )(_fwd_gqa_decode_kernel)
 
 

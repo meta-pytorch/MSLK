@@ -161,6 +161,10 @@ def _dispatch_fw_priority_list(
                     priority_list_ops.appendleft(flash.FwOp)
 
     if torch.version.hip is not None and not needs_gradient:
+        # Prefer triton_gqa_decode over all other ops on ROCm for decode
+        # workloads: it uses a native GQA grid instead of the expand+head-swap
+        # path in triton_splitk, which is more efficient for single-token
+        # generation. not_supported_reasons() gates it to valid shapes.
         priority_list_ops.appendleft(triton_gqa_decode.FwOp)
 
     # torch.mtia.is_available() cannot be called here because it isn't supported

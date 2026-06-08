@@ -155,7 +155,6 @@ class FwOp(AttentionFwOpBase):
         int,
         bool,
         int,
-        int,
     ]:
         attn_bias = inp.attn_bias
         assert attn_bias is not None
@@ -195,11 +194,9 @@ class FwOp(AttentionFwOpBase):
 
         block_tables = None
         page_size = 0
-        kv_blocks_per_row = 0
         if is_paged:
             block_tables = attn_bias.block_tables
             page_size = attn_bias.page_size
-            kv_blocks_per_row = block_tables.shape[1]
 
         B, Mq, G, Hq, D = q.shape
         N_CTX_K = key.shape[1]
@@ -217,7 +214,6 @@ class FwOp(AttentionFwOpBase):
             D,
             is_paged,
             page_size,
-            kv_blocks_per_row,
         )
 
     @classmethod
@@ -244,7 +240,6 @@ class FwOp(AttentionFwOpBase):
             D,
             is_paged,
             page_size,
-            kv_blocks_per_row,
         ) = cls._prepare_tensors(inp)
 
         out = torch.empty_like(q)
@@ -272,7 +267,6 @@ class FwOp(AttentionFwOpBase):
             BLOCK_DMODEL=D,
             USE_PAGED=is_paged,
             PAGE_SIZE=page_size,
-            KV_BLOCKS_PER_ROW=kv_blocks_per_row,
         )
 
         # Restore flattened batch layout expected by callers/tests.
