@@ -161,8 +161,7 @@ class FwOp(AttentionFwOpBase):
                 reasons.append("key padding exceeds 8192")
         elif isinstance(attn_bias, PagedBlockDiagonalCausalWithOffsetPaddedKeysMask):
             if d.query.shape[0] != 1 and d.query.ndim == 5:
-                if d.query.shape[0] != 1:
-                    reasons.append("paged decode expects query batch dim 1")
+                reasons.append("paged decode expects query batch dim 1")
         elif attn_bias is not None:
             reasons.append(f"unsupported attn_bias type {type(attn_bias)}")
 
@@ -289,7 +288,11 @@ class FwOp(AttentionFwOpBase):
             **_strides(key, "kz", "kn", "kg", "kh", "kk"),
             **_strides(value, "vz", "vn", "vg", "vh", "vk"),
             **_strides(out, "oz", "om", "og", "oh", "ok"),
-            **_strides(block_tables, "bt_batch", "bt_page"),
+            **(
+                _strides(block_tables, "bt_batch", "bt_page")
+                if is_paged
+                else {"stride_bt_batch": 0, "stride_bt_page": 0}
+            ),
             Z=B,
             G=G,
             Hq=Hq,
