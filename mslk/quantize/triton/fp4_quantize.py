@@ -6003,3 +6003,372 @@ def triton_fake_quantize_nvfp4_per_tensor(
     )
 
     return output, scales
+
+
+# -----------------------------------------------------------------------------
+# AMD MXFP4 quantizer.
+#
+# Standalone helper that produces the plain layout consumed by
+# mslk/gemm/triton/f4f4bf16.py on gfx950:
+#   weights: [M, K//2] uint8  — two E2M1 nibbles per byte, low nibble even-K
+#   scales:  [M, K//32] uint8 — one E8M0 (UE8M0, power-of-two) scale per
+#                               32 K-elements, NOT TCGen5-swizzled
+#
+# Unlike the NVFP4-flavoured triton_quantize_mx4_unpack above this kernel:
+#  - uses no NVIDIA inline asm (cvt.rn.satfinite.e2m1x2.f32 is Blackwell-only;
+#    AMDGPU LLVM rejects the 'f' PTX constraint)
+#  - does not swizzle the scale tensor for TCGen5
+#  - rounds-to-nearest only (no stochastic rounding)
+#
+# E2M1 representable values: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
+# Encoding: bit3 = sign, bits[2:1] = exp, bit0 = mantissa.
+# Pair packing: byte = low_nibble | (high_nibble << 4), low = even K element.
+# E8M0 scale: byte = exponent + 127, value = 2**(byte - 127).
+#
+# -----------------------------------------------------------------------------
+
+
+
+def _has_gfx950_fp4_cvt() -> bool:
+    """True iff the `v_cvt_scalef32_pk_fp4_f32` encode is available (gfx950 /
+    CDNA4 only).
+
+    gfx942 (MI300X) and CUDA fall back to the portable comparison ladder.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        return False
+    arch = (getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or "").lower()
+    return "gfx950" in arch
+
+
+@triton.jit
+def _cvt_pk_fp4_f32_gfx950(lo, hi):
+    """Pack two fp32 lanes into one E2M1 byte (bits[7:0]) via the gfx950 cvt.
+
+    lo → low nibble (even-K element), hi → high nibble (odd-K). RNE rounding,
+    saturates |x|>6 to ±6. gfx950-only; callers gate with USE_CVT.
+    """
+    return tl.inline_asm_elementwise(
+        asm=tl.constexpr("v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0"),
+        constraints="=v,v,v",
+        args=[lo, hi],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _amd_quantize_mxfp4_kernel(
+    in_ptr,        # [M, K] fp16/bf16/fp32
+    out_ptr,       # [M, K//2] uint8
+    scale_ptr,     # [M, K//32] uint8
+    M, K,
+    stride_im, stride_ik,
+    stride_om, stride_ok,
+    stride_sm, stride_sk,
+    BLOCK_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,   # 32, fixed by OCP MX spec
+    USE_CVT: tl.constexpr,      # gfx950: hardware fp32->FP4 cvt; else ladder
+):
+    """One program per (BLOCK_M rows, 1 K-group of 32 elements).
+
+    Grid = (cdiv(M, BLOCK_M), K // GROUP_SIZE).
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # [BLOCK_M]
+    cols = pid_k * GROUP_SIZE + tl.arange(0, GROUP_SIZE)  # [GROUP_SIZE]
+    row_mask = rows < M
+
+    # Load the 32-element K-group as fp32.
+    in_offs = rows[:, None] * stride_im + cols[None, :] * stride_ik
+    x = tl.load(in_ptr + in_offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    ax = tl.abs(x)
+
+    # Per-group absmax → E8M0 scale exponent. MXFP4 max representable = 6.
+    # The scale `s` makes (x / s) fit in {±0,...,±6}; we pick s = 2^ceil(log2(absmax/6)).
+    # Empty / all-zero groups get exp=0 (scale=2^-127), keeping the dequant safe.
+    amax = tl.max(ax, axis=1)                          # [BLOCK_M]
+    # log2 of zero is -inf; clamp to a tiny positive.
+    amax_safe = tl.maximum(amax, 1e-30)
+    # We want amax / s <= 6 i.e. s >= amax / 6 i.e. exp >= ceil(log2(amax/6)).
+    exp_f = tl.ceil(tl.log2(amax_safe / 6.0))
+    # E8M0 byte = exp + 127. Clamp to [0, 254] (255 is reserved for NaN/inf).
+    scale_exp = tl.clamp(exp_f, -127.0, 127.0)
+    scale_byte = (scale_exp.to(tl.int32) + 127).to(tl.uint8)
+    # Build divisor as fp32 from the chosen exponent. exp2(e) with e in [-127, 127].
+    s = tl.exp2(scale_exp)
+    s = tl.maximum(s, 1e-30)
+
+    # Normalize values into the E2M1 range, then quantize/pack each pair.
+    y = x / s[:, None]                                # [BLOCK_M, GROUP_SIZE]
+    # Split into even-K / odd-K lanes (low/high nibble of each packed byte).
+    y_pairs = tl.reshape(y, (BLOCK_M, GROUP_SIZE // 2, 2))
+    y_even, y_odd = tl.split(y_pairs)                 # [BLOCK_M, GROUP_SIZE//2]
+
+    if USE_CVT:
+        # gfx950: one hardware instruction per fp32 pair. RNE rounding,
+        # saturates |y|>6 to ±6 — no explicit clamp/sign/where needed.
+        packed = _cvt_pk_fp4_f32_gfx950(y_even, y_odd).to(tl.uint8)
+    else:
+        # Portable ladder (gfx942 / CUDA). Round-to-nearest via E2M1 codepoints:
+        #   ay<=0.25->0  <=0.75->0.5  <=1.25->1  <=1.75->1.5
+        #   <=2.5->2  <=3.5->3  <=5.0->4  else->6. Inlined per lane (a nested
+        #   def inside @triton.jit triggers a StopIteration at compile time).
+        se = (y_even < 0).to(tl.int32)
+        ae = tl.abs(y_even)
+        ce = (
+            (ae > 0.25).to(tl.int32) + (ae > 0.75).to(tl.int32)
+          + (ae > 1.25).to(tl.int32) + (ae > 1.75).to(tl.int32)
+          + (ae > 2.5).to(tl.int32) + (ae > 3.5).to(tl.int32)
+          + (ae > 5.0).to(tl.int32)
+        )
+        ce = tl.minimum(ce, 7)
+        even = tl.where(ce == 0, 0, (se << 3) | ce)
+
+        so = (y_odd < 0).to(tl.int32)
+        ao = tl.abs(y_odd)
+        co = (
+            (ao > 0.25).to(tl.int32) + (ao > 0.75).to(tl.int32)
+          + (ao > 1.25).to(tl.int32) + (ao > 1.75).to(tl.int32)
+          + (ao > 2.5).to(tl.int32) + (ao > 3.5).to(tl.int32)
+          + (ao > 5.0).to(tl.int32)
+        )
+        co = tl.minimum(co, 7)
+        odd = tl.where(co == 0, 0, (so << 3) | co)
+
+        packed = (even | (odd << 4)).to(tl.uint8)     # [BLOCK_M, GROUP_SIZE//2]
+
+    # Store packed weights for this group.
+    packed_cols = pid_k * (GROUP_SIZE // 2) + tl.arange(0, GROUP_SIZE // 2)
+    out_offs = rows[:, None] * stride_om + packed_cols[None, :] * stride_ok
+    tl.store(out_ptr + out_offs, packed, mask=row_mask[:, None])
+
+    # Store one scale byte per (row, group).
+    scale_offs = rows * stride_sm + pid_k * stride_sk
+    tl.store(scale_ptr + scale_offs, scale_byte, mask=row_mask)
+
+
+def triton_quantize_mxfp4_amd(
+    input: torch.Tensor,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """ROCm-friendly MXFP4 quantizer for the f4f4bf16 GEMM path on gfx950.
+
+    Layout matches mslk/gemm/triton/f4f4bf16.py (NOT the TCGen5-swizzled
+    NVFP4 layout produced by triton_quantize_mx4_unpack).
+
+    Args:
+        input: [..., K] fp16 / bf16 / fp32 tensor; K must be a multiple of
+            group_size (32 per OCP MX v1.0).
+        group_size: must be 32. Kept as a kwarg for signature symmetry.
+
+    Returns:
+        (xq, x_scale):
+            xq:       [..., K//2] uint8, two E2M1 elements per byte
+            x_scale:  [..., K//32] uint8, one UE8M0 scale per 32-element group
+    """
+    assert group_size == 32, "MXFP4 group_size must be 32 (OCP MX v1.0)"
+    assert input.dtype in (torch.float16, torch.bfloat16, torch.float32), (
+        f"input must be fp16/bf16/fp32, got {input.dtype}"
+    )
+    orig_shape = input.shape
+    x = input.reshape(-1, orig_shape[-1])
+    M, K = x.shape
+    assert K % group_size == 0, f"K={K} must be a multiple of {group_size}"
+
+    device = x.device
+    out = torch.empty((M, K // 2), dtype=torch.uint8, device=device)
+    scale = torch.empty((M, K // group_size), dtype=torch.uint8, device=device)
+
+    BLOCK_M = 8
+    grid = (triton.cdiv(M, BLOCK_M), K // group_size)
+    _amd_quantize_mxfp4_kernel[grid](
+        x.contiguous(), out, scale,
+        M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scale.stride(0), scale.stride(1),
+        BLOCK_M=BLOCK_M,
+        GROUP_SIZE=group_size,
+        USE_CVT=_has_gfx950_fp4_cvt(),
+    )
+
+    out = out.reshape(list(orig_shape[:-1]) + [K // 2])
+    scale = scale.reshape(list(orig_shape[:-1]) + [K // group_size])
+    return out, scale
+
+
+# -----------------------------------------------------------------------------
+# AMD NVFP4 quantizer.
+#
+# Produces the plain layout consumed by the AMD NVFP4 dequant-to-BF16 path in
+# mslk/gemm/triton/f4f4bf16.py::nvfp4_dequant_gemm():
+#   weights: [M, K//2] uint8 — two E2M1 nibbles per byte, low nibble = even-K
+#   scales:  [M, K//16] uint8 viewable as float8_e4m3fn — one scale per 16
+#            K-elements, NOT TCGen5-swizzled (vs the NVIDIA quantizer which is)
+#   global_scale: () fp32 — per-tensor scalar
+#
+# The NVFP4 convention is that the stored per-block scale already absorbs the
+# global scale: dequant is `value * stored_scale / global_scale`. We follow the
+# same convention as mslk.quantize.triton.fp4_utils.global_scale_nvfp4()/
+# scale_nvfp4() so the dequant on the inference side matches CUTLASS/NVIDIA.
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _amd_quantize_nvfp4_kernel(
+    in_ptr,           # [M, K] fp16/bf16/fp32
+    out_ptr,          # [M, K//2] uint8
+    scale_ptr,        # [M, K//16] uint8 (stored as fp8_e4m3 bits)
+    inv_global_scale, # fp32 scalar = 1.0 / global_scale (so per-block stored = round((amax/6) * global) as fp8)
+    M, K,
+    stride_im, stride_ik,
+    stride_om, stride_ok,
+    stride_sm, stride_sk,
+    BLOCK_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,    # 16, NVFP4
+    FP8_E4M3_MAX: tl.constexpr,  # 448.0
+    USE_CVT: tl.constexpr,       # gfx950: hardware fp32->FP4 cvt; else ladder
+):
+    """One program per (BLOCK_M rows, 1 K-group of GROUP_SIZE elements).
+
+    Grid = (cdiv(M, BLOCK_M), K // GROUP_SIZE).
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_k * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    row_mask = rows < M
+
+    in_offs = rows[:, None] * stride_im + cols[None, :] * stride_ik
+    x = tl.load(in_ptr + in_offs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    ax = tl.abs(x)
+
+    # Per-block scale: stored_scale = clip(amax/6 * global_scale, FP8_E4M3 range), as fp8 E4M3.
+    # Dequant later does: value * stored_scale / global_scale, so multiplying
+    # in inv_global_scale here cancels: stored = (amax/6) * global → effective = amax/6.
+    amax = tl.max(ax, axis=1)                                  # [BLOCK_M]
+    amax_safe = tl.maximum(amax, 1e-30)
+    # E2M1 max = 6, so the block's "natural" scale is amax / 6.
+    block_scale = amax_safe / 6.0                              # [BLOCK_M] fp32
+    # NVFP4 stores (block_scale * global_scale) as fp8 E4M3, clipped to FP8 max.
+    stored = block_scale * (1.0 / inv_global_scale)            # = block_scale * global_scale
+    stored_clipped = tl.minimum(stored, FP8_E4M3_MAX)
+    # Triton 3.6 ROCm doesn't expose direct fp32 → fp8_e4m3 conversion as a
+    # standalone op everywhere; do it via the fp16 intermediate which is well
+    # supported on gfx950 (Triton lowers .to(float8) properly from fp16).
+    stored_fp8 = stored_clipped.to(tl.float16).to(tl.float8e4nv)
+    # Bitcast to uint8 for storage.
+    stored_u8 = stored_fp8.to(tl.uint8, bitcast=True)
+    scale_off = rows * stride_sm + pid_k * stride_sk
+    tl.store(scale_ptr + scale_off, stored_u8, mask=row_mask)
+
+    # Quantize values: y_code = round(value / effective_scale), clip to E2M1.
+    # effective_scale = stored_fp8.to(fp32) / global_scale, which equals
+    # block_scale up to fp8 rounding. Recompute it to honor the rounded scale.
+    eff_scale = stored_fp8.to(tl.float32) * inv_global_scale   # [BLOCK_M]
+    eff_scale_safe = tl.maximum(eff_scale, 1e-30)
+    y = x / eff_scale_safe[:, None]
+    y_pairs = tl.reshape(y, (BLOCK_M, GROUP_SIZE // 2, 2))
+    y_even, y_odd = tl.split(y_pairs)
+
+    if USE_CVT:
+        # gfx950: one hardware instruction per fp32 pair (RNE, saturates to ±6).
+        packed = _cvt_pk_fp4_f32_gfx950(y_even, y_odd).to(tl.uint8)
+    else:
+        # Portable ladder (gfx942 / CUDA), inlined per lane (a nested def inside
+        # @triton.jit triggers a StopIteration at compile time).
+        se = (y_even < 0).to(tl.int32)
+        ae = tl.abs(y_even)
+        ce = (
+            (ae > 0.25).to(tl.int32) + (ae > 0.75).to(tl.int32)
+          + (ae > 1.25).to(tl.int32) + (ae > 1.75).to(tl.int32)
+          + (ae > 2.5).to(tl.int32) + (ae > 3.5).to(tl.int32)
+          + (ae > 5.0).to(tl.int32)
+        )
+        ce = tl.minimum(ce, 7)
+        even = tl.where(ce == 0, 0, (se << 3) | ce)
+
+        so = (y_odd < 0).to(tl.int32)
+        ao = tl.abs(y_odd)
+        co = (
+            (ao > 0.25).to(tl.int32) + (ao > 0.75).to(tl.int32)
+          + (ao > 1.25).to(tl.int32) + (ao > 1.75).to(tl.int32)
+          + (ao > 2.5).to(tl.int32) + (ao > 3.5).to(tl.int32)
+          + (ao > 5.0).to(tl.int32)
+        )
+        co = tl.minimum(co, 7)
+        odd = tl.where(co == 0, 0, (so << 3) | co)
+
+        packed = (even | (odd << 4)).to(tl.uint8)
+
+    packed_cols = pid_k * (GROUP_SIZE // 2) + tl.arange(0, GROUP_SIZE // 2)
+    out_offs = rows[:, None] * stride_om + packed_cols[None, :] * stride_ok
+    tl.store(out_ptr + out_offs, packed, mask=row_mask[:, None])
+
+
+def triton_quantize_nvfp4_amd(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    group_size: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ROCm-friendly NVFP4 quantizer for the dequant-to-BF16 GEMM path.
+
+    Layout matches mslk/gemm/triton/f4f4bf16.py::nvfp4_dequant_gemm (NOT the
+    TCGen5-swizzled NVFP4 layout produced by triton_quantize_nvfp4 — that one
+    is Blackwell-only and uses NVIDIA-specific PTX).
+
+    Args:
+        input: [..., K] fp16 / bf16 / fp32 tensor; K must be a multiple of 16.
+        global_scale: optional per-tensor fp32 scalar. If None, computed as
+            (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax(|input|) following NVIDIA's
+            convention (see fp4_utils.global_scale_nvfp4).
+        group_size: must be 16 (NVFP4 spec).
+
+    Returns:
+        (xq, x_scale, global_scale):
+            xq:          [..., K//2] uint8, two E2M1 elements per byte
+            x_scale:     [..., K//16] uint8, one fp8_e4m3 stored scale per 16-elem block
+            global_scale: () fp32 per-tensor scalar
+    """
+    assert group_size == 16, "NVFP4 group_size must be 16"
+    assert input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+    orig_shape = input.shape
+    x = input.reshape(-1, orig_shape[-1])
+    M, K = x.shape
+    assert K % group_size == 0, f"K={K} must be a multiple of {group_size}"
+
+    device = x.device
+    if global_scale is None:
+        amax = torch.amax(torch.abs(x.to(torch.float32)))
+        # NVFP4 convention (see fp4_utils.global_scale_nvfp4).
+        global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / amax.clamp_min(1e-30)
+    global_scale = global_scale.to(torch.float32).reshape(())
+    inv_global = (1.0 / global_scale).item()
+
+    out = torch.empty((M, K // 2), dtype=torch.uint8, device=device)
+    scale = torch.empty((M, K // group_size), dtype=torch.uint8, device=device)
+
+    BLOCK_M = 8
+    grid = (triton.cdiv(M, BLOCK_M), K // group_size)
+    _amd_quantize_nvfp4_kernel[grid](
+        x.contiguous(), out, scale,
+        inv_global,
+        M, K,
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1),
+        scale.stride(0), scale.stride(1),
+        BLOCK_M=BLOCK_M,
+        GROUP_SIZE=group_size,
+        FP8_E4M3_MAX=float(FP8_E4M3_MAX),
+        USE_CVT=_has_gfx950_fp4_cvt(),
+    )
+
+    out = out.reshape(list(orig_shape[:-1]) + [K // 2])
+    scale = scale.reshape(list(orig_shape[:-1]) + [K // group_size])
+    return out, scale, global_scale
