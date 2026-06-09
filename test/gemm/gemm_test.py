@@ -27,11 +27,7 @@ from mslk.quantize.triton.fp4_quantize import (
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.shuffle import quantize_int4_preshuffle
-    from mslk.quantize.triton.fp8_quantize import (
-        quantize_fp8_block,
-        quantize_fp8_row,
-        triton_quantize_fp8_tensor,
-    )
+    from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
     from mslk.utils.triton.fp8_utils import supports_float8_fnuz
 
     if torch.cuda.get_device_capability() >= (10, 0):
@@ -327,10 +323,6 @@ class ExportCompileTests(unittest.TestCase):
         )
 
     @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
-    def test_compile_f8f8bf16(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8bf16)(self.XQ, self.WQ, self.tensor_scale)
-
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_f8i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8i4bf16_rowwise)(
             self.XQ,
@@ -367,57 +359,6 @@ class FP8Tests(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            ["cutlass"],  # kernel
-            [True, False],  # use_fast_accum
-        )
-    )
-    @unittest.skipIf(not torch.version.cuda, "Skip on AMD: f8f8bf16 not yet supported.")
-    @unittest.skipIf(
-        not evaluate_cuda_compute_capability(9, 9), "Only SM90 is supported."
-    )
-    def test_f8f8bf16(self, kernel: str, use_fast_accum: bool) -> None:
-        M = 128
-        N = 128
-        K = 256
-        fp8_max = E4M3_MAX_POS
-        x = (
-            torch.randn(
-                size=(M, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.1
-        )
-        w = (
-            torch.randn(
-                size=(N, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.01
-        )
-
-        x_max = x.abs().max()
-        w_max = w.abs().max()
-
-        x_scale = (x_max / fp8_max).float()
-        w_scale = (w_max / fp8_max).float()
-
-        xq = (x * fp8_max / x_max).to(fp8_e4m3)
-        wq = (w * fp8_max / w_max).to(fp8_e4m3)
-
-        zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale, use_fast_accum)
-
-        # Fake quant
-        x = xq.bfloat16() * x_scale
-        w = wq.bfloat16() * w_scale
-
-        zq_ref = (x @ w.T).to(torch.bfloat16)
-
-        torch.testing.assert_close(zq, zq_ref, atol=1.0e-3, rtol=1.0e-3)
-
-    @parameterized.expand(
-        itertools.product(
             [0, 2048, 4096],  # B_T
             [128, 256],  # D
             [256, 512, 4096, 8192],  # HD_L
@@ -425,11 +366,6 @@ class FP8Tests(unittest.TestCase):
             + (
                 ["blockwise"]
                 if torch.version.hip or evaluate_cuda_compute_capability(9, 9)
-                else []
-            )
-            + (
-                ["tensorwise"]
-                if torch.version.cuda and evaluate_cuda_compute_capability(9, 9)
                 else []
             ),  # Mode
             [fp8_e4m3],  # QType
@@ -497,29 +433,7 @@ class FP8Tests(unittest.TestCase):
             else None
         )
 
-        if Mode == "tensorwise":
-
-            def f(
-                x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
-            ) -> torch.Tensor:
-                xq, x_scale = triton_quantize_fp8_tensor(x)
-                wq, w_scale = triton_quantize_fp8_tensor(w)
-                zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale)
-                if bias is not None:
-                    zq += bias
-                return zq
-
-            if CudaGraph:
-                # Warm-up to avoid capture issues
-                f(x, w, bias)
-
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    zq = f(x, w, bias)
-                g.replay()
-            else:
-                zq = f(x, w, bias)
-        elif Mode == "rowwise":
+        if Mode == "rowwise":
 
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
