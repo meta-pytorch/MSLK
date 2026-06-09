@@ -27,6 +27,46 @@ FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448
 # exponent and mantissa bits of `torch.float4_e2m1fn_x2`
 FP4_EBITS, FP4_MBITS = 2, 1
 
+# ---------------------------------------------------------------------------
+# gfx950 (CDNA4) hardware FP4 conversion
+# ---------------------------------------------------------------------------
+# V_CVT_SCALEF32_PK_FP4_F32 is a VOP3 instruction introduced in gfx950 (CDNA4,
+# MI350/MI355X). It converts two F32 values to a packed byte containing two
+# FP4 E2M1 nibbles using hardware block-scaling.
+#
+# AMD CDNA4 ISA Reference, section 6.7.1 Packed Convert — pseudo-code:
+#   scale    = 32'U(exponent(S2.f32))   # extract biased exponent -> E8M0 uint8
+#   tmp0     = f32_to_fp4_scale(S0.f32, scale.u8)   # S0 -> low  nibble [3:0]
+#   tmp1     = f32_to_fp4_scale(S1.f32, scale.u8)   # S1 -> high nibble [7:4]
+#   dstbyte  = OPSEL[3:2] * 8           # selects which byte [0..3] in VDST
+#   VDST[dstbyte+7:dstbyte] = {tmp1, tmp0}
+#   # other destination bits are preserved
+#
+# Scale operand is the GCN inline constant 1.0 (biased_exp=127 -> E8M0=127
+# -> effective scale 2^(127-127)=1.0). No extra scaling is applied because
+# the quantization kernel's group-scaling step already places inputs in
+# [-6, 6] (the E2M1 representable range).
+#
+# Rounding: round-toward-nearest-even (RNE / banker's rounding), per ISA.
+#   This differs from the pure-Triton path (_fp32_to_e2m1_nibble) which uses
+#   nearest-ties-away-from-zero, so results may differ at exact midpoints
+#   (e.g. ±0.25, ±0.75, ±1.25, ±1.75, ±2.5, ±3.5, ±5.0).
+#
+# OPSEL defaults to 0 when omitted, so the result is placed in bits [7:0].
+# Nibble ordering (S0→low nibble [3:0], S1→high nibble [7:4]) matches the
+# AMD VOP3 2-src packed-byte convention.
+_GFX950_CVT_PK_FP4_F32 = tl.constexpr("v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0")
+
+
+def _detect_gfx950() -> bool:
+    """Return True if the current CUDA/ROCm device is gfx950 (CDNA4)."""
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
 
 class RoundingMode(IntEnum):
     """Rounding options for quantization."""
@@ -53,6 +93,152 @@ def get_mx4_exp_bias(ebits):
         return 3
     else:
         raise NotImplementedError(f"MX4 with ebits={ebits} not supported.")
+
+
+@triton.jit
+def _fp32_to_e2m1_nibble(v):
+    """Encode one float32 element-wise as a 4-bit E2M1 nibble (int32, 0–15).
+
+    Used by the pure-Triton fallback path (_fp32x8_to_e2m1_packed_rocm) for
+    gfx942 (MI300X) and other non-gfx950 ROCm devices.  gfx950 uses the
+    hardware instruction V_CVT_SCALEF32_PK_FP4_F32 instead (see
+    _fp32x8_to_e2m1_packed_gfx950).
+
+    E2M1 format: s | e1 | e0 | m0.
+    Representable magnitudes: {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+    Rounding: nearest-ties-away-from-zero (matches PTX ``cvt.rn`` for
+    positive values).  This differs from the gfx950 hardware path which uses
+    round-toward-nearest-even (RNE); results diverge only at exact midpoints
+    (±0.25, ±0.75, ±1.25, ±1.75, ±2.5, ±3.5, ±5.0).
+
+    Note on implementation: E2M1 levels are non-uniformly spaced, so a single
+    IEEE 754 bit-manipulation trick (add rounding offset + shift) does NOT
+    correctly handle all midpoints — specifically the 0.5↔1.0 boundary where
+    the required offset differs from the 1.0↔1.5 boundary.  The tl.where chain
+    is therefore the correct branchless GPU implementation: each tl.where lowers
+    to a v_cmp + v_cndmask_b32 pair on CDNA, which is uniform across the warp.
+    """
+    sign = tl.where(v < 0.0, 1, 0).to(tl.int32)
+    ax = tl.abs(v)
+    # Clamp to the representable range [0, 6].
+    ax = tl.minimum(ax, 6.0)
+    # Midpoints between consecutive E2M1 levels; values *at* a midpoint
+    # round up (nearest, ties-away-from-zero — matches PTX rn for positives).
+    mag = tl.where(
+        ax < 0.25,
+        0,
+        tl.where(
+            ax < 0.75,
+            1,
+            tl.where(
+                ax < 1.25,
+                2,
+                tl.where(
+                    ax < 1.75,
+                    3,
+                    tl.where(
+                        ax < 2.5, 4, tl.where(ax < 3.5, 5, tl.where(ax < 5.0, 6, 7))
+                    ),
+                ),
+            ),
+        ),
+    )
+    return ((sign << 3) | mag).to(tl.int32)
+
+
+@triton.jit
+def _fp32x8_to_e2m1_packed_rocm(
+    f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight
+):
+    """Pack 8 float32 values into one int32 containing 8 E2M1 nibbles.
+
+    Pure-Triton replacement for the PTX ``cvt.rn.satfinite.e2m1x2.f32``
+    inline-asm block.  Argument order matches the PTX version:
+
+        byte0 = pack(f_one,   f_five)   # low nibble = f_one, high = f_five
+        byte1 = pack(f_three, f_seven)
+        byte2 = pack(f_two,   f_six)
+        byte3 = pack(f_four,  f_eight)
+        result = byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24)
+    """
+    n0 = _fp32_to_e2m1_nibble(f_one)
+    n1 = _fp32_to_e2m1_nibble(f_five)
+    n2 = _fp32_to_e2m1_nibble(f_three)
+    n3 = _fp32_to_e2m1_nibble(f_seven)
+    n4 = _fp32_to_e2m1_nibble(f_two)
+    n5 = _fp32_to_e2m1_nibble(f_six)
+    n6 = _fp32_to_e2m1_nibble(f_four)
+    n7 = _fp32_to_e2m1_nibble(f_eight)
+
+    byte0 = n0 | (n1 << 4)
+    byte1 = n2 | (n3 << 4)
+    byte2 = n4 | (n5 << 4)
+    byte3 = n6 | (n7 << 4)
+
+    return byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24)
+
+
+@triton.jit
+def _fp32x8_to_e2m1_packed_gfx950(
+    f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight
+):
+    """gfx950-native FP4 packing using V_CVT_SCALEF32_PK_FP4_F32.
+
+    Replaces ~56 VALU compare+select ops (7 tl.where × 8 values) with
+    4 hardware conversion instructions.  Only valid on gfx950 (CDNA4,
+    MI350/MI355X); gfx942 (MI300X) does not have this instruction.
+
+    ISA semantics (AMD CDNA4 §6.7.1, see module comment above):
+        scale    = exponent(S2) as E8M0 uint8  [S2=1.0 → E8M0=127 → ×1.0]
+        dst[3:0] = f32_to_fp4_scale(S0, scale)  # S0 → low  nibble
+        dst[7:4] = f32_to_fp4_scale(S1, scale)  # S1 → high nibble
+    Rounding: round-toward-nearest-even (RNE), per ISA.
+    OPSEL defaults to 0: result lands in bits [7:0] of the destination VGPR.
+
+    Constraints use ``v`` (VGPR) — the only valid class on AMDGPU LLVM;
+    ``f`` (x87 float) and ``r`` (PTX register) are NVIDIA-only.
+
+    Argument order matches _fp32x8_to_e2m1_packed_rocm so callers need no change:
+        byte0 = CVT(f_one  [low nibble], f_five  [high nibble])
+        byte1 = CVT(f_three[low nibble], f_seven [high nibble])
+        byte2 = CVT(f_two  [low nibble], f_six   [high nibble])
+        byte3 = CVT(f_four [low nibble], f_eight [high nibble])
+        result = byte0 | (byte1<<8) | (byte2<<16) | (byte3<<24)
+    """
+    b0 = tl.inline_asm_elementwise(
+        asm=_GFX950_CVT_PK_FP4_F32,
+        constraints="=v,v,v",
+        args=[f_one, f_five],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    b1 = tl.inline_asm_elementwise(
+        asm=_GFX950_CVT_PK_FP4_F32,
+        constraints="=v,v,v",
+        args=[f_three, f_seven],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    b2 = tl.inline_asm_elementwise(
+        asm=_GFX950_CVT_PK_FP4_F32,
+        constraints="=v,v,v",
+        args=[f_two, f_six],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    b3 = tl.inline_asm_elementwise(
+        asm=_GFX950_CVT_PK_FP4_F32,
+        constraints="=v,v,v",
+        args=[f_four, f_eight],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    # Each bN has the packed FP4 byte in bits [7:0]; shift and OR into int32.
+    return (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24)
 
 
 @triton.jit
@@ -144,6 +330,8 @@ def _kernel_quantize_mx4_unpack(
     GROUP_LOAD: tl.constexpr,
     USE_INT64: tl.constexpr,
     SCALE_K: tl.constexpr,
+    IS_ROCM: tl.constexpr,
+    IS_GFX950: tl.constexpr,
 ) -> None:
     """Quantize a 1D float tensor into a packed MX4 tensor.
 
@@ -273,27 +461,40 @@ def _kernel_quantize_mx4_unpack(
         f_seven, f_eight = tl.split(
             tl.reshape(t_four, [(GROUP_LOAD * GROUP_SIZE) // 8, 2])
         )  # 3, 11 || 7, 15
-        packed_result = tl.inline_asm_elementwise(
-            asm="""
-            {
-                .reg .b8 byte0;
-                .reg .b8 byte1;
-                .reg .b8 byte2;
-                .reg .b8 byte3;
-                cvt.rn.satfinite.e2m1x2.f32  byte0, $2, $1;
-                cvt.rn.satfinite.e2m1x2.f32  byte1, $4, $3;
-                cvt.rn.satfinite.e2m1x2.f32  byte2, $6, $5;
-                cvt.rn.satfinite.e2m1x2.f32  byte3, $8, $7;
-                mov.b32 $0, {byte0, byte1, byte2, byte3};
+        if IS_GFX950:
+            # gfx950 (CDNA4): hardware V_CVT_SCALEF32_PK_FP4_F32 instruction.
+            # 4 instructions replace ~56 compare+select ops of the fallback.
+            packed_result = _fp32x8_to_e2m1_packed_gfx950(
+                f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight
+            )
+        elif IS_ROCM:
+            # gfx942 (CDNA3) or other ROCm: no FP4 hardware instruction.
+            packed_result = _fp32x8_to_e2m1_packed_rocm(
+                f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight
+            )
+        else:
+            # NVIDIA: PTX hardware instruction (SM90a+ / Hopper+).
+            packed_result = tl.inline_asm_elementwise(
+                asm="""
+                {
+                    .reg .b8 byte0;
+                    .reg .b8 byte1;
+                    .reg .b8 byte2;
+                    .reg .b8 byte3;
+                    cvt.rn.satfinite.e2m1x2.f32  byte0, $2, $1;
+                    cvt.rn.satfinite.e2m1x2.f32  byte1, $4, $3;
+                    cvt.rn.satfinite.e2m1x2.f32  byte2, $6, $5;
+                    cvt.rn.satfinite.e2m1x2.f32  byte3, $8, $7;
+                    mov.b32 $0, {byte0, byte1, byte2, byte3};
 
-            }
-            """,
-            constraints="=r,f, f, f, f, f, f, f, f",
-            args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
-            dtype=tl.int32,
-            is_pure=True,
-            pack=1,
-        )
+                }
+                """,
+                constraints="=r,f, f, f, f, f, f, f, f",
+                args=[f_one, f_five, f_three, f_seven, f_two, f_six, f_four, f_eight],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
 
         row = exp_offset // GROUPS_PER_ROW
         col = exp_offset % GROUPS_PER_ROW
@@ -536,6 +737,10 @@ def triton_quantize_mx4_unpack(
         USE_INT64=use_int64,
         # pyre-ignore[6]
         SCALE_K=rounded_K,
+        # pyre-ignore[6]
+        IS_ROCM=torch.version.hip is not None,
+        # pyre-ignore[6]
+        IS_GFX950=_detect_gfx950(),
     )
 
     scale = scale.flatten()
