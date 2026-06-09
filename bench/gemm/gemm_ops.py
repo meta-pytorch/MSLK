@@ -27,6 +27,15 @@ from mslk.quantize.triton.fp4_quantize import (
 )
 
 
+from mslk.quantize.triton.fp8_quantize import (
+    quantize_fp8_block,
+    quantize_fp8_group,
+    quantize_fp8_row,
+    triton_quantize_fp8_tensor,
+)
+from mslk.utils.triton.fp8_utils import get_fp8_constants
+
+
 def _mxfp4_quantize_for_current_backend(x):
     """Pick the right MXFP4 quantizer per backend.
 
@@ -38,13 +47,6 @@ def _mxfp4_quantize_for_current_backend(x):
     if torch.version.hip is not None:
         return triton_quantize_mxfp4_amd(x)
     return triton_quantize_mx4_unpack(x)
-from mslk.quantize.triton.fp8_quantize import (
-    quantize_fp8_block,
-    quantize_fp8_group,
-    quantize_fp8_row,
-    triton_quantize_fp8_tensor,
-)
-from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 
 try:

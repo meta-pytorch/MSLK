@@ -226,8 +226,10 @@ def mxfp4_gemm(
     if output is None:
         output = torch.empty((M, N), device=XQ.device, dtype=torch.bfloat16)
 
-    # autotune picks BLOCK_M/N/K/GROUP_M; grid is computed per-config via a lambda.
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+    # autotune picks BLOCK_M/N/K/GROUP_M; grid is computed per-config.
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
+
     _mxfp4_gemm_kernel[grid](
         XQ, WQ, x_scale, w_scale, output,
         M, N, K,
@@ -359,8 +361,8 @@ def nvfp4_dequant_gemm(
     K = XQ.shape[1] * 2
     assert WQ.shape[1] * 2 == K
     assert K % 32 == 0, f"K={K} must be a multiple of 32 (FP4 packing + 16-elem scale block)"
-    assert x_scale.shape == (M, K // 16), f"x_scale {tuple(x_scale.shape)} != ({M}, {K//16})"
-    assert w_scale.shape == (N, K // 16), f"w_scale {tuple(w_scale.shape)} != ({N}, {K//16})"
+    assert x_scale.shape == (M, K // 16), f"x_scale {tuple(x_scale.shape)} != ({M}, {K // 16})"
+    assert w_scale.shape == (N, K // 16), f"w_scale {tuple(w_scale.shape)} != ({N}, {K // 16})"
 
     # NVFP4 convention: stored per-block scale already absorbs global_scale, so
     # dequant uses (scale / global_scale). Pre-compute reciprocals as scalars
@@ -618,9 +620,10 @@ def _ocp_fp8_gemm(a8, b8, output):
     N = b8.shape[0]
     out = output if output is not None else torch.empty(
         (M, N), dtype=torch.bfloat16, device=a8.device)
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-    )
+
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),)
+
     # NOTE: do not pass _HIP_OPTS here — matrix_instr_nonkdim=32 aborts MFMA
     # instruction selection for some of this kernel's tile configs (BK=64 /
     # 64-row tiles). The plain fp8 GEMM autotunes fine without it.
@@ -678,7 +681,6 @@ def _predequant_fp8_gemm(XQ, WQ, x_scale, w_scale, inv_a, inv_b, M, N, K, is_nvf
 def _mxfp4_grouped_autotune_configs():
     """Grouped MXFP4 GEMM configs spanning small-M (MoE decode) → large shapes.
 
-    
     G ∈ {4,8}, M ∈ {128, 512, 1024}, N=4096, K ∈ {2048,4096}. Findings:
       - Small-M (M=128): BM ≤ 128 + BN ∈ {64,128,256}, num_warps=2-4 (not 8 —
         too little K work per warp). BM=32 BN=64 nw=2 hits ~450 TFLOPS at M=128.
@@ -897,10 +899,11 @@ def mxfp4_grouped_mm(
     # never launched (silent wrong output). total_M is the safe upper bound on
     # any one expert's row count; the kernel's `pid >= total_tiles` guard skips
     # the over-provisioned tiles per expert.
-    grid = lambda META: (
-        triton.cdiv(total_M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        G,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(total_M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            G,
+        )
 
     _mxfp4_grouped_mm_kernel[grid](
         XQ, WQ, x_scale, w_scale, output, offsets,
@@ -994,10 +997,11 @@ def mxfp4_grouped_stacked_gemm(
     # (uneven expert sizes would otherwise drop tail M-tiles).
     max_m_per_group = (total_M + G - 1) // G
 
-    grid = lambda META: (
-        triton.cdiv(total_M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-        G,
-    )
+    def grid(META):
+        return (
+            triton.cdiv(total_M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+            G,
+        )
 
     # Stride remap: kernel reads B as [G, K//2, N] with (stride_bg, stride_bk, stride_bn).
     # We have [G, N, K//2] with (stride_g, stride_n, stride_k). Re-bind:

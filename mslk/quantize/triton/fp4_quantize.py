@@ -6028,7 +6028,6 @@ def triton_fake_quantize_nvfp4_per_tensor(
 # -----------------------------------------------------------------------------
 
 
-
 def _has_gfx950_fp4_cvt() -> bool:
     """True iff the `v_cvt_scalef32_pk_fp4_f32` encode is available (gfx950 /
     CDNA4 only).
@@ -6120,10 +6119,13 @@ def _amd_quantize_mxfp4_kernel(
         se = (y_even < 0).to(tl.int32)
         ae = tl.abs(y_even)
         ce = (
-            (ae > 0.25).to(tl.int32) + (ae > 0.75).to(tl.int32)
-          + (ae > 1.25).to(tl.int32) + (ae > 1.75).to(tl.int32)
-          + (ae > 2.5).to(tl.int32) + (ae > 3.5).to(tl.int32)
-          + (ae > 5.0).to(tl.int32)
+            (ae > 0.25).to(tl.int32)
+            + (ae > 0.75).to(tl.int32)
+            + (ae > 1.25).to(tl.int32)
+            + (ae > 1.75).to(tl.int32)
+            + (ae > 2.5).to(tl.int32)
+            + (ae > 3.5).to(tl.int32)
+            + (ae > 5.0).to(tl.int32)
         )
         ce = tl.minimum(ce, 7)
         even = tl.where(ce == 0, 0, (se << 3) | ce)
@@ -6131,10 +6133,13 @@ def _amd_quantize_mxfp4_kernel(
         so = (y_odd < 0).to(tl.int32)
         ao = tl.abs(y_odd)
         co = (
-            (ao > 0.25).to(tl.int32) + (ao > 0.75).to(tl.int32)
-          + (ao > 1.25).to(tl.int32) + (ao > 1.75).to(tl.int32)
-          + (ao > 2.5).to(tl.int32) + (ao > 3.5).to(tl.int32)
-          + (ao > 5.0).to(tl.int32)
+            (ao > 0.25).to(tl.int32)
+            + (ao > 0.75).to(tl.int32)
+            + (ao > 1.25).to(tl.int32)
+            + (ao > 1.75).to(tl.int32)
+            + (ao > 2.5).to(tl.int32)
+            + (ao > 3.5).to(tl.int32)
+            + (ao > 5.0).to(tl.int32)
         )
         co = tl.minimum(co, 7)
         odd = tl.where(co == 0, 0, (so << 3) | co)
@@ -6223,7 +6228,7 @@ def _amd_quantize_nvfp4_kernel(
     in_ptr,           # [M, K] fp16/bf16/fp32
     out_ptr,          # [M, K//2] uint8
     scale_ptr,        # [M, K//16] uint8 (stored as fp8_e4m3 bits)
-    inv_global_scale, # fp32 scalar = 1.0 / global_scale (so per-block stored = round((amax/6) * global) as fp8)
+    inv_global_scale,  # fp32 scalar = 1.0 / global_scale (so per-block stored = round((amax/6) * global) as fp8)
     M, K,
     stride_im, stride_ik,
     stride_om, stride_ok,
@@ -6285,10 +6290,13 @@ def _amd_quantize_nvfp4_kernel(
         se = (y_even < 0).to(tl.int32)
         ae = tl.abs(y_even)
         ce = (
-            (ae > 0.25).to(tl.int32) + (ae > 0.75).to(tl.int32)
-          + (ae > 1.25).to(tl.int32) + (ae > 1.75).to(tl.int32)
-          + (ae > 2.5).to(tl.int32) + (ae > 3.5).to(tl.int32)
-          + (ae > 5.0).to(tl.int32)
+            (ae > 0.25).to(tl.int32)
+            + (ae > 0.75).to(tl.int32)
+            + (ae > 1.25).to(tl.int32)
+            + (ae > 1.75).to(tl.int32)
+            + (ae > 2.5).to(tl.int32)
+            + (ae > 3.5).to(tl.int32)
+            + (ae > 5.0).to(tl.int32)
         )
         ce = tl.minimum(ce, 7)
         even = tl.where(ce == 0, 0, (se << 3) | ce)
@@ -6296,10 +6304,13 @@ def _amd_quantize_nvfp4_kernel(
         so = (y_odd < 0).to(tl.int32)
         ao = tl.abs(y_odd)
         co = (
-            (ao > 0.25).to(tl.int32) + (ao > 0.75).to(tl.int32)
-          + (ao > 1.25).to(tl.int32) + (ao > 1.75).to(tl.int32)
-          + (ao > 2.5).to(tl.int32) + (ao > 3.5).to(tl.int32)
-          + (ao > 5.0).to(tl.int32)
+            (ao > 0.25).to(tl.int32)
+            + (ao > 0.75).to(tl.int32)
+            + (ao > 1.25).to(tl.int32)
+            + (ao > 1.75).to(tl.int32)
+            + (ao > 2.5).to(tl.int32)
+            + (ao > 3.5).to(tl.int32)
+            + (ao > 5.0).to(tl.int32)
         )
         co = tl.minimum(co, 7)
         odd = tl.where(co == 0, 0, (so << 3) | co)

@@ -2917,7 +2917,6 @@ class MXFP4Tests(unittest.TestCase):
         m_sizes_list = [64, 232, 600]
         G = len(m_sizes_list)
         N, K = 512, 2048
-        total_M = sum(m_sizes_list)
 
         XS = [
             torch.randn((m, K), dtype=torch.bfloat16, device=self.device) * 0.1
