@@ -12,7 +12,16 @@ from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import torch
 
-from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, triton_splitk
+from . import (  # noqa: F401
+    attn_bias,
+    ck,
+    cutlass,
+    flash,
+    flash3,
+    flash_mtia,
+    triton_mla,
+    triton_splitk,
+)
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
@@ -66,11 +75,9 @@ def _ensure_op_supports_or_raise(exc_type, name: str, op, inp: Inputs) -> None:
     reasons = op.not_supported_reasons(inp)
     if not reasons:
         return
-    raise exc_type(
-        f"""Operator `{name}` does not support inputs:
+    raise exc_type(f"""Operator `{name}` does not support inputs:
 {textwrap.indent(_format_inputs_description(inp), "     ")}
-{_format_not_supported_reasons(op, reasons)}"""
-    )
+{_format_not_supported_reasons(op, reasons)}""")
 
 
 def _format_not_supported_reasons(op, reasons: List[str]) -> str:

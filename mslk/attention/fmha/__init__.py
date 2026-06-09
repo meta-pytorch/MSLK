@@ -9,7 +9,7 @@ from typing import Any, cast, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 
-from . import (
+from . import (  # noqa: F401
     attn_bias,
     ck,
     ck_decoder,
@@ -21,6 +21,7 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    triton_mla,
     triton_splitk,
 )
 from .attn_bias import (
@@ -148,9 +149,9 @@ class _fMHA(torch.autograd.Function):
         ):
             varlen_lse_packed = _detect_lse_packed_or_raise(op_ctx.lse, inp)
             if varlen_lse_packed is not None and op_fw is not None:
-                assert op_fw.VARLEN_LSE_PACKED == varlen_lse_packed, (
-                    f"{op_fw.NAME}: wrong value for `VARLEN_LSE_PACKED` ?"
-                )
+                assert (
+                    op_fw.VARLEN_LSE_PACKED == varlen_lse_packed
+                ), f"{op_fw.NAME}: wrong value for `VARLEN_LSE_PACKED` ?"
             # NOTE: We need to check tensor strides to decide which operator we run in the BW pass.
             # Unfortunately, PyTorch only allows to call this function during the FW pass, so
             # we decide the operator to use now.
@@ -959,6 +960,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash_mtia.FwOp,
     flash3.FwOp,
     triton_splitk.FwOp,
+    triton_mla.FwOp,
 ]
 
 ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
