@@ -314,31 +314,6 @@ if hasattr(torch.ops.mslk, "mx6mx6bf16"):
         return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-if hasattr(torch.ops.mslk, "f8f8bf16"):
-
-    @torch.library.register_fake("mslk::f8f8bf16")
-    def f8f8bf16_meta(
-        X: torch.Tensor,
-        W: torch.Tensor,
-        scale: torch.Tensor,
-        use_fast_accum: bool = True,
-    ) -> torch.Tensor:
-        x_dims = X.dim()
-        w_dims = W.dim()
-        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
-            "The dim of X must be 2 or 3, and dim of W must be 2"
-        )
-        if x_dims == 2:
-            M = X.shape[0]
-            N = W.shape[0]
-            return torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
-        else:
-            B = X.shape[0]
-            M = X.shape[1]
-            N = W.shape[0]
-            return torch.empty((B, M, N), dtype=torch.bfloat16, device=X.device)
-
-
 if hasattr(torch.ops.mslk, "f8f8bf16_groupwise"):
 
     @torch.library.register_fake("mslk::f8f8bf16_groupwise")

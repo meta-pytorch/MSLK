@@ -45,6 +45,11 @@ def evaluate_cuda_compute_capability(major_min, major_max=None):
     return major >= major_min and (major_max is None or major <= major_max)
 
 
+def evaluate_gfx_arch_in(arch_list):
+    gcn_arch_name = torch.cuda.get_device_properties("cuda").gcnArchName
+    return any(arch in gcn_arch_name for arch in arch_list)
+
+
 def supports_nvfp4():
     if torch.cuda.is_available():
         if torch.version.cuda:
@@ -56,6 +61,8 @@ def supports_mxfp4():
     if torch.cuda.is_available():
         if torch.version.cuda:
             return evaluate_cuda_compute_capability(10)
+        if torch.version.hip:
+            return evaluate_gfx_arch_in(["gfx950"])
     return False
 
 

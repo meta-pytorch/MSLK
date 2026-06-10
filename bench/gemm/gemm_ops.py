@@ -28,7 +28,6 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_block,
     quantize_fp8_group,
     quantize_fp8_row,
-    triton_quantize_fp8_tensor,
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
@@ -646,38 +645,6 @@ class TorchNVFP4Groupwise(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP4
-
-
-@register_gemm_op
-class CutlassFP8Tensorwise(GemmOpBase):
-    """
-    FP8 matmul with tensorwise scaling.
-    """
-
-    def quantize(self, x, w):
-        # Quantize both input tensors.
-        xq, x_scale = triton_quantize_fp8_tensor(x)
-        wq, w_scale = triton_quantize_fp8_tensor(w)
-        return xq, wq, x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        return torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90}
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP8
 
 
 @register_gemm_op
