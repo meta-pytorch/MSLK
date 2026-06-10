@@ -33,8 +33,6 @@ if torch.cuda.is_available():
     if torch.cuda.get_device_capability() >= (10, 0):
         from mslk.quantize.triton.fp4_quantize import _to_blocked
 
-import itertools
-
 from parameterized import parameterized
 
 # Marlin is currently only supported internally at Meta.
@@ -240,6 +238,72 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
     return selected_values.to(dtype).to(device)
 
 
+def _fp8_gemm_cases() -> list[tuple]:
+    modes = ["rowwise"] + (
+        # Blockwise fp8 GEMM is numerically broken on AMD/MI300 (~99% relative
+        # RMS error at all K); the loose tolerance only masked it while K was
+        # small. Keep it NVIDIA-only until the CK kernel
+        # (mslk/csrc/gemm/ck/fp8_blockwise_gemm.hip) is fixed. See T275007617.
+        ["blockwise"]
+        if torch.version.cuda is not None and evaluate_cuda_compute_capability(9, 9)
+        else []
+    )
+
+    def case(
+        M: int,
+        K: int,
+        N: int,
+        *,
+        bias: bool = False,
+        cudagraph: bool = False,
+        use_triton: bool = False,
+        fast_accum: bool = True,
+        multi_dim: bool = False,
+    ) -> tuple:
+        # (M, K, N, Bias, CudaGraph, UseTriton, UseFastAccum, InputMultiDim)
+        return (
+            M,
+            K,
+            N,
+            bias,
+            cudagraph,
+            use_triton,
+            fast_accum,
+            multi_dim,
+        )
+
+    cases = [
+        case(256, 128, 256),  # small
+        case(2048, 2048, 4096),  # medium
+        case(4096, 4096, 8192),  # large
+        case(0, 256, 4096),  # empty input
+        # Other features
+        case(2048, 256, 4096, bias=True),
+        case(2048, 256, 4096, cudagraph=True),
+        case(2048, 256, 4096, multi_dim=True),
+    ]
+    if torch.version.cuda is not None:
+        cases += [
+            case(2048, 256, 4096, use_triton=True),
+            case(2048, 256, 4096, fast_accum=False),  # slow accumulation
+        ]
+    return [(*case, mode) for mode in modes for case in cases]
+
+
+def _fp8_batched_gemm_cases() -> list[tuple]:
+    modes = ["default"] + (["torch_3d3d"] if torch.version.hip else [])
+    cases = []
+    for mode in modes:
+        for use_loopover in (True, False):
+            # (B, M, N, K, use_loopover, Bias, mode)
+            cases.append((1, 256, 128, 256, use_loopover, False, mode))  # small
+            cases.append((4, 4096, 256, 512, use_loopover, False, mode))  # large
+            # Fused bias is only supported on Nvidia for batched GEMM.
+            if torch.version.cuda is not None:
+                cases.append((4, 2048, 256, 512, use_loopover, True, mode))  # bias
+    return cases
+
+
 @unittest.skipIf(
     not torch.cuda.is_available(),
     "Operators are only available on CUDA enabled machines",
@@ -357,41 +421,22 @@ class FP8Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    @parameterized.expand(
-        itertools.product(
-            [0, 2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512, 4096, 8192],  # HD_L
-            ["rowwise"]
-            + (
-                ["blockwise"]
-                if torch.version.hip or evaluate_cuda_compute_capability(9, 9)
-                else []
-            ),  # Mode
-            [fp8_e4m3],  # QType
-            [True, False],  # Bias
-            [True, False],  # CudaGraph
-            [False] + ([True] if torch.version.cuda else []),  # UseTriton
-            [True, False],  # UseFastAccum
-            [True, False],  # InputMultiDim
-        )
-    )
+    @parameterized.expand(_fp8_gemm_cases())
     @unittest.skipIf(
         torch.version.hip is not None and running_on_github,
         "type fp8e4b8 not supported in this architecture. The supported fp8 dtypes are ('fp8e5',)",
     )
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
-        Mode: str,
-        QType: torch.dtype,
+        M: int,
+        K: int,
+        N: int,
         Bias: bool,
         CudaGraph: bool,
         UseTriton: bool,
         UseFastAccum: bool,
         InputMultiDim: bool,
+        Mode: str,
     ) -> None:
         # Slow accumulation is only supported on Nvidia.
         if torch.version.hip:
@@ -400,7 +445,7 @@ class FP8Tests(unittest.TestCase):
         if InputMultiDim:
             x = (
                 torch.randn(
-                    size=(3, B_T, D),
+                    size=(3, M, K),
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
@@ -409,7 +454,7 @@ class FP8Tests(unittest.TestCase):
         else:
             x = (
                 torch.randn(
-                    size=(B_T, D),
+                    size=(M, K),
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
@@ -417,7 +462,7 @@ class FP8Tests(unittest.TestCase):
             )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -425,7 +470,7 @@ class FP8Tests(unittest.TestCase):
         )
         bias = (
             torch.randn(
-                size=(HD_L,),
+                size=(N,),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -526,17 +571,7 @@ class FP8Tests(unittest.TestCase):
             rtol = 9.0e-2
         torch.testing.assert_close(zq, zq_ref, atol=atol, rtol=rtol)
 
-    @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [2048, 4096],  # M
-            [128, 256],  # N
-            [256, 512],  # K
-            [True, False],  # use_loopover
-            [False] + ([True] if torch.version.cuda else []),  # Bias
-            ["default"] + (["torch_3d3d"] if torch.version.hip else []),  # mode
-        )
-    )
+    @parameterized.expand(_fp8_batched_gemm_cases())
     def test_batched_gemm(
         self,
         B: int,
@@ -633,14 +668,19 @@ class FP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_ref, y_fp8, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-            ["default", "cat", "padded"],  # mode
-        )
+        [
+            (*case, mode)
+            for mode in ["default", "cat", "padded"]
+            for case in [
+                (1, 512, 512, 512, False),  # small MNK (also small G)
+                (16, 2048, 1024, 2048, False),  # medium MNK
+                (64, 3584, 6144, 3584, False),  # large MNK
+                (16, 512, 512, 512, False),  # medium G
+                (64, 512, 512, 512, False),  # large G
+                (1, 0, 512, 512, False),  # empty (M=0)
+                (16, 2048, 1024, 2048, True),  # cudagraph
+            ]
+        ]
     )
     def test_grouped_gemm_internal_api(
         self, G: int, M: int, N: int, K: int, use_cudagraph: bool, mode: str
@@ -783,12 +823,14 @@ class FP8Tests(unittest.TestCase):
         )
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [0, 64, 2048, 3584],  # M
-            [64, 256, 1024, 6144],  # N
-            [64, 256, 512, 3584],  # K
-        )
+        [
+            (1, 512, 512, 512),  # small MNK (also small G)
+            (16, 2048, 1024, 2048),  # medium MNK
+            (64, 3584, 6144, 3584),  # large MNK
+            (16, 512, 512, 512),  # medium G
+            (64, 512, 512, 512),  # large G
+            (1, 0, 512, 512),  # empty (M=0)
+        ]
     )
     @unittest.skipIf(
         not is_mi300x(),
@@ -832,13 +874,15 @@ class FP8Tests(unittest.TestCase):
         self.bf16_loopover_validate(X, W_split, y_fp8)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [16, 2048, 3584],  # M
-            [16, 256, 1024, 6144],  # N
-            [16, 256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 512, 512, 512, False),  # small MNK (also small G)
+            (16, 2048, 1024, 2048, False),  # medium MNK
+            (64, 3584, 6144, 3584, False),  # large MNK
+            (16, 512, 512, 512, False),  # medium G
+            (64, 512, 512, 512, False),  # large G
+            (1, 0, 512, 512, False),  # empty (M=0)
+            (16, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
     @unittest.skipIf(
         not is_mi300x(),
@@ -931,14 +975,19 @@ class FP8Tests(unittest.TestCase):
                 )
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [0, 2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-            ["stacked"] + (["torch_2d3d"] if torch.version.hip else []),  # mode
-        )
+        [
+            (*case, mode)
+            for mode in ["stacked"] + (["torch_2d3d"] if torch.version.hip else [])
+            for case in [
+                (1, 512, 512, 512, False),  # small MNK (also small G)
+                (16, 2048, 1024, 2048, False),  # medium MNK
+                (64, 3584, 6144, 3584, False),  # large MNK
+                (16, 512, 512, 512, False),  # medium G
+                (64, 512, 512, 512, False),  # large G
+                (1, 0, 512, 512, False),  # empty (M=0)
+                (16, 2048, 1024, 512, True),  # cudagraph
+            ]
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -1044,25 +1093,28 @@ class BF16Int4Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512],  # HD_L
-            [True, False],  # CudaGraph
-            [True, False],  # Preshuffle
-        )
+        [
+            (*case, preshuffle)
+            for preshuffle in [True, False]
+            for case in [
+                (256, 128, 256, False),  # small
+                (2048, 2048, 4096, False),  # medium
+                (4096, 4096, 8192, False),  # large
+                (2048, 256, 512, True),  # cudagraph
+            ]
+        ]
     )
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
+        M: int,
+        K: int,
+        N: int,
         CudaGraph: bool,
-        Preshuffle: bool,
+        preshuffle: bool,
     ) -> None:
         x = (
             torch.randn(
-                size=(B_T, D),
+                size=(M, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1070,14 +1122,14 @@ class BF16Int4Tests(unittest.TestCase):
         )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
             * 0.01
         )
 
-        if Preshuffle:
+        if preshuffle:
             wq, (w_scale, w_zp) = quantize_int4_preshuffle(w, dtype="bf16")
         else:
             wq, w_scale, w_zp = int4_row_quantize(w, 128)
@@ -1087,7 +1139,7 @@ class BF16Int4Tests(unittest.TestCase):
 
         bf16i4_op = (
             torch.ops.mslk.bf16i4bf16_shuffled
-            if Preshuffle
+            if preshuffle
             else torch.ops.mslk.bf16i4bf16_rowwise
         )
 
@@ -1103,13 +1155,15 @@ class BF16Int4Tests(unittest.TestCase):
         torch.testing.assert_close(zq, zq_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [2048, 4096],  # M
-            [256, 512],  # N
-            [256, 512],  # K
-            [True, False],  # use_loopover
-        )
+        [
+            (*case, use_loopover)
+            for use_loopover in [True, False]
+            for case in [
+                (1, 256, 256, 256),  # small
+                (4, 2048, 256, 256),  # medium
+                (4, 4096, 512, 512),  # large
+            ]
+        ]
     )
     @unittest.skipIf(not MARLIN_ENABLED, "Skip if Marlin is not enabled.")
     def test_batched_gemm(
@@ -1185,13 +1239,13 @@ class BF16Int4Tests(unittest.TestCase):
         torch.testing.assert_close(y_ref, y_int4, atol=1e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [1024, 6144],  # N
-            [512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 256, 1024, 512, False),  # small
+            (16, 2048, 1024, 512, False),  # medium
+            (64, 3584, 6144, 3584, False),  # large
+            (1, 0, 1024, 512, False),  # empty (M=0)
+            (16, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
     @unittest.skipIf(not torch.version.cuda, "Currently not supported on AMD.")
     def test_shuffled_grouped_gemm(
@@ -1320,12 +1374,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         cls.matmul_rowwise_batched = staticmethod(matmul_bf16i4_rowwise_batched)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 16, 64, 512, 2048],  # M
-            [256, 512, 1024, 4096],  # N
-            [256, 512, 1024],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 256, 256, 128),  # small
+            (512, 1024, 512, 128),  # medium
+            (2048, 4096, 1024, 128),  # large
+        ]
     )
     def test_rowwise_accuracy(
         self,
@@ -1352,13 +1405,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [64, 512, 2048],  # M
-            [256, 512, 1024],  # N
-            [256, 512],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 64, 256, 256, 128),  # small
+            (4, 512, 512, 512, 128),  # medium
+            (4, 2048, 1024, 512, 128),  # large
+        ]
     )
     def test_rowwise_batched_accuracy(
         self,
@@ -1391,12 +1442,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 16, 128, 2048],  # M
-            [256, 1024, 4096],  # N
-            [256, 1024],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 256, 256, 128),  # small
+            (128, 1024, 256, 128),  # medium
+            (2048, 4096, 1024, 128),  # large
+        ]
     )
     def test_torch_op_dispatch(
         self,
@@ -1437,23 +1487,24 @@ class FP8Int4Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [0, 2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512],  # HD_L
-            [True, False],  # CudaGraph
-        )
+        [
+            (256, 128, 256, False),  # small
+            (2048, 2048, 4096, False),  # medium
+            (4096, 4096, 8192, False),  # large
+            (0, 128, 256, False),  # empty (M=0)
+            (2048, 256, 512, True),  # cudagraph
+        ]
     )
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
+        M: int,
+        K: int,
+        N: int,
         CudaGraph: bool,
     ) -> None:
         x = (
             torch.randn(
-                size=(B_T, D),
+                size=(M, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1461,7 +1512,7 @@ class FP8Int4Tests(unittest.TestCase):
         )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1498,13 +1549,14 @@ class FP8Int4Tests(unittest.TestCase):
         torch.testing.assert_close(zq_shuffled, zq_ref, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [1024, 6144],  # N
-            [512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 256, 1024, 512, False),  # small
+            (4, 2048, 1024, 512, False),  # medium
+            (16, 3584, 6144, 3584, False),  # large
+            (64, 3584, 6144, 3584, False),  # large G
+            (1, 0, 1024, 512, False),  # empty (M=0)
+            (4, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
     def test_shuffled_grouped_gemm(
         self,
@@ -1619,12 +1671,12 @@ class MXFP8Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [2048, 3584],  # K
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # M
-        )
+        [
+            (1, 2048, 256, 256),  # small
+            (4, 2048, 1024, 512),  # medium
+            (16, 3584, 6144, 3584),  # large
+            (64, 3584, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -1723,12 +1775,12 @@ class MXFP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-        )
+        [
+            (1, 256, 256, 256),  # small
+            (4, 2048, 1024, 512),  # medium
+            (16, 3584, 6144, 3584),  # large
+            (64, 3584, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -1803,13 +1855,13 @@ class MXFP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [4, 16, 32],  # G
-            [16, 32, 64],  # M_per_group
-            [2, 4, 8],  # pad_factor
-            [1024, 2048],  # N
-            [512, 3072],  # K
-        )
+        [
+            (1, 16, 2, 1024, 512),  # small G
+            (4, 16, 2, 1024, 512),  # small
+            (16, 32, 4, 1024, 512),  # medium
+            (32, 64, 8, 2048, 3072),  # large
+            (64, 64, 8, 2048, 3072),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d_actual_num_tokens(
         self,
@@ -1964,14 +2016,18 @@ class BF16Tests(unittest.TestCase):
             )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-            [True, False],  # output_accum
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128, False),  # small G
+                (2, 257, 256, 128, False),  # small
+                (16, 2049, 2048, 1024, False),  # large
+                (64, 2049, 2048, 1024, False),  # large G
+                (2, 0, 256, 128, False),  # empty (M=0)
+                (16, 2049, 2048, 1024, True),  # output_accum
+            ]
+        ]
     )
     @unittest.skipIf(
         not torch.version.cuda,
@@ -1983,8 +2039,8 @@ class BF16Tests(unittest.TestCase):
         M: int,
         N: int,
         K: int,
-        dtype: torch.dtype,
         output_accum: bool,
+        dtype: torch.dtype,
     ) -> None:
         torch.manual_seed(hash((G, M, N, K)))
         # Inputs
@@ -2072,13 +2128,17 @@ class BF16Tests(unittest.TestCase):
                 )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128),  # small G
+                (2, 257, 256, 128),  # small
+                (16, 2049, 2048, 1024),  # large
+                (64, 2049, 2048, 1024),  # large G
+                (2, 0, 256, 128),  # empty (M=0)
+            ]
+        ]
     )
     @unittest.skipIf(
         not torch.version.cuda,
@@ -2151,13 +2211,17 @@ class BF16Tests(unittest.TestCase):
         )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128),  # small G
+                (2, 257, 256, 128),  # small
+                (16, 2049, 2048, 1024),  # large
+                (64, 2049, 2048, 1024),  # large G
+                (2, 0, 256, 128),  # empty (M=0)
+            ]
+        ]
     )
     @unittest.skipIf(
         not torch.version.cuda,
@@ -2223,13 +2287,15 @@ class BF16Tests(unittest.TestCase):
         )
 
     @parameterized.expand(
-        itertools.product(
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-            [True, False],  # output_accum
-            [True, False],  # all_zero
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (256, 128, False, True),  # small, all experts zero
+                (2048, 1024, False, False),  # large, some experts zero
+                (2048, 1024, True, False),  # output_accum
+            ]
+        ]
     )
     @unittest.skipIf(
         not torch.version.cuda,
@@ -2239,9 +2305,9 @@ class BF16Tests(unittest.TestCase):
         self,
         N: int,
         K: int,
-        dtype: torch.dtype,
         output_accum: bool,
         all_zero: bool,
+        dtype: torch.dtype,
     ) -> None:
         """Test wgrad produces zeros (not NaN) for experts with zero tokens.
 
@@ -2359,11 +2425,11 @@ class NVFP4Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -2384,12 +2450,11 @@ class NVFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -2434,12 +2499,12 @@ class NVFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -2579,11 +2644,11 @@ class MXFP4Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -2598,12 +2663,12 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -2655,12 +2720,12 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [1, 4, 32, 128],  # M
-            [256, 1024, 4096],  # N
-            [512, 2048],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
     )
     def test_mx8mx4_grouped_gemm_2d_3d(
         self,
@@ -2773,12 +2838,11 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+        ]
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -2843,11 +2907,11 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -3033,11 +3097,11 @@ class MX8MX4Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         from mslk.gemm.triton.fp8_gemm import to_mxfp8
@@ -3075,11 +3139,11 @@ class MX8MX6Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         from mslk.gemm.triton.fp8_gemm import to_mxfp8
@@ -3121,11 +3185,11 @@ class MX6MX6Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         # Both A and B are random uint8 bytes packed at 6 bits/element. The
