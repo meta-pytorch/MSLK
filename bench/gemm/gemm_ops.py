@@ -31,7 +31,6 @@ from mslk.quantize.triton.fp8_quantize import (
 )
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
-
 try:
     from tinygemm.utils import group_quantize_tensor
 
@@ -88,6 +87,7 @@ class Accelerator(Enum):
     NVIDIA_SM100 = auto()
     NVIDIA_SM103 = auto()
     AMD_MI300X = auto()
+    AMD_GFX950 = auto()
 
 
 class GemmType(Enum):
@@ -109,8 +109,12 @@ def get_current_accelerator() -> Accelerator | None:
         raise Exception("Cannot run gemm_bench without accelerator.")
 
     if torch.version.hip is not None:
-        device_name = torch.cuda.get_device_name()
-        if "MI300X" in device_name.upper():
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "").upper()
+        device_name = torch.cuda.get_device_name().upper()
+        if "GFX950" in gcn_arch or "GFX950" in device_name or "MI350" in device_name:
+            return Accelerator.AMD_GFX950
+        if "MI300X" in device_name or "GFX942" in gcn_arch:
             return Accelerator.AMD_MI300X
     elif torch.version.cuda is not None:
         major, minor = torch.cuda.get_device_capability()
@@ -2252,7 +2256,7 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
 
 @register_gemm_op
-class CutlassMX8MX4Groupwise(GemmOpBase):
+class MX8MX4Groupwise(GemmOpBase):
     """
     MX8 activation x MX4 weight matmul with groupwise scaling.
     """
@@ -2275,7 +2279,11 @@ class CutlassMX8MX4Groupwise(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -3064,7 +3072,7 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
 
 
 @register_gemm_op
-class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
+class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
     """
     MXFP8 activation x MXFP4 weight grouped GEMM with 2D inputs and 3D weights.
     """
@@ -3132,7 +3140,11 @@ class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
