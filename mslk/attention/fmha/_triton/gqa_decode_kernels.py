@@ -63,6 +63,7 @@ def _fwd_gqa_decode_kernel(
     BLOCK_N: tl.constexpr,
     USE_PAGED: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    HQ_BLOCK: tl.constexpr,
 ):
     """
     Decode-phase causal attention for BMGHK layout.
@@ -83,6 +84,7 @@ def _fwd_gqa_decode_kernel(
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_n = tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, HQ_BLOCK)
 
     # KV head index 0: one logical KV head per group (standard GQA/MQA decode layout).
     k_base = K + off_g * stride_kg
@@ -93,101 +95,108 @@ def _fwd_gqa_decode_kernel(
 
     num_kv_blocks = tl.cdiv(kv_len, BLOCK_N)
 
-    for off_hq in tl.static_range(Hq):
-        for off_mq in tl.static_range(Mq):
-            q_ptr = (
-                Q
-                + off_b * stride_qz
-                + off_mq * stride_qm
-                + off_g * stride_qg
-                + off_hq * stride_qh
-            )
-            q = tl.load(
-                q_ptr + offs_d * stride_qk,
-                mask=offs_d < BLOCK_DMODEL,
-                other=0.0,
-            ).to(tl.float32)
-            q = q * sm_scale
+    for off_mq in tl.static_range(Mq):
+        # Load all Hq query heads as a 2D tile [HQ_BLOCK, D].
+        # Rows offs_h >= Hq are masked to 0 — they never influence real outputs.
+        q_all = tl.load(
+            Q
+            + off_b * stride_qz
+            + off_mq * stride_qm
+            + off_g * stride_qg
+            + offs_h[:, None] * stride_qh
+            + offs_d[None, :] * stride_qk,
+            mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+            other=0.0,
+        ).to(tl.float32) * sm_scale  # [HQ_BLOCK, D]
 
-            m_i = tl.full([], -float("inf"), dtype=tl.float32)
-            l_i = tl.full([], 0.0, dtype=tl.float32)
-            acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+        m_is = tl.full([HQ_BLOCK], -float("inf"), dtype=tl.float32)
+        l_is = tl.zeros([HQ_BLOCK], dtype=tl.float32)
+        accs = tl.zeros([HQ_BLOCK, BLOCK_DMODEL], dtype=tl.float32)
 
-            for block_idx in range(num_kv_blocks):
-                start_n = block_idx * BLOCK_N
-                n_mask = offs_n < kv_len - start_n
+        for block_idx in range(num_kv_blocks):
+            start_n = block_idx * BLOCK_N
+            n_mask = offs_n < kv_len - start_n
 
-                if USE_PAGED:
-                    n_idx = start_n + offs_n
-                    page_idx = n_idx // PAGE_SIZE
-                    page_offset = n_idx % PAGE_SIZE
-                    physical_page = tl.load(
-                        block_tables
-                        + off_b * stride_bt_batch
-                        + page_idx * stride_bt_page
-                    ).to(tl.int64)
-                    k = tl.load(
-                        k_base
-                        + physical_page * PAGE_SIZE * stride_kn
-                        + page_offset[:, None] * stride_kn
-                        + offs_d[None, :] * stride_kk,
-                        mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
-                        other=0.0,
-                    ).to(tl.float32)
-                    v = tl.load(
-                        v_base
-                        + physical_page * PAGE_SIZE * stride_vn
-                        + page_offset[:, None] * stride_vn
-                        + offs_d[None, :] * stride_vk,
-                        mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
-                        other=0.0,
-                    ).to(tl.float32)
-                else:
-                    k_offs_n = start_n + offs_n
-                    k = tl.load(
-                        k_base
-                        + k_offs_n[:, None] * stride_kn
-                        + offs_d[None, :] * stride_kk,
-                        mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
-                        other=0.0,
-                    ).to(tl.float32)
-                    v = tl.load(
-                        v_base
-                        + k_offs_n[:, None] * stride_vn
-                        + offs_d[None, :] * stride_vk,
-                        mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
-                        other=0.0,
-                    ).to(tl.float32)
+            # KV loaded once per tile and reused across all Hq heads via tl.dot.
+            if USE_PAGED:
+                n_idx = start_n + offs_n
+                page_idx = n_idx // PAGE_SIZE
+                page_offset = n_idx % PAGE_SIZE
+                physical_page = tl.load(
+                    block_tables
+                    + off_b * stride_bt_batch
+                    + page_idx * stride_bt_page
+                ).to(tl.int64)
+                k = tl.load(
+                    k_base
+                    + physical_page * PAGE_SIZE * stride_kn
+                    + page_offset[:, None] * stride_kn
+                    + offs_d[None, :] * stride_kk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )  # [BLOCK_N, D]
+                v = tl.load(
+                    v_base
+                    + physical_page * PAGE_SIZE * stride_vn
+                    + page_offset[:, None] * stride_vn
+                    + offs_d[None, :] * stride_vk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )  # [BLOCK_N, D]
+            else:
+                k_offs_n = start_n + offs_n
+                k = tl.load(
+                    k_base
+                    + k_offs_n[:, None] * stride_kn
+                    + offs_d[None, :] * stride_kk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )  # [BLOCK_N, D]
+                v = tl.load(
+                    v_base
+                    + k_offs_n[:, None] * stride_vn
+                    + offs_d[None, :] * stride_vk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )  # [BLOCK_N, D]
 
-                qk = tl.sum(q[None, :] * k, axis=1)
-                qk = tl.where(n_mask, qk, float("-inf"))
+            # QK: [HQ_BLOCK, D] x [D, BLOCK_N] -> [HQ_BLOCK, BLOCK_N]
+            # MFMA dims on ROCm: M=HQ_BLOCK>=16, K=D>=64, N=BLOCK_N>=16
+            qk = tl.dot(
+                q_all.to(Q.dtype.element_ty),
+                tl.trans(k).to(Q.dtype.element_ty),
+            ).to(tl.float32)  # [HQ_BLOCK, BLOCK_N]
 
-                m_ij = tl.max(qk, axis=0)
-                m_new = tl.maximum(m_i, m_ij)
-                alpha = tl.exp(m_i - m_new)
-                p = tl.exp(qk - m_new)
-                l_new = alpha * l_i + tl.sum(p, axis=0)
+            # Mask padded head rows and out-of-bounds KV positions.
+            qk = tl.where(offs_h[:, None] < Hq, qk, float("-inf"))
+            qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
-                acc = acc * alpha
-                acc += tl.sum(p[:, None] * v, axis=0)
+            # Online softmax — 2D state, each row independent.
+            m_new = tl.maximum(m_is, tl.max(qk, axis=1))  # [HQ_BLOCK]
+            alpha = tl.exp(m_is - m_new)  # [HQ_BLOCK]
+            p = tl.exp(qk - m_new[:, None])  # [HQ_BLOCK, BLOCK_N]
+            l_is = alpha * l_is + tl.sum(p, axis=1)  # [HQ_BLOCK]
 
-                l_i = l_new
-                m_i = m_new
+            # PV: [HQ_BLOCK, BLOCK_N] x [BLOCK_N, D] -> [HQ_BLOCK, D]
+            # MFMA dims on ROCm: M=HQ_BLOCK>=16, K=BLOCK_N>=16, N=D>=64
+            accs = accs * alpha[:, None] + tl.dot(
+                p.to(Q.dtype.element_ty),
+                v.to(Q.dtype.element_ty),
+            )  # [HQ_BLOCK, D]
+            m_is = m_new
 
-            acc = acc / tl.maximum(l_i, 1e-6)
-
-            out_ptr = (
-                Out
-                + off_b * stride_oz
-                + off_mq * stride_om
-                + off_g * stride_og
-                + off_hq * stride_oh
-            )
-            tl.store(
-                out_ptr + offs_d * stride_ok,
-                acc.to(Out.dtype.element_ty),
-                mask=offs_d < BLOCK_DMODEL,
-            )
+        # Finalise: only real head rows (offs_h < Hq) are written.
+        accs = accs / tl.maximum(l_is[:, None], 1e-6)
+        tl.store(
+            Out
+            + off_b * stride_oz
+            + off_mq * stride_om
+            + off_g * stride_og
+            + offs_h[:, None] * stride_oh
+            + offs_d[None, :] * stride_ok,
+            accs.to(Out.dtype.element_ty),
+            mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+        )
 
 
 def _build_autotune_configs() -> List[triton.Config]:

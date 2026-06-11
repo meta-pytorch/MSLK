@@ -275,6 +275,9 @@ class FwOp(AttentionFwOpBase):
         out = torch.empty_like(q)
         kernel = cls.OPERATOR()
         grid = (B, G)
+        # HQ_BLOCK: smallest power-of-2 >= max(16, Hq).
+        # Minimum 16 satisfies tl.dot's MFMA M-dimension requirement on ROCm.
+        HQ_BLOCK = 32 if Hq > 16 else 16
 
         kernel[grid](
             q,
@@ -301,6 +304,7 @@ class FwOp(AttentionFwOpBase):
             BLOCK_DMODEL=D,
             USE_PAGED=is_paged,
             PAGE_SIZE=page_size,
+            HQ_BLOCK=HQ_BLOCK,
         )
 
         # Restore flattened batch layout expected by callers/tests.
