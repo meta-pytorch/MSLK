@@ -1,0 +1,18 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Keep formatting in sync with the internal fbcode pyfmt configuration for
+# fbcode/mslk (see fbsource/tools/lint/pyfmt/config.toml). pyfmt resolves
+# mslk to the ruff-api formatter with the usort import sorter, so configure
+# ufmt to use the same tools here for the open source mirror.
+[tool.ufmt]
+formatter = "ruff-api"
+sorter = "usort"
+
+# pyfmt sorts everything in fbsource alongside third-party packages (it does
+# not do first-party namespace detection), so disable it here to match.
+[tool.usort]
+first_party_detection = false

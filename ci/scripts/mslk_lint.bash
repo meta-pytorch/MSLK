@@ -38,8 +38,14 @@ install_lint_tools () {
   # shellcheck disable=SC2086
   (exec_with_retries 3 conda install ${env_prefix} -c conda-forge --override-channels -y \
     click \
-    flake8 \
-    ufmt) || return 1
+    flake8) || return 1
+
+  # Install the Python formatting toolchain (ufmt + usort + black + ruff-api) at
+  # the exact versions used internally by fbcode pyfmt. requirements-fmt.txt is a
+  # byte-identical copy of fbsource/tools/lint/pyfmt/reqs/requirements-fmt.txt;
+  # keep it in sync so the open source mirror formats identically to fbcode.
+  # shellcheck disable=SC2086
+  (exec_with_retries 3 conda run ${env_prefix} pip install -r requirements-fmt.txt) || return 1
 
   # Check binaries are visible in the PAATH
   (test_binpath "${env_name}" flake8) || return 1
