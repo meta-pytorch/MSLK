@@ -11,6 +11,15 @@
 [tool.ufmt]
 formatter = "ruff-api"
 sorter = "usort"
+# Vendored OSS flash-attention code; excluded from formatting to match the
+# internal fbcode pyfmt config (which excludes mslk/attention/flash_attn).
+excludes = [
+    "mslk/attention/flash_attn",
+    "mslk/gemm/blackwell_mixed_input_gemm",
+    "test/gemm/test_blackwell_mixed_input_gemm.py",
+    "test/attention/test_flash_attn_varlen.py",
+    "test/attention/test_flash_attn.py",
+]
 
 # pyfmt sorts everything in fbsource alongside third-party packages (it does
 # not do first-party namespace detection), so disable it here to match.

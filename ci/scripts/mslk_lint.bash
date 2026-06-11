@@ -111,9 +111,9 @@ lint_mslk_ufmt () {
   fi
 
   local lint_paths=(
-    mslk/mslk
-    mslk/test
-    mslk/bench
+    mslk
+    test
+    bench
   )
 
   # shellcheck disable=SC2155
