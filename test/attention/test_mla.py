@@ -358,9 +358,9 @@ class TestMLADecode:
         )
 
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Decode long-ctx cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Decode long-ctx cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     def test_decode_variable_seqlens(self) -> None:
         """Test decode where each batch element has a different KV length."""
@@ -383,9 +383,9 @@ class TestMLADecode:
         )
 
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Decode variable-seqlen cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Decode variable-seqlen cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     def test_decode_output_shape(self) -> None:
         """Verify output tensor shape matches (batch, num_heads, v_head_dim)."""
@@ -555,7 +555,9 @@ class TestMLAPrefill:
             batch * qlen,
             NUM_HEADS,
             V_HEAD_DIM,
-        ), f"Expected shape ({batch * qlen}, {NUM_HEADS}, {V_HEAD_DIM}), got {out.shape}"
+        ), (
+            f"Expected shape ({batch * qlen}, {NUM_HEADS}, {V_HEAD_DIM}), got {out.shape}"
+        )
         assert out.dtype == torch.bfloat16
 
 
@@ -658,7 +660,6 @@ class TestMLACrossKernel:
 
 
 class TestMLAEdgeCases:
-
     # --- Odd batch sizes (not powers of 2) ---
 
     @pytest.mark.parametrize("batch", [3, 7, 13])
@@ -682,9 +683,9 @@ class TestMLAEdgeCases:
             inp["q_bf16"], inp["kv_master_bf16"], inp["sm_scale"], inp["seqused_k"]
         )
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Odd batch={batch} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Odd batch={batch} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     @pytest.mark.parametrize("batch", [3, 7])
     def test_prefill_odd_batch(self, batch: int) -> None:
@@ -708,9 +709,9 @@ class TestMLAEdgeCases:
             inp["q_bf16"], inp["kv_master_bf16"], inp["sm_scale"], qlen
         )
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Odd batch={batch} prefill cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Odd batch={batch} prefill cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     # --- Non-aligned context lengths ---
 
@@ -735,9 +736,9 @@ class TestMLAEdgeCases:
             inp["q_bf16"], inp["kv_master_bf16"], inp["sm_scale"], inp["seqused_k"]
         )
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Non-aligned ctx_len={ctx_len} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Non-aligned ctx_len={ctx_len} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     # --- Large batch decode ---
 
@@ -762,9 +763,9 @@ class TestMLAEdgeCases:
             inp["q_bf16"], inp["kv_master_bf16"], inp["sm_scale"], inp["seqused_k"]
         )
         cos_dist = _cosine_distance(out, ref)
-        assert (
-            cos_dist < COSINE_TOL
-        ), f"Large batch={batch} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        assert cos_dist < COSINE_TOL, (
+            f"Large batch={batch} cosine distance {cos_dist:.6f} >= {COSINE_TOL}"
+        )
 
     # --- Chunked prefill (qlen < ctx_len) ---
 
