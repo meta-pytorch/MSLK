@@ -32,7 +32,6 @@ import math
 from typing import Optional
 
 import torch
-
 from mslk.attention.fmha._triton.available import is_triton_available
 
 if is_triton_available():
