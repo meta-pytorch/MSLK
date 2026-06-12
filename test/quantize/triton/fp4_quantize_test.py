@@ -37,33 +37,18 @@ from mslk.quantize.triton.fp4_utils import (
     fp4_to_float,
     global_scale_nvfp4,
 )
+from mslk.utils.device import compute_capability_in, gfx_arch_in, is_cuda, is_rocm
 from torch.testing._internal.common_quantized import _f32_to_floatx_unpacked, pack_uint4
 
 
-def evaluate_cuda_compute_capability(major_min, major_max=None):
-    major, _ = torch.cuda.get_device_capability()
-    return major >= major_min and (major_max is None or major <= major_max)
-
-
-def evaluate_gfx_arch_in(arch_list):
-    gcn_arch_name = torch.cuda.get_device_properties("cuda").gcnArchName
-    return any(arch in gcn_arch_name for arch in arch_list)
-
-
 def supports_nvfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-    return False
+    return is_cuda() and compute_capability_in(10)
 
 
 def supports_mxfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-        if torch.version.hip:
-            return evaluate_gfx_arch_in(["gfx950"])
-    return False
+    if is_rocm():
+        return gfx_arch_in(["gfx950"])
+    return compute_capability_in(10)
 
 
 SUPPORTS_NVFP4 = supports_nvfp4()

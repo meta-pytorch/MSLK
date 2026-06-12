@@ -23,12 +23,19 @@ from mslk.quantize.triton.fp4_quantize import (
     quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
 )
+from mslk.utils.device import (
+    compute_capability_in,
+    gfx_arch_in,
+    is_cuda,
+    is_gfx942,
+    is_rocm,
+    supports_float8_fnuz,
+)
 
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
-    from mslk.utils.triton.fp8_utils import supports_float8_fnuz
 
     if torch.cuda.get_device_capability() >= (10, 0):
         from mslk.quantize.triton.fp4_quantize import _to_blocked
@@ -49,73 +56,41 @@ except ImportError:
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
 
-def evaluate_gfx_arch_in(arch_list):
-    gcn_arch_name = torch.cuda.get_device_properties("cuda").gcnArchName
-    return any(arch in gcn_arch_name for arch in arch_list)
-
-
-def is_mi300x():
-    return (
-        torch.cuda.is_available()
-        and torch.version.hip is not None
-        and evaluate_gfx_arch_in(["gfx942"])
-    )
-
-
-def evaluate_cuda_compute_capability(major_min, major_max=None):
-    major, _ = torch.cuda.get_device_capability()
-    return major >= major_min and (major_max is None or major <= major_max)
-
-
+# Feature-support matrix for the GEMM kernels exercised in this file. These map
+# the device's arch/compute-capability (via mslk.utils.device primitives) to
+# whether a given GEMM dtype path is supported, and are specific to these tests.
 def supports_bf16():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return is_mi300x()
-        return evaluate_cuda_compute_capability(9)
-    return False
+    if is_rocm():
+        return is_gfx942()
+    return compute_capability_in(9)
 
 
 def supports_fp8():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return is_mi300x() and supports_float8_fnuz(
-                throw_on_hip_incompatibility=False
-            )
-        return evaluate_cuda_compute_capability(9, 10)
-    return False
+    if is_rocm():
+        return is_gfx942() and supports_float8_fnuz(throw_on_hip_incompatibility=False)
+    return compute_capability_in(9, 10)
 
 
 def supports_mxfp8():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return False
-        return evaluate_cuda_compute_capability(10)
-    return False
+    if is_rocm():
+        return False
+    return compute_capability_in(10)
 
 
 def supports_bf16_int4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(9, 9)
-    return False
+    return is_cuda() and compute_capability_in(9, 9)
 
 
-def support_fp8_int4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(9, 9)
-    return False
+def supports_fp8_int4():
+    return is_cuda() and compute_capability_in(9, 9)
 
 
 def supports_nvfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-    return False
+    return is_cuda() and compute_capability_in(10)
 
 
 def supports_nvfp4_ultra():
-    if not torch.cuda.is_available() or not torch.version.cuda:
+    if not is_cuda() or torch.version.cuda is None:
         return False
     cuda_major = int(torch.version.cuda.split(".")[0])
     major, minor = torch.cuda.get_device_capability()
@@ -123,17 +98,23 @@ def supports_nvfp4_ultra():
 
 
 def supports_mxfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
+    if is_rocm():
         # TODO add AMD here later
-    return False
+        return False
+    return compute_capability_in(10)
+
+
+def supports_int8():
+    """True on CUDA SM80+ or ROCm CDNA3 (gfx942) / CDNA4 (gfx950)."""
+    if is_rocm():
+        return gfx_arch_in(["gfx942", "gfx950"])
+    return compute_capability_in(8)
 
 
 SUPPORTS_BF16 = supports_bf16()
 SUPPORTS_FP8 = supports_fp8()
 SUPPORTS_MXFP8 = supports_mxfp8()
-SUPPORTS_FP8_INT4 = support_fp8_int4()
+SUPPORTS_FP8_INT4 = supports_fp8_int4()
 SUPPORTS_BF16_INT4 = supports_bf16_int4()
 SUPPORTS_NVFP4 = supports_nvfp4()
 SUPPORTS_NVFP4_ULTRA = supports_nvfp4_ultra()
@@ -245,7 +226,7 @@ def _fp8_gemm_cases() -> list[tuple]:
         # small. Keep it NVIDIA-only until the CK kernel
         # (mslk/csrc/gemm/ck/fp8_blockwise_gemm.hip) is fixed. See T275007617.
         ["blockwise"]
-        if torch.version.cuda is not None and evaluate_cuda_compute_capability(9, 9)
+        if torch.version.cuda is not None and compute_capability_in(9, 9)
         else []
     )
 
@@ -374,7 +355,7 @@ class ExportCompileTests(unittest.TestCase):
             self.XQ, self.WQ, self.row_scale, self.col_scale, self.output
         )
 
-    @unittest.skipIf(not is_mi300x(), "Requires MI300X")
+    @unittest.skipIf(not is_gfx942(), "Requires MI300X")
     def test_compile_f8f8f16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
             self.XQ, self.WQ, self.row_scale, self.col_scale
@@ -833,7 +814,7 @@ class FP8Tests(unittest.TestCase):
         ]
     )
     @unittest.skipIf(
-        not is_mi300x(),
+        not is_gfx942(),
         "Only MI300X supports torch 3D-2D grouped gemm API",
     )
     def test_grouped_gemm_3d_2d(
@@ -885,7 +866,7 @@ class FP8Tests(unittest.TestCase):
         ]
     )
     @unittest.skipIf(
-        not is_mi300x(),
+        not is_gfx942(),
         "Only MI300X supports torch 2D-2D grouped gemm API",
     )
     def test_grouped_gemm_2d_2d(
@@ -3220,16 +3201,7 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
 
-def _supports_int8_triton() -> bool:
-    """True on CUDA SM80+ or ROCm CDNA3 (gfx942) / CDNA3+ (gfx950)."""
-    if not torch.cuda.is_available():
-        return False
-    if torch.version.hip:
-        return evaluate_gfx_arch_in(["gfx942", "gfx950"])
-    return evaluate_cuda_compute_capability(8)
-
-
-@unittest.skipIf(not _supports_int8_triton(), "Requires CUDA SM80+ or ROCm")
+@unittest.skipIf(not supports_int8(), "Requires CUDA SM80+ or ROCm")
 class RocmInt8GemmTests(unittest.TestCase):
     """Correctness tests for the Triton INT8 GEMM kernel.
 

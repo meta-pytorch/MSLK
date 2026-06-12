@@ -26,8 +26,9 @@ on:
       # External dependencies
       - 'external/hipify_torch.submodule.txt'
       - 'external/composable_kernel.submodule.txt'
-      # Python ROCm utilities
-      - 'mslk/testing/rocm.py'
+      # Python device-capability utilities
+      - 'mslk/utils/device.py'
+      - 'mslk/testing/device.py'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels
