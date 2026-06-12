@@ -37,6 +37,7 @@ from mslk.quantize.triton.legacy.primitives import (  # noqa: F401
     RoundingMode,
 )
 from mslk.quantize.triton.legacy.quantize import (  # noqa: F401
+    _detect_gfx950,
     _kernel_quantize_mx4_unpack,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
