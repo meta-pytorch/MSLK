@@ -185,9 +185,15 @@ create_conda_environment () {
   # this, `conda run env pip ...` falls back to base conda's pip and installs to
   # the wrong site-packages, causing later `import` checks to fail with
   # ModuleNotFoundError.
+  # NOTE: `openssl` is pinned because it is otherwise an unpinned transitive dep
+  # that conda is free to float to the latest release. OpenSSL 3.5.7 regressed
+  # ASN.1 parsing and rejects malformed certs that 3.5.6 tolerated, breaking SSL
+  # context creation (`ssl.SSLError: [ASN1: NOT_ENOUGH_DATA]`), most notably when
+  # loading the Windows machine cert store. See pytorch/test-infra#8165 and
+  # pytorch/pytorch#186846.
   echo "[SETUP] Creating new Conda environment (Python ${python_version}) ..."
   # shellcheck disable=SC2086
-  (exec_with_retries 3 conda create ${env_prefix} -c conda-forge -y python="${python_version}" pip) || return 1
+  (exec_with_retries 3 conda create ${env_prefix} -c conda-forge -y python="${python_version}" pip openssl=3.5.6) || return 1
 
   echo "[SETUP] Upgrading PIP to latest ..."
   # shellcheck disable=SC2086
