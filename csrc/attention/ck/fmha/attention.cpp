@@ -31,11 +31,5 @@ TORCH_LIBRARY_FRAGMENT(xformers, m) {
   m.def(TORCH_SELECTIVE_SCHEMA(
       "xformers::efficient_attention_forward_decoder_splitk_ck(Tensor query, Tensor key, "
       " Tensor value, Tensor? seq_positions, float scale, int split_k) -> Tensor"));
-  m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::efficient_attention_mla_decode(Tensor query, Tensor kv_buffer, "
-      "Tensor block_tables, Tensor cu_seqlens_q, Tensor seqused_k, float scale) -> Tensor"));
-  m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::efficient_attention_mla_prefill(Tensor query, Tensor kv_buffer, "
-      "Tensor block_tables, Tensor cu_seqlens_q, Tensor seqused_k, float scale) -> Tensor"));
 #endif
 }

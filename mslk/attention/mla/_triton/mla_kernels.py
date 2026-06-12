@@ -541,7 +541,7 @@ def _mla_prefill_fwd(
 
 
 # ===================================================================
-#  LAUNCHER FUNCTIONS (called by triton_mla.py FwOp)
+#  LAUNCHER FUNCTIONS (called by triton_mla.py)
 # ===================================================================
 
 

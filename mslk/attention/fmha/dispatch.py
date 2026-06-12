@@ -19,7 +19,6 @@ from . import (  # noqa: F401
     flash,
     flash3,
     flash_mtia,
-    triton_mla,
     triton_splitk,
 )
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs

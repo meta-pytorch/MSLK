@@ -21,7 +21,6 @@ from . import (  # noqa: F401
     flash,
     flash3,
     flash_mtia,
-    triton_mla,
     triton_splitk,
 )
 from .attn_bias import (
@@ -960,7 +959,6 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash_mtia.FwOp,
     flash3.FwOp,
     triton_splitk.FwOp,
-    triton_mla.FwOp,
 ]
 
 ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [

@@ -254,7 +254,7 @@ class TestMLADecode:
     @pytest.mark.parametrize("ctx_len", [1024, 4096])
     def test_decode_bf16(self, batch: int, ctx_len: int) -> None:
         """Test MLA decode with BF16 inputs against reference."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         page_size = 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -282,7 +282,7 @@ class TestMLADecode:
     @pytest.mark.parametrize("ctx_len", [1024, 4096])
     def test_decode_fp8(self, batch: int, ctx_len: int) -> None:
         """Test MLA decode with FP8 quantized inputs."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         page_size = 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -313,7 +313,7 @@ class TestMLADecode:
     @pytest.mark.parametrize("ctx_len", [64, 128, 256])
     def test_decode_short_context(self, ctx_len: int) -> None:
         """Test decode with short contexts near tile boundaries."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, page_size = 4, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -339,7 +339,7 @@ class TestMLADecode:
 
     def test_decode_long_context(self) -> None:
         """Test decode at ctx_len=8192 (backlog spec shape)."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, ctx_len, page_size = 4, 8192, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -364,7 +364,7 @@ class TestMLADecode:
 
     def test_decode_variable_seqlens(self) -> None:
         """Test decode where each batch element has a different KV length."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, ctx_len, page_size = 8, 1024, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size, variable_seqlens=True)
@@ -389,7 +389,7 @@ class TestMLADecode:
 
     def test_decode_output_shape(self) -> None:
         """Verify output tensor shape matches (batch, num_heads, v_head_dim)."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, ctx_len, page_size = 8, 512, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -412,7 +412,7 @@ class TestMLADecode:
 
     def test_decode_reproducibility(self) -> None:
         """Verify decode gives the same output across two runs with same seed."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, ctx_len, page_size = 4, 1024, 1
 
@@ -449,7 +449,7 @@ class TestMLAPrefill:
     @pytest.mark.parametrize("ctx_len", [1024, 4096])
     def test_prefill_bf16(self, batch: int, ctx_len: int) -> None:
         """Test MLA prefill with BF16 inputs against reference."""
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         page_size = 16
         qlen = ctx_len
@@ -477,7 +477,7 @@ class TestMLAPrefill:
     @pytest.mark.parametrize("ctx_len", [1024, 4096])
     def test_prefill_fp8(self, ctx_len: int) -> None:
         """Test MLA prefill with FP8 quantized inputs."""
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         batch, page_size = 1, 16
         qlen = ctx_len
@@ -509,7 +509,7 @@ class TestMLAPrefill:
     @pytest.mark.parametrize("ctx_len", [64, 128, 256])
     def test_prefill_short_context(self, ctx_len: int) -> None:
         """Test prefill with short contexts near tile boundaries."""
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         batch, page_size = 1, 16
         qlen = ctx_len
@@ -536,7 +536,7 @@ class TestMLAPrefill:
 
     def test_prefill_output_shape(self) -> None:
         """Verify output tensor shape matches (total_tokens, num_heads, v_head_dim)."""
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         batch, ctx_len, page_size = 1, 512, 16
         qlen = ctx_len
@@ -567,7 +567,7 @@ class TestMLAPrefill:
 class TestMLACrossKernel:
     def test_decode_prefill_consistency(self) -> None:
         """For qlen=1, prefill should produce the same output as decode."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd, mla_prefill_fwd
+        from mslk.attention.mla import mla_decode_fwd, mla_prefill_fwd
 
         batch, ctx_len = 4, 512
         page_size_decode = 1
@@ -664,7 +664,7 @@ class TestMLAEdgeCases:
     @pytest.mark.parametrize("batch", [3, 7, 13])
     def test_decode_odd_batch(self, batch: int) -> None:
         """Odd batch sizes can expose grid/tiling alignment bugs."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         ctx_len, page_size = 512, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -689,7 +689,7 @@ class TestMLAEdgeCases:
     @pytest.mark.parametrize("batch", [3, 7])
     def test_prefill_odd_batch(self, batch: int) -> None:
         """Odd batch sizes for prefill."""
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         ctx_len, page_size = 256, 16
         qlen = ctx_len
@@ -717,7 +717,7 @@ class TestMLAEdgeCases:
     @pytest.mark.parametrize("ctx_len", [100, 500, 1000, 1023])
     def test_decode_nonaligned_ctx(self, ctx_len: int) -> None:
         """Context lengths that don't divide evenly by BLOCK_N or page_size."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         batch, page_size = 4, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -744,7 +744,7 @@ class TestMLAEdgeCases:
     @pytest.mark.parametrize("batch", [128, 256])
     def test_decode_large_batch(self, batch: int) -> None:
         """Large batches typical of high-throughput DeepSeek serving."""
-        from mslk.attention.fmha.triton_mla import mla_decode_fwd
+        from mslk.attention.mla import mla_decode_fwd
 
         ctx_len, page_size = 512, 1
         inp = _build_decode_inputs(batch, ctx_len, page_size)
@@ -785,7 +785,7 @@ class TestMLAEdgeCases:
         at the tail end. The causal mask ensures query token qi attends to
         KV positions 0..(ctx_len - qlen + qi).
         """
-        from mslk.attention.fmha.triton_mla import mla_prefill_fwd
+        from mslk.attention.mla import mla_prefill_fwd
 
         batch, page_size = 1, 16
         inp = _build_prefill_inputs(batch, ctx_len, qlen, page_size)

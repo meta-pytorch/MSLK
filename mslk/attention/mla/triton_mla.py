@@ -20,24 +20,20 @@ This module provides:
 
 Both accept a paged ``kv_buffer`` with ``block_tables`` for cache indirection.
 
-Kernel source: mslk/attention/fmha/_triton/mla_kernels.py
+Kernel source: mslk/attention/mla/_triton/mla_kernels.py
 Reference: ROCm/aimodels agent harness + aiter MLA decode rope kernel
 
 Hardware target: AMD MI300X (gfx942) and MI350X (gfx950).
-
-Note: The CUDA-side MLA op schema is not yet registered. This module
-provides standalone functions until the cross-platform schema is agreed.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, List, Optional, Set, Tuple
+from typing import Optional
 
 import torch
 
-from ._triton.available import is_triton_available
-from .common import AttentionFwOpBase, Context, Inputs
+from mslk.attention.fmha._triton.available import is_triton_available
 
 if is_triton_available():
     from ._triton.mla_kernels import mla_decode_forward, mla_prefill_forward
@@ -209,55 +205,3 @@ def mla_prefill_fwd(
         softmax_scale=softmax_scale,
         **tuning,
     )
-
-
-# ---------------------------------------------------------------------------
-# FwOp class for MSLK dispatch integration
-# ---------------------------------------------------------------------------
-
-
-class FwOp(AttentionFwOpBase):
-    """MLA (Multi-head Latent Attention) forward op for ROCm.
-
-    DeepSeek-V3 style MLA with weight absorption. Supports decode
-    (qlen=1, split-K) and prefill (single-stage flash attention).
-    Requires paged KV cache with block_tables indirection.
-
-    Note: MLA has a fundamentally different input format from standard
-    attention (single shared KV head, no separate K/V tensors). Use
-    mla_decode_fwd() and mla_prefill_fwd() directly for MLA workloads.
-    This FwOp class provides MSLK dispatch integration.
-    """
-
-    OPERATOR = True
-    SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16}
-    SUPPORTED_MAX_K = 576
-    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (type(None),)
-    SUPPORTS_DROPOUT = False
-    SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = True
-    SUPPORTS_BMGHK = False
-    SUPPORTS_OUTPUT_DTYPE = False
-    SUPPORTS_PARTIAL = False
-    NAME = "triton_mlaF"
-
-    @classmethod
-    def not_supported_reasons(cls, d: Inputs) -> List[str]:
-        reasons = super().not_supported_reasons(d)
-        if not _is_rocm():
-            reasons.append("MLA Triton kernels require ROCm")
-        if d.query.shape[-1] != MLA_QK_HEAD_DIM:
-            reasons.append(
-                f"MLA requires qk_head_dim={MLA_QK_HEAD_DIM}, got {d.query.shape[-1]}"
-            )
-        return reasons
-
-    @classmethod
-    def apply(
-        cls, inp: Inputs, needs_gradient: bool
-    ) -> Tuple[torch.Tensor, Optional[Context]]:
-        raise NotImplementedError(
-            "MLA uses a different input format. Call mla_decode_fwd() or "
-            "mla_prefill_fwd() directly instead of the standard dispatch."
-        )
