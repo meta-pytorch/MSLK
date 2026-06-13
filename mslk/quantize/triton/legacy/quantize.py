@@ -21,6 +21,7 @@ from mslk.quantize.triton.legacy.primitives import (
     nvfp4_scale_swizzle,
     RoundingMode,
 )
+from mslk.utils.device import is_gfx950, is_rocm
 from triton import language as tl  # @manual
 
 
@@ -53,16 +54,6 @@ from triton import language as tl  # @manual
 # Nibble ordering (S0→low nibble [3:0], S1→high nibble [7:4]) matches the
 # AMD VOP3 2-src packed-byte convention.
 _GFX950_CVT_PK_FP4_F32 = tl.constexpr("v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0")
-
-
-def _detect_gfx950() -> bool:
-    """Return True if the current CUDA/ROCm device is gfx950 (CDNA4)."""
-    if torch.version.hip is None or not torch.cuda.is_available():
-        return False
-    try:
-        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
-        return False
 
 
 @triton.jit
@@ -568,9 +559,9 @@ def triton_quantize_mx4_unpack(
         # pyre-ignore[6]
         SCALE_K=rounded_K,
         # pyre-ignore[6]
-        IS_ROCM=torch.version.hip is not None,
+        IS_ROCM=is_rocm(),
         # pyre-ignore[6]
-        IS_GFX950=_detect_gfx950(),
+        IS_GFX950=is_gfx950(),
     )
 
     scale = scale.flatten()

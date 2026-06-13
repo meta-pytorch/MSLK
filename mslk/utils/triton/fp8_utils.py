@@ -5,39 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-unsafe
-import functools
-import logging
 import os
 from typing import Tuple
 
 import torch
 import triton.language as tl  # @manual
+
+# Re-exported for backward compatibility; the canonical definition lives in the
+# device-capability utility so that both library and test code share one source.
+from mslk.utils.device import supports_float8_fnuz  # noqa: F401
 from triton.runtime.jit import reinterpret as tl_reinterpret, TensorWrapper  # @manual
 
 
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
-
-
-@functools.lru_cache
-def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
-    if torch.version.hip:
-        device_capability = torch.cuda.get_device_capability()
-
-        if device_capability < (9, 4):
-            gpu_arch = torch.cuda.get_device_properties("cuda").gcnArchName
-            msg = f"Unsupported GPU arch: {gpu_arch} for FP8"
-            if throw_on_hip_incompatibility:
-                raise RuntimeError(msg)
-            else:
-                logging.error(msg)
-                return False
-
-        elif device_capability >= (9, 4):
-            # gfx942 (MI300) reports (9, 4), gfx950 (MI350) reports (9, 5)
-            # Both use fnuz format
-            return True
-
-    return False
 
 
 def get_fp8_constants() -> Tuple[torch.dtype, tl.dtype, float, float]:
