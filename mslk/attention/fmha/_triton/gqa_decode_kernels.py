@@ -129,7 +129,7 @@ def _fwd_gqa_decode_kernel(
                 ).to(tl.int64)
                 k = tl.load(
                     k_base
-                    + physical_page * PAGE_SIZE * stride_kn
+                    + physical_page[:, None] * PAGE_SIZE * stride_kn
                     + page_offset[:, None] * stride_kn
                     + offs_d[None, :] * stride_kk,
                     mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
@@ -137,7 +137,7 @@ def _fwd_gqa_decode_kernel(
                 )  # [BLOCK_N, D]
                 v = tl.load(
                     v_base
-                    + physical_page * PAGE_SIZE * stride_vn
+                    + physical_page[:, None] * PAGE_SIZE * stride_vn
                     + page_offset[:, None] * stride_vn
                     + offs_d[None, :] * stride_vk,
                     mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),

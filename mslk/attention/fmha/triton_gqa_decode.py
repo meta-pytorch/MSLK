@@ -157,8 +157,6 @@ class FwOp(AttentionFwOpBase):
                     f"one formal batch dim expected on query; got {d.query.shape[0]}"
                 )
             padding = attn_bias.k_seqinfo.padding
-            if padding > 8192:
-                reasons.append("key padding exceeds 8192")
         elif isinstance(attn_bias, PagedBlockDiagonalCausalWithOffsetPaddedKeysMask):
             if d.query.shape[0] != 1 and d.query.ndim == 5:
                 reasons.append("paged decode expects query batch dim 1")
