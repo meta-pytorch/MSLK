@@ -817,12 +817,18 @@ OutputType _bf16bf16bf16_grouped(at::TensorList X, at::TensorList W) {
   }
 }
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry point
+// (bf16bf16bf16_grouped_stacked) instead.
 std::vector<at::Tensor> bf16bf16bf16_grouped(
     at::TensorList X,
     at::TensorList W) {
   return _bf16bf16bf16_grouped<std::vector<at::Tensor>>(X, W);
 }
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry point
+// (bf16bf16bf16_grouped_stacked) instead.
 at::Tensor bf16bf16bf16_grouped_cat(at::TensorList X, at::TensorList W) {
   return _bf16bf16bf16_grouped<at::Tensor>(X, W);
 }
@@ -865,6 +871,8 @@ at::Tensor bf16bf16bf16_grouped_stacked(
   return output.view({total_M, N});
 }
 
+// UNSUPPORTED AND DEPRECATED: this internal API is no longer supported. Use the
+// torch-native grouped GEMM entry point (bf16bf16bf16_grouped_stacked) instead.
 at::Tensor bf16bf16bf16_grouped_dynamic(
     at::Tensor X,
     at::Tensor W,
