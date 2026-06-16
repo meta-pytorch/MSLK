@@ -77,7 +77,7 @@ class FwOp(AttentionFwOpBase):
       per-sequence padding.  The query tensor is expected with a single formal
       batch dimension (``query.shape[0] == 1``); internally the operator reshapes
       ``(1, B*Mq, G, Hq, D)`` → ``(B, Mq, G, Hq, D)`` and unfolds the key/value
-      blocks accordingly.  Key padding must not exceed 8 192 tokens.
+      blocks accordingly.
 
     * ``PagedBlockDiagonalCausalWithOffsetPaddedKeysMask`` — paged KV cache.
       ``block_tables`` of shape ``[batch_size, max_num_pages]`` maps each batch

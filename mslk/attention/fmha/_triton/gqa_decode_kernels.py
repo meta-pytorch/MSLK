@@ -98,16 +98,19 @@ def _fwd_gqa_decode_kernel(
     for off_mq in tl.static_range(Mq):
         # Load all Hq query heads as a 2D tile [HQ_BLOCK, D].
         # Rows offs_h >= Hq are masked to 0 — they never influence real outputs.
-        q_all = tl.load(
-            Q
-            + off_b * stride_qz
-            + off_mq * stride_qm
-            + off_g * stride_qg
-            + offs_h[:, None] * stride_qh
-            + offs_d[None, :] * stride_qk,
-            mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
-            other=0.0,
-        ).to(tl.float32) * sm_scale  # [HQ_BLOCK, D]
+        q_all = (
+            tl.load(
+                Q
+                + off_b * stride_qz
+                + off_mq * stride_qm
+                + off_g * stride_qg
+                + offs_h[:, None] * stride_qh
+                + offs_d[None, :] * stride_qk,
+                mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+                other=0.0,
+            ).to(tl.float32)
+            * sm_scale
+        )  # [HQ_BLOCK, D]
 
         m_is = tl.full([HQ_BLOCK], -float("inf"), dtype=tl.float32)
         l_is = tl.zeros([HQ_BLOCK], dtype=tl.float32)
@@ -123,9 +126,7 @@ def _fwd_gqa_decode_kernel(
                 page_idx = n_idx // PAGE_SIZE
                 page_offset = n_idx % PAGE_SIZE
                 physical_page = tl.load(
-                    block_tables
-                    + off_b * stride_bt_batch
-                    + page_idx * stride_bt_page
+                    block_tables + off_b * stride_bt_batch + page_idx * stride_bt_page
                 ).to(tl.int64)
                 k = tl.load(
                     k_base
@@ -165,7 +166,9 @@ def _fwd_gqa_decode_kernel(
             qk = tl.dot(
                 q_all.to(Q.dtype.element_ty),
                 tl.trans(k).to(Q.dtype.element_ty),
-            ).to(tl.float32)  # [HQ_BLOCK, BLOCK_N]
+            ).to(
+                tl.float32
+            )  # [HQ_BLOCK, BLOCK_N]
 
             # Mask padded head rows and out-of-bounds KV positions.
             qk = tl.where(offs_h[:, None] < Hq, qk, float("-inf"))
