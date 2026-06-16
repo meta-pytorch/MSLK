@@ -166,9 +166,7 @@ def _fwd_gqa_decode_kernel(
             qk = tl.dot(
                 q_all.to(Q.dtype.element_ty),
                 tl.trans(k).to(Q.dtype.element_ty),
-            ).to(
-                tl.float32
-            )  # [HQ_BLOCK, BLOCK_N]
+            ).to(tl.float32)  # [HQ_BLOCK, BLOCK_N]
 
             # Mask padded head rows and out-of-bounds KV positions.
             qk = tl.where(offs_h[:, None] < Hq, qk, float("-inf"))
