@@ -6,11 +6,14 @@
 
 # pyre-unsafe
 
-"""Autograd (backward) support for FP4 GEMM custom ops.
+"""
+Autograd support for FP4 GEMM custom ops.
+
 Registers torch.library.register_autograd for:
   - mslk::f4f4bf16
   - mslk::f4f4bf16_grouped_mm
   - mslk::f4f4bf16_ultra_grouped_mm
+  
 Backward strategy: dequantize packed FP4 inputs to BF16, then compute
 gradients via standard BF16 matmuls.  FP4 (E2M1, 3 magnitude levels)
 cannot carry gradient signal, so this follows the same FP8-forward /
