@@ -60,12 +60,6 @@ running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 # the device's arch/compute-capability (via mslk.utils.device primitives) to
 # whether a given GEMM dtype path is supported, and are specific to these tests.
 def supports_bf16():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            # gfx942 (MI300X) and gfx950 (MI350) both support bf16.
-            return is_mi300x() or evaluate_gfx_arch_in(["gfx950"])
-        return evaluate_cuda_compute_capability(9)
-    return False
     if is_rocm():
         return is_gfx942()
     return compute_capability_in(9)
