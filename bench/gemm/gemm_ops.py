@@ -31,6 +31,12 @@ from mslk.quantize.triton.fp8_quantize import (
 )
 from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
 from mslk.utils.triton.fp8_utils import get_fp8_constants
+from mslk.utils.device import (
+    is_cuda,
+    is_gfx942,
+    is_gfx950,
+    is_rocm,
+)
 
 try:
     from tinygemm.utils import group_quantize_tensor
@@ -87,7 +93,7 @@ class Accelerator(Enum):
     NVIDIA_SM90 = auto()
     NVIDIA_SM100 = auto()
     NVIDIA_SM103 = auto()
-    AMD_MI300X = auto()
+    AMD_GFX942 = auto()
     AMD_GFX950 = auto()
 
 
@@ -113,7 +119,7 @@ def get_current_accelerator() -> Accelerator | None:
         if is_gfx950():
             return Accelerator.AMD_GFX950
         if is_gfx942():
-            return Accelerator.AMD_MI300X
+            return Accelerator.AMD_GFX942
     elif is_cuda():
         major, minor = torch.cuda.get_device_capability()
         if major == 9 and minor == 0:
@@ -724,7 +730,7 @@ class FP8Rowwise(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -753,7 +759,7 @@ class FP8RowwisePreshuffle(FP8Rowwise):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_MI300X}
+        return {Accelerator.AMD_GFX942}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -1167,7 +1173,7 @@ class FP8RowwiseGrouped(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -1201,7 +1207,7 @@ class FP8RowwiseGrouped2D3D(FP8RowwiseGrouped):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_MI300X}
+        return {Accelerator.AMD_GFX942}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -1245,7 +1251,7 @@ class TorchFP8RowwiseGrouped(FP8RowwiseGrouped2D3D):
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -1258,7 +1264,7 @@ class TorchFP8RowwiseGrouped(FP8RowwiseGrouped2D3D):
 
 
 @register_gemm_op
-class CutlassFP8GroupwiseGrouped(GemmOpBase):
+class FP8GroupwiseGrouped(GemmOpBase):
     """
     FP8 grouped matmul with groupwise scaling.
     """
@@ -1293,7 +1299,7 @@ class CutlassFP8GroupwiseGrouped(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90}
+        return {Accelerator.NVIDIA_SM90, Accelerator.AMD_GFX950, Accelerator.AMD_GFX942}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -1337,7 +1343,7 @@ class FP8RowwiseBatched(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -1456,7 +1462,7 @@ class FP8Blockwise(GemmOpBase):
     def supported_accelerators(self) -> set[Accelerator]:
         return {
             Accelerator.NVIDIA_SM90,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -1469,7 +1475,7 @@ class FP8Blockwise(GemmOpBase):
 
 
 @register_gemm_op
-class CutlassFP8Groupwise(GemmOpBase):
+class FP8Groupwise(GemmOpBase):
     """
     FP8 matmul with groupwise scaling.
     """
@@ -1496,7 +1502,7 @@ class CutlassFP8Groupwise(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM90}
+        return {Accelerator.NVIDIA_SM90, Accelerator.AMD_GFX950, Accelerator.AMD_GFX942}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -1982,7 +1988,7 @@ class BF16Grouped(GemmOpBase):
             Accelerator.NVIDIA_SM90,
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
-            Accelerator.AMD_MI300X,
+            Accelerator.AMD_GFX942,
         }
 
     @property
@@ -2055,7 +2061,7 @@ class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_MI300X}
+        return {Accelerator.AMD_GFX942}
 
 
 @register_gemm_op

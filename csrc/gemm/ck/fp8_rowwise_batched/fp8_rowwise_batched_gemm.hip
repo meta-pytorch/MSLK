@@ -210,9 +210,8 @@ at::Tensor f8f8bf16_rowwise_batched(
       XQ.dim() == 3 && WQ.dim() == 3,
       "Inputs must have 3 dimensions, with the first being batch.");
   TORCH_CHECK(
-      (XQ.dtype() == at::kFloat8_e4m3fnuz) &&
-          (WQ.dtype() == at::kFloat8_e4m3fnuz),
-      "Inputs must be type float8_e4m3fnuz.");
+      XQ.dtype() == WQ.dtype(),
+      "XQ and WQ dtypes must match, got ", XQ.dtype(), " vs ", WQ.dtype());
   TORCH_CHECK(
       (x_scale.dtype() == at::kFloat) && (w_scale.dtype() == at::kFloat),
       "Scales must be float32.");

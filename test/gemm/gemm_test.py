@@ -203,7 +203,7 @@ def _fp8_gemm_cases() -> list[tuple]:
 
 
 def _fp8_batched_gemm_cases() -> list[tuple]:
-    modes = ["default"] + (["torch_3d3d"] if torch.version.hip else [])
+    modes = ["default", "torch_3d3d"]
     cases = []
     for mode in modes:
         for use_loopover in (True, False):
@@ -223,7 +223,13 @@ class ExportCompileTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+        fp8_dtype = (
+            torch.float8_e4m3fnuz
+            if supports_float8_fnuz(
+                throw_on_hip_incompatibility=(not running_on_github)
+            )
+            else torch.float8_e4m3fn
+        )
         cls.device = torch.accelerator.current_accelerator()
         cls.M = 256
         cls.N = 256
@@ -255,7 +261,7 @@ class ExportCompileTests(unittest.TestCase):
         model = TestModule().cuda()
         M, N, K = 256, 256, 256
         fp8_dtype = torch.float8_e4m3fn
-        if torch.version.hip:
+        if supports_float8_fnuz(throw_on_hip_incompatibility=(not running_on_github)):
             fp8_dtype = torch.float8_e4m3fnuz
         xq = torch.randn(M, K).to(fp8_dtype).cuda()
         wq = torch.randn(N, K).to(fp8_dtype).cuda()
@@ -328,7 +334,7 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
         )
 
 
-@skipUnlessGfxArch("gfx942")
+@skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9, 10)
 class FP8Tests(unittest.TestCase):
     @classmethod
@@ -832,6 +838,106 @@ class FP8Tests(unittest.TestCase):
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
+
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(9, 10)
+class FP8GroupwiseTests(unittest.TestCase):
+    """Correctness tests for the FP8 groupwise GEMM kernel (f8f8bf16_groupwise).
+
+    On CUDA the CUTLASS implementation is exercised; on ROCm the Triton kernel.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (128, 128, 256),  # small
+            (512, 1024, 2048),  # medium
+            (1, 128, 256),  # M=1 decode
+            (2048, 6144, 3584),  # large
+        ]
+    )
+    def test_f8f8bf16_groupwise(self, M: int, N: int, K: int) -> None:
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize: x_scale [K//128, M], w_scale [K//128, N//128]
+        xq, x_scale = quantize_fp8_group(x, k_major=False)
+        wq, w_scale = quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+
+        out = torch.ops.mslk.f8f8bf16_groupwise(xq, wq, x_scale, w_scale)
+        ref = (x @ w.t()).to(torch.bfloat16)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            # (m_values, N, K)
+            ([128, 64], 128, 256),  # small, 2 groups
+            ([512, 256, 128], 256, 512),  # medium, 3 groups
+            ([1, 128, 256], 128, 256),  # decode + prefill mix
+            ([2048, 1024], 512, 512),  # large, 2 groups
+        ]
+    )
+    def test_f8f8bf16_groupwise_grouped(self, m_values: list, N: int, K: int) -> None:
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        G = len(m_values)
+        device = self.device
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=device)
+        TotalM = sum(m_values)
+
+        x = torch.randn((TotalM, K), dtype=torch.bfloat16, device=device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=device) * 0.01
+            for _ in range(G)
+        ]
+
+        # Quantize weights: each [N, K] -> wq [N, K], w_scale [K//128, N//128].
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()  # [G, N, K]
+        w_scale = torch.stack(ws_list, dim=0).contiguous()  # [G, K//128, N//128]
+
+        # Quantize activations: xq [TotalM, K], x_scale [K//128, TotalM].
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
+            xq, wq, x_scale, w_scale, m_sizes
+        )
+
+        # BF16 reference: compute per group and concatenate.
+        ref_parts = []
+        row = 0
+        for g, m_g in enumerate(m_values):
+            ref_parts.append((x[row : row + m_g] @ ws[g].t()).to(torch.bfloat16))
+            row += m_g
+        ref = torch.cat(ref_parts, dim=0)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+
+
+@unittest.skipIf(
+    not SUPPORTS_BF16_INT4, "Skip if BF16Int4Tests is not supported on this device."
+)
 
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)
