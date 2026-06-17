@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-unsafe
-
 """
 Autograd support for FP4 GEMM custom ops.
 
@@ -13,11 +11,11 @@ Registers torch.library.register_autograd for:
   - mslk::f4f4bf16
   - mslk::f4f4bf16_grouped_mm
   - mslk::f4f4bf16_ultra_grouped_mm
-  
+
 Backward strategy: dequantize packed FP4 inputs to BF16, then compute
 gradients via standard BF16 matmuls.  FP4 (E2M1, 3 magnitude levels)
 cannot carry gradient signal, so this follows the same FP8-forward /
-BF16-backward pattern used throughout the repo.
+BF16-backward pattern.
 """
 
 from typing import Optional
@@ -39,12 +37,12 @@ def _dequantize_mxfp4_to_bf16(
 ) -> torch.Tensor:
     """
     Dequantize MXFP4 packed tensor to BF16.
-    
+
     Args:
         xq: Packed FP4 tensor [M, K/2] in float4_e2m1fn_x2 / uint8.
         scale: Blocked E8M0 scale tensor (swizzled layout).
         block_size: Number of elements per scale group (default 32).
-        
+
     Returns:
         BF16 tensor [M, K].
     """
@@ -75,23 +73,23 @@ def _dequantize_fp4_to_bf16(
 ) -> torch.Tensor:
     """
     Dequantize packed FP4 tensor to BF16, dispatching MXFP4 vs NVFP4.
-    
+
     Args:
         xq: Packed FP4 tensor (float4_e2m1fn_x2 / uint8).
         scale: Per-block scale factors (E8M0 for MXFP4, FP8 for NVFP4).
         global_scale: If present, use NVFP4 path; if None, use MXFP4 path.
         mxfp4_block_size: Block size for MXFP4 (ignored for NVFP4).
-        
+
     Returns:
         BF16 tensor with unpacked shape.
     """
+    # NVFP4 path: group_size is always 16
     if global_scale is not None:
-        # NVFP4 path: group_size is always 16
         return dequantize_nvfp4(
             xq.view(torch.uint8), scale, global_scale, group_size=16
         )
+    # MXFP4 path
     else:
-        # MXFP4 path
         return _dequantize_mxfp4_to_bf16(xq, scale, block_size=mxfp4_block_size)
 
 
@@ -103,16 +101,16 @@ def _dequantize_fp4_ultra(
 ) -> torch.Tensor:
     """
     Dequantize NVFP4 with per-token/per-group inverse global scale.
-    
+
     Ultra grouped MM uses inverse global scales (1/global_scale) per token (X)
     or per group (W), rather than the standard combined global scale.
-    
+
     Args:
         xq: Packed FP4 tensor in uint8.
         scale: Per-block FP8 scales (swizzled/blocked layout).
         global_scale_inv: Inverse global scale — scalar or [M] per-token.
         group_size: Elements per scale group (default 16).
-        
+
     Returns:
         BF16 tensor with unpacked shape.
     """
@@ -142,10 +140,6 @@ def _dequantize_fp4_ultra(
 
     return x_scaled.to(torch.bfloat16)
 
-
-# ---------------------------------------------------------------------------
-# mslk::f4f4bf16
-# ---------------------------------------------------------------------------
 
 if hasattr(torch.ops.mslk, "f4f4bf16"):
 
