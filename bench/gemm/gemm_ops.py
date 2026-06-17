@@ -3080,18 +3080,19 @@ class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
     def preprocess(self, x, w):
         assert isinstance(x, list)
         assert isinstance(w, list)
+        # Cache per-group M sizes before concatenation so quantize can use
+        # the exact boundaries regardless of whether groups are equal-sized.
+        self._m_sizes = [xi.shape[0] for xi in x]
         x = torch.cat(x, dim=0).contiguous()
         w = torch.stack(w, dim=0).contiguous()
         return x, w
 
     def quantize(self, x, w):
-        block_size = 32
         G, _, K = w.shape
-        total_M = x.shape[0]
-        group_size = total_M // G
-        input_group_end_offsets = torch.arange(
-            group_size, total_M + 1, group_size, dtype=torch.int32, device=x.device
-        )
+        m_sizes = self._m_sizes
+        input_group_end_offsets = torch.tensor(
+            m_sizes, dtype=torch.int32, device=x.device
+        ).cumsum(0)
 
         wq_list = []
         w_scale_list = []
@@ -3104,19 +3105,18 @@ class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
 
         xq_list = []
         x_scale_list = []
-        for i in range(G):
-            prev_group_end = 0 if i == 0 else input_group_end_offsets[i - 1]
-            curr_group_end = input_group_end_offsets[i]
-            x_slice = x[prev_group_end:curr_group_end, :]
+        row = 0
+        for m_g in m_sizes:
+            x_slice = x[row : row + m_g, :]
             x_scale, xq = to_mxfp8(x_slice)
-            x_scale = _to_blocked(
-                x_scale.view(torch.int8).reshape(x_slice.shape[0], -1)
-            ).view(torch.uint8)
+            x_scale = _to_blocked(x_scale.view(torch.int8).reshape(m_g, -1)).view(
+                torch.uint8
+            )
             xq_list.append(xq)
             x_scale_list.append(x_scale)
+            row += m_g
         xq = torch.cat(xq_list, dim=0).contiguous()
         x_scale = torch.cat(x_scale_list, dim=0).contiguous()
-        x_scale = x_scale.reshape(-1, K // block_size)
         return xq, wq, x_scale, w_scale, input_group_end_offsets
 
     def compute(self, xq, wq, x_scale, w_scale, input_group_end_offsets):
