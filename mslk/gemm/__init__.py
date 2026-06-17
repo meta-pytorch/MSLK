@@ -23,4 +23,7 @@ import torch._utils_internal  # noqa: E402
 
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
-from . import _meta  # noqa: F401, E402
+from . import (
+    _meta,
+    fp4_autograd,
+)  # noqa: F401, E402
