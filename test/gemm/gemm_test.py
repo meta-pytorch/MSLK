@@ -29,6 +29,7 @@ from mslk.utils.device import (
     gfx_arch_in,
     is_cuda,
     is_gfx942,
+    is_gfx950,
     is_rocm,
     supports_float8_fnuz,
 )
@@ -2795,7 +2796,8 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
 
 
 @unittest.skipIf(
-    not SUPPORTS_MXFP4 and not torch.version.hip, "Skip if MXFP4 is not supported"
+    not SUPPORTS_MXFP4 and not is_gfx950(),
+    "Skip if MXFP4 is not supported (ROCm requires gfx950+)",
 )
 class MX8MX4Tests(unittest.TestCase):
     """Tests for the mixed MX8 x MX4 GEMM kernel (mx8mx4bf16)."""
