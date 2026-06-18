@@ -65,6 +65,7 @@ def _nvfp4_quantize_stacked_kernel(
     FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
 
     NUM_ELEM_PER_LAYOUT: tl.constexpr = (  # type: ignore[Incompatible variable type]
+        # pyrefly: ignore [bad-assignment]
         128 * 4
     )
     NUM_N_BLOCKS = tl.cdiv(N, 64)
@@ -380,8 +381,10 @@ def nvfp4_quantize_stacked(
         # pyre-ignore[6]
         NUM_GROUPS=num_segments,
         PREFIX_NUM=triton.next_power_of_2(num_segments),
+        # pyrefly: ignore [bad-argument-type]
         BSEARCH_ITERS=max(1, (num_segments - 1).bit_length()),
         M_PER_BLOCK=m_per_block,  # pyre-ignore[6]
+        # pyrefly: ignore [unexpected-keyword]
         num_stages=n_stages,
     )
 
@@ -439,9 +442,13 @@ def nvfp4_quantize_stacked_with_token_scale(
         PREFIX_NUM=triton.next_power_of_2(num_segments),
         BLOCK_K=block_k,  # pyre-ignore[6]
         SCALE_BLOCKS=block_k // 16,  # pyre-ignore[6]
+        # pyrefly: ignore [bad-argument-type]
         USE_FULL_ROW_QUANT=block_k == K and K <= 8192,
+        # pyrefly: ignore [bad-argument-type]
         CHUNK_SIZE=2048,
+        # pyrefly: ignore [bad-argument-type]
         CHUNK_SCALE_BLOCKS=2048 // 16,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=8,
     )
 

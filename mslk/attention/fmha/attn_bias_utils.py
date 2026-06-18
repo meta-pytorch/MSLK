@@ -183,6 +183,7 @@ def create_attn_bias(  # noqa: C901
                 window_size=min(window_size, min(k)),
             )
         elif bias_type is fmha.attn_bias.BlockDiagonalLocalAttentionPaddedKeysMask:
+            # pyrefly: ignore [missing-attribute]
             g_block_diag = block_diag_type.from_seqlens_local(
                 q_seqlen=q,
                 kv_padding=kv_len,

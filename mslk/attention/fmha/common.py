@@ -60,6 +60,7 @@ class ScaledTensor(torch.Tensor):
     __slots__ = ["scale", "dequant_func", "original_dtype"]
 
     # Disabling custom torch function handling for this class
+    # pyrefly: ignore [bad-override]
     __torch_function__ = torch._C._disabled_torch_function_impl
 
     @staticmethod
@@ -116,6 +117,7 @@ class ScaledTensor(torch.Tensor):
         """
         return self.data, self.scale  # type: ignore
 
+    # pyrefly: ignore [bad-override]
     def __repr__(self):
         """
         Custom string representation for ScaledTensor.
@@ -135,6 +137,7 @@ def pack_fp8_tensorwise_per_head(
     def dequant_func(x, scale):
         return x * scale[:, None, :, None]
 
+    # pyrefly: ignore [no-matching-overload]
     return ScaledTensor(
         data=x,
         scale=scale,
