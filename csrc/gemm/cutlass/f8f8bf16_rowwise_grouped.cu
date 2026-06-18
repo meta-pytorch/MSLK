@@ -316,6 +316,9 @@ OutputType _f8f8bf16_rowwise_grouped(
   }
 }
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry points
+// (f8f8bf16_rowwise_grouped_stacked / f8f8bf16_rowwise_grouped_mm) instead.
 std::vector<at::Tensor> f8f8bf16_rowwise_grouped(
     at::TensorList XQ, // FP8
     at::TensorList WQ, // FP8
@@ -325,6 +328,9 @@ std::vector<at::Tensor> f8f8bf16_rowwise_grouped(
       XQ, WQ, x_scale, w_scale);
 }
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry points
+// (f8f8bf16_rowwise_grouped_stacked / f8f8bf16_rowwise_grouped_mm) instead.
 at::Tensor f8f8bf16_rowwise_grouped_cat(
     at::TensorList XQ, // FP8
     at::TensorList WQ, // FP8
@@ -361,6 +367,9 @@ at::Tensor f8f8bf16_rowwise_grouped_stacked(
   return out.view({total_M, N});
 }
 
+// UNSUPPORTED AND DEPRECATED: this internal API is no longer supported. Use the
+// torch-native grouped GEMM entry points (f8f8bf16_rowwise_grouped_stacked /
+// f8f8bf16_rowwise_grouped_mm) instead.
 at::Tensor f8f8bf16_rowwise_grouped_dynamic(
     at::Tensor XQ, // FP8
     at::Tensor WQ, // FP8
