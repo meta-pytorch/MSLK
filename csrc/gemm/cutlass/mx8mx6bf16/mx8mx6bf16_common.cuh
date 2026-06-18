@@ -27,11 +27,15 @@ namespace mslk::gemm {
 namespace cutlass = cutlass_mslk;
 
 using MXFP8 = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+using MXFP8_16 = cutlass::mx_float8_16_t<cutlass::float_e4m3_t>;
 using MXFP6 = cutlass::mx_float6_t<cutlass::float_e2m3_t>;
+using MXFP6_16 = cutlass::mx_float6_16_t<cutlass::float_e2m3_t>;
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
 template <
+    typename ElementAType,
+    typename ElementBType,
     int TB_M,
     int TB_N,
     int TBS_M,
@@ -49,13 +53,13 @@ at::Tensor _mx8mx6bf16(
   const int N = WQ.size(0);
   const int K = XQ.size(1);
 
-  using ElementA = MXFP8;
+  using ElementA = ElementAType;
   using LayoutATag = cutlass::layout::RowMajor;
   using LayoutATag_Transpose =
       typename cutlass::layout::LayoutTranspose<LayoutATag>::type;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
-  using ElementB = MXFP6;
+  using ElementB = ElementBType;
   using LayoutBTag = cutlass::layout::ColumnMajor;
   using LayoutBTag_Transpose =
       typename cutlass::layout::LayoutTranspose<LayoutBTag>::type;

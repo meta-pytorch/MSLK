@@ -17,52 +17,65 @@ at::Tensor mx8mx6bf16_128_128_1_1_1(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_128_128_2_2_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_256_128_2_1_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_256_128_2_2_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_256_256_2_1_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_256_256_2_4_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_256_128_4_1_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 at::Tensor mx8mx6bf16_128_128_4_1_1(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output);
+    at::Tensor output,
+    int64_t block_size);
 
-using Kernel_mx8mx6bf16 =
-    at::Tensor (*)(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor);
+using Kernel_mx8mx6bf16 = at::Tensor (*)(
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    int64_t);
 
 #endif
 } // namespace mslk::gemm

@@ -17,8 +17,14 @@ at::Tensor mx8mx6bf16_256_128_4_1_1(
     at::Tensor WQ, // MX FP6
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output) {
-  return _mx8mx6bf16<256, 128, 4, 1, 1>(XQ, WQ, x_scale, w_scale, output);
+    at::Tensor output,
+    int64_t block_size) {
+  if (block_size == 16) {
+    return _mx8mx6bf16<MXFP8_16, MXFP6_16, 256, 128, 4, 1, 1>(
+        XQ, WQ, x_scale, w_scale, output);
+  }
+  return _mx8mx6bf16<MXFP8, MXFP6, 256, 128, 4, 1, 1>(
+      XQ, WQ, x_scale, w_scale, output);
 }
 
 #endif
