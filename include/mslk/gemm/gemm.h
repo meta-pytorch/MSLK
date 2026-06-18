@@ -13,6 +13,12 @@
 
 namespace mslk::gemm {
 
+at::Tensor f8f8bf16_tensorwise(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    double scale,
+    bool use_fast_accum = true);
+
 at::Tensor f8f8bf16_blockwise(
     at::Tensor XQ,
     at::Tensor WQ,
@@ -149,6 +155,20 @@ at::Tensor f4f4bf16_grouped_stacked(
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
     bool use_mx = true);
 
+at::Tensor f8f8bf16(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor scale,
+    bool use_fast_accum = true);
+
+at::Tensor f8f8bf16_cublas(
+    at::Tensor A,
+    at::Tensor B,
+    std::optional<at::Tensor> Ainvs = std::nullopt,
+    std::optional<at::Tensor> Binvs = std::nullopt,
+    bool use_fast_accum = true,
+    std::optional<at::Tensor> output = std::nullopt);
+
 at::Tensor bf16x9_gemm(
     at::Tensor A,
     at::Tensor B,
@@ -229,9 +249,8 @@ at::Tensor mx8mx6bf16(
     at::Tensor w_scale,
     std::optional<at::Tensor> output = std::nullopt);
 
-// Symmetric MX6 x MX6 GEMM using mxf8f6f4 block-scaled tensor core instruction
-// ElementA = ElementB = mx_float6_t<float_e2m3_t>
-at::Tensor mx6mx6bf16(
+// Fused NV4→MX6 GEMM: loads NV4 (4-bit) weights, converts to MX6 in SMEM
+at::Tensor nv4mx6bf16_fused(
     at::Tensor XQ,
     at::Tensor WQ,
     at::Tensor x_scale,
