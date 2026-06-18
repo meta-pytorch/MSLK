@@ -55,7 +55,8 @@ Kernel_mx8mx4bf16 get_kernel_via_tuning(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output) {
+    at::Tensor output,
+    int64_t block_size) {
   static TuningCache cache("mx8mx4bf16");
 
   M = nextPowerOf2OrRoundUp(M, 1024, 1024);
@@ -68,7 +69,7 @@ Kernel_mx8mx4bf16 get_kernel_via_tuning(
   const auto& kernels = get_mx8mx4bf16_kernels();
 
   auto kernel = cache.findBestKernelMaybeAutotune(
-      shape_key, kernels, XQ, WQ, x_scale, w_scale, output);
+      shape_key, kernels, XQ, WQ, x_scale, w_scale, output, block_size);
   return kernel;
 }
 
@@ -79,18 +80,22 @@ at::Tensor mx8mx4bf16(
     at::Tensor WQ, // MX FP4 (e2m1)
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    int64_t block_size) {
   TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
   TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
   TORCH_CHECK(x_scale.is_cuda() && x_scale.is_contiguous());
   TORCH_CHECK(w_scale.is_cuda() && w_scale.is_contiguous());
+  TORCH_CHECK(
+      block_size == 16 || block_size == 32,
+      "block_size must be 16 or 32 for MX block-scaled GEMM");
 
   const auto M = XQ.size(0);
   const auto N = WQ.size(0);
   const auto K = XQ.size(1);
   TORCH_CHECK(
-      K % 32 == 0,
-      "K must be a multiple of block size 32 for MX block-scaled GEMM");
+      K % block_size == 0,
+      "K must be a multiple of block_size for MX block-scaled GEMM");
 
   if (M == 0 || N == 0 || K == 0) {
     return at::zeros({M, N}, XQ.options().dtype(at::kBFloat16));
@@ -102,11 +107,12 @@ at::Tensor mx8mx4bf16(
 
   auto kernel = [&]() {
     if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
-      return get_kernel_via_tuning(M, N, K, XQ, WQ, x_scale, w_scale, out);
+      return get_kernel_via_tuning(
+          M, N, K, XQ, WQ, x_scale, w_scale, out, block_size);
     }
     return get_kernel_via_heuristics(M, N, K);
   }();
-  return kernel(XQ, WQ, x_scale, w_scale, out);
+  return kernel(XQ, WQ, x_scale, w_scale, out, block_size);
 }
 
 #else
@@ -116,7 +122,8 @@ at::Tensor mx8mx4bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    int64_t block_size) {
   throw std::runtime_error("CUDA version is older than 12.8");
 }
 

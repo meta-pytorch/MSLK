@@ -53,9 +53,9 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, Tensor? global_scale=None, int mxfp4_block_size=32) -> Tensor");
   m.def(
-      "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
+      "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, int block_size=32) -> Tensor");
   m.def(
-      "mx8mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
+      "mx8mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, int block_size=32) -> Tensor");
   m.def(
       "nv4mx6bf16_fused(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
   m.def(
@@ -221,7 +221,8 @@ at::Tensor mx8mx4bf16_meta(
     at::Tensor WQ, // MX FP4
     at::Tensor /* x_scale */,
     at::Tensor /* w_scale */,
-    std::optional<at::Tensor> /* output = std::nullopt */) {
+    std::optional<at::Tensor> /* output = std::nullopt */,
+    int64_t /* block_size = 32 */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
   auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));
@@ -233,7 +234,8 @@ at::Tensor mx8mx6bf16_meta(
     at::Tensor WQ, // MX FP6
     at::Tensor /* x_scale */,
     at::Tensor /* w_scale */,
-    std::optional<at::Tensor> /* output = std::nullopt */) {
+    std::optional<at::Tensor> /* output = std::nullopt */,
+    int64_t /* block_size = 32 */) {
   const at::SymInt M = XQ.sym_size(0);
   const at::SymInt N = WQ.sym_size(0);
   auto Y = at::empty_symint({M, N}, XQ.options().dtype(at::kBFloat16));

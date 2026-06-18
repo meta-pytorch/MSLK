@@ -238,7 +238,8 @@ at::Tensor mx8mx4bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output = std::nullopt);
+    std::optional<at::Tensor> output = std::nullopt,
+    int64_t block_size = 32);
 
 // Mixed MX8 x MX6 GEMM using mxf8f6f4 block-scaled tensor core instruction
 // ElementA = mx_float8_t<float_e4m3_t>, ElementB = mx_float6_t<float_e2m3_t>
@@ -247,7 +248,8 @@ at::Tensor mx8mx6bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output = std::nullopt);
+    std::optional<at::Tensor> output = std::nullopt,
+    int64_t block_size = 32);
 
 // Fused NV4→MX6 GEMM: loads NV4 (4-bit) weights, converts to MX6 in SMEM
 at::Tensor nv4mx6bf16_fused(
