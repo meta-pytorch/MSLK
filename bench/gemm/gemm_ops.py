@@ -3092,7 +3092,7 @@ class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
         m_sizes = self._m_sizes
         input_group_end_offsets = torch.tensor(
             m_sizes, dtype=torch.int32, device=x.device
-        ).cumsum(0)
+        ).cumsum(0, dtype=torch.int32)
 
         wq_list = []
         w_scale_list = []
