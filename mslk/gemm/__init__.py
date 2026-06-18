@@ -21,6 +21,7 @@ for op in gemm_ops:
 # by default in OSS PyTorch.
 import torch._utils_internal  # noqa: E402
 
+# pyrefly: ignore [missing-attribute]
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 from . import _meta  # noqa: F401, E402

@@ -27,6 +27,7 @@ def is_pt_cutlass_compatible(force: bool = False) -> bool:
     expected_fwd_schema = parse_schema(fwd_schema_str)
 
     current_schema = torch.ops.aten._efficient_attention_forward.default._schema
+    # pyrefly: ignore [missing-attribute]
     if not current_schema.is_backward_compatible_with(expected_fwd_schema):
         compatible = False
 
@@ -48,6 +49,7 @@ def is_pt_cutlass_compatible(force: bool = False) -> bool:
     expected_bwd_schema = parse_schema(bwd_schema_str)
 
     current_schema = torch.ops.aten._efficient_attention_backward.default._schema
+    # pyrefly: ignore [missing-attribute]
     if not current_schema.is_backward_compatible_with(expected_bwd_schema):
         compatible = False
 
@@ -96,6 +98,7 @@ def ensure_pt_flash_ok() -> None:
     expected_fwd_schema = parse_schema(fwd_schema_str)
 
     current_schema = torch.ops.aten._flash_attention_forward.default._schema  # noqa: E501
+    # pyrefly: ignore [missing-attribute]
     if not current_schema.is_backward_compatible_with(expected_fwd_schema):
         raise ImportError(
             "Current Torch with Flash-Attention "
@@ -122,6 +125,7 @@ def ensure_pt_flash_ok() -> None:
     expected_bwd_schema = parse_schema(bwd_schema_str)
 
     current_schema = torch.ops.aten._flash_attention_backward.default._schema  # noqa: E501
+    # pyrefly: ignore [missing-attribute]
     if not current_schema.is_backward_compatible_with(expected_bwd_schema):
         raise ImportError(
             "Current Torch with Flash-Attention "
