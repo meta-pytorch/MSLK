@@ -905,18 +905,20 @@ def _kernel_quantize_fp8_group(
         scale_chunk_offset = scale_k_offset + k * GROUP_LOAD
 
         if USE_M_MAJOR and G > 0:
-            # Cast scale_chunk_offset to int64 to match group_M's dtype (a
-            # tl.tensor loaded from m_sizes), preventing a type mismatch in
-            # the pointer arithmetic that causes a Triton compilation
-            # error ("cannot convert int32[] tensor to tensor").
-            sco = scale_chunk_offset.to(group_M.dtype)
+            # Recompute the 1-D mask from tl.arange + Python ints to avoid a
+            # Triton compilation error: the SSA merge of group_M (a 0-D
+            # loaded tensor) into scale_chunk_offset causes the type resolver
+            # to infer a 0-D type for scale_chunk_offset in this branch, which
+            # makes "scale_chunk_offset < NUM_GROUPS" a 0-D mask that tl.store
+            # cannot use. Using tl.arange directly guarantees a 1-D mask.
+            valid = tl.arange(0, GROUP_LOAD) + k * GROUP_LOAD < NUM_GROUPS
             tl.store(
                 A_scale
                 + group_offset
                 + (pid - group_cumsum) * stride_a_scale_k
-                + (sco * group_M),
+                + (scale_chunk_offset * group_M),
                 1.0 / a_scale,
-                mask=sco < NUM_GROUPS,
+                mask=valid,
             )
         else:
             if USE_M_MAJOR:
