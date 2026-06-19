@@ -31,12 +31,6 @@ from mslk.quantize.triton.fp8_quantize import (
 )
 from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
 from mslk.utils.triton.fp8_utils import get_fp8_constants
-from mslk.utils.device import (
-    is_cuda,
-    is_gfx942,
-    is_gfx950,
-    is_rocm,
-)
 
 try:
     from tinygemm.utils import group_quantize_tensor
