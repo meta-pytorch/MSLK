@@ -17,6 +17,7 @@ from .attn_bias import (
 )
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
 from .utils.op_common import register_operator
+from .triton_splitk import merge_attentions
 
 if is_triton_available():
     from ._triton.gqa_decode_kernels import (
@@ -343,11 +344,11 @@ class FwOp(AttentionFwOpBase):
                 if additive_bias is None
                 else 1
             )
+
         if (
             num_splits > 1
             and get_gqa_decode_split_kernel is not None
         ):
-            from .triton_splitk import merge_attentions
 
             split_kernel = get_gqa_decode_split_kernel()
             partial_o = torch.empty(
