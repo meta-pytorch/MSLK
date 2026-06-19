@@ -253,6 +253,7 @@ def unroll_varargs(kernel, N: int, mode: VarargMode = VarargMode.UNROLL):
     jitted_fn = triton.jit(fn)
     if not hasattr(jitted_fn, "_unsafe_update_src"):
         # Triton older than 3.2
+        # pyrefly: ignore [bad-argument-count]
         jitted_fn.src = new_src
     return jitted_fn
 

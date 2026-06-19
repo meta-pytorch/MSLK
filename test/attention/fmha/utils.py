@@ -465,6 +465,7 @@ compute_capability = (0, 0)
 if torch.cuda.is_available():
     compute_capability = torch.cuda.get_device_capability("cuda")
 sm75_or_better_only = wrong_hardware(
+    # pyrefly: ignore [unsupported-operation]
     torch.version.cuda is not None and compute_capability < (7, 5),
     reason="requires sm75+",
 )

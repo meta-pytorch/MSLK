@@ -197,6 +197,11 @@ __conda_install_clang () {
   # Remove the Conda activations scripts for gcc; see comments in the method for details
   __remove_gcc_activation_scripts
 
+  # shellcheck disable=SC2155,SC2086
+  local cc_path=$(conda run ${env_prefix} which clang)
+  # shellcheck disable=SC2155,SC2086
+  local cxx_path=$(conda run ${env_prefix} which clang++)
+
   # shellcheck disable=SC2086
   print_exec conda env config vars set ${env_prefix} CC="${cc_path}"
   # shellcheck disable=SC2086

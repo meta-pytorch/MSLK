@@ -29,6 +29,7 @@ class IndexFirstAxis(torch.autograd.Function):
         ).reshape(-1, *other_shape)
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
         (indices,) = ctx.saved_tensors
         assert grad_output.ndim >= 2
@@ -65,6 +66,7 @@ class IndexPutFirstAxis(torch.autograd.Function):
         return output
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
         (indices,) = ctx.saved_tensors
         # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.

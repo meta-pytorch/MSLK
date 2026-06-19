@@ -128,6 +128,7 @@ def _dispatch_fw_priority_list(
                 ck.FwOp,
             ]
         )
+    # pyrefly: ignore [bad-argument-type]
     priority_list_ops.append(triton_splitk.FwOp)
     if not needs_gradient:
         mqa_or_gqa = (
@@ -149,15 +150,20 @@ def _dispatch_fw_priority_list(
                 and not torch.mtia.is_available()
             ):
                 # priority_list_ops.appendleft(ck_splitk.FwOp)
+                # pyrefly: ignore [bad-argument-type]
                 priority_list_ops.remove(triton_splitk.FwOp)
+                # pyrefly: ignore [bad-argument-type]
                 priority_list_ops.appendleft(triton_splitk.FwOp)
                 # Without variable seqlen flash is fastest
                 if torch.version.cuda and not isinstance(
                     inp.attn_bias, attn_bias.BlockDiagonalMask
                 ):
                     if _get_use_fa3():
+                        # pyrefly: ignore [bad-argument-type]
                         priority_list_ops.remove(flash3.FwOp)
+                    # pyrefly: ignore [bad-argument-type]
                     priority_list_ops.remove(flash.FwOp)
+                    # pyrefly: ignore [bad-argument-type]
                     priority_list_ops.appendleft(flash.FwOp)
 
     if torch.version.hip is not None and not needs_gradient:
@@ -171,6 +177,7 @@ def _dispatch_fw_priority_list(
     # when tracing with PT2, so we simply add flash_mtia to the end if the MTIA
     # dynamic library can be loaded
     if _USE_MTIA_FLASH_ATTENTION:
+        # pyrefly: ignore [bad-argument-type]
         priority_list_ops.append(flash_mtia.FwOp)
 
     return priority_list_ops

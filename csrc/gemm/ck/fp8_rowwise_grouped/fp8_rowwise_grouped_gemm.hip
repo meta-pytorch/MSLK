@@ -599,6 +599,9 @@ void validate_inputs_common(
 } // namespace
 
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry points
+// (f8f8bf16_rowwise_grouped_stacked / f8f8bf16_rowwise_grouped_mm) instead.
 std::vector<at::Tensor> f8f8bf16_rowwise_grouped(
     at::TensorList XQ,
     at::TensorList WQ,
@@ -608,6 +611,9 @@ std::vector<at::Tensor> f8f8bf16_rowwise_grouped(
       XQ, WQ, x_scale, w_scale);
 }
 
+// UNSUPPORTED AND DEPRECATED: this TensorList-based internal API is no longer
+// supported. Use the torch-native grouped GEMM entry points
+// (f8f8bf16_rowwise_grouped_stacked / f8f8bf16_rowwise_grouped_mm) instead.
 at::Tensor f8f8bf16_rowwise_grouped_cat(
     at::TensorList XQ,
     at::TensorList WQ,
@@ -667,6 +673,9 @@ at::Tensor f8f8bf16_rowwise_grouped_stacked(
   return selected_kernel(XQ, WQ, x_scale, w_scale, kernel_args, Y);
 }
 
+// UNSUPPORTED AND DEPRECATED: this internal API is no longer supported. Use the
+// torch-native grouped GEMM entry points (f8f8bf16_rowwise_grouped_stacked /
+// f8f8bf16_rowwise_grouped_mm) instead.
 at::Tensor f8f8bf16_rowwise_grouped_dynamic(
     at::Tensor XQ,
     at::Tensor WQ,

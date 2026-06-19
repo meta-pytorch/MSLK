@@ -166,6 +166,7 @@ def _fwd_kernel_splitK(  # noqa: C901
         f"Only row-wise fp8 quantization is supported, but got {N_GROUPS=} > 1.",
     )
     FP8_QUANTIZED: tl.constexpr = K_fp8_scale_shift is not None
+    # pyrefly: ignore [bad-assignment]
     INT4_QUANTIZED: tl.constexpr = PACKED_PER_VAL > 1 and not FP8_QUANTIZED
     PACKED_D_PER_GROUP: tl.constexpr = BLOCK_DMODEL // PACKED_PER_VAL // N_GROUPS
     D_PER_GROUP: tl.constexpr = BLOCK_DMODEL // N_GROUPS
@@ -361,6 +362,7 @@ def _fwd_kernel_splitK(  # noqa: C901
     # This is a solution for Triton native lack of support for lists of tensors.
     acc: "VAR_ARGS_ARRAY"  # noqa: F821
 
+    # pyrefly: ignore [unbound-name]
     for i in range(len(acc)):  # noqa: F821
         acc[i] = tl.zeros([BLOCK_M, D_PER_GROUP], dtype=internal_dtype)  # noqa: F821
     # scale sm_scale by log_2(e) and use
@@ -402,10 +404,12 @@ def _fwd_kernel_splitK(  # noqa: C901
             q_scale = tl.load(
                 tl.advance(q_scale_block_ptr, (0, i * D_PER_GROUP)), boundary_check=(0,)
             )
+            # pyrefly: ignore [unbound-name]
             q[i] = q_quantized.to(Q.dtype.element_ty)  # noqa: F821
     else:
         # Regular query loading
         for i in range(len(acc)):  # noqa: F821
+            # pyrefly: ignore [unbound-name]
             q[i] = tl.load(  # noqa: F821
                 tl.advance(Q_block_ptr, (0, i * D_PER_GROUP)), boundary_check=(0,)
             )
@@ -430,10 +434,12 @@ def _fwd_kernel_splitK(  # noqa: C901
     for start_n in range(lo, hi, BLOCK_N):
         if PAGE_SIZE > 0:
             # Offset in integer blocks from the beginning of the page
+            # pyrefly: ignore [unbound-name]
             block_offset_in_page = logical_block_idx % BLOCKS_IN_PAGE
             # Offset in integer pages
             logical_page_idx = logical_block_idx // BLOCKS_IN_PAGE
             physical_page_idx = tl.load(
+                # pyrefly: ignore [unbound-name]
                 block_table + stride_blocktablesl * logical_page_idx
             ).to(tl.int32)
             offset = physical_page_idx * PAGE_SIZE + block_offset_in_page * BLOCK_N
@@ -483,6 +489,7 @@ def _fwd_kernel_splitK(  # noqa: C901
                 )
             elif FP8_QUANTIZED:
                 K_scale_shift_block_ptr = tl.make_block_ptr(
+                    # pyrefly: ignore [bad-argument-type]
                     base=k_fp8_scale_shift_base,
                     shape=(1, offset + current_block_size),
                     strides=(1, stride_k_fp8_scale_shift_n),
@@ -491,6 +498,7 @@ def _fwd_kernel_splitK(  # noqa: C901
                     order=(0, 1),
                 )
                 V_scale_shift_block_ptr = tl.make_block_ptr(
+                    # pyrefly: ignore [bad-argument-type]
                     base=v_fp8_scale_shift_base,
                     shape=(offset + current_block_size, 1),
                     strides=(stride_v_fp8_scale_shift_n, 1),
@@ -513,9 +521,13 @@ def _fwd_kernel_splitK(  # noqa: C901
         for i in range(len(acc)):  # noqa: F821
             # Load and dequantize K/V with appropriate return values based on quantization flags
             result = load_dequantize_k_v_group(  # noqa: F821
+                # pyrefly: ignore [unbound-name]
                 K_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 V_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 K_scale_shift_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 V_scale_shift_block_ptr,
                 BOUNDS_CHECKS_N,
                 PACKED_PER_VAL,
@@ -532,26 +544,33 @@ def _fwd_kernel_splitK(  # noqa: C901
 
             # Unpack results based on quantization configuration
             if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], v_scale, k_scale = result  # noqa: F821
             elif QUANTIZE_PV_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], v_scale = result  # noqa: F821
             elif QUANTIZE_QK_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], k_scale = result  # noqa: F821
             else:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i] = result  # noqa: F821
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for i in range(len(acc)):  # noqa: F821
+            # pyrefly: ignore [unbound-name]
             qk += tl.dot(q[i], k[i])  # noqa: F821
 
         if QUANTIZE_QK_TO_FP8:
             # Reshape k_scale for proper broadcasting with qk
             # k_scale has shape (BLOCK_N,), we need to reshape it to (1, BLOCK_N)
             # for proper broadcasting with qk of shape (BLOCK_M, BLOCK_N)
+            # pyrefly: ignore [unbound-name]
             k_scale_reshaped = tl.reshape(k_scale, (1, BLOCK_N))
 
             # Apply k_scale to qk
             qk = qk * k_scale_reshaped
+            # pyrefly: ignore [unbound-name]
             qk = qk * tl.reshape(q_scale, (BLOCK_M, 1))  # noqa: F821
 
         # Apply qk_scale (scalar)
@@ -564,6 +583,7 @@ def _fwd_kernel_splitK(  # noqa: C901
 
         if HAS_ADDITIVE_BIAS:
             loaded_bias = tl.load(
+                # pyrefly: ignore [unbound-name]
                 additive_bias_block_ptr,
                 boundary_check=(0, 1) if BOUNDS_CHECKS_N else (0,),
             )
@@ -576,10 +596,12 @@ def _fwd_kernel_splitK(  # noqa: C901
             qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
         if IS_CAUSAL:
             # -- apply the causal mask --
+            # pyrefly: ignore [unbound-name]
             qk = tl.where(diag_idx_shifted >= start_n - start_kv_idx, qk, float("-inf"))
         if IS_LOCAL:
             # -- apply the local window size mask --
             qk = tl.where(
+                # pyrefly: ignore [unbound-name]
                 diag_idx_shifted < start_n - start_kv_idx + WINDOW_LEFT + 1,
                 qk,
                 float("-inf"),
@@ -608,6 +630,7 @@ def _fwd_kernel_splitK(  # noqa: C901
             p = p.to(v_dtype)
         else:
             # Apply v-scale to P
+            # pyrefly: ignore [unbound-name]
             p = p * tl.trans(v_scale)
 
             # Quantize P to FP8
@@ -624,9 +647,11 @@ def _fwd_kernel_splitK(  # noqa: C901
         for i in range(len(acc)):  # noqa: F821
             acc[i] *= alpha[:, None]  # noqa: F821
             if not QUANTIZE_PV_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 acc[i] += tl.dot(p, v[i])  # noqa: F821
             else:
                 # Re-scale PV using p_scale
+                # pyrefly: ignore [unbound-name]
                 acc[i] += tl.dot(p, v[i]) * p_scale[:, None]  # noqa: F821
 
         if not PAGE_SIZE:
@@ -869,12 +894,15 @@ def load_dequantize_k_v_group(
     # Return appropriate values based on quantization flags
     if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
         # Return both v_scale and k_scale for applying to P and K
+        # pyrefly: ignore [unbound-name]
         return k, v, v_scale, k_scale
     elif QUANTIZE_PV_TO_FP8:
         # Return v_scale for applying v_scale to P
+        # pyrefly: ignore [unbound-name]
         return k, v, v_scale
     elif QUANTIZE_QK_TO_FP8:
         # Return k_scale for applying k_scale to K
+        # pyrefly: ignore [unbound-name]
         return k, v, k_scale
     else:
         return k, v
@@ -1109,6 +1137,7 @@ def dequantize(
     shift,
     PACKED_PER_VAL: tl.constexpr,
     IS_HIP: tl.constexpr,
+    # pyrefly: ignore [bad-function-definition]
     USE_FP32_SCALES: tl.constexpr = False,
 ):
     """PACKED_PER_VAL is the number of values packed into each element x_.
@@ -1324,6 +1353,7 @@ def _splitK_reduce_varargs(
 
     out_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
     for i in range(len(Out_splitK)):
+        # pyrefly: ignore [unbound-name]
         out_splitk_offset[i] = (  # noqa: F821
             stride_osk_z[i] * off_z  # type: ignore # noqa: F821
             + stride_osk_g[i] * off_g
@@ -1333,6 +1363,7 @@ def _splitK_reduce_varargs(
         )
     lse_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
     for i in range(len(Out_splitK)):
+        # pyrefly: ignore [unbound-name]
         lse_splitk_offset[i] = (  # noqa: F821
             stride_lsek_z[i] * off_z  # type: ignore # noqa: F821
             + stride_lsek_g[i] * off_g

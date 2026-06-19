@@ -35,6 +35,14 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f8f8bf16_rowwise_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
   m.def(
       "f8f8bf16_rowwise_grouped_dynamic(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor zero_start_index_M, bool zeroing_output_tensor=True) -> Tensor");
+  // MXFP8 x MXFP4 GEMM: shared schema; CUDA uses the CUTLASS implementation,
+  // ROCm uses the Triton implementation registered by mx8mx4_gemm.py.
+  m.def(
+      "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
+  // Grouped variant: CUDA uses CUTLASS, ROCm uses the Triton implementation
+  // registered by mx8mx4_gemm.py via torch.library.impl.
+  m.def(
+      "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
 #ifdef USE_ROCM
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
@@ -61,10 +69,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None, Tensor? global_scale=None, int mxfp4_block_size=32) -> Tensor");
   m.def(
-      "mx8mx4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
-  m.def(
-      "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
-  m.def(
       "mx8mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
   m.def(
       "mx6mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
@@ -76,8 +80,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f4f4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, Tensor(a!)? global_scale=None) -> Tensor");
   m.def(
       "f4f4bf16_ultra_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor x_global_scale, Tensor w_global_scale, Tensor(a!)? output=None) -> Tensor");
-  m.def(
-      "f8f8bf16(Tensor XQ, Tensor WQ, Tensor scale, bool use_fast_accum=True) -> Tensor");
   m.def(
       "f8f8bf16_groupwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale) -> Tensor");
   m.def(
@@ -143,7 +145,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f4f4bf16_ultra_grouped_mm", f4f4bf16_ultra_grouped_mm);
-  m.impl("f8f8bf16", f8f8bf16);
   m.impl("bf16x9_gemm", bf16x9_gemm);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);
@@ -197,7 +198,6 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("mx8mx8bf16_grouped_mm", mx8mx8bf16_grouped_mm);
   m.impl("f4f4bf16_grouped_mm", f4f4bf16_grouped_mm);
   m.impl("f4f4bf16_ultra_grouped_mm", f4f4bf16_ultra_grouped_mm);
-  m.impl("f8f8bf16", f8f8bf16);
   m.impl("bf16x9_gemm", bf16x9_gemm);
   m.impl("f8i4bf16_rowwise", f8i4bf16_rowwise);
   m.impl("f8i4bf16_shuffled", f8i4bf16_shuffled);

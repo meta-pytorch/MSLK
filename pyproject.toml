@@ -1,0 +1,27 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Keep formatting in sync with the internal fbcode pyfmt configuration for
+# fbcode/mslk (see fbsource/tools/lint/pyfmt/config.toml). pyfmt resolves
+# mslk to the ruff-api formatter with the usort import sorter, so configure
+# ufmt to use the same tools here for the open source mirror.
+[tool.ufmt]
+formatter = "ruff-api"
+sorter = "usort"
+# Vendored OSS flash-attention code; excluded from formatting to match the
+# internal fbcode pyfmt config (which excludes mslk/attention/flash_attn).
+excludes = [
+    "mslk/attention/flash_attn",
+    "mslk/gemm/blackwell_mixed_input_gemm",
+    "test/gemm/test_blackwell_mixed_input_gemm.py",
+    "test/attention/test_flash_attn_varlen.py",
+    "test/attention/test_flash_attn.py",
+]
+
+# pyfmt sorts everything in fbsource alongside third-party packages (it does
+# not do first-party namespace detection), so disable it here to match.
+[tool.usort]
+first_party_detection = false

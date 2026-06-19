@@ -1232,6 +1232,7 @@ def _kernel_quantize_fp8_tensor(
         chunk_id += num_sms
 
     # Atomically update global max using integer atomics on float bits
+    # pyrefly: ignore [missing-attribute]
     local_max_int = local_max.to(tl.float32, bitcast=False).to(tl.int32, bitcast=True)
     tl.atomic_max(global_max_ptr, local_max_int)
 

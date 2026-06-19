@@ -152,11 +152,17 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
   # Note that .H sources are not automatically HIPified, so if they reference
   # CUDA-specific code, e.g. `#include <c10/cuda/CUDAStream.h>`, they will need
   # to be updated with `#ifdef USE_ROCM` guards.
+  #
+  # Exclude external/ - it contains vendored third-party submodules
+  # (composable_kernel, cutlass, googletest, hipify_torch) that are already
+  # HIP-native or CUDA-agnostic and must not be modified in-place.
   hipify(
     CUDA_SOURCE_DIR
       ${PROJECT_SOURCE_DIR}
     HEADER_INCLUDE_DIR
-      ${include_dirs_for_hipification})
+      ${include_dirs_for_hipification}
+    IGNORES
+      ${PROJECT_SOURCE_DIR}/external/*)
 
   BLOCK_PRINT(
     "HIPify Sources"
@@ -166,6 +172,9 @@ if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
     " "
     "HEADER_INCLUDE_DIR:"
     "${include_dirs_for_hipification}"
+    " "
+    "IGNORES:"
+    "${PROJECT_SOURCE_DIR}/external/*"
   )
 endif()
 

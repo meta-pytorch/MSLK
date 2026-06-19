@@ -43,11 +43,13 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractproperty
+    # pyrefly: ignore [bad-return]
     def hip(self) -> bool:
         """Whether this operator supports AMD or not."""
         pass
 
     @abc.abstractproperty
+    # pyrefly: ignore [bad-return]
     def cuda(self) -> bool:
         """Whether this operator supports Nvidia or not."""
         pass
