@@ -70,10 +70,11 @@ class FwOp(AttentionFwOpBase):
     Inputs are expected in BMGHK layout (batch, seq, kv_groups, heads_per_group,
     head_dim).  The default path launches a 2-D grid ``(B, G)`` — one program per
     (batch element, KV-head group) — and processes all ``Hq`` query heads that
-    share a single KV head inside that program.  For contiguous (non-paged) KV
-    when ``B * G`` is small but the context is long, the operator may launch an
-    additional split dimension ``(B, G, num_splits)``, run partial attention per
-    KV chunk, and merge with the same reduction as ``triton_splitk`` split-K.
+    share a single KV head inside that program.  When ``B * G`` is small but the
+    context is long, the operator may launch an additional split dimension
+    ``(B, G, num_splits)``, run partial attention per KV chunk, and merge with the
+    same reduction as ``triton_splitk`` split-K (contiguous or paged KV; paged
+    requires ``PAGE_SIZE`` divisible by the kernel ``BLOCK_N``).
 
     **Padding and paged KV cache.**
     Two attention-bias types are supported:
@@ -344,7 +345,6 @@ class FwOp(AttentionFwOpBase):
             )
         if (
             num_splits > 1
-            and not is_paged
             and get_gqa_decode_split_kernel is not None
         ):
             from .triton_splitk import merge_attentions
@@ -368,6 +368,7 @@ class FwOp(AttentionFwOpBase):
                 partial_o,
                 partial_lse,
                 seq_len,
+                block_tables,
                 inp.scale_float,
                 **_strides(q, "qz", "qm", "qg", "qh", "qk"),
                 **_strides(key, "kz", "kn", "kg", "kh", "kk"),
@@ -376,13 +377,18 @@ class FwOp(AttentionFwOpBase):
                     partial_o, "op_z", "op_g", "op_h", "op_s", "op_m", "op_k"
                 ),
                 **_strides(partial_lse, "lp_z", "lp_g", "lp_h", "lp_s", "lp_m"),
+                **(
+                    _strides(block_tables, "bt_batch", "bt_page")
+                    if is_paged
+                    else {"stride_bt_batch": 0, "stride_bt_page": 0}
+                ),
                 Z=B,
                 G=G,
                 Hq=Hq,
                 Mq=Mq,
                 N_CTX_K=N_CTX_K,
                 BLOCK_DMODEL=D,
-                USE_PAGED=False,
+                USE_PAGED=is_paged,
                 PAGE_SIZE=page_size,
                 HQ_BLOCK=HQ_BLOCK,
                 num_splits=num_splits,
