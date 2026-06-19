@@ -19,9 +19,13 @@ from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context,
 from .utils.op_common import register_operator
 
 if is_triton_available():
-    from ._triton.gqa_decode_kernels import get_gqa_decode_kernel
+    from ._triton.gqa_decode_kernels import (
+        get_gqa_decode_kernel,
+        get_gqa_decode_split_kernel,
+    )
 else:
     get_gqa_decode_kernel = None  # type: ignore
+    get_gqa_decode_split_kernel = None  # type: ignore
 
 
 def _strides(x: Optional[torch.Tensor], *stride_names: str):
@@ -64,11 +68,12 @@ class FwOp(AttentionFwOpBase):
 
     **GQA layout and launch grid.**
     Inputs are expected in BMGHK layout (batch, seq, kv_groups, heads_per_group,
-    head_dim).  The kernel launches a 2-D grid of shape ``(B, G)`` — one program
-    per (batch element, KV-head group) — and processes all ``Hq`` query heads
-    that share a single KV head inside that program.  This avoids the
-    expand-and-head-swap trick used by ``triton_splitk.FwOp`` and keeps KV
-    traffic minimal.
+    head_dim).  The default path launches a 2-D grid ``(B, G)`` — one program per
+    (batch element, KV-head group) — and processes all ``Hq`` query heads that
+    share a single KV head inside that program.  For contiguous (non-paged) KV
+    when ``B * G`` is small but the context is long, the operator may launch an
+    additional split dimension ``(B, G, num_splits)``, run partial attention per
+    KV chunk, and merge with the same reduction as ``triton_splitk`` split-K.
 
     **Padding and paged KV cache.**
     Two attention-bias types are supported:
@@ -108,6 +113,8 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_BMGHK = True
     SUPPORTS_PARTIAL = False
     NAME = "triton_gqa_decodeF"
+
+    SPLIT_K: Optional[int] = None
 
     @classmethod
     def shape_not_supported_reasons(
@@ -242,6 +249,51 @@ class FwOp(AttentionFwOpBase):
             is_paged,
             page_size,
         )
+        
+    @classmethod
+    def get_split_k(
+        cls, B: int, G: int, H: int, Mk: int, Mq: int, page_size: int, is_paged=False
+    ) -> int:
+        """Heuristic for the number of splits"""
+        bh = max(B * H, 1)  # NOTE: Handle B*h=0 case
+        if torch.version.hip:
+            split_k = max(Mk + bh - 1, 1024) // bh
+            max_chunk_size = 64
+            split_k_stop_val = max(1024 / (B * G * H), 1)
+            split_k = max(min(split_k, Mk // max_chunk_size + 1), 1)                
+
+            while split_k > split_k_stop_val:
+                split_k = split_k // 2
+
+            split_size = (Mk + split_k - 1) // max(split_k, 1)
+
+            chunk_size = split_size // max_chunk_size * max_chunk_size
+            if chunk_size < split_size:
+                split_k += 1
+
+            split_k_upper_bound = 512
+        else:
+            if Mq > 1 and B * G * H > 64:
+                return 1
+            split_k = max(Mk, 1024) // bh
+            max_chunk_size = 64 if Mk <= 512 and bh <= 64 else 128
+            split_k_stop_val = Mk / max_chunk_size
+            split_k_upper_bound = 64
+
+            while split_k > split_k_stop_val:
+                split_k = split_k // 2
+
+        split_k = min(split_k, split_k_upper_bound)
+        split_k = max(split_k, 1)
+
+        # makes no sense that split_size is larger than page_size
+        if is_paged and torch.version.hip:
+            split_size = (Mk + split_k - 1) // split_k
+            if split_size > page_size:
+                split_size = page_size
+                split_k = (Mk + split_size - 1) // split_size
+
+        return split_k
 
     @classmethod
     def apply(
@@ -271,38 +323,103 @@ class FwOp(AttentionFwOpBase):
 
         out = torch.empty_like(q)
         kernel = cls.OPERATOR()
-        grid = (B, G)
         # HQ_BLOCK: smallest power-of-2 >= max(16, Hq).
         # Minimum 16 satisfies tl.dot's MFMA M-dimension requirement on ROCm.
         HQ_BLOCK = 32 if Hq > 16 else 16
 
-        kernel[grid](
-            q,
-            key,
-            value,
-            out,
-            seq_len,
-            block_tables,
-            inp.scale_float,
-            **_strides(q, "qz", "qm", "qg", "qh", "qk"),
-            **_strides(key, "kz", "kn", "kg", "kh", "kk"),
-            **_strides(value, "vz", "vn", "vg", "vh", "vk"),
-            **_strides(out, "oz", "om", "og", "oh", "ok"),
-            **(
-                _strides(block_tables, "bt_batch", "bt_page")
-                if is_paged
-                else {"stride_bt_batch": 0, "stride_bt_page": 0}
-            ),
-            Z=B,
-            G=G,
-            Hq=Hq,
-            Mq=Mq,
-            N_CTX_K=N_CTX_K,
-            BLOCK_DMODEL=D,
-            USE_PAGED=is_paged,
-            PAGE_SIZE=page_size,
-            HQ_BLOCK=HQ_BLOCK,
+        attn_bias = inp.attn_bias
+        assert attn_bias is not None
+        Mk = min(N_CTX_K, int(attn_bias.k_seqinfo.max_seqlen))
+        additive_bias = (
+            inp.attn_bias if isinstance(inp.attn_bias, torch.Tensor) else None
         )
+
+        if cls.SPLIT_K is not None:
+            num_splits = cls.SPLIT_K
+        else:
+            num_splits = (
+                cls.get_split_k(B, G, Hq, Mk, Mq, page_size, is_paged)
+                if additive_bias is None
+                else 1
+            )
+        if (
+            num_splits > 1
+            and not is_paged
+            and get_gqa_decode_split_kernel is not None
+        ):
+            from .triton_splitk import merge_attentions
+
+            split_kernel = get_gqa_decode_split_kernel()
+            partial_o = torch.empty(
+                (B, G, Hq, num_splits, Mq, D),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            partial_lse = torch.empty(
+                (B, G, Hq, num_splits, Mq),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            grid = (B, G, num_splits)
+            split_kernel[grid](
+                q,
+                key,
+                value,
+                partial_o,
+                partial_lse,
+                seq_len,
+                inp.scale_float,
+                **_strides(q, "qz", "qm", "qg", "qh", "qk"),
+                **_strides(key, "kz", "kn", "kg", "kh", "kk"),
+                **_strides(value, "vz", "vn", "vg", "vh", "vk"),
+                **_strides(
+                    partial_o, "op_z", "op_g", "op_h", "op_s", "op_m", "op_k"
+                ),
+                **_strides(partial_lse, "lp_z", "lp_g", "lp_h", "lp_s", "lp_m"),
+                Z=B,
+                G=G,
+                Hq=Hq,
+                Mq=Mq,
+                N_CTX_K=N_CTX_K,
+                BLOCK_DMODEL=D,
+                USE_PAGED=False,
+                PAGE_SIZE=page_size,
+                HQ_BLOCK=HQ_BLOCK,
+                num_splits=num_splits,
+            )
+            lse_merge_buf = torch.empty(
+                (B, G, Hq, Mq), dtype=torch.float32, device=q.device
+            )
+            merge_attentions(out, lse_merge_buf, partial_o, partial_lse)
+        else:
+            grid = (B, G)
+            kernel[grid](
+                q,
+                key,
+                value,
+                out,
+                seq_len,
+                block_tables,
+                inp.scale_float,
+                **_strides(q, "qz", "qm", "qg", "qh", "qk"),
+                **_strides(key, "kz", "kn", "kg", "kh", "kk"),
+                **_strides(value, "vz", "vn", "vg", "vh", "vk"),
+                **_strides(out, "oz", "om", "og", "oh", "ok"),
+                **(
+                    _strides(block_tables, "bt_batch", "bt_page")
+                    if is_paged
+                    else {"stride_bt_batch": 0, "stride_bt_page": 0}
+                ),
+                Z=B,
+                G=G,
+                Hq=Hq,
+                Mq=Mq,
+                N_CTX_K=N_CTX_K,
+                BLOCK_DMODEL=D,
+                USE_PAGED=is_paged,
+                PAGE_SIZE=page_size,
+                HQ_BLOCK=HQ_BLOCK,
+            )
 
         # Restore flattened batch layout expected by callers/tests.
         if inp.query.shape[0] == 1:

@@ -22,6 +22,8 @@ AUTOTUNER_KEY = [
     "PAGE_SIZE",
 ]
 
+AUTOTUNER_KEY_SPLIT = AUTOTUNER_KEY + ["num_splits"]
+
 
 @triton.jit
 def _fwd_gqa_decode_kernel(
@@ -75,6 +77,9 @@ def _fwd_gqa_decode_kernel(
         not USE_PAGED or BLOCK_N <= PAGE_SIZE,
         "BLOCK_N must be <= PAGE_SIZE for paged attention: each tile must fit within one page",
     )
+    # Same log2e as splitk_kernels: use exp2 in the softmax loop so logits are in
+    # "log2 domain" (m_is stores max * log2e). See triton issue #5466 / CSE on exp.
+    log2e = tl.full((), 1.44269504, tl.float32)
     off_b = tl.program_id(0)
     off_g = tl.program_id(1)
 
@@ -112,6 +117,7 @@ def _fwd_gqa_decode_kernel(
             * sm_scale
         )  # [HQ_BLOCK, D]
 
+        # m_is holds max logits scaled by log2e (matches splitk online softmax state).
         m_is = tl.full([HQ_BLOCK], -float("inf"), dtype=tl.float32)
         l_is = tl.zeros([HQ_BLOCK], dtype=tl.float32)
         accs = tl.zeros([HQ_BLOCK, BLOCK_DMODEL], dtype=tl.float32)
@@ -172,10 +178,13 @@ def _fwd_gqa_decode_kernel(
             qk = tl.where(offs_h[:, None] < Hq, qk, float("-inf"))
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
-            # Online softmax — 2D state, each row independent.
-            m_new = tl.maximum(m_is, tl.max(qk, axis=1))  # [HQ_BLOCK]
-            alpha = tl.exp(m_is - m_new)  # [HQ_BLOCK]
-            p = tl.exp(qk - m_new[:, None])  # [HQ_BLOCK, BLOCK_N]
+            # Online softmax (exp2 + log2e), same algebra as natural exp; see splitk_kernels.
+            qk_s = qk * log2e
+            m_new = tl.maximum(m_is, tl.max(qk_s, axis=1))  # [HQ_BLOCK]
+            alpha = tl.math.exp2(m_is - m_new)  # [HQ_BLOCK]
+            p = tl.math.exp2(qk_s - m_new[:, None])  # [HQ_BLOCK, BLOCK_N]
+            alpha = tl.where(m_new == float("-inf"), 0.0, alpha)
+            p = tl.where(m_new[:, None] == float("-inf"), 0.0, p)
             l_is = alpha * l_is + tl.sum(p, axis=1)  # [HQ_BLOCK]
 
             # PV: [HQ_BLOCK, BLOCK_N] x [BLOCK_N, D] -> [HQ_BLOCK, D]
@@ -197,6 +206,179 @@ def _fwd_gqa_decode_kernel(
             + offs_d[None, :] * stride_ok,
             accs.to(Out.dtype.element_ty),
             mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+        )
+
+
+@triton.jit
+def _fwd_gqa_decode_split_kernel(
+    Q,
+    K,
+    V,
+    Out_partial,
+    LSE_partial,
+    Seq_len,
+    sm_scale,
+    stride_qz,
+    stride_qm,
+    stride_qg,
+    stride_qh,
+    stride_qk,
+    stride_kz,
+    stride_kn,
+    stride_kg,
+    stride_kh,
+    stride_kk,
+    stride_vz,
+    stride_vn,
+    stride_vg,
+    stride_vh,
+    stride_vk,
+    stride_op_z,
+    stride_op_g,
+    stride_op_h,
+    stride_op_s,
+    stride_op_m,
+    stride_op_k,
+    stride_lp_z,
+    stride_lp_g,
+    stride_lp_h,
+    stride_lp_s,
+    stride_lp_m,
+    # partial layout matches merge_attentions: O (B,G,H,split,M,D), LSE (B,G,H,split,M)
+    Z: tl.constexpr,
+    G: tl.constexpr,
+    Hq: tl.constexpr,
+    Mq: tl.constexpr,
+    N_CTX_K: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_PAGED: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HQ_BLOCK: tl.constexpr,
+    num_splits: tl.int32,
+):
+    """
+    One KV chunk per (batch, group, split): partial attention + LSE for merge_attentions.
+    Non-paged only (USE_PAGED must be false). Grid: (Z, G, num_splits).
+
+    Partial tensors must match ``merge_attentions`` layout:
+    ``Out_partial`` (B, G, H, split, M, D), ``LSE_partial`` (B, G, H, split, M).
+    """
+    tl.static_assert(not USE_PAGED, "split decode path is non-paged only")
+    log2e = tl.full((), 1.44269504, tl.float32)
+    off_b = tl.program_id(0)
+    off_g = tl.program_id(1)
+    split_idx = tl.program_id(2)
+
+    kv_len = tl.load(Seq_len + off_b)
+    if kv_len <= 0:
+        return
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, HQ_BLOCK)
+
+    k_base = K + off_g * stride_kg + off_b * stride_kz
+    v_base = V + off_g * stride_vg + off_b * stride_vz
+
+    split_size = tl.cdiv(kv_len, num_splits)
+    chunk_lo = split_idx * split_size
+    chunk_hi = tl.minimum(chunk_lo + split_size, kv_len)
+
+    for off_mq in tl.static_range(Mq):
+        q_all = (
+            tl.load(
+                Q
+                + off_b * stride_qz
+                + off_mq * stride_qm
+                + off_g * stride_qg
+                + offs_h[:, None] * stride_qh
+                + offs_d[None, :] * stride_qk,
+                mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+                other=0.0,
+            ).to(tl.float32)
+            * sm_scale
+        )
+
+        m_is = tl.full([HQ_BLOCK], -float("inf"), dtype=tl.float32)
+        l_is = tl.zeros([HQ_BLOCK], dtype=tl.float32)
+        accs = tl.zeros([HQ_BLOCK, BLOCK_DMODEL], dtype=tl.float32)
+
+        if chunk_lo < chunk_hi:
+            first_b = chunk_lo // BLOCK_N
+            last_excl = tl.cdiv(chunk_hi, BLOCK_N)
+            for block_idx in range(first_b, last_excl):
+                start_n = block_idx * BLOCK_N
+                in_chunk = (start_n + offs_n >= chunk_lo) & (start_n + offs_n < chunk_hi)
+                n_mask = in_chunk & (offs_n < kv_len - start_n)
+
+                k_offs_n = start_n + offs_n
+                k = tl.load(
+                    k_base
+                    + k_offs_n[:, None] * stride_kn
+                    + offs_d[None, :] * stride_kk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )
+                v = tl.load(
+                    v_base
+                    + k_offs_n[:, None] * stride_vn
+                    + offs_d[None, :] * stride_vk,
+                    mask=n_mask[:, None] & (offs_d[None, :] < BLOCK_DMODEL),
+                    other=0.0,
+                )
+
+                qk = tl.dot(
+                    q_all.to(Q.dtype.element_ty),
+                    tl.trans(k).to(Q.dtype.element_ty),
+                ).to(tl.float32)
+                qk = tl.where(offs_h[:, None] < Hq, qk, float("-inf"))
+                qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+                qk_s = qk * log2e
+                m_new = tl.maximum(m_is, tl.max(qk_s, axis=1))
+                alpha = tl.math.exp2(m_is - m_new)
+                p = tl.math.exp2(qk_s - m_new[:, None])
+                alpha = tl.where(m_new == float("-inf"), 0.0, alpha)
+                p = tl.where(m_new[:, None] == float("-inf"), 0.0, p)
+                l_is = alpha * l_is + tl.sum(p, axis=1)
+                accs = accs * alpha[:, None] + tl.dot(
+                    p.to(Q.dtype.element_ty),
+                    v.to(Q.dtype.element_ty),
+                )
+                m_is = m_new
+
+            accs = accs / tl.maximum(l_is[:, None], 1e-6)
+            lse_row = (tl.math.log2(tl.maximum(l_is, 1e-30)) + m_is) / log2e
+        else:
+            accs = tl.zeros([HQ_BLOCK, BLOCK_DMODEL], dtype=tl.float32)
+            lse_row = tl.full([HQ_BLOCK], float("-inf"), dtype=tl.float32)
+
+        o_base = (
+            Out_partial
+            + off_b * stride_op_z
+            + off_g * stride_op_g
+            + off_mq * stride_op_m
+            + split_idx * stride_op_s
+        )
+        tl.store(
+            o_base
+            + offs_h[:, None] * stride_op_h
+            + offs_d[None, :] * stride_op_k,
+            accs.to(Out_partial.dtype.element_ty),
+            mask=(offs_h[:, None] < Hq) & (offs_d[None, :] < BLOCK_DMODEL),
+        )
+
+        lse_base = (
+            LSE_partial
+            + off_b * stride_lp_z
+            + off_g * stride_lp_g
+            + off_mq * stride_lp_m
+            + split_idx * stride_lp_s
+        )
+        tl.store(
+            lse_base + offs_h * stride_lp_h,
+            lse_row.to(LSE_partial.dtype.element_ty),
+            mask=offs_h < Hq,
         )
 
 
@@ -229,5 +411,21 @@ _fwd_gqa_decode_autotune = triton.autotune(
 )(_fwd_gqa_decode_kernel)
 
 
+def _early_config_prune_split(configs, named_args, **kwargs):
+    # Split path is non-paged only; same BLOCK_N vs PAGE_SIZE rule as the fused kernel.
+    return _early_config_prune(configs, named_args, **kwargs)
+
+
+_fwd_gqa_decode_split_autotune = triton.autotune(
+    configs=_build_autotune_configs(),
+    key=AUTOTUNER_KEY_SPLIT,
+    prune_configs_by={"early_config_prune": _early_config_prune_split},
+)(_fwd_gqa_decode_split_kernel)
+
+
 def get_gqa_decode_kernel():
     return _fwd_gqa_decode_autotune
+
+
+def get_gqa_decode_split_kernel():
+    return _fwd_gqa_decode_split_autotune
