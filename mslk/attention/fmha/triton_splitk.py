@@ -96,7 +96,8 @@ def _is_supported_paged_bias(attn_bias: Any) -> bool:
 
 
 if TYPE_CHECKING or is_triton_available():
-    from ._triton.splitk_kernels import _fwd_kernel_splitK, _splitK_reduce
+    from ._triton.reduce_kernels import _splitK_reduce
+    from ._triton.splitk_kernels import _fwd_kernel_splitK
 else:
     _fwd_kernel_splitK = None
     _splitK_reduce = None
@@ -1067,7 +1068,7 @@ def merge_attentions(
 ):
     import triton
 
-    from ._triton.splitk_kernels import _splitK_reduce
+    from ._triton.reduce_kernels import _splitK_reduce
 
     B, M, G, H, Kq = attn_out.shape
     B1, G1, H1, split_k, M1, Kq1 = attn_split.shape
@@ -1144,7 +1145,7 @@ def merge_attentions_varargs(
 ) -> List[torch.Tensor]:
     import triton
 
-    from ._triton.splitk_kernels import _splitK_reduce_varargs
+    from ._triton.reduce_kernels import _splitK_reduce_varargs
     from ._triton.vararg_kernel import unroll_varargs
 
     attn_out = torch.empty(
@@ -1236,7 +1237,7 @@ def merge_attentions_varargs_backward(
     grad_attn: torch.Tensor,
     grad_lse: torch.Tensor,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    from ._triton.splitk_kernels import _splitK_reduce_varargs_backward
+    from ._triton.reduce_kernels import _splitK_reduce_varargs_backward
     from ._triton.vararg_kernel import unroll_varargs
 
     dattn_splitk = [torch.empty_like(x) for x in attn_split]
