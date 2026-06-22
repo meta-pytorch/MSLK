@@ -12,11 +12,12 @@ import unittest
 import mslk.conv  # noqa: F401
 import torch
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_tensor
-from mslk.testing.device import skip_unless_compute_capability
+from mslk.testing.device import skipUnlessCuda, skipUnlessCudaCapability
 
 
 # f8f8bf16_conv is currently only supported on CUDA (not HIP) and requires SM100+.
-@skip_unless_compute_capability(10, reason="f8f8bf16_conv requires CUDA SM100+")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class F8F8BF16ConvTest(unittest.TestCase):
     """Test f8f8bf16_conv operator for correctness, compile, and export."""
 
