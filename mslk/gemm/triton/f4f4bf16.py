@@ -443,9 +443,16 @@ def mxfp4_grouped_mm(
         x_scale = x_scale.view(torch.uint8)
     if w_scale.dtype != torch.uint8:
         w_scale = w_scale.view(torch.uint8)
-    assert offsets.dtype == torch.int32 and offsets.dim() == 1
+        assert offsets.dtype == torch.int32 and offsets.dim() == 1
 
-    total_M = XQ.shape[0]
+        if WQ.dim() != 3:
+            raise RuntimeError(
+                "ROCm f4f4bf16_grouped_mm only supports 2D-3D grouped GEMM "
+                "(XQ [total_M, K//2], WQ [G, K//2, N] after caller transpose). "
+                "2D-2D K-grouped layout is CUDA-only."
+            )
+
+        total_M = XQ.shape[0]
     G = WQ.shape[0]
     # WQ here is [G, K//2, N] (already transposed by caller per the CUTLASS
     # convention WQ.transpose(-2,-1).is_contiguous()).
