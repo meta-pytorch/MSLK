@@ -66,10 +66,18 @@ def _mxfp4_autotune_configs():
                         continue
                     if bm * bk + bk * bn > 256 * 256 * 2:
                         continue
-                    configs.append(triton.Config(
-                        {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm},
-                        num_warps=nw, num_stages=ns,
-                    ))
+                    configs.append(
+                        triton.Config(
+                            {
+                                "BLOCK_M": bm,
+                                "BLOCK_N": bn,
+                                "BLOCK_K": bk,
+                                "GROUP_M": gm,
+                            },
+                            num_warps=nw,
+                            num_stages=ns,
+                        )
+                    )
     return configs
 
 
@@ -77,19 +85,26 @@ def _mxfp4_autotune_configs():
 @triton.jit
 def _mxfp4_gemm_kernel(
     # Pointers
-    a_ptr,             # [M, K//2] uint8
-    b_ptr,             # [N, K//2] uint8
-    a_scale_ptr,       # [M, K//32] uint8 (E8M0)
-    b_scale_ptr,       # [N, K//32] uint8 (E8M0)
-    c_ptr,             # [M, N] bf16
+    a_ptr,  # [M, K//2] uint8
+    b_ptr,  # [N, K//2] uint8
+    a_scale_ptr,  # [M, K//32] uint8 (E8M0)
+    b_scale_ptr,  # [N, K//32] uint8 (E8M0)
+    c_ptr,  # [M, N] bf16
     # Sizes
-    M, N, K,
+    M,
+    N,
+    K,
     # Strides (in elements/bytes for the respective tensor)
-    stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_asm, stride_ask,
-    stride_bsn, stride_bsk,
-    stride_cm, stride_cn,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_asm,
+    stride_ask,
+    stride_bsn,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
     # Meta
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -146,8 +161,12 @@ def _mxfp4_gemm_kernel(
     # B: stored as (N, K) row-major; tl.dot_scaled rhs wants [K_packed, BLOCK_N].
     b_base = b_ptr + safe_n[None, :] * stride_bn + offs_k_packed[:, None] * stride_bk
     # Scales: tl.dot_scaled expects both as [outer, K_blocks].
-    as_base = a_scale_ptr + safe_m[:, None] * stride_asm + offs_k_scale[None, :] * stride_ask
-    bs_base = b_scale_ptr + safe_n[:, None] * stride_bsn + offs_k_scale[None, :] * stride_bsk
+    as_base = (
+        a_scale_ptr + safe_m[:, None] * stride_asm + offs_k_scale[None, :] * stride_ask
+    )
+    bs_base = (
+        b_scale_ptr + safe_n[:, None] * stride_bsn + offs_k_scale[None, :] * stride_bsk
+    )
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -160,8 +179,12 @@ def _mxfp4_gemm_kernel(
         b_scale = tl.load(bs_base + scale_off * stride_bsk)
         # Chain accumulation through dot_scaled (avoids a separate add).
         acc = tl.dot_scaled(
-            a_pack, a_scale, "e2m1",
-            b_pack, b_scale, "e2m1",
+            a_pack,
+            a_scale,
+            "e2m1",
+            b_pack,
+            b_scale,
+            "e2m1",
             acc=acc,
             out_dtype=tl.float32,
         )
@@ -173,10 +196,10 @@ def _mxfp4_gemm_kernel(
 
 
 def mxfp4_gemm(
-    XQ: torch.Tensor,         # [M, K//2] uint8
-    WQ: torch.Tensor,         # [N, K//2] uint8
-    x_scale: torch.Tensor,    # [M, K//32] uint8 (E8M0)
-    w_scale: torch.Tensor,    # [N, K//32] uint8 (E8M0)
+    XQ: torch.Tensor,  # [M, K//2] uint8
+    WQ: torch.Tensor,  # [N, K//2] uint8
+    x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
+    w_scale: torch.Tensor,  # [N, K//32] uint8 (E8M0)
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """MXFP4 × MXFP4 → BF16 via native ``tl.dot_scaled`` MFMA (gfx950 only on ROCm)."""
@@ -206,13 +229,24 @@ def mxfp4_gemm(
         return (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
 
     _mxfp4_gemm_kernel[grid](
-        XQ, WQ, x_scale, w_scale, output,
-        M, N, K,
-        XQ.stride(0), XQ.stride(1),
-        WQ.stride(0), WQ.stride(1),
-        x_scale.stride(0), x_scale.stride(1),
-        w_scale.stride(0), w_scale.stride(1),
-        output.stride(0), output.stride(1),
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        output,
+        M,
+        N,
+        K,
+        XQ.stride(0),
+        XQ.stride(1),
+        WQ.stride(0),
+        WQ.stride(1),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        w_scale.stride(0),
+        w_scale.stride(1),
+        output.stride(0),
+        output.stride(1),
         **_HIP_OPTS,
     )
     return output
@@ -226,7 +260,9 @@ def _has_native_mxfp4_mfma() -> bool:
         return False
     if torch.version.hip is None:
         return True  # CUDA SM100 has native dot_scaled
-    arch = (getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or "").lower()
+    arch = (
+        getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
+    ).lower()
     return "gfx950" in arch
 
 
@@ -299,32 +335,47 @@ def _mxfp4_grouped_autotune_configs():
         (16, 256, 256, 1, 4, 2),
     ]
     for bm, bn, bk, gm, nw, ns in spec:
-        configs.append(triton.Config(
-            {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm},
-            num_warps=nw, num_stages=ns,
-        ))
+        configs.append(
+            triton.Config(
+                {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_M": gm},
+                num_warps=nw,
+                num_stages=ns,
+            )
+        )
     return configs
 
 
-@triton.autotune(configs=_mxfp4_grouped_autotune_configs(), key=["MAX_M_PER_GROUP", "N", "K", "G"])
+@triton.autotune(
+    configs=_mxfp4_grouped_autotune_configs(), key=["MAX_M_PER_GROUP", "N", "K", "G"]
+)
 @triton.jit
 def _mxfp4_grouped_mm_kernel(
     # Pointers
-    a_ptr,             # [total_M, K//2] uint8
-    b_ptr,             # [G, K//2, N] uint8 (caller passed transpose-of-[G,N,K//2])
-    a_scale_ptr,       # [total_M, K//32] uint8
-    b_scale_ptr,       # [G, N, K//32] uint8
-    c_ptr,             # [total_M, N] bf16
-    offsets_ptr,       # [G] int32, cumulative M ends
+    a_ptr,  # [total_M, K//2] uint8
+    b_ptr,  # [G, K//2, N] uint8 (caller passed transpose-of-[G,N,K//2])
+    a_scale_ptr,  # [total_M, K//32] uint8
+    b_scale_ptr,  # [G, N, K//32] uint8
+    c_ptr,  # [total_M, N] bf16
+    offsets_ptr,  # [G] int32, cumulative M ends
     # Sizes
-    total_M, N, K, G,
-    MAX_M_PER_GROUP,   # autotune key only (not used inside)
+    total_M,
+    N,
+    K,
+    G,
+    MAX_M_PER_GROUP,  # autotune key only (not used inside)
     # Strides
-    stride_am, stride_ak,
-    stride_bg, stride_bk, stride_bn,
-    stride_asm, stride_ask,
-    stride_bsg, stride_bsn, stride_bsk,
-    stride_cm, stride_cn,
+    stride_am,
+    stride_ak,
+    stride_bg,
+    stride_bk,
+    stride_bn,
+    stride_asm,
+    stride_ask,
+    stride_bsg,
+    stride_bsn,
+    stride_bsk,
+    stride_cm,
+    stride_cn,
     # Meta
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -342,7 +393,7 @@ def _mxfp4_grouped_mm_kernel(
     # cdiv(total_M, BLOCK_M) * cdiv(N, BLOCK_N), which can exceed HIP's 65535
     # grid-Y/Z limit, so it must live on X (limit 2**31-1). Expert id is on Y
     # (G is small).
-    pid = tl.program_id(0)    # tile id within this expert
+    pid = tl.program_id(0)  # tile id within this expert
     pid_g = tl.program_id(1)  # expert id 0..G-1
 
     # Resolve [m_start, m_end) for this expert. Use a mask on the load itself
@@ -384,11 +435,14 @@ def _mxfp4_grouped_mm_kernel(
     n_mask = offs_n_unclamped < N
 
     # A: row-major [total_M, K//2], pick the expert's slab via m_start offset.
-    a_base = a_ptr + offs_m_global[:, None] * stride_am + offs_k_packed[None, :] * stride_ak
+    a_base = (
+        a_ptr + offs_m_global[:, None] * stride_am + offs_k_packed[None, :] * stride_ak
+    )
     # B: [G, K//2, N], stored with caller-supplied .transpose(-2,-1) so the
     # K-major view here is what tl.dot_scaled rhs expects.
     b_base = (
-        b_ptr + pid_g * stride_bg
+        b_ptr
+        + pid_g * stride_bg
         + offs_k_packed[:, None] * stride_bk
         + offs_n[None, :] * stride_bn
     )
@@ -398,7 +452,8 @@ def _mxfp4_grouped_mm_kernel(
         + offs_k_scale[None, :] * stride_ask
     )
     bs_base = (
-        b_scale_ptr + pid_g * stride_bsg
+        b_scale_ptr
+        + pid_g * stride_bsg
         + offs_n[:, None] * stride_bsn
         + offs_k_scale[None, :] * stride_bsk
     )
@@ -406,14 +461,22 @@ def _mxfp4_grouped_mm_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     K_packed = K // 2
     for k_off_packed in range(0, K_packed, PACKED_BLOCK_K):
-        a_pack = tl.load(a_base + k_off_packed * stride_ak, mask=m_mask[:, None], other=0)
+        a_pack = tl.load(
+            a_base + k_off_packed * stride_ak, mask=m_mask[:, None], other=0
+        )
         b_pack = tl.load(b_base + k_off_packed * stride_bk)
         scale_off = (k_off_packed * 2) // 32
-        a_scale = tl.load(as_base + scale_off * stride_ask, mask=m_mask[:, None], other=0)
+        a_scale = tl.load(
+            as_base + scale_off * stride_ask, mask=m_mask[:, None], other=0
+        )
         b_scale = tl.load(bs_base + scale_off * stride_bsk)
         acc = tl.dot_scaled(
-            a_pack, a_scale, "e2m1",
-            b_pack, b_scale, "e2m1",
+            a_pack,
+            a_scale,
+            "e2m1",
+            b_pack,
+            b_scale,
+            "e2m1",
             acc=acc,
             out_dtype=tl.float32,
         )
@@ -425,11 +488,11 @@ def _mxfp4_grouped_mm_kernel(
 
 
 def mxfp4_grouped_mm(
-    XQ: torch.Tensor,                       # [total_M, K//2] uint8
-    WQ: torch.Tensor,                       # [G, K//2, N] uint8 (K-major, caller transposed)
-    x_scale: torch.Tensor,                  # [total_M, K//32] uint8
-    w_scale: torch.Tensor,                  # [G, N, K//32] uint8
-    offsets: torch.Tensor,                  # [G] int32, cumulative M ends
+    XQ: torch.Tensor,  # [total_M, K//2] uint8
+    WQ: torch.Tensor,  # [G, K//2, N] uint8 (K-major, caller transposed)
+    x_scale: torch.Tensor,  # [total_M, K//32] uint8
+    w_scale: torch.Tensor,  # [G, N, K//32] uint8
+    offsets: torch.Tensor,  # [G] int32, cumulative M ends
     output: Optional[torch.Tensor] = None,
     global_scale: Optional[torch.Tensor] = None,  # unused in MXFP4 path
 ) -> torch.Tensor:
@@ -495,13 +558,29 @@ def mxfp4_grouped_mm(
         )
 
     _mxfp4_grouped_mm_kernel[grid](
-        XQ, WQ, x_scale, w_scale, output, offsets,
-        total_M, N, K, G, max_m_per_group,
-        XQ.stride(0), XQ.stride(1),
-        WQ.stride(0), WQ.stride(1), WQ.stride(2),
-        x_scale.stride(0), x_scale.stride(1),
-        w_scale.stride(0), w_scale.stride(1), w_scale.stride(2),
-        output.stride(0), output.stride(1),
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        output,
+        offsets,
+        total_M,
+        N,
+        K,
+        G,
+        max_m_per_group,
+        XQ.stride(0),
+        XQ.stride(1),
+        WQ.stride(0),
+        WQ.stride(1),
+        WQ.stride(2),
+        x_scale.stride(0),
+        x_scale.stride(1),
+        w_scale.stride(0),
+        w_scale.stride(1),
+        w_scale.stride(2),
+        output.stride(0),
+        output.stride(1),
         **_HIP_OPTS,
     )
     return output
@@ -528,22 +607,25 @@ def mxfp4_grouped_mm(
 
 
 def mxfp4_grouped_stacked_gemm(
-    XQ: torch.Tensor,                       # [total_M, K//2] uint8 contiguous
-    WQ: torch.Tensor,                       # [G, N, K//2] uint8
-    x_scale: torch.Tensor,                  # [total_M, K//32] or [G, M, K//32] uint8
-    w_scale: torch.Tensor,                  # [G, N, K//32] uint8
-    M_sizes: torch.Tensor,                  # [G] int64
+    XQ: torch.Tensor,  # [total_M, K//2] uint8 contiguous
+    WQ: torch.Tensor,  # [G, N, K//2] uint8
+    x_scale: torch.Tensor,  # [total_M, K//32] or [G, M, K//32] uint8
+    w_scale: torch.Tensor,  # [G, N, K//32] uint8
+    M_sizes: torch.Tensor,  # [G] int64
     output: Optional[torch.Tensor] = None,
-    global_scale: Optional[torch.Tensor] = None,        # unused (NVFP4 only)
-    starting_row_after_padding: Optional[torch.Tensor] = None,  # CUTLASS-specific; ignored on AMD
+    global_scale: Optional[torch.Tensor] = None,  # unused (NVFP4 only)
+    starting_row_after_padding: Optional[
+        torch.Tensor
+    ] = None,  # CUTLASS-specific; ignored on AMD
     use_mx: bool = True,
-    offsets_override: Optional[torch.Tensor] = None,    # AMD-only: pre-computed int32 cumulative M ends; skips cumsum
+    offsets_override: Optional[
+        torch.Tensor
+    ] = None,  # AMD-only: pre-computed int32 cumulative M ends; skips cumsum
 ) -> torch.Tensor:
-    """ROCm Triton implementation of mslk::f4f4bf16_grouped_stacked (MXFP4 path).
-
-
-    """
-    assert use_mx, "AMD path only supports MXFP4 (use_mx=True). NVFP4 path not implemented."
+    """ROCm Triton implementation of mslk::f4f4bf16_grouped_stacked (MXFP4 path)."""
+    assert use_mx, (
+        "AMD path only supports MXFP4 (use_mx=True). NVFP4 path not implemented."
+    )
     _require_native_mxfp4()
 
     if XQ.dtype != torch.uint8:
@@ -599,13 +681,29 @@ def mxfp4_grouped_stacked_gemm(
     #   stride_bk = WQ.stride(2)
     #   stride_bn = WQ.stride(1)
     _mxfp4_grouped_mm_kernel[grid](
-        XQ, WQ, x_scale, w_scale, output, offsets,
-        total_M, N, K, G, max_m_per_group,
-        XQ.stride(0), XQ.stride(1),
-        WQ.stride(0), WQ.stride(2), WQ.stride(1),  # <-- swapped
-        x_scale.stride(0), x_scale.stride(1),
-        w_scale.stride(0), w_scale.stride(1), w_scale.stride(2),
-        output.stride(0), output.stride(1),
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        output,
+        offsets,
+        total_M,
+        N,
+        K,
+        G,
+        max_m_per_group,
+        XQ.stride(0),
+        XQ.stride(1),
+        WQ.stride(0),
+        WQ.stride(2),
+        WQ.stride(1),  # <-- swapped
+        x_scale.stride(0),
+        x_scale.stride(1),
+        w_scale.stride(0),
+        w_scale.stride(1),
+        w_scale.stride(2),
+        output.stride(0),
+        output.stride(1),
         **_HIP_OPTS,
     )
     return output

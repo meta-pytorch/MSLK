@@ -398,7 +398,9 @@ def _kernel_quantize_mx4_unpack(
 
             n_col_blocks = SCALE_K // 4
             first_dim = padded_exp_offset // (512 * n_col_blocks)
-            second_dim = (padded_exp_offset % (512 * n_col_blocks)) // (128 * n_col_blocks)
+            second_dim = (padded_exp_offset % (512 * n_col_blocks)) // (
+                128 * n_col_blocks
+            )
             third_dim = (padded_exp_offset % (128 * n_col_blocks)) // (4 * n_col_blocks)
             fourth_dim = (padded_exp_offset % (4 * n_col_blocks)) // 4
             fifth_dim = padded_exp_offset % 4

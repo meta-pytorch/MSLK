@@ -579,7 +579,10 @@ if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
         from mslk.gemm.triton.f4f4bf16 import f4f4bf16 as _triton_f4f4bf16
 
         return _triton_f4f4bf16(
-            XQ, WQ, x_scale, w_scale,
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
             output=output,
             global_scale=global_scale,
             mxfp4_block_size=mxfp4_block_size,
@@ -621,12 +624,18 @@ if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_mm") and torch.version.hip is n
         from mslk.gemm.triton.f4f4bf16 import mxfp4_grouped_mm
 
         return mxfp4_grouped_mm(
-            XQ, WQ, x_scale, w_scale, offsets,
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            offsets,
             output=output,
             global_scale=global_scale,
         )
 
-    _f4f4bf16_grouped_mm_lib.impl("f4f4bf16_grouped_mm", _f4f4bf16_grouped_mm_rocm_impl, "CUDA")
+    _f4f4bf16_grouped_mm_lib.impl(
+        "f4f4bf16_grouped_mm", _f4f4bf16_grouped_mm_rocm_impl, "CUDA"
+    )
 
     @torch.library.register_fake("mslk::f4f4bf16_grouped_mm")
     def _f4f4bf16_grouped_mm_rocm_meta(
@@ -644,7 +653,10 @@ if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_mm") and torch.version.hip is n
         return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
-if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_stacked") and torch.version.hip is not None:
+if (
+    not hasattr(torch.ops.mslk, "f4f4bf16_grouped_stacked")
+    and torch.version.hip is not None
+):
     _f4f4bf16_grouped_stacked_lib = torch.library.Library("mslk", "FRAGMENT")
     _f4f4bf16_grouped_stacked_lib.define(
         "f4f4bf16_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, "
@@ -665,7 +677,11 @@ if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_stacked") and torch.version.hip
         from mslk.gemm.triton.f4f4bf16 import mxfp4_grouped_stacked_gemm
 
         return mxfp4_grouped_stacked_gemm(
-            XQ, WQ, x_scale, w_scale, M_sizes,
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            M_sizes,
             global_scale=global_scale,
             starting_row_after_padding=starting_row_after_padding,
             use_mx=use_mx,
