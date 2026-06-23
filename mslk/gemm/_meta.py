@@ -550,3 +550,142 @@ if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
         M = XQ.shape[0]
         N = WQ.shape[0]
         return torch.empty((M, N), dtype=torch.float16, device=XQ.device)
+
+
+# ---------------------------------------------------------------------------
+# ROCm-only fallback: define mslk::f4f4bf16 in Python when the CUDA C++ op
+# isn't present (i.e. we're on a ROCm build of MSLK). Dispatches to the Triton
+# MXFP4 kernel — see mslk/gemm/triton/f4f4bf16.py.
+# ---------------------------------------------------------------------------
+
+if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
+    _f4f4bf16_lib = torch.library.Library("mslk", "FRAGMENT")
+    _f4f4bf16_lib.define(
+        "f4f4bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, "
+        "Tensor? output=None, Tensor? global_scale=None, "
+        "int mxfp4_block_size=32) -> Tensor"
+    )
+
+    def _f4f4bf16_rocm_impl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+        mxfp4_block_size: int = 32,
+    ) -> torch.Tensor:
+        # Import lazily so importing mslk.gemm doesn't pull in triton on CPU-only nodes.
+        from mslk.gemm.triton.f4f4bf16 import f4f4bf16 as _triton_f4f4bf16
+
+        return _triton_f4f4bf16(
+            XQ, WQ, x_scale, w_scale,
+            output=output,
+            global_scale=global_scale,
+            mxfp4_block_size=mxfp4_block_size,
+        )
+
+    _f4f4bf16_lib.impl("f4f4bf16", _f4f4bf16_rocm_impl, "CUDA")
+
+    @torch.library.register_fake("mslk::f4f4bf16")
+    def _f4f4bf16_rocm_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+        mxfp4_block_size: int = 32,
+    ) -> torch.Tensor:
+        M = XQ.shape[0]
+        N = WQ.shape[0]
+        return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
+if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_mm") and torch.version.hip is not None:
+    _f4f4bf16_grouped_mm_lib = torch.library.Library("mslk", "FRAGMENT")
+    _f4f4bf16_grouped_mm_lib.define(
+        "f4f4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, "
+        "Tensor offsets, Tensor? output=None, Tensor? global_scale=None) -> Tensor"
+    )
+
+    def _f4f4bf16_grouped_mm_rocm_impl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        offsets: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from mslk.gemm.triton.f4f4bf16 import mxfp4_grouped_mm
+
+        return mxfp4_grouped_mm(
+            XQ, WQ, x_scale, w_scale, offsets,
+            output=output,
+            global_scale=global_scale,
+        )
+
+    _f4f4bf16_grouped_mm_lib.impl("f4f4bf16_grouped_mm", _f4f4bf16_grouped_mm_rocm_impl, "CUDA")
+
+    @torch.library.register_fake("mslk::f4f4bf16_grouped_mm")
+    def _f4f4bf16_grouped_mm_rocm_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        offsets: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        global_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        total_M = XQ.shape[0]
+        # WQ on ROCm is the caller-transposed [G, K//2, N]; N is the last dim.
+        N = WQ.shape[-1]
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
+if not hasattr(torch.ops.mslk, "f4f4bf16_grouped_stacked") and torch.version.hip is not None:
+    _f4f4bf16_grouped_stacked_lib = torch.library.Library("mslk", "FRAGMENT")
+    _f4f4bf16_grouped_stacked_lib.define(
+        "f4f4bf16_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, "
+        "Tensor w_scale, Tensor M_sizes, Tensor? global_scale=None, "
+        "Tensor? starting_row_after_padding=None, bool use_mx=True) -> Tensor"
+    )
+
+    def _f4f4bf16_grouped_stacked_rocm_impl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        M_sizes: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        starting_row_after_padding: Optional[torch.Tensor] = None,
+        use_mx: bool = True,
+    ) -> torch.Tensor:
+        from mslk.gemm.triton.f4f4bf16 import mxfp4_grouped_stacked_gemm
+
+        return mxfp4_grouped_stacked_gemm(
+            XQ, WQ, x_scale, w_scale, M_sizes,
+            global_scale=global_scale,
+            starting_row_after_padding=starting_row_after_padding,
+            use_mx=use_mx,
+        )
+
+    _f4f4bf16_grouped_stacked_lib.impl(
+        "f4f4bf16_grouped_stacked", _f4f4bf16_grouped_stacked_rocm_impl, "CUDA"
+    )
+
+    @torch.library.register_fake("mslk::f4f4bf16_grouped_stacked")
+    def _f4f4bf16_grouped_stacked_rocm_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        M_sizes: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        starting_row_after_padding: Optional[torch.Tensor] = None,
+        use_mx: bool = True,
+    ) -> torch.Tensor:
+        total_M = XQ.shape[0]
+        N = WQ.shape[1]  # WQ is [G, N, K//2] for grouped_stacked (no transpose)
+        return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
