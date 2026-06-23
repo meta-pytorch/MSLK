@@ -51,7 +51,6 @@ try:
 except ImportError:
     pass
 
-
 # Device gating for the GEMM kernels exercised in this file uses the shared skip
 # decorators from mslk.testing.device: the strict platform gates
 # skipUnlessCuda / skipUnlessRocm, refined by skipUnlessCudaCapability,
@@ -2182,6 +2181,7 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
 
+    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel).
     @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small

@@ -554,8 +554,8 @@ if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
 
 # ---------------------------------------------------------------------------
 # ROCm-only fallback: define mslk::f4f4bf16 in Python when the CUDA C++ op
-# isn't present (i.e. we're on a ROCm build of MSLK). Dispatches to the Triton
-# MXFP4 kernel — see mslk/gemm/triton/f4f4bf16.py.
+# isn't present. Dispatches to native MXFP4 Triton on gfx950 only — see
+# mslk/gemm/triton/f4f4bf16.py.
 # ---------------------------------------------------------------------------
 
 if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
