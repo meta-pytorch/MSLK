@@ -2466,8 +2466,8 @@ class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
     def preprocess(self, x, w):
         # x: list[Tensor [M, K]], w: list[Tensor [N, K]]; convert to stacked tensors.
         wq, w_scale = zip(*[triton_quantize_mx4_unpack(i) for i in w])
-        wq = torch.stack(wq, dim=0).contiguous()                 # [G, N, K//2]
-        w_scale = torch.stack(w_scale, dim=0).contiguous()       # [G, N, K//32]
+        wq = torch.stack(wq, dim=0).contiguous()  # [G, N, K//2]
+        w_scale = torch.stack(w_scale, dim=0).contiguous()  # [G, N, K//32]
         return x, wq, w_scale
 
     def quantize(self, x, wq, w_scale):
@@ -2476,7 +2476,7 @@ class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
             q, s = triton_quantize_mx4_unpack(xi)
             xq_list.append(q)
             x_scale_list.append(s)
-        xq = torch.cat(xq_list, dim=0).contiguous()              # [total_M, K//2]
+        xq = torch.cat(xq_list, dim=0).contiguous()  # [total_M, K//2]
         x_scale = torch.stack(x_scale_list, dim=0).contiguous()  # [G, M, K//32]
         # offsets: cumulative M per expert (int32 per the op schema).
         G = len(x)
