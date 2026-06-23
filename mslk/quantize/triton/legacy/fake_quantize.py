@@ -29,6 +29,7 @@ def _fake_quantize_nvfp4_kernel(
     pid = tl.program_id(0)
     FP8_E4M3_MAX = 448.0
     FLT_MIN: tl.constexpr = (  # type: ignore[Incompatible variable type]
+        # pyrefly: ignore [bad-assignment]
         1.175494350822287508e-38  # C FLT_MIN
     )
 

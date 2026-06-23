@@ -49,6 +49,30 @@ def compute_capability_in(major_min: int, major_max: int | None = None) -> bool:
     return major >= major_min and (major_max is None or major <= major_max)
 
 
+def compute_capability_at_least(major_min: int, minor_min: int = 0) -> bool:
+    """True if the device compute capability is at least ``(major_min, minor_min)``.
+
+    Unlike :func:`compute_capability_in`, this compares the full
+    ``(major, minor)`` pair, so it can express e.g. SM10.3+ (``(10, 3)``).
+    Returns ``False`` when no GPU is available.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() >= (major_min, minor_min)
+
+
+def cuda_version_at_least(major_min: int) -> bool:
+    """True on a CUDA build whose toolkit major version is at least ``major_min``.
+
+    This checks the CUDA *toolkit* the binary was built against
+    (``torch.version.cuda``), which is distinct from the device compute
+    capability. Returns ``False`` on ROCm or CPU-only builds.
+    """
+    if torch.version.cuda is None:
+        return False
+    return int(torch.version.cuda.split(".")[0]) >= major_min
+
+
 def get_gfx_arch_name() -> str:
     """Return the ROCm ``gcnArchName`` of the current device (e.g. ``gfx942``).
 

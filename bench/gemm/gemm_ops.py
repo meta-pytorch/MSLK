@@ -29,13 +29,13 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_group,
     quantize_fp8_row,
 )
+from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
 from mslk.utils.triton.fp8_utils import get_fp8_constants
-
 
 try:
     from tinygemm.utils import group_quantize_tensor
 
-    if torch.cuda.is_available() and torch.version.cuda:
+    if is_cuda():
         torch.ops.load_library("//tinygemm:tinygemm")
     TINYGEMM_ENABLED = True
 except ImportError:
@@ -88,6 +88,7 @@ class Accelerator(Enum):
     NVIDIA_SM100 = auto()
     NVIDIA_SM103 = auto()
     AMD_MI300X = auto()
+    AMD_GFX950 = auto()
 
 
 class GemmType(Enum):
@@ -108,11 +109,12 @@ def get_current_accelerator() -> Accelerator | None:
     if not torch.cuda.is_available():
         raise Exception("Cannot run gemm_bench without accelerator.")
 
-    if torch.version.hip is not None:
-        device_name = torch.cuda.get_device_name()
-        if "MI300X" in device_name.upper():
+    if is_rocm():
+        if is_gfx950():
+            return Accelerator.AMD_GFX950
+        if is_gfx942():
             return Accelerator.AMD_MI300X
-    elif torch.version.cuda is not None:
+    elif is_cuda():
         major, minor = torch.cuda.get_device_capability()
         if major == 9 and minor == 0:
             return Accelerator.NVIDIA_SM90
@@ -655,7 +657,7 @@ class FP8Rowwise(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def __init__(self):
@@ -1310,7 +1312,7 @@ class FP8RowwiseBatched(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
@@ -1432,7 +1434,7 @@ class FP8Blockwise(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
@@ -1950,7 +1952,7 @@ class BF16Grouped(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def preprocess(self, x, w):
@@ -2252,7 +2254,7 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
 
 @register_gemm_op
-class CutlassMX8MX4Groupwise(GemmOpBase):
+class MX8MX4Groupwise(GemmOpBase):
     """
     MX8 activation x MX4 weight matmul with groupwise scaling.
     """
@@ -2275,7 +2277,11 @@ class CutlassMX8MX4Groupwise(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -3064,7 +3070,7 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
 
 
 @register_gemm_op
-class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
+class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
     """
     MXFP8 activation x MXFP4 weight grouped GEMM with 2D inputs and 3D weights.
     """
@@ -3072,18 +3078,19 @@ class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
     def preprocess(self, x, w):
         assert isinstance(x, list)
         assert isinstance(w, list)
+        # Cache per-group M sizes before concatenation so quantize can use
+        # the exact boundaries regardless of whether groups are equal-sized.
+        self._m_sizes = [xi.shape[0] for xi in x]
         x = torch.cat(x, dim=0).contiguous()
         w = torch.stack(w, dim=0).contiguous()
         return x, w
 
     def quantize(self, x, w):
-        block_size = 32
         G, _, K = w.shape
-        total_M = x.shape[0]
-        group_size = total_M // G
-        input_group_end_offsets = torch.arange(
-            group_size, total_M + 1, group_size, dtype=torch.int32, device=x.device
-        )
+        m_sizes = self._m_sizes
+        input_group_end_offsets = torch.tensor(
+            m_sizes, dtype=torch.int32, device=x.device
+        ).cumsum(0, dtype=torch.int32)
 
         wq_list = []
         w_scale_list = []
@@ -3096,19 +3103,18 @@ class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
 
         xq_list = []
         x_scale_list = []
-        for i in range(G):
-            prev_group_end = 0 if i == 0 else input_group_end_offsets[i - 1]
-            curr_group_end = input_group_end_offsets[i]
-            x_slice = x[prev_group_end:curr_group_end, :]
+        row = 0
+        for m_g in m_sizes:
+            x_slice = x[row : row + m_g, :]
             x_scale, xq = to_mxfp8(x_slice)
-            x_scale = _to_blocked(
-                x_scale.view(torch.int8).reshape(x_slice.shape[0], -1)
-            ).view(torch.uint8)
+            x_scale = _to_blocked(x_scale.view(torch.int8).reshape(m_g, -1)).view(
+                torch.uint8
+            )
             xq_list.append(xq)
             x_scale_list.append(x_scale)
+            row += m_g
         xq = torch.cat(xq_list, dim=0).contiguous()
         x_scale = torch.cat(x_scale_list, dim=0).contiguous()
-        x_scale = x_scale.reshape(-1, K // block_size)
         return xq, wq, x_scale, w_scale, input_group_end_offsets
 
     def compute(self, xq, wq, x_scale, w_scale, input_group_end_offsets):
@@ -3132,7 +3138,11 @@ class CutlassMX8MX4GroupwiseGrouped2D3D(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:

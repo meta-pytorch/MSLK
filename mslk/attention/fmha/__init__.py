@@ -178,6 +178,7 @@ class _fMHA(torch.autograd.Function):
 
     @staticmethod
     @torch.autograd.function.once_differentiable
+    # pyrefly: ignore [bad-override]
     def backward(ctx, grad, grad_lse):
         # Re-create context
         query, key, value, out, lse = ctx.saved_tensors

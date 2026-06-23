@@ -21,9 +21,21 @@ for op in gemm_ops:
 # by default in OSS PyTorch.
 import torch._utils_internal  # noqa: E402
 
+# pyrefly: ignore [missing-attribute]
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 from . import (
     _meta,
     fp4_autograd,
 )  # noqa: F401, E402
+import torch  # noqa: E402
+
+from . import _meta  # noqa: F401, E402
+
+if torch.version.hip is not None:
+    # Register the Triton implementation of mx8mx4bf16 for ROCm.  This import
+    # triggers the @torch.library.impl("mslk::mx8mx4bf16", "CUDA") decoration
+    # in mx8mx4_gemm.py, which overrides the default (non-existent) CUDA impl
+    # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
+    # kernel on AMD.
+    from .triton import mx8mx4_gemm  # noqa: F401

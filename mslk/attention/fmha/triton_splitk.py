@@ -96,7 +96,8 @@ def _is_supported_paged_bias(attn_bias: Any) -> bool:
 
 
 if TYPE_CHECKING or is_triton_available():
-    from ._triton.splitk_kernels import _fwd_kernel_splitK, _splitK_reduce
+    from ._triton.reduce_kernels import _splitK_reduce
+    from ._triton.splitk_kernels import _fwd_kernel_splitK
 else:
     _fwd_kernel_splitK = None
     _splitK_reduce = None
@@ -320,8 +321,8 @@ class FwOp(AttentionFwOpBase):
             split_k = max(Mk + bh - 1, 1024) // bh
             max_chunk_size = 64
             split_k_stop_val = max(1024 / (B * G * H), 1)
-            while split_k > 1 and Mk / (split_k - 1) < max_chunk_size:
-                split_k = split_k - 1
+            # Largest split_k whose chunk is still >= max_chunk_size keys
+            split_k = max(min(split_k, Mk // max_chunk_size + 1), 1)
 
             while split_k > split_k_stop_val:
                 split_k = split_k // 2
@@ -1067,7 +1068,7 @@ def merge_attentions(
 ):
     import triton
 
-    from ._triton.splitk_kernels import _splitK_reduce
+    from ._triton.reduce_kernels import _splitK_reduce
 
     B, M, G, H, Kq = attn_out.shape
     B1, G1, H1, split_k, M1, Kq1 = attn_split.shape
@@ -1101,17 +1102,27 @@ def merge_attentions(
         lse_split,
         attn_out,
         lse_out,
+        # pyrefly: ignore [bad-argument-type]
         split_k=split_k,
         splitK_pow2=splitK_pow2,
+        # pyrefly: ignore [bad-argument-type]
         **_strides(attn_split, "osk_z", "osk_g", "osk_h", "osk_s", "osk_m", "osk_k"),
+        # pyrefly: ignore [bad-argument-type]
         **_strides(lse_split, "lsek_z", "lsek_g", "lsek_h", "lsek_s", "lsek_m"),
+        # pyrefly: ignore [bad-argument-type]
         **_strides(attn_out, "oz", "om", "og", "oh", "ok"),
+        # pyrefly: ignore [bad-argument-type]
         **_strides(lse_out, "lse_z", "lse_g", "lse_h", "lse_m"),
+        # pyrefly: ignore [bad-argument-type]
         head_dim=head_dim,
         head_dim_pow_2=triton.next_power_of_2(head_dim),
+        # pyrefly: ignore [bad-argument-type]
         G=G,
+        # pyrefly: ignore [bad-argument-type]
         H=H,
+        # pyrefly: ignore [bad-argument-type]
         WRITE_LSE=lse_out is not None,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
     )
 
@@ -1134,7 +1145,7 @@ def merge_attentions_varargs(
 ) -> List[torch.Tensor]:
     import triton
 
-    from ._triton.splitk_kernels import _splitK_reduce_varargs
+    from ._triton.reduce_kernels import _splitK_reduce_varargs
     from ._triton.vararg_kernel import unroll_varargs
 
     attn_out = torch.empty(
@@ -1226,7 +1237,7 @@ def merge_attentions_varargs_backward(
     grad_attn: torch.Tensor,
     grad_lse: torch.Tensor,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    from ._triton.splitk_kernels import _splitK_reduce_varargs_backward
+    from ._triton.reduce_kernels import _splitK_reduce_varargs_backward
     from ._triton.vararg_kernel import unroll_varargs
 
     dattn_splitk = [torch.empty_like(x) for x in attn_split]
@@ -1299,6 +1310,7 @@ def _prepare_reduce_kernel_params(
     attn_split_strides = {}
     lse_split_strides = {}
     for i in range(len(attn_split)):
+        # pyrefly: ignore [no-matching-overload]
         attn_split_strides.update(
             _strides(
                 attn_split[i],
@@ -1309,6 +1321,7 @@ def _prepare_reduce_kernel_params(
                 "osk_k" + str(i),
             )
         )
+        # pyrefly: ignore [no-matching-overload]
         lse_split_strides.update(
             _strides(
                 lse_split[i],
@@ -1329,10 +1342,14 @@ def _prepare_reduce_kernel_params(
         **attn_split_strides,
         **lse_split_strides,
     }
+    # pyrefly: ignore [no-matching-overload]
     kernel_args.update(_strides(attn_out, "oz", "om", "og", "oh", "ok"))
+    # pyrefly: ignore [no-matching-overload]
     kernel_args.update(_strides(lse_out, "lse_z", "lse_g", "lse_h", "lse_m"))
     if grad_attn is not None:
+        # pyrefly: ignore [no-matching-overload]
         kernel_args.update(_strides(grad_attn, "doz", "dom", "dog", "doh", "dok"))
+        # pyrefly: ignore [no-matching-overload]
         kernel_args.update(_strides(grad_lse, "dlse_z", "dlse_g", "dlse_h", "dlse_m"))
     return kernel_args, grid
 

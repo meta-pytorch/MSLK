@@ -24,6 +24,7 @@ class FwOp(AttentionFwOpBase):
     OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16, torch.float}
+    # pyrefly: ignore [bad-override-mutable-attribute]
     SUPPORTED_MAX_K: int = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
