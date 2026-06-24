@@ -7,6 +7,7 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import os
 import unittest
 from typing import Optional, Union
 
@@ -49,6 +50,8 @@ try:
         MARLIN_ENABLED = True
 except ImportError:
     pass
+
+running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
 # Device gating for the GEMM kernels exercised in this file uses the shared skip
 # decorators from mslk.testing.device: the strict platform gates
@@ -934,10 +937,6 @@ class FP8GroupwiseTests(unittest.TestCase):
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
         torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
 
-
-@unittest.skipIf(
-    not SUPPORTS_BF16_INT4, "Skip if BF16Int4Tests is not supported on this device."
-)
 
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)
