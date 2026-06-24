@@ -35,3 +35,6 @@ if torch.version.hip is not None:
     # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
     # kernel on AMD.
     from .triton import mx8mx4_gemm  # noqa: F401
+
+    # Register BF16xINT4 rowwise, shuffled, and preshuffle_i4 Triton impls.
+    from .triton import int4_gemm  # noqa: F401

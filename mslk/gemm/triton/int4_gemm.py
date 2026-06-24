@@ -42,7 +42,6 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from triton import Config  # @manual
 
-
 # ---------------------------------------------------------------------------
 # Autotuning configs
 # ---------------------------------------------------------------------------
@@ -216,12 +215,14 @@ def matmul_bf16i4_rowwise(
     K2 = K // 2
 
     assert W.shape == (N, K2), f"W must be [N, K//2], got {W.shape}"
-    assert w_scale_group.shape == (num_groups, N), (
-        f"w_scale_group must be [num_groups, N]={num_groups, N}, got {w_scale_group.shape}"
-    )
-    assert w_zero_group.shape == (num_groups, N), (
-        f"w_zero_group must be [num_groups, N]={num_groups, N}, got {w_zero_group.shape}"
-    )
+    assert w_scale_group.shape == (
+        num_groups,
+        N,
+    ), f"w_scale_group must be [num_groups, N]={num_groups, N}, got {w_scale_group.shape}"
+    assert w_zero_group.shape == (
+        num_groups,
+        N,
+    ), f"w_zero_group must be [num_groups, N]={num_groups, N}, got {w_zero_group.shape}"
     group_size = K // num_groups
     assert group_size % 64 == 0, (
         f"group_size={group_size} must be divisible by 64 (2 * BLOCK_K_min=32); "
@@ -286,9 +287,9 @@ def matmul_bf16i4_rowwise_batched(
     B, M, K = X.shape
     _, N, _ = W.shape
     num_groups_total = w_scale.shape[0]
-    assert num_groups_total % B == 0, (
-        f"w_scale.shape[0]={num_groups_total} must be divisible by B={B}"
-    )
+    assert (
+        num_groups_total % B == 0
+    ), f"w_scale.shape[0]={num_groups_total} must be divisible by B={B}"
     num_groups = num_groups_total // B
 
     outs = []
@@ -297,6 +298,155 @@ def matmul_bf16i4_rowwise_batched(
         zp_b = w_zp[b * num_groups : (b + 1) * num_groups]
         outs.append(matmul_bf16i4_rowwise(X[b], W[b], scale_b, zp_b))
     return torch.stack(outs, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# BF16 preshuffle / unshuffle helpers
+# ---------------------------------------------------------------------------
+#
+# CUTLASS preshuffle_i4 (BF16 variant) reorders INT4 values within each
+# group of 8 along K using the permutation [0,2,4,6,1,3,5,7].  The CUDA
+# implementation uses cutlass::reorder_tensor; here we replicate it with
+# vectorised bitwise ops so it works on ROCm without CUTLASS headers.
+#
+# Input layout (rowwise): each byte packs (lo=even_K, hi=odd_K).
+#   Bytes [b0, b1, b2, b3] hold nibbles [n0,n1,n2,n3,n4,n5,n6,n7].
+# After preshuffle [0,2,4,6,1,3,5,7]:
+#   out_byte0 = lo(n0) | hi(n2)  — lo nibbles of b0 and b1
+#   out_byte1 = lo(n4) | hi(n6)  — lo nibbles of b2 and b3
+#   out_byte2 = lo(n1) | hi(n3)  — hi nibbles of b0 and b1
+#   out_byte3 = lo(n5) | hi(n7)  — hi nibbles of b2 and b3
+# This separates even-K (lo) nibbles into bytes 0-1 and odd-K (hi)
+# nibbles into bytes 2-3, which is a pure bitwise rearrangement.
+
+
+def _bf16_preshuffle_i4(WQ: torch.Tensor) -> torch.Tensor:
+    N, K2 = WQ.shape
+    assert (K2 * 2) % 8 == 0, f"K={K2 * 2} must be divisible by 8 for preshuffle"
+    b = WQ.view(torch.uint8).view(N, K2 // 4, 4).to(torch.int32)
+    lo = b & 0x0F
+    hi = (b >> 4) & 0x0F
+    out = torch.stack(
+        [
+            lo[:, :, 0] | (lo[:, :, 1] << 4),
+            lo[:, :, 2] | (lo[:, :, 3] << 4),
+            hi[:, :, 0] | (hi[:, :, 1] << 4),
+            hi[:, :, 2] | (hi[:, :, 3] << 4),
+        ],
+        dim=-1,
+    )
+    return out.to(torch.uint8).view(torch.int8).view(N, K2).contiguous()
+
+
+@triton.jit
+def _unshuffle_i4_kernel(
+    src_ptr,
+    dst_ptr,
+    num_elements,
+    BLOCK: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_elements
+
+    # Load 4 bytes as int32 — one group of 8 INT4 values in shuffled layout
+    val = tl.load(src_ptr + offs, mask=mask).to(tl.int32)
+
+    # Shuffled layout: lo nibbles in bytes 0-1, hi nibbles in bytes 2-3
+    # Extract each byte
+    b0 = val & 0xFF
+    b1 = (val >> 8) & 0xFF
+    b2 = (val >> 16) & 0xFF
+    b3 = (val >> 24) & 0xFF
+
+    # Reconstruct original rowwise bytes: byte_i = lo_nibble_i | (hi_nibble_i << 4)
+    out0 = (b0 & 0x0F) | ((b2 & 0x0F) << 4)
+    out1 = ((b0 >> 4) & 0x0F) | ((b2 >> 4) << 4)
+    out2 = (b1 & 0x0F) | ((b3 & 0x0F) << 4)
+    out3 = ((b1 >> 4) & 0x0F) | ((b3 >> 4) << 4)
+
+    result = out0 | (out1 << 8) | (out2 << 16) | (out3 << 24)
+    tl.store(dst_ptr + offs, result.to(tl.int32), mask=mask)
+
+
+def _bf16_unshuffle_i4(WQ_shuffled: torch.Tensor) -> torch.Tensor:
+    N, K2 = WQ_shuffled.shape
+    assert (K2 * 2) % 8 == 0, f"K={K2 * 2} must be divisible by 8 for unshuffle"
+    src = WQ_shuffled.view(torch.int32).contiguous()
+    dst = torch.empty_like(src)
+    num_elements = src.numel()
+    BLOCK = 1024
+    grid = (triton.cdiv(num_elements, BLOCK),)
+    _unshuffle_i4_kernel[grid](src, dst, num_elements, BLOCK)
+    return dst.view(torch.int8).view(N, K2)
+
+
+def preshuffle_i4_bf16(
+    WQ: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    WQ_shuffled = _bf16_preshuffle_i4(WQ)
+    return WQ_shuffled, w_scale
+
+
+# ---------------------------------------------------------------------------
+# Shuffled wrappers — unshuffle then delegate to rowwise kernel
+# ---------------------------------------------------------------------------
+
+
+def matmul_bf16i4_shuffled(
+    X: torch.Tensor,
+    W_shuffled: torch.Tensor,
+    w_scale_group: torch.Tensor,
+    w_zero_group: torch.Tensor,
+) -> torch.Tensor:
+    W = _bf16_unshuffle_i4(W_shuffled)
+    return matmul_bf16i4_rowwise(X, W, w_scale_group, w_zero_group)
+
+
+def matmul_bf16i4_shuffled_grouped(
+    X: torch.Tensor,
+    WQ: torch.Tensor,
+    w_scale_group: torch.Tensor,
+    w_zero_group: torch.Tensor,
+    M_sizes: torch.Tensor,
+) -> torch.Tensor:
+    G = M_sizes.shape[0]
+    N = WQ.shape[1]
+    K2 = WQ.shape[2]
+    M = X.shape[0]
+
+    W_unshuffled = torch.stack([_bf16_unshuffle_i4(WQ[g]) for g in range(G)])
+
+    m_list = M_sizes.cpu().tolist()
+    x_groups = torch.split(X, m_list, dim=0)
+
+    outs = []
+    for g in range(G):
+        if m_list[g] == 0:
+            outs.append(X.new_empty((0, N)))
+            continue
+        num_groups = w_scale_group.shape[1]
+        outs.append(
+            matmul_bf16i4_rowwise(
+                x_groups[g],
+                W_unshuffled[g],
+                w_scale_group[g],
+                w_zero_group[g],
+            )
+        )
+    return torch.cat(outs, dim=0)
+
+
+def matmul_bf16i4_shuffled_batched(
+    X: torch.Tensor,
+    WQ: torch.Tensor,
+    w_scale: torch.Tensor,
+    w_zp: torch.Tensor,
+) -> torch.Tensor:
+    B = X.shape[0]
+    W_unshuffled = torch.stack([_bf16_unshuffle_i4(WQ[b]) for b in range(B)])
+    return matmul_bf16i4_rowwise_batched(X, W_unshuffled, w_scale, w_zp)
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +479,52 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
             w_zp: torch.Tensor,
         ) -> torch.Tensor:
             return matmul_bf16i4_rowwise_batched(X, W, w_scale, w_zp)
+
+    if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled"):
+
+        @torch.library.impl("mslk::bf16i4bf16_shuffled", "CUDA")
+        def _bf16i4bf16_shuffled_rocm(
+            X: torch.Tensor,
+            W: torch.Tensor,
+            w_scale_group: torch.Tensor,
+            w_zero_group: torch.Tensor,
+        ) -> torch.Tensor:
+            return matmul_bf16i4_shuffled(X, W, w_scale_group, w_zero_group)
+
+    if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled_grouped"):
+
+        @torch.library.impl("mslk::bf16i4bf16_shuffled_grouped", "CUDA")
+        def _bf16i4bf16_shuffled_grouped_rocm(
+            X: torch.Tensor,
+            WQ: torch.Tensor,
+            w_scale_group: torch.Tensor,
+            w_zero_group: torch.Tensor,
+            M_sizes: torch.Tensor,
+        ) -> torch.Tensor:
+            return matmul_bf16i4_shuffled_grouped(
+                X, WQ, w_scale_group, w_zero_group, M_sizes
+            )
+
+    if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled_batched"):
+
+        @torch.library.impl("mslk::bf16i4bf16_shuffled_batched", "CUDA")
+        def _bf16i4bf16_shuffled_batched_rocm(
+            X: torch.Tensor,
+            WQ: torch.Tensor,
+            w_scale: torch.Tensor,
+            w_zp: torch.Tensor,
+        ) -> torch.Tensor:
+            return matmul_bf16i4_shuffled_batched(X, WQ, w_scale, w_zp)
+
+    if hasattr(torch.ops.mslk, "preshuffle_i4"):
+
+        @torch.library.impl("mslk::preshuffle_i4", "CUDA")
+        def _preshuffle_i4_rocm(
+            WQ: torch.Tensor,
+            w_scale: torch.Tensor,
+        ) -> "tuple[torch.Tensor, torch.Tensor]":
+            if w_scale.dtype == torch.bfloat16:
+                return preshuffle_i4_bf16(WQ, w_scale)
+            raise NotImplementedError(
+                f"ROCm preshuffle_i4 only supports BF16 scales, got {w_scale.dtype}"
+            )
