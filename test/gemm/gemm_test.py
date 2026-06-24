@@ -7,7 +7,6 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
-import itertools
 import unittest
 from typing import Optional, Union
 
@@ -2450,68 +2449,26 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4],  # G
-            [250, 500],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),   # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (3, None, 512, 2048),  # uneven: m_sizes_list=[64, 232, 600]
+        ]
     )
     def test_grouped_stacked_gemm(
         self,
         G: int,
-        M: int,
+        M,  # int for even case, None for uneven case
         N: int,
         K: int,
     ) -> None:
         """f4f4bf16_grouped_stacked uses per-expert M sizes, not offsets."""
-        XS = [
-            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-            for _ in range(G)
-        ]
-        WS = [
-            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
-            for _ in range(G)
-        ]
-        M_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
-
-        xqs, wqs, x_scales, w_scales = [], [], [], []
-        for x, w in zip(XS, WS):
-            xq, x_scale = triton_quantize_mx4_unpack(x)
-            wq, w_scale = triton_quantize_mx4_unpack(w)
-            xqs.append(xq)
-            wqs.append(wq)
-            x_scales.append(x_scale)
-            w_scales.append(w_scale)
-
-        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
-        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
-
-        X = torch.cat(XS, dim=0)
-        W = torch.stack(WS, dim=0)
-        offsets_for_ref = torch.arange(
-            M, G * (M + 1), M, dtype=torch.int32, device=self.device
-        )
-        out_bf16 = torch._grouped_mm(
-            X, W.transpose(-2, -1), offs=offsets_for_ref, out_dtype=torch.bfloat16
-        )
-
-        out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
-            xq, wq, x_scale, w_scale, M_sizes
-        )
-        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
-        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
-
-    @skipUnlessRocm()
-    @skipUnlessGfxArch("gfx950")
-    def test_grouped_stacked_gemm_uneven(self) -> None:
-        # Uneven expert row counts: the grid must size the M-tile axis from
-        # total_M, not the average, or the largest expert's tail rows are dropped.
-        m_sizes_list = [64, 232, 600]
-        G = len(m_sizes_list)
-        N, K = 512, 2048
+        if M is None:
+            m_sizes_list = [64, 232, 600]
+            assert len(m_sizes_list) == G
+        else:
+            m_sizes_list = [M] * G
 
         XS = [
             torch.randn((m, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -2539,9 +2496,9 @@ class MXFP4Tests(unittest.TestCase):
 
         X = torch.cat(XS, dim=0)
         W = torch.stack(WS, dim=0)
-        offsets = torch.cumsum(M_sizes, dim=0).to(torch.int32)
+        offsets_for_ref = torch.cumsum(M_sizes, dim=0).to(torch.int32)
         out_bf16 = torch._grouped_mm(
-            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+            X, W.transpose(-2, -1), offs=offsets_for_ref, out_dtype=torch.bfloat16
         )
 
         out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
@@ -2557,14 +2514,7 @@ class MXFP4Tests(unittest.TestCase):
             (16, 3500, 6144, 3584),  # large
         ]
     )
-    @unittest.skipIf(
-        torch.version.hip is not None,
-        "ROCm grouped MXFP4 only supports 2D-3D (MoE) layout; 2D-2D K-grouped is CUDA-only",
-    )
-    @unittest.skipIf(
-        torch.version.hip is not None,
-        "ROCm grouped MXFP4 only supports 2D-3D (MoE) layout; 2D-2D K-grouped is CUDA-only",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
