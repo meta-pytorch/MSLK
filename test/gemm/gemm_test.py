@@ -2450,7 +2450,7 @@ class MXFP4Tests(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (1, 256, 256, 2048),   # small
+            (1, 256, 256, 2048),  # small
             (4, 500, 1024, 2048),  # medium
             (16, 3500, 6144, 3584),  # large
             (3, None, 512, 2048),  # uneven: m_sizes_list=[64, 232, 600]
