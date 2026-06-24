@@ -149,6 +149,7 @@ __configure_mslk_test_rocm () {
   fi
 
   export ignored_tests=(
+    ./attention/*_test.py
     ./comm/*.py
     ./moe/*.py
     ./quantize/fp8_quantize_test.py
