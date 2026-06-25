@@ -641,7 +641,13 @@ def main(argv: List[str]) -> None:
 
         python_only_plat = os.environ.get("MSLK_PYTHON_ONLY_PLAT", "")
         if python_only_plat:
-            from wheel.bdist_wheel import bdist_wheel as _BdistWheel
+            try:
+                # setuptools >= 70.1 vendors bdist_wheel; prefer it so we
+                # avoid the legacy ``wheel`` module, which imports
+                # ``pkg_resources`` at load time (removed in setuptools >= 81).
+                from setuptools.command.bdist_wheel import bdist_wheel as _BdistWheel
+            except ImportError:
+                from wheel.bdist_wheel import bdist_wheel as _BdistWheel
 
             class _PlatBdistWheel(_BdistWheel):
                 def get_tag(self):
