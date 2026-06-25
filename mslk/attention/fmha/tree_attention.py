@@ -633,10 +633,18 @@ def tree_attention(
             torch.bfloat16,
         )
         packed_k = pack_fp8_tensorwise_per_head(
-            cache_k.view(1, Bkv * Mk, G, H, D), cache_k.scale, torch.bfloat16
+            # pyrefly: ignore [missing-attribute]
+            cache_k.view(1, Bkv * Mk, G, H, D),
+            # pyrefly: ignore [missing-attribute]
+            cache_k.scale,
+            torch.bfloat16,
         )
         packed_v = pack_fp8_tensorwise_per_head(
-            cache_v.view(1, Bkv * Mk, G, H, D), cache_v.scale, torch.bfloat16
+            # pyrefly: ignore [missing-attribute]
+            cache_v.view(1, Bkv * Mk, G, H, D),
+            # pyrefly: ignore [missing-attribute]
+            cache_v.scale,
+            torch.bfloat16,
         )
         attn_prefix, lse_prefix = memory_efficient_attention_partial(
             packed_q,

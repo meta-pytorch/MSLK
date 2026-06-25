@@ -21,6 +21,7 @@ def _flash_attention3_incompatible_reason() -> Optional[str]:
             "- is your Flash-Attention version recent enough?"
         )
     _fwd_schema = torch.ops.flash_attn_3.fwd.default._schema  # type: ignore
+    # pyrefly: ignore [missing-attribute]
     if not _fwd_schema.is_backward_compatible_with(
         parse_schema(
             "flash_attn_3::fwd("
@@ -106,9 +107,12 @@ def _flash_attention3_incompatible_reason() -> Optional[str]:
         "int sm_margin=0) "
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
     )
-    if not _bwd_schema.is_backward_compatible_with(
-        _bwd_expected
-    ) and not _bwd_schema.is_backward_compatible_with(_bwd_expected_alt):
+    if (
+        # pyrefly: ignore [missing-attribute]
+        not _bwd_schema.is_backward_compatible_with(_bwd_expected)
+        # pyrefly: ignore [missing-attribute]
+        and not _bwd_schema.is_backward_compatible_with(_bwd_expected_alt)
+    ):
         return "flash_attn_3::bwd operator is not compatible"
     return None
 

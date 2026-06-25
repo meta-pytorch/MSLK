@@ -29,12 +29,13 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_group,
     quantize_fp8_row,
 )
+from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 try:
     from tinygemm.utils import group_quantize_tensor
 
-    if torch.cuda.is_available() and torch.version.cuda:
+    if is_cuda():
         torch.ops.load_library("//tinygemm:tinygemm")
     TINYGEMM_ENABLED = True
 except ImportError:
@@ -108,15 +109,12 @@ def get_current_accelerator() -> Accelerator | None:
     if not torch.cuda.is_available():
         raise Exception("Cannot run gemm_bench without accelerator.")
 
-    if torch.version.hip is not None:
-        props = torch.cuda.get_device_properties(0)
-        gcn_arch = getattr(props, "gcnArchName", "").upper()
-        device_name = torch.cuda.get_device_name().upper()
-        if "GFX950" in gcn_arch or "GFX950" in device_name or "MI350" in device_name:
+    if is_rocm():
+        if is_gfx950():
             return Accelerator.AMD_GFX950
-        if "MI300X" in device_name or "GFX942" in gcn_arch:
+        if is_gfx942():
             return Accelerator.AMD_MI300X
-    elif torch.version.cuda is not None:
+    elif is_cuda():
         major, minor = torch.cuda.get_device_capability()
         if major == 9 and minor == 0:
             return Accelerator.NVIDIA_SM90
@@ -659,7 +657,7 @@ class FP8Rowwise(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def __init__(self):
@@ -1314,7 +1312,7 @@ class FP8RowwiseBatched(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
@@ -1436,7 +1434,7 @@ class FP8Blockwise(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def quantize(self, x, w):
@@ -1954,7 +1952,7 @@ class BF16Grouped(GemmOpBase):
 
     @property
     def name(self) -> str:
-        prefix = "Cutlass" if torch.version.cuda else "CK"
+        prefix = "Cutlass" if is_cuda() else "CK"
         return f"{prefix}{self.__class__.__name__}"
 
     def preprocess(self, x, w):

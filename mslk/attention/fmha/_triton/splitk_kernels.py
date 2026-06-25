@@ -166,6 +166,7 @@ def _fwd_kernel_splitK(  # noqa: C901
         f"Only row-wise fp8 quantization is supported, but got {N_GROUPS=} > 1.",
     )
     FP8_QUANTIZED: tl.constexpr = K_fp8_scale_shift is not None
+    # pyrefly: ignore [bad-assignment]
     INT4_QUANTIZED: tl.constexpr = PACKED_PER_VAL > 1 and not FP8_QUANTIZED
     PACKED_D_PER_GROUP: tl.constexpr = BLOCK_DMODEL // PACKED_PER_VAL // N_GROUPS
     D_PER_GROUP: tl.constexpr = BLOCK_DMODEL // N_GROUPS
@@ -361,6 +362,7 @@ def _fwd_kernel_splitK(  # noqa: C901
     # This is a solution for Triton native lack of support for lists of tensors.
     acc: "VAR_ARGS_ARRAY"  # noqa: F821
 
+    # pyrefly: ignore [unbound-name]
     for i in range(len(acc)):  # noqa: F821
         acc[i] = tl.zeros([BLOCK_M, D_PER_GROUP], dtype=internal_dtype)  # noqa: F821
     # scale sm_scale by log_2(e) and use
@@ -402,10 +404,12 @@ def _fwd_kernel_splitK(  # noqa: C901
             q_scale = tl.load(
                 tl.advance(q_scale_block_ptr, (0, i * D_PER_GROUP)), boundary_check=(0,)
             )
+            # pyrefly: ignore [unbound-name]
             q[i] = q_quantized.to(Q.dtype.element_ty)  # noqa: F821
     else:
         # Regular query loading
         for i in range(len(acc)):  # noqa: F821
+            # pyrefly: ignore [unbound-name]
             q[i] = tl.load(  # noqa: F821
                 tl.advance(Q_block_ptr, (0, i * D_PER_GROUP)), boundary_check=(0,)
             )
@@ -430,10 +434,12 @@ def _fwd_kernel_splitK(  # noqa: C901
     for start_n in range(lo, hi, BLOCK_N):
         if PAGE_SIZE > 0:
             # Offset in integer blocks from the beginning of the page
+            # pyrefly: ignore [unbound-name]
             block_offset_in_page = logical_block_idx % BLOCKS_IN_PAGE
             # Offset in integer pages
             logical_page_idx = logical_block_idx // BLOCKS_IN_PAGE
             physical_page_idx = tl.load(
+                # pyrefly: ignore [unbound-name]
                 block_table + stride_blocktablesl * logical_page_idx
             ).to(tl.int32)
             offset = physical_page_idx * PAGE_SIZE + block_offset_in_page * BLOCK_N
@@ -483,6 +489,7 @@ def _fwd_kernel_splitK(  # noqa: C901
                 )
             elif FP8_QUANTIZED:
                 K_scale_shift_block_ptr = tl.make_block_ptr(
+                    # pyrefly: ignore [bad-argument-type]
                     base=k_fp8_scale_shift_base,
                     shape=(1, offset + current_block_size),
                     strides=(1, stride_k_fp8_scale_shift_n),
@@ -491,6 +498,7 @@ def _fwd_kernel_splitK(  # noqa: C901
                     order=(0, 1),
                 )
                 V_scale_shift_block_ptr = tl.make_block_ptr(
+                    # pyrefly: ignore [bad-argument-type]
                     base=v_fp8_scale_shift_base,
                     shape=(offset + current_block_size, 1),
                     strides=(stride_v_fp8_scale_shift_n, 1),
@@ -513,9 +521,13 @@ def _fwd_kernel_splitK(  # noqa: C901
         for i in range(len(acc)):  # noqa: F821
             # Load and dequantize K/V with appropriate return values based on quantization flags
             result = load_dequantize_k_v_group(  # noqa: F821
+                # pyrefly: ignore [unbound-name]
                 K_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 V_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 K_scale_shift_block_ptr,
+                # pyrefly: ignore [unbound-name]
                 V_scale_shift_block_ptr,
                 BOUNDS_CHECKS_N,
                 PACKED_PER_VAL,
@@ -532,26 +544,33 @@ def _fwd_kernel_splitK(  # noqa: C901
 
             # Unpack results based on quantization configuration
             if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], v_scale, k_scale = result  # noqa: F821
             elif QUANTIZE_PV_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], v_scale = result  # noqa: F821
             elif QUANTIZE_QK_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i], k_scale = result  # noqa: F821
             else:
+                # pyrefly: ignore [unbound-name]
                 k[i], v[i] = result  # noqa: F821
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         for i in range(len(acc)):  # noqa: F821
+            # pyrefly: ignore [unbound-name]
             qk += tl.dot(q[i], k[i])  # noqa: F821
 
         if QUANTIZE_QK_TO_FP8:
             # Reshape k_scale for proper broadcasting with qk
             # k_scale has shape (BLOCK_N,), we need to reshape it to (1, BLOCK_N)
             # for proper broadcasting with qk of shape (BLOCK_M, BLOCK_N)
+            # pyrefly: ignore [unbound-name]
             k_scale_reshaped = tl.reshape(k_scale, (1, BLOCK_N))
 
             # Apply k_scale to qk
             qk = qk * k_scale_reshaped
+            # pyrefly: ignore [unbound-name]
             qk = qk * tl.reshape(q_scale, (BLOCK_M, 1))  # noqa: F821
 
         # Apply qk_scale (scalar)
@@ -564,6 +583,7 @@ def _fwd_kernel_splitK(  # noqa: C901
 
         if HAS_ADDITIVE_BIAS:
             loaded_bias = tl.load(
+                # pyrefly: ignore [unbound-name]
                 additive_bias_block_ptr,
                 boundary_check=(0, 1) if BOUNDS_CHECKS_N else (0,),
             )
@@ -576,10 +596,12 @@ def _fwd_kernel_splitK(  # noqa: C901
             qk = tl.where(tl.arange(0, BLOCK_N) < hi - start_n, qk, float("-inf"))
         if IS_CAUSAL:
             # -- apply the causal mask --
+            # pyrefly: ignore [unbound-name]
             qk = tl.where(diag_idx_shifted >= start_n - start_kv_idx, qk, float("-inf"))
         if IS_LOCAL:
             # -- apply the local window size mask --
             qk = tl.where(
+                # pyrefly: ignore [unbound-name]
                 diag_idx_shifted < start_n - start_kv_idx + WINDOW_LEFT + 1,
                 qk,
                 float("-inf"),
@@ -608,6 +630,7 @@ def _fwd_kernel_splitK(  # noqa: C901
             p = p.to(v_dtype)
         else:
             # Apply v-scale to P
+            # pyrefly: ignore [unbound-name]
             p = p * tl.trans(v_scale)
 
             # Quantize P to FP8
@@ -624,9 +647,11 @@ def _fwd_kernel_splitK(  # noqa: C901
         for i in range(len(acc)):  # noqa: F821
             acc[i] *= alpha[:, None]  # noqa: F821
             if not QUANTIZE_PV_TO_FP8:
+                # pyrefly: ignore [unbound-name]
                 acc[i] += tl.dot(p, v[i])  # noqa: F821
             else:
                 # Re-scale PV using p_scale
+                # pyrefly: ignore [unbound-name]
                 acc[i] += tl.dot(p, v[i]) * p_scale[:, None]  # noqa: F821
 
         if not PAGE_SIZE:
@@ -869,12 +894,15 @@ def load_dequantize_k_v_group(
     # Return appropriate values based on quantization flags
     if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
         # Return both v_scale and k_scale for applying to P and K
+        # pyrefly: ignore [unbound-name]
         return k, v, v_scale, k_scale
     elif QUANTIZE_PV_TO_FP8:
         # Return v_scale for applying v_scale to P
+        # pyrefly: ignore [unbound-name]
         return k, v, v_scale
     elif QUANTIZE_QK_TO_FP8:
         # Return k_scale for applying k_scale to K
+        # pyrefly: ignore [unbound-name]
         return k, v, k_scale
     else:
         return k, v
@@ -1109,6 +1137,7 @@ def dequantize(
     shift,
     PACKED_PER_VAL: tl.constexpr,
     IS_HIP: tl.constexpr,
+    # pyrefly: ignore [bad-function-definition]
     USE_FP32_SCALES: tl.constexpr = False,
 ):
     """PACKED_PER_VAL is the number of values packed into each element x_.
@@ -1162,373 +1191,3 @@ def dequantize(
             # Use asymmetric quantization only for FP16 scales
             dequant += shift
     return dequant
-
-
-@triton.jit
-def _splitK_reduce(
-    Out_splitK,  # [B, G, H, split_k, Mq, K]
-    LSE_splitK,  # [B, G, H, split_k, Mq]
-    Out,  # [B, H, M, K]
-    LSE,  # [B, H, M]
-    split_k: tl.constexpr,
-    splitK_pow2: tl.constexpr,
-    stride_osk_z: tl.constexpr,
-    stride_osk_g: tl.constexpr,
-    stride_osk_h: tl.constexpr,
-    stride_osk_s: tl.constexpr,
-    stride_osk_m: tl.constexpr,
-    stride_osk_k: tl.constexpr,
-    stride_lsek_z: tl.constexpr,
-    stride_lsek_g: tl.constexpr,
-    stride_lsek_h: tl.constexpr,
-    stride_lsek_s: tl.constexpr,
-    stride_lsek_m: tl.constexpr,
-    stride_oz: tl.constexpr,
-    stride_og: tl.constexpr,
-    stride_oh: tl.constexpr,
-    stride_om: tl.constexpr,
-    stride_ok: tl.constexpr,
-    stride_lse_z: tl.constexpr,
-    stride_lse_g: tl.constexpr,
-    stride_lse_h: tl.constexpr,
-    stride_lse_m: tl.constexpr,
-    head_dim: tl.constexpr,
-    head_dim_pow_2: tl.constexpr,
-    H: tl.constexpr,
-    G: tl.constexpr,
-    WRITE_LSE: tl.constexpr,
-):
-    # grid = (M, B * G * H, 1)
-    off_m = tl.program_id(0).to(tl.int64)
-    off_zhg = tl.program_id(1).to(tl.int64)
-    off_z = off_zhg // (H * G)
-    off_h = (off_zhg // G) % H
-    off_g = off_zhg % G
-
-    head_dim_mask = tl.arange(0, head_dim_pow_2) < head_dim
-
-    Out_splitK_ptr = (
-        Out_splitK
-        + stride_osk_z * off_z
-        + stride_osk_g * off_g
-        + stride_osk_h * off_h
-        + stride_osk_m * off_m
-        + tl.arange(0, head_dim_pow_2)[None, :]
-        + stride_osk_s * tl.arange(0, splitK_pow2)[:, None]
-    )
-
-    LSE_splitK_ptr0 = (
-        LSE_splitK
-        + stride_lsek_z * off_z
-        + stride_lsek_g * off_g
-        + stride_lsek_h * off_h
-        + stride_lsek_m * off_m
-        + stride_lsek_s * tl.arange(0, splitK_pow2)
-    )
-
-    if splitK_pow2 > split_k:
-        mask_1d = tl.arange(0, splitK_pow2) < split_k
-        mask_2d = mask_1d[:, None] & head_dim_mask[None, :]
-        lse_splitk = tl.load(LSE_splitK_ptr0, mask=mask_1d, other=float("-inf"))
-        lse_max = tl.max(lse_splitk)
-        out_splitk = tl.load(
-            Out_splitK_ptr, mask=mask_2d, other=0
-        )  # (split_k, head_dim_pow_2)
-        lse_splitk = tl.load(
-            LSE_splitK_ptr0, mask=mask_1d, other=float("-inf")
-        )  # (split_k,)
-    else:
-        lse_splitk = tl.load(LSE_splitK_ptr0)
-        lse_max = tl.max(lse_splitk)
-        out_splitk = tl.load(Out_splitK_ptr)
-        lse_splitk = tl.load(LSE_splitK_ptr0)
-
-    sumexp_normalized_splitk = tl.math.exp2(
-        (lse_splitk - lse_max).to(tl.float32) * 1.44269504
-    )  # (split_k,)
-    sumexp_normalized = tl.sum(sumexp_normalized_splitk, axis=0)  # scalar
-    # Compute numerator
-    numerator_normalized = tl.sum(
-        out_splitk * sumexp_normalized_splitk[:, None], axis=0
-    )
-    acc = numerator_normalized / sumexp_normalized
-    acc = tl.where(lse_max == float("-inf"), 0.0, acc)
-
-    Out_ptr = (
-        Out
-        + stride_oz * off_z
-        + stride_oh * off_h
-        + stride_og * off_g
-        + stride_om * off_m
-        + tl.arange(0, head_dim_pow_2)
-    )
-    if acc.dtype is tl.float64 and Out.dtype.element_ty is not tl.float64:
-        # must avoid direct cast f64->f16
-        acc = acc.to(tl.float32)
-    tl.store(Out_ptr, acc, mask=head_dim_mask)
-
-    if WRITE_LSE:
-        l_ptrs = (
-            LSE
-            + off_z * stride_lse_z
-            + off_g * stride_lse_g
-            + off_h * stride_lse_h
-            + off_m * stride_lse_m
-        )
-        to_store = lse_max + tl.math.log2(sumexp_normalized) / 1.44269504
-        to_store = tl.where(lse_max == float("-inf"), lse_max, to_store)
-        tl.store(l_ptrs, to_store)
-
-
-@triton.jit
-def _splitK_reduce_varargs(
-    Out_splitK: "VAR_ARGS_ARRAY",  # list of [B, G, H, Mq, K];
-    LSE_splitK: "VAR_ARGS_ARRAY",  # list of [B, G, H, Mq]
-    Out,  # [B, G, H, M, K]
-    LSE,  # [B, G, H, M]
-    stride_osk_z: "VAR_ARGS_ARRAY",
-    stride_osk_g: "VAR_ARGS_ARRAY",
-    stride_osk_h: "VAR_ARGS_ARRAY",
-    stride_osk_m: "VAR_ARGS_ARRAY",
-    stride_osk_k: "VAR_ARGS_ARRAY",
-    stride_lsek_z: "VAR_ARGS_ARRAY",
-    stride_lsek_g: "VAR_ARGS_ARRAY",
-    stride_lsek_h: "VAR_ARGS_ARRAY",
-    stride_lsek_m: "VAR_ARGS_ARRAY",
-    stride_oz,
-    stride_og,
-    stride_oh,
-    stride_om,
-    stride_ok,
-    stride_lse_z,
-    stride_lse_g,
-    stride_lse_h,
-    stride_lse_m,
-    head_dim: tl.constexpr,
-    head_dim_pow_2: tl.constexpr,
-    H: tl.constexpr,
-    G: tl.constexpr,
-    WRITE_LSE: tl.constexpr,
-):
-    """
-    This version of reduce kernel takes attention and LSE of chunks as lists of tensors,
-    as opposed to _splitK_reduce, which takes each as a stacked tensor.
-    """
-    # grid = (M, B * G * H, 1)
-    off_m = tl.program_id(0).to(tl.int64)
-    off_zhg = tl.program_id(1).to(tl.int64)
-    off_z = off_zhg // (H * G)
-    off_h = (off_zhg // G) % H
-    off_g = off_zhg % G
-    head_dim_mask = tl.arange(0, head_dim_pow_2) < head_dim
-
-    out_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
-    for i in range(len(Out_splitK)):
-        out_splitk_offset[i] = (  # noqa: F821
-            stride_osk_z[i] * off_z  # type: ignore # noqa: F821
-            + stride_osk_g[i] * off_g
-            + stride_osk_h[i] * off_h
-            + stride_osk_m[i] * off_m
-            + tl.arange(0, head_dim_pow_2)
-        )
-    lse_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
-    for i in range(len(Out_splitK)):
-        lse_splitk_offset[i] = (  # noqa: F821
-            stride_lsek_z[i] * off_z  # type: ignore # noqa: F821
-            + stride_lsek_g[i] * off_g
-            + stride_lsek_h[i] * off_h
-            + stride_lsek_m[i] * off_m
-        )
-
-    lse_max = float("-inf")
-    for split_k_idx in range(len(Out_splitK)):  # type: ignore # noqa: F821
-        LSE_splitK_ptr = LSE_splitK[split_k_idx] + lse_splitk_offset[split_k_idx]  # type: ignore # noqa: F821
-        lse_splitk = tl.load(LSE_splitK_ptr)
-        lse_max = tl.maximum(lse_max, lse_splitk)
-
-    sumexp_normalized = 0.0
-    numerator_normalized = tl.zeros([head_dim_pow_2], dtype=tl.float32)
-
-    for split_k_idx in range(len(Out_splitK)):  # type: ignore # noqa: F821
-        out_splitk = tl.load(
-            Out_splitK[split_k_idx] + out_splitk_offset[split_k_idx],  # type: ignore # noqa: F821
-            mask=head_dim_mask,
-        )
-        lse_splitk = tl.load(LSE_splitK[split_k_idx] + lse_splitk_offset[split_k_idx])  # type: ignore # noqa: F821
-        # Compute denominator
-        sumexp_normalized_splitk = tl.math.exp2(
-            (lse_splitk - lse_max).to(tl.float32) * 1.44269504
-        )
-        sumexp_normalized += sumexp_normalized_splitk
-
-        # Compute numerator
-        numerator_normalized += out_splitk * sumexp_normalized_splitk
-
-    acc = numerator_normalized / sumexp_normalized
-    acc = tl.where(lse_max == float("-inf"), 0.0, acc)
-
-    Out_ptr = (
-        Out
-        + stride_oz * off_z
-        + stride_oh * off_h
-        + stride_og * off_g
-        + stride_om * off_m
-        + tl.arange(0, head_dim_pow_2)
-    )
-    if acc.dtype is tl.float64 and Out.dtype.element_ty is not tl.float64:
-        # must avoid direct cast f64->f16
-        acc = acc.to(tl.float32)
-    tl.store(Out_ptr, acc, mask=head_dim_mask)
-
-    if WRITE_LSE:
-        l_ptrs = (
-            LSE
-            + off_z * stride_lse_z
-            + off_g * stride_lse_g
-            + off_h * stride_lse_h
-            + off_m * stride_lse_m
-        )
-        to_store = lse_max + tl.math.log2(sumexp_normalized) / 1.44269504
-        to_store = tl.where(lse_max == float("-inf"), lse_max, to_store)
-        tl.store(l_ptrs, to_store)
-
-
-@triton.jit
-def _splitK_reduce_varargs_backward(
-    Out_splitK: "VAR_ARGS_ARRAY",  # list of [B, G, H, Mq, K];
-    LSE_splitK: "VAR_ARGS_ARRAY",  # list of [B, G, H, Mq]
-    Dout_splitK: "VAR_ARGS_ARRAY",  # gradients - same shape as the inputs themselves
-    DLSE_splitK: "VAR_ARGS_ARRAY",
-    Out,  # [B, G, H, M, K]
-    LSE,  # [B, G, H, M]
-    DOut,
-    DLSE,
-    # strides of chunked inputs: attention and LSE
-    stride_osk_z: "VAR_ARGS_ARRAY",
-    stride_osk_g: "VAR_ARGS_ARRAY",
-    stride_osk_h: "VAR_ARGS_ARRAY",
-    stride_osk_m: "VAR_ARGS_ARRAY",
-    stride_osk_k: "VAR_ARGS_ARRAY",
-    stride_lsek_z: "VAR_ARGS_ARRAY",
-    stride_lsek_g: "VAR_ARGS_ARRAY",
-    stride_lsek_h: "VAR_ARGS_ARRAY",
-    stride_lsek_m: "VAR_ARGS_ARRAY",
-    # strides of merged outputs: attention and LSE
-    stride_oz,
-    stride_og,
-    stride_oh,
-    stride_om,
-    stride_ok,
-    stride_lse_z,
-    stride_lse_g,
-    stride_lse_h,
-    stride_lse_m,
-    # strides of gradients
-    stride_doz,
-    stride_dog,
-    stride_doh,
-    stride_dom,
-    stride_dok,
-    stride_dlse_z,
-    stride_dlse_g,
-    stride_dlse_h,
-    stride_dlse_m,
-    BLOCK_SIZE: tl.constexpr,
-    H: tl.constexpr,
-    G: tl.constexpr,
-):
-    """
-    Backward for _splitK_reduce_varargs. Similar to forward, it takes
-    attention and LSE of chunks as lists of tensors,
-    and outputs the corresponding gradients in the same format.
-    """
-
-    # grid = (M, B * G * H, 1)
-    off_m = tl.program_id(0).to(tl.int64)
-    off_zhg = tl.program_id(1).to(tl.int64)
-    off_z = off_zhg // (H * G)
-    off_h = (off_zhg // G) % H
-    off_g = off_zhg % G
-
-    # Compute offsets inside each attention/LSE chunk.
-    # Note that each chunk can have different strides, so offsets can also be different.
-    out_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
-    for i in range(len(Out_splitK)):
-        out_splitk_offset[i] = (  # type: ignore # noqa: F821
-            stride_osk_z[i] * off_z
-            + stride_osk_g[i] * off_g
-            + stride_osk_h[i] * off_h
-            + stride_osk_m[i] * off_m
-            + tl.arange(0, BLOCK_SIZE)
-        )
-    lse_splitk_offset: "VAR_ARGS_ARRAY"  # noqa: F821
-    for i in range(len(Out_splitK)):
-        lse_splitk_offset[i] = (  # type: ignore # noqa: F821
-            stride_lsek_z[i] * off_z
-            + stride_lsek_g[i] * off_g
-            + stride_lsek_h[i] * off_h
-            + stride_lsek_m[i] * off_m
-        )
-
-    lse_max = float("-inf")
-    for split_k_idx in range(len(Out_splitK)):  # type: ignore # noqa: F821
-        LSE_splitK_ptr = LSE_splitK[split_k_idx] + lse_splitk_offset[split_k_idx]  # type: ignore # noqa: F821
-        lse_splitk = tl.load(LSE_splitK_ptr)
-        lse_max = tl.maximum(lse_max, lse_splitk)
-
-    # Load attention and the corresponding gradient
-    offset_out = (
-        stride_oz * off_z
-        + stride_oh * off_h
-        + stride_og * off_g
-        + stride_om * off_m
-        + tl.arange(0, BLOCK_SIZE)
-    )
-    offset_dout = (
-        stride_doz * off_z
-        + stride_doh * off_h
-        + stride_dog * off_g
-        + stride_dom * off_m
-        + tl.arange(0, BLOCK_SIZE)
-    )
-    out = tl.load(Out + offset_out)
-    dattn = tl.load(DOut + offset_dout)
-
-    # Load LSE and the corresponding gradient
-    offset_lse = (
-        stride_lse_z * off_z
-        + stride_lse_h * off_h
-        + stride_lse_g * off_g
-        + stride_lse_m * off_m
-    )
-    offset_dlse = (
-        stride_dlse_z * off_z
-        + stride_dlse_h * off_h
-        + stride_dlse_g * off_g
-        + stride_dlse_m * off_m
-    )
-    lse = tl.load(LSE + offset_lse)
-    dlse = tl.load(DLSE + offset_dlse)
-
-    for split_k_idx in range(len(Out_splitK)):  # type: ignore # noqa: F821
-        # Load attention and LSE of chunks
-        out_splitk = tl.load(Out_splitK[split_k_idx] + out_splitk_offset[split_k_idx])  # type: ignore # noqa: F821
-        lse_splitk = tl.load(LSE_splitK[split_k_idx] + lse_splitk_offset[split_k_idx])  # type: ignore # noqa: F821
-
-        # Pointers to save gradients of attention and LSE of chunks
-        dout_splitk_ptr = Dout_splitK[split_k_idx] + out_splitk_offset[split_k_idx]  # type: ignore # noqa: F821
-        dlse_splitk_ptr = DLSE_splitK[split_k_idx] + lse_splitk_offset[split_k_idx]  # type: ignore # noqa: F821
-
-        # dX/dattn_i = dX/dattn * dattn/dattn_i + dX/dlse * dlse/dattn_i, and dlse/dattn_i == 0
-        dattn_dattn_i = tl.exp(lse_splitk - lse_max) / tl.exp(lse - lse_max)
-        dX_dattn_i = dattn_dattn_i * dattn
-        tl.store(dout_splitk_ptr, dX_dattn_i)
-
-        dattn_dlse_i = (out_splitk - out) * dattn_dattn_i
-
-        # dX/dlse_i = dX/dattn * dattn/dlse_i + dX/dlse * dlse/dlse_i
-        dlse_dlse_i = dattn_dattn_i
-        dX_dlse_i = dlse_dlse_i * dlse + tl.sum(
-            dattn_dlse_i * dattn
-        )  # Sum is over the hidden dimension
-        tl.store(dlse_splitk_ptr, dX_dlse_i)

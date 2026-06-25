@@ -235,7 +235,9 @@ def _convert_input_format(
             output_dtype=inp.output_dtype,
             is_partial=inp.is_partial,
             # We want k_fp8_scale_shift and v_fp8_scale_shift to be in the same shape as key and value[:-1]
+            # pyrefly: ignore [missing-attribute]
             k_fp8_scale_shift=key_scale.view(key.shape[:-1]),
+            # pyrefly: ignore [missing-attribute]
             v_fp8_scale_shift=value_scale.view(value.shape[:-1]),
             use_fp32_scales=inp.use_fp32_scales,
         )
@@ -258,9 +260,11 @@ def _convert_input_format(
         else:
             key = key.view(torch.float8_e4m3fn)
             value = value.view(torch.float8_e4m3fn)
+            # pyrefly: ignore [missing-attribute]
             key_scale = key_scale.view(torch.float8_e8m0fnu)
             key_scale = key_scale.view(*key.shape[:-1], key.shape[-1] // 32)
 
+            # pyrefly: ignore [missing-attribute]
             value_scale = value_scale.view(torch.float8_e8m0fnu)
             value_scale = value_scale.view(*value.shape[:-1], value.shape[-1] // 32)
 

@@ -7,7 +7,6 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
-import os
 import unittest
 from typing import Optional, Union
 
@@ -24,15 +23,14 @@ from mslk.quantize.triton.fp4_quantize import (
     quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
 )
-from mslk.utils.device import (
-    compute_capability_in,
-    gfx_arch_in,
-    is_cuda,
-    is_gfx942,
-    is_gfx950,
-    is_rocm,
-    supports_float8_fnuz,
+from mslk.testing.device import (
+    skipUnlessCuda,
+    skipUnlessCudaCapability,
+    skipUnlessCudaVersion,
+    skipUnlessGfxArch,
+    skipUnlessRocm,
 )
+from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
@@ -52,75 +50,13 @@ try:
 except ImportError:
     pass
 
-running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
-
-# Feature-support matrix for the GEMM kernels exercised in this file. These map
-# the device's arch/compute-capability (via mslk.utils.device primitives) to
-# whether a given GEMM dtype path is supported, and are specific to these tests.
-def supports_bf16():
-    if is_rocm():
-        return is_gfx942()
-    return compute_capability_in(9)
-
-
-def supports_fp8():
-    if is_rocm():
-        return is_gfx942() and supports_float8_fnuz(throw_on_hip_incompatibility=False)
-    return compute_capability_in(9, 10)
-
-
-def supports_mxfp8():
-    if is_rocm():
-        return False
-    return compute_capability_in(10)
-
-
-def supports_bf16_int4():
-    return is_cuda() and compute_capability_in(9, 9)
-
-
-def supports_fp8_int4():
-    return is_cuda() and compute_capability_in(9, 9)
-
-
-def supports_nvfp4():
-    return is_cuda() and compute_capability_in(10)
-
-
-def supports_nvfp4_ultra():
-    if not is_cuda() or torch.version.cuda is None:
-        return False
-    cuda_major = int(torch.version.cuda.split(".")[0])
-    major, minor = torch.cuda.get_device_capability()
-    return cuda_major >= 13 and (major, minor) >= (10, 3)
-
-
-def supports_mxfp4():
-    if is_rocm():
-        # TODO add AMD here later
-        return False
-    return compute_capability_in(10)
-
-
-def supports_int8():
-    """True on CUDA SM80+ or ROCm CDNA3 (gfx942) / CDNA4 (gfx950)."""
-    if is_rocm():
-        return gfx_arch_in(["gfx942", "gfx950"])
-    return compute_capability_in(8)
-
-
-SUPPORTS_BF16 = supports_bf16()
-SUPPORTS_FP8 = supports_fp8()
-SUPPORTS_MXFP8 = supports_mxfp8()
-SUPPORTS_FP8_INT4 = supports_fp8_int4()
-SUPPORTS_BF16_INT4 = supports_bf16_int4()
-SUPPORTS_NVFP4 = supports_nvfp4()
-SUPPORTS_NVFP4_ULTRA = supports_nvfp4_ultra()
-SUPPORTS_MXFP4 = supports_mxfp4()
-
+# Device gating for the GEMM kernels exercised in this file uses the shared skip
+# decorators from mslk.testing.device: the strict platform gates
+# skipUnlessCuda / skipUnlessRocm, refined by skipUnlessCudaCapability,
+# skipUnlessGfxArch, and skipUnlessCudaVersion.
 if torch.cuda.is_available() and supports_float8_fnuz(
-    throw_on_hip_incompatibility=(not running_on_github)
+    throw_on_hip_incompatibility=False
 ):
     # Supported FP8 format is different on NV and AMD.
     fp8_e4m3: torch.dtype = torch.float8_e4m3fnuz
@@ -133,9 +69,6 @@ else:
 E4M3_MAX_POS: float = torch.finfo(fp8_e4m3).max
 EPS: float = 1e-12
 FP16_MAX_POS: float = torch.finfo(torch.float16).max
-
-# pyre-fixme[16]: Module `mslk` has no attribute `open_source`.
-open_source: bool = getattr(mslk, "open_source", False)
 
 
 def int4_row_quantize(
@@ -284,15 +217,8 @@ def _fp8_batched_gemm_cases() -> list[tuple]:
     return cases
 
 
-@unittest.skipIf(
-    not torch.cuda.is_available(),
-    "Operators are only available on CUDA enabled machines",
-)
-@unittest.skipIf(open_source, "Temporarily disabled in OSS.")
-@unittest.skipIf(
-    not all((SUPPORTS_FP8, SUPPORTS_BF16_INT4, SUPPORTS_FP8_INT4)),
-    "ExportCompileTests is not supported on this device.",
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class ExportCompileTests(unittest.TestCase):
     """Test that GEMM ops can be compiled & exported."""
 
@@ -354,19 +280,11 @@ class ExportCompileTests(unittest.TestCase):
             self.XQ, self.WQ, self.row_scale, self.col_scale, self.output
         )
 
-    @unittest.skipIf(not is_gfx942(), "Requires MI300X")
-    def test_compile_f8f8f16_rowwise(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
-            self.XQ, self.WQ, self.row_scale, self.col_scale
-        )
-
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_i8i8bf16(self) -> None:
         torch.compile(torch.ops.mslk.i8i8bf16)(
             self.XQ.view(torch.int8), self.WQ.view(torch.int8), 1.0, 1
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_f8i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8i4bf16_rowwise)(
             self.XQ,
@@ -376,7 +294,6 @@ class ExportCompileTests(unittest.TestCase):
             self.block_scale[0],
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_bf16i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.bf16i4bf16_rowwise)(
             self.X,
@@ -385,7 +302,6 @@ class ExportCompileTests(unittest.TestCase):
             self.block_scale[0].repeat(self.N).view(-1, self.N),
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_bf16i4bf16_rowwise_batched(self) -> None:
         torch.compile(torch.ops.mslk.bf16i4bf16_rowwise_batched)(
             self.X.view(1, self.M, self.K),
@@ -395,17 +311,32 @@ class ExportCompileTests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not SUPPORTS_FP8, "FP8Tests is not supported on this device.")
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942")
+class F8F8F16RowwiseCompileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = torch.accelerator.current_accelerator()
+        M = N = K = 256
+        cls.XQ = torch.randn(M, K, device=cls.device).to(torch.float8_e4m3fnuz)
+        cls.WQ = torch.randn(N, K, device=cls.device).to(torch.float8_e4m3fnuz)
+        cls.row_scale = torch.randn(M, device=cls.device)
+        cls.col_scale = torch.randn(N, device=cls.device)
+
+    def test_compile_f8f8f16_rowwise(self) -> None:
+        torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
+            self.XQ, self.WQ, self.row_scale, self.col_scale
+        )
+
+
+@skipUnlessGfxArch("gfx942")
+@skipUnlessCudaCapability(9, 10)
 class FP8Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(_fp8_gemm_cases())
-    @unittest.skipIf(
-        torch.version.hip is not None and running_on_github,
-        "type fp8e4b8 not supported in this architecture. The supported fp8 dtypes are ('fp8e5',)",
-    )
     def test_gemm(
         self,
         M: int,
@@ -657,10 +588,7 @@ class FP8Tests(unittest.TestCase):
             (1, 0, 512, 512),  # empty (M=0)
         ]
     )
-    @unittest.skipIf(
-        not is_gfx942(),
-        "Only MI300X supports torch 3D-2D grouped gemm API",
-    )
+    @skipUnlessRocm()
     def test_grouped_gemm_3d_2d(
         self,
         G: int,
@@ -709,10 +637,7 @@ class FP8Tests(unittest.TestCase):
             (16, 2048, 1024, 512, True),  # cudagraph
         ]
     )
-    @unittest.skipIf(
-        not is_gfx942(),
-        "Only MI300X supports torch 2D-2D grouped gemm API",
-    )
+    @skipUnlessRocm()
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
@@ -909,9 +834,8 @@ class FP8Tests(unittest.TestCase):
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
 
-@unittest.skipIf(
-    not SUPPORTS_BF16_INT4, "Skip if BF16Int4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class BF16Int4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1072,7 +996,6 @@ class BF16Int4Tests(unittest.TestCase):
             (16, 2048, 1024, 512, True),  # cudagraph
         ]
     )
-    @unittest.skipIf(not torch.version.cuda, "Currently not supported on AMD.")
     def test_shuffled_grouped_gemm(
         self,
         G: int,
@@ -1178,7 +1101,7 @@ class BF16Int4Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(torch.version.hip is None, "ROCm-only: BF16xINT4 Triton rowwise GEMM")
+@skipUnlessRocm()
 class BF16Int4TritonROCmTests(unittest.TestCase):
     """
     Tests for the Triton BF16xINT4 rowwise GEMM running on AMD GPUs.
@@ -1303,9 +1226,8 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
 
-@unittest.skipIf(
-    not SUPPORTS_FP8_INT4, "Skip if FP8Int4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class FP8Int4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1487,9 +1409,8 @@ class FP8Int4Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(
-    not SUPPORTS_MXFP8, "Skip if MXFP8Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP8Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1813,9 +1734,8 @@ class MXFP8Tests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(
-    not SUPPORTS_BF16, "Skip if BF16Tests is not supported on this device."
-)
+@skipUnlessGfxArch("gfx942")
+@skipUnlessCudaCapability(9)
 class BF16Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2065,10 +1985,7 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_fprop not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_fprop(
         self,
         G: int,
@@ -2139,10 +2056,7 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_wgrad_zero_token_experts(
         self,
         N: int,
@@ -2258,9 +2172,8 @@ class BF16Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(
-    not SUPPORTS_NVFP4, "Skip if NVFP4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class NVFP4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2390,10 +2303,8 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
-    @unittest.skipIf(
-        not SUPPORTS_NVFP4_ULTRA,
-        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
-    )
+    @skipUnlessCudaVersion(13)
+    @skipUnlessCudaCapability(10, minor_min=3)
     def test_ultra_grouped_gemm_2d_3d(self) -> None:
         G = 2
         N = 512
@@ -2445,10 +2356,8 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
-    @unittest.skipIf(
-        not SUPPORTS_NVFP4_ULTRA,
-        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
-    )
+    @skipUnlessCudaVersion(13)
+    @skipUnlessCudaCapability(10, minor_min=3)
     def test_ultra_grouped_gemm_meta(self) -> None:
         G = 2
         M = 384
@@ -2479,7 +2388,8 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2618,7 +2528,8 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP4BlockSize16Tests(unittest.TestCase):
     """
     Tests for MXFP4_16 format: MXFP4 with 1x16 block size
@@ -2812,10 +2723,8 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(
-    not SUPPORTS_MXFP4 and not is_gfx950(),
-    "Skip if MXFP4 is not supported (ROCm requires gfx950+)",
-)
+@skipUnlessGfxArch("gfx950")
+@skipUnlessCudaCapability(10)
 class MX8MX4Tests(unittest.TestCase):
     """Tests for the mixed MX8 x MX4 GEMM kernel (mx8mx4bf16)."""
 
@@ -2975,7 +2884,8 @@ class MX8MX4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MX8MX6Tests(unittest.TestCase):
     """Tests for the mixed MX8 x MX6 CUTLASS GEMM kernel (mx8mx6bf16)."""
 
@@ -3021,7 +2931,8 @@ class MX8MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx8mx6.shape, (M, N))
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if block-scaled GEMM is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MX6MX6Tests(unittest.TestCase):
     """Tests for the symmetric MX6 x MX6 CUTLASS GEMM kernel (mx6mx6bf16)."""
 
@@ -3065,7 +2976,8 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
 
-@unittest.skipIf(not supports_int8(), "Requires CUDA SM80+ or ROCm")
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(8)
 class RocmInt8GemmTests(unittest.TestCase):
     """Correctness tests for the Triton INT8 GEMM kernel.
 
@@ -3162,7 +3074,7 @@ class RocmInt8GemmTests(unittest.TestCase):
     # Parity with CUDA CUTLASS path (CUDA only)
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    @skipUnlessCuda()
     def test_parity_with_cutlass_static(self) -> None:
         M, N, K = 128, 2048, 4096
         scale = 0.01
@@ -3171,7 +3083,7 @@ class RocmInt8GemmTests(unittest.TestCase):
         triton_out = self.i8i8bf16_triton(XQ, WQ, scale)
         torch.testing.assert_close(cutlass_out, triton_out, atol=1e-2, rtol=1e-2)
 
-    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    @skipUnlessCuda()
     def test_parity_with_cutlass_dynamic(self) -> None:
         M, N, K = 128, 2048, 4096
         scale = 0.01
@@ -3185,7 +3097,7 @@ class RocmInt8GemmTests(unittest.TestCase):
     # torch.ops.mslk dispatch on ROCm
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    @skipUnlessRocm()
     def test_ops_dispatch_static(self) -> None:
         M, N, K = 128, 1024, 1024
         scale = 0.01
@@ -3195,7 +3107,7 @@ class RocmInt8GemmTests(unittest.TestCase):
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
 
-    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    @skipUnlessRocm()
     def test_ops_dispatch_dynamic(self) -> None:
         M, N, K = 128, 1024, 1024
         scale = 0.01

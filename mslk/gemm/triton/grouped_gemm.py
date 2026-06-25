@@ -303,6 +303,7 @@ def _mslk_grouped_gemm(
             if USE_TMA_STORE:
                 c_desc_ptr = tl.make_tensor_descriptor(
                     c_ptr + M_start_offset * N,
+                    # pyrefly: ignore [bad-argument-type]
                     shape=[m_size, n_size],
                     # pyre-ignore
                     strides=[n_size, 1],
@@ -477,6 +478,7 @@ def _mslk_grouped_gemm_ws(
             if USE_TMA_STORE:
                 c_desc_ptr = tl.make_tensor_descriptor(
                     c_ptr + M_start_offset * N,
+                    # pyrefly: ignore [bad-argument-type]
                     shape=[m_size, N],
                     # pyre-ignore
                     strides=[N, 1],
@@ -628,6 +630,7 @@ def _mslk_grouped_gemm_fp8_rowwise(
             if USE_TMA_STORE:
                 c_desc_ptr = tl.make_tensor_descriptor(
                     c_ptr + M_start_offset * N,
+                    # pyrefly: ignore [bad-argument-type]
                     shape=[m_size, n_size],
                     # pyre-ignore
                     strides=[n_size, 1],
@@ -783,6 +786,7 @@ def _mslk_grouped_gemm_fp8_rowwise_ws(
             if USE_TMA_STORE:
                 c_desc_ptr = tl.make_tensor_descriptor(
                     c_ptr + M_start_offset * N,
+                    # pyrefly: ignore [bad-argument-type]
                     shape=[m_size, N],
                     # pyre-ignore
                     strides=[N, 1],

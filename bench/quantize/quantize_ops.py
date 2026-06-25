@@ -27,6 +27,7 @@ from mslk.quantize.triton.fp8_quantize import (
     triton_quantize_fp8_group,
     triton_quantize_fp8_tensor,
 )
+from mslk.utils.device import is_cuda, is_rocm
 
 
 class QuantizeOpBase(metaclass=abc.ABCMeta):
@@ -43,11 +44,13 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
         pass
 
     @abc.abstractproperty
+    # pyrefly: ignore [bad-return]
     def hip(self) -> bool:
         """Whether this operator supports AMD or not."""
         pass
 
     @abc.abstractproperty
+    # pyrefly: ignore [bad-return]
     def cuda(self) -> bool:
         """Whether this operator supports Nvidia or not."""
         pass
@@ -64,9 +67,9 @@ class QuantizeOpBase(metaclass=abc.ABCMeta):
     @property
     def supported(self) -> bool:
         """Whether this op will run on the current device."""
-        if torch.version.hip is not None:
+        if is_rocm():
             return self.hip
-        elif torch.version.cuda is not None:
+        elif is_cuda():
             return self.cuda
         else:
             return False
