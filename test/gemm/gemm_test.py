@@ -1224,6 +1224,121 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         y_direct = self.matmul_rowwise(x, wq, w_scale, w_zp)
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
+    @parameterized.expand(
+        [
+            (256, 256, 128, 128),  # small (matches Meta BF16Int4Tests)
+            (2048, 4096, 2048, 128),  # medium
+            (4096, 8192, 4096, 128),  # large
+        ]
+    )
+    def test_shuffled_accuracy(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        from mslk.gemm.triton.int4_gemm import (
+            matmul_bf16i4_shuffled,
+            preshuffle_i4_bf16,
+        )
+
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+        w_scale = w_scale.contiguous().to(device=self.device)
+        w_zp = w_zp.contiguous().to(device=self.device)
+
+        y_rowwise = self.matmul_rowwise(x, wq, w_scale, w_zp)
+
+        wq_shuffled, _ = preshuffle_i4_bf16(wq, w_scale)
+        y_shuffled = matmul_bf16i4_shuffled(x, wq_shuffled, w_scale, w_zp)
+
+        torch.testing.assert_close(y_shuffled, y_rowwise, atol=0.0, rtol=0.0)
+
+    @parameterized.expand(
+        [
+            (1, 256, 1024, 512),  # small (matches Meta BF16Int4Tests)
+            (16, 2048, 1024, 512),  # medium
+            (64, 3584, 6144, 3584),  # large
+            (1, 0, 1024, 512),  # empty (M=0 edge case)
+        ]
+    )
+    def test_shuffled_grouped_accuracy(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        from mslk.gemm.triton.int4_gemm import (
+            matmul_bf16i4_shuffled_grouped,
+            preshuffle_i4_bf16,
+        )
+
+        group_size = 128
+        if M > 0:
+            ms = torch.randint(1, (M // 64) + 1, (G,), dtype=torch.int) * 64
+        else:
+            ms = torch.zeros((G,), dtype=torch.int)
+        M_sizes = ms.to(device=self.device, dtype=torch.int64)
+
+        x_parts = []
+        w_list = []
+        wq_list = []
+        scale_list = []
+        zp_list = []
+        for g in range(G):
+            m = ms[g].item()
+            x_g = torch.randn(m, K, dtype=torch.bfloat16, device=self.device) * 0.1
+            w_g = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+            wq_g, s_g, z_g = int4_row_quantize(w_g, group_size)
+            wq_g = pack_int4(wq_g).contiguous().to(device=self.device)
+            s_g = s_g.contiguous().to(device=self.device, dtype=torch.bfloat16)
+            z_g = z_g.contiguous().to(device=self.device, dtype=torch.bfloat16)
+            x_parts.append(x_g)
+            w_list.append(w_g)
+            wq_shuffled_g, _ = preshuffle_i4_bf16(wq_g, s_g)
+            wq_list.append(wq_shuffled_g)
+            scale_list.append(s_g)
+            zp_list.append(z_g)
+
+        x_cat = torch.cat(x_parts, dim=0)
+        wq_stacked = torch.stack(wq_list)
+        scales_stacked = torch.stack(scale_list)
+        zp_stacked = torch.stack(zp_list)
+
+        y = matmul_bf16i4_shuffled_grouped(
+            x_cat, wq_stacked, scales_stacked, zp_stacked, M_sizes
+        )
+
+        y_ref_parts = []
+        for g in range(G):
+            y_ref_parts.append(
+                (x_parts[g].float() @ w_list[g].float().T).to(torch.bfloat16)
+            )
+        y_ref = torch.cat(y_ref_parts, dim=0)
+
+        torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+    def test_preshuffle_roundtrip(self) -> None:
+        from mslk.gemm.triton.int4_gemm import (
+            _bf16_preshuffle_i4,
+            _bf16_unshuffle_i4,
+        )
+
+        N, K = 256, 512
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device)
+        wq, w_scale, w_zp = int4_row_quantize(w, 128)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+
+        wq_shuffled = _bf16_preshuffle_i4(wq)
+        wq_roundtrip = _bf16_unshuffle_i4(wq_shuffled)
+
+        self.assertTrue(torch.equal(wq, wq_roundtrip))
+
 
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)
@@ -2783,7 +2898,7 @@ class MX8MX4Tests(unittest.TestCase):
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
         # Quantize A to MX8 with blocked scale layout
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -2944,7 +3059,7 @@ class MX8MX6Tests(unittest.TestCase):
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
         # Quantize A to MX8 with blocked scale layout
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -2953,7 +3068,7 @@ class MX8MX6Tests(unittest.TestCase):
         # then create E2M3 weight data from the MX8 data.
         # E2M3 is stored as 1 byte per element (6-bit value in uint8).
         # We use the FP8 data masked to 6 bits as a proxy for E2M3.
-        (b_scale_raw, bq_fp8) = to_mxfp8(B)
+        b_scale_raw, bq_fp8 = to_mxfp8(B)
         b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
             torch.uint8
         )
