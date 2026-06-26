@@ -1741,9 +1741,7 @@ class BF16Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    def generate_random_splits(
-        G: int, M: int, min_group_size: int = 1
-    ) -> torch.Tensor:
+    def generate_random_splits(G: int, M: int, min_group_size: int = 1) -> torch.Tensor:
         device = torch.accelerator.current_accelerator()
         if M <= 0:
             return torch.zeros((G,), dtype=torch.int32, device=device)
@@ -1773,9 +1771,7 @@ class BF16Tests(unittest.TestCase):
         block_counts = torch.zeros(G, dtype=torch.int64, device=device)
         if num_blocks > 0:
             idx = torch.randint(0, G, (num_blocks,), device=device)
-            block_counts.scatter_add_(
-                0, idx, torch.ones_like(idx, dtype=torch.int64)
-            )
+            block_counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.int64))
         m_sizes = block_counts * min_group_size
         if remainder > 0:
             nz = torch.nonzero(m_sizes, as_tuple=False)

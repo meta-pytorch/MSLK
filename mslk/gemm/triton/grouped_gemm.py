@@ -1240,9 +1240,7 @@ def _mslk_grouped_gemm_dgrad(
                 tile_m_idx = gidx % num_m_tiles
                 tile_n_idx = gidx // num_m_tiles
 
-                accumulator = tl.zeros(
-                    (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32
-                )
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
                 offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
                 offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1250,9 +1248,7 @@ def _mslk_grouped_gemm_dgrad(
 
                 # A: X[M_start + offs_am, offs_k] (row-major in K).
                 a_ptrs = (
-                    x_ptr
-                    + (M_start_offset + offs_am[:, None]) * K
-                    + offs_k[None, :]
+                    x_ptr + (M_start_offset + offs_am[:, None]) * K + offs_k[None, :]
                 )
                 # B: per-group view of W as a [K, N] row-major matrix.
                 # W[g, n, k] lives at addr g*N*K + n + k*N; equivalently
@@ -1284,9 +1280,7 @@ def _mslk_grouped_gemm_dgrad(
 
                 c = accumulator.to(c_ptr.dtype.element_ty)
                 tl.store(
-                    c_ptr
-                    + (M_start_offset + offs_am[:, None]) * N
-                    + offs_bn[None, :],
+                    c_ptr + (M_start_offset + offs_am[:, None]) * N + offs_bn[None, :],
                     c,
                     mask=(offs_am[:, None] < m_size) & (offs_bn[None, :] < N),
                 )
@@ -1345,9 +1339,7 @@ def _mslk_grouped_gemm_wgrad(
                 tile_n_idx = gidx % num_n_tiles
                 tile_k_idx = gidx // num_n_tiles
 
-                accumulator = tl.zeros(
-                    (BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32
-                )
+                accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
 
                 offs_am = tl.arange(0, BLOCK_SIZE_M)
                 offs_an = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1355,15 +1347,11 @@ def _mslk_grouped_gemm_wgrad(
 
                 # X slice for this group/tile: [BM, BN]
                 a_base = (
-                    x_ptr
-                    + (M_start_offset + offs_am[:, None]) * N
-                    + offs_an[None, :]
+                    x_ptr + (M_start_offset + offs_am[:, None]) * N + offs_an[None, :]
                 )
                 # W slice for this group/tile: [BM, BK]
                 b_base = (
-                    w_ptr
-                    + (M_start_offset + offs_am[:, None]) * K
-                    + offs_bk[None, :]
+                    w_ptr + (M_start_offset + offs_am[:, None]) * K + offs_bk[None, :]
                 )
 
                 an_mask = offs_an[None, :] < N

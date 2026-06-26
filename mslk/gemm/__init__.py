@@ -28,18 +28,5 @@ import torch  # noqa: E402
 
 from . import _meta  # noqa: F401, E402
 
-# On ROCm/HIP builds, the CUDA-only CUTLASS kernels for
-# bf16bf16bf16_grouped_{grad,wgrad} are unavailable. Importing the Triton
-# port triggers its @torch.library.impl("mslk::...", "CUDA") registrations so
-# torch.ops.mslk.bf16bf16bf16_grouped_{grad,wgrad} work on AMD GPUs.
-import torch  # noqa: E402
-
 if torch.version.hip is not None:
-    from .triton import grouped_gemm as _grouped_gemm  # noqa: F401, E402
-if torch.version.hip is not None:
-    # Register the Triton implementation of mx8mx4bf16 for ROCm.  This import
-    # triggers the @torch.library.impl("mslk::mx8mx4bf16", "CUDA") decoration
-    # in mx8mx4_gemm.py, which overrides the default (non-existent) CUDA impl
-    # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
-    # kernel on AMD.
-    from .triton import mx8mx4_gemm  # noqa: F401
+    from .triton import grouped_gemm as _grouped_gemm, mx8mx4_gemm  # noqa: F401, E402
