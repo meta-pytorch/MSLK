@@ -1134,3 +1134,509 @@ def grouped_gemm_fp8_rowwise(
         output_tensor=_output_tensor,
         scatter_add_indices=_scatter_add_indices,
     )
+
+
+# ---------------------------------------------------------------------------
+# Triton port of CUTLASS bf16bf16bf16_grouped_grad / _wgrad ops.
+#
+# The CUTLASS kernels in csrc/gemm/cutlass/bf16bf16bf16_grouped_{grad,wgrad}.cu
+# are CUDA-only (Sm90/Sm100 TMA + ptr-array grouped GEMM). The Triton kernels
+# below reproduce the same numerics with the same external schema, and are
+# registered as the ROCm dispatch of:
+#   torch.ops.mslk.bf16bf16bf16_grouped_grad
+#   torch.ops.mslk.bf16bf16bf16_grouped_wgrad
+# (see _register_rocm_grad_ops below).
+#
+# Conventions (matching the .cu / test_grouped_gemm_{dgrad,wgrad}):
+#   dgrad: X [total_M, K]            W [G, N, K] with W.stride(-2) == 1
+#          out [total_M, N]          per group: out[g] = X[g] @ W[g].T
+#          (caller typically passes w.permute(0, 2, 1) of a contiguous [G,K,N])
+#   wgrad: X [total_M, N]            W [total_M, K] (here W is really `dy`)
+#          out [G, N, K]             per group: out[g] = X[g].T @ W[g]
+#          OUTPUT_ACCUM: pre-allocated fp32 out, accumulator is added in-place
+# ---------------------------------------------------------------------------
+
+
+_AMD_GRAD_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": block_size_m,
+            "BLOCK_SIZE_N": block_size_n,
+            "BLOCK_SIZE_K": block_size_k,
+            "waves_per_eu": waves_per_cu,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    for block_size_m in [32, 64, 128]
+    for block_size_n in [64, 128, 256]
+    for block_size_k in [64, 128]
+    for num_stages in [1, 2]
+    for num_warps, waves_per_cu in [(4, 1), (8, 2)]
+]
+
+
+_AMD_WGRAD_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": block_size_m,
+            "BLOCK_SIZE_N": block_size_n,
+            "BLOCK_SIZE_K": block_size_k,
+            "waves_per_eu": waves_per_cu,
+            "matrix_instr_nonkdim": 16,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    for block_size_m in [32, 64]
+    for block_size_n in [32, 64, 128]
+    for block_size_k in [32, 64, 128]
+    for num_stages in [1, 2]
+    for num_warps, waves_per_cu in [(4, 1), (8, 2)]
+]
+
+
+@triton.autotune(
+    configs=_AMD_GRAD_CONFIGS,
+    key=["G", "M_BUCKET", "N", "K"],
+)
+@triton.jit
+def _mslk_grouped_gemm_dgrad(
+    x_ptr,  # X [total_M, K] row-major
+    w_ptr,  # W [G, N, K] with strides [N*K, 1, N] (i.e. K-major per group)
+    c_ptr,  # output [total_M, N] row-major
+    m_sizes,
+    G: tl.constexpr,
+    M_BUCKET,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+) -> None:
+    tidx = tl.program_id(0)
+
+    M_end_offset = 0
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
+    # Keep tile counters in int64. M_sizes is int64 (required by the op), so
+    # num_tiles is int64; iterated_tiles must match to stay type-stable across
+    # the `if m_size > 0` block (Triton forbids dtype changes across blocks).
+    iterated_tiles = 0
+    iterated_tiles = iterated_tiles.to(tl.int64)  # pyre-ignore
+    for g in tl.range(G):
+        m_size = tl.load(m_sizes + g).to(tl.int64)
+        if m_size > 0:
+            M_start_offset = M_end_offset
+            M_end_offset = M_start_offset + m_size
+
+            num_m_tiles = tl.cdiv(m_size, BLOCK_SIZE_M)
+            num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+            num_tiles = num_m_tiles * num_n_tiles
+
+            while tidx >= iterated_tiles and tidx < iterated_tiles + num_tiles:
+                gidx = tidx - iterated_tiles
+                tile_m_idx = gidx % num_m_tiles
+                tile_n_idx = gidx // num_m_tiles
+
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+                offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+                # A: X[M_start + offs_am, offs_k] (row-major in K).
+                a_ptrs = (
+                    x_ptr + (M_start_offset + offs_am[:, None]) * K + offs_k[None, :]
+                )
+                # B: per-group view of W as a [K, N] row-major matrix.
+                # W[g, n, k] lives at addr g*N*K + n + k*N; equivalently
+                # B[k, n] = W[g, n, k] at addr g*N*K + offs_k*N + offs_bn.
+                b_ptrs = (
+                    w_ptr
+                    + g.to(tl.int64) * N * K
+                    + offs_k[:, None] * N
+                    + offs_bn[None, :]
+                )
+
+                for k_offset in range(0, K, BLOCK_SIZE_K):
+                    k_remaining = k_offset + offs_k
+                    k_mask_row = k_remaining[None, :] < K
+                    k_mask_col = k_remaining[:, None] < K
+                    a = tl.load(
+                        a_ptrs,
+                        mask=(offs_am[:, None] < m_size) & k_mask_row,
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        b_ptrs,
+                        mask=k_mask_col & (offs_bn[None, :] < N),
+                        other=0.0,
+                    )
+                    accumulator += tl.dot(a, b)
+                    a_ptrs += BLOCK_SIZE_K
+                    b_ptrs += BLOCK_SIZE_K * N
+
+                c = accumulator.to(c_ptr.dtype.element_ty)
+                tl.store(
+                    c_ptr + (M_start_offset + offs_am[:, None]) * N + offs_bn[None, :],
+                    c,
+                    mask=(offs_am[:, None] < m_size) & (offs_bn[None, :] < N),
+                )
+                tidx += NUM_SMS
+
+            iterated_tiles += num_tiles
+
+
+@triton.autotune(
+    configs=_AMD_WGRAD_CONFIGS,
+    key=["G", "M_BUCKET", "N", "K", "OUTPUT_ACCUM"],
+    # When OUTPUT_ACCUM is set the kernel does an in-place read-modify-write
+    # (output += dW). The autotuner benchmarks each config by invoking the
+    # kernel many times on the *same* buffer, which would otherwise compound
+    # the accumulation and corrupt the user's output. restore_value snapshots
+    # the buffer before each trial and restores it (including before the final
+    # real launch), so accumulation happens exactly once.
+    restore_value=["c_ptr"],
+)
+@triton.jit
+def _mslk_grouped_gemm_wgrad(
+    x_ptr,  # X [total_M, N] row-major
+    w_ptr,  # W [total_M, K] row-major (a.k.a. dy)
+    c_ptr,  # output [G, N, K] row-major (fp32 if OUTPUT_ACCUM else bf16/fp16)
+    m_sizes,
+    G: tl.constexpr,
+    M_BUCKET,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    OUTPUT_ACCUM: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+) -> None:
+    tidx = tl.program_id(0)
+
+    M_end_offset = 0
+    M_end_offset = M_end_offset.to(tl.int64)  # pyre-ignore
+    # Keep tile counters in int64 for type-stability across the `if m_size > 0`
+    # block (M_sizes is int64; see dgrad kernel note).
+    iterated_tiles = 0
+    iterated_tiles = iterated_tiles.to(tl.int64)  # pyre-ignore
+    for g in tl.range(G):
+        m_size = tl.load(m_sizes + g).to(tl.int64)
+        if m_size > 0:
+            M_start_offset = M_end_offset
+            M_end_offset = M_start_offset + m_size
+
+            num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+            num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+            num_tiles = num_n_tiles * num_k_tiles
+
+            while tidx >= iterated_tiles and tidx < iterated_tiles + num_tiles:
+                gidx = tidx - iterated_tiles
+                tile_n_idx = gidx % num_n_tiles
+                tile_k_idx = gidx // num_n_tiles
+
+                accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+
+                offs_am = tl.arange(0, BLOCK_SIZE_M)
+                offs_an = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_bk = tile_k_idx * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+                # X slice for this group/tile: [BM, BN]
+                a_base = (
+                    x_ptr + (M_start_offset + offs_am[:, None]) * N + offs_an[None, :]
+                )
+                # W slice for this group/tile: [BM, BK]
+                b_base = (
+                    w_ptr + (M_start_offset + offs_am[:, None]) * K + offs_bk[None, :]
+                )
+
+                an_mask = offs_an[None, :] < N
+                bk_mask = offs_bk[None, :] < K
+
+                for m_offset in range(0, m_size, BLOCK_SIZE_M):
+                    m_mask = (m_offset + offs_am[:, None]) < m_size
+                    a = tl.load(
+                        a_base + m_offset * N,
+                        mask=m_mask & an_mask,
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        b_base + m_offset * K,
+                        mask=m_mask & bk_mask,
+                        other=0.0,
+                    )
+                    accumulator += tl.dot(tl.trans(a), b)
+
+                out_ptrs = (
+                    c_ptr
+                    + g.to(tl.int64) * N * K
+                    + offs_an[:, None] * K
+                    + offs_bk[None, :]
+                )
+                store_mask = (offs_an[:, None] < N) & (offs_bk[None, :] < K)
+
+                if OUTPUT_ACCUM:
+                    prev = tl.load(out_ptrs, mask=store_mask, other=0.0)
+                    tl.store(
+                        out_ptrs,
+                        accumulator + prev,
+                        mask=store_mask,
+                    )
+                else:
+                    tl.store(
+                        out_ptrs,
+                        accumulator.to(c_ptr.dtype.element_ty),
+                        mask=store_mask,
+                    )
+
+                tidx += NUM_SMS
+
+            iterated_tiles += num_tiles
+
+
+_MIN_M_PER_GROUP = 8
+
+
+def _assert_m_sizes_min(m_sizes: torch.Tensor, op_name: str) -> None:
+    """Ensure every non-empty group has m_size >= _MIN_M_PER_GROUP.
+
+    Matches the host-side guard requested for the Triton ports: groups of size
+    0 are allowed (and skipped inside the kernel), but any non-empty group
+    smaller than _MIN_M_PER_GROUP would land on an MFMA-tile edge case.
+    """
+    sizes = m_sizes.tolist()
+    for g, s in enumerate(sizes):
+        if 0 < s < _MIN_M_PER_GROUP:
+            raise ValueError(
+                f"{op_name} requires every non-empty group to have "
+                f"m_size >= {_MIN_M_PER_GROUP}; got m_sizes[{g}] = {s}. "
+                "Pad your group on the caller side (or round up to a "
+                f"multiple of {_MIN_M_PER_GROUP})."
+            )
+
+
+def grouped_gemm_dgrad(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    m_sizes: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    num_sms: Optional[int] = None,
+) -> torch.Tensor:
+    """Triton port of mslk::bf16bf16bf16_grouped_grad.
+
+    Args:
+        x:        [total_M, K], row-major, bf16/fp16
+        w:        [G, N, K] with w.stride(-2) == 1, bf16/fp16 (typically
+                  the caller does w.permute(0, 2, 1) on a contiguous
+                  [G, K, N] tensor)
+        m_sizes:  [G], int64 — per-group token counts
+        out:      Optional pre-allocated output buffer (numel >= total_M * N);
+                  will be returned viewed as [total_M, N].
+        num_sms:  Override the launch grid (defaults to all SMs).
+
+    Returns:
+        [total_M, N] tensor, dtype = x.dtype.
+    """
+    assert x.dim() == 2, f"X must be 2D, got shape {x.shape}"
+    assert w.dim() == 3, f"W must be 3D, got shape {w.shape}"
+    assert x.is_contiguous(), "X must be contiguous (row-major)"
+    assert w.stride(-2) == 1, (
+        "W must be column-major in the N (-2) dim; pass "
+        "w_contig.permute(0, 2, 1) of a [G, K, N] contiguous tensor"
+    )
+    assert m_sizes.is_contiguous() and m_sizes.dtype == torch.int64, (
+        "M_sizes must be a contiguous int64 tensor of shape [G]"
+    )
+    assert m_sizes.device == x.device, "M_sizes must be on the same device as X"
+    assert x.dtype == w.dtype, f"X and W must share dtype, got {x.dtype} vs {w.dtype}"
+    assert x.dtype in (torch.bfloat16, torch.float16), (
+        f"grouped_gemm_dgrad supports bf16/fp16, got {x.dtype}"
+    )
+
+    total_M, K = x.shape
+    G, N, K_w = w.shape
+    assert K == K_w, f"X.shape[-1] ({K}) must match W.shape[-1] ({K_w})"
+    assert m_sizes.shape == (G,), f"M_sizes shape {m_sizes.shape} != ({G},)"
+
+    if out is None:
+        y = torch.empty(total_M * N, device=x.device, dtype=x.dtype)
+    else:
+        assert out.device == x.device and out.dtype == x.dtype
+        assert out.is_contiguous()
+        assert out.numel() >= total_M * N, (
+            f"Pre-allocated out buffer has {out.numel()} elements, need >= {total_M * N}"
+        )
+        y = out
+
+    if total_M == 0:
+        return y.view(total_M, N)
+
+    _assert_m_sizes_min(m_sizes, "grouped_gemm_dgrad")
+
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    NUM_SMS = int(num_sms)
+
+    M_BUCKET_CAP = 16384
+    M_BUCKET = min(triton.next_power_of_2(total_M), M_BUCKET_CAP)
+
+    grid = (NUM_SMS,)
+    _mslk_grouped_gemm_dgrad[grid](
+        x,
+        w,
+        y,
+        m_sizes,
+        G,
+        M_BUCKET,
+        N,
+        K,
+        NUM_SMS,
+    )
+
+    return y.view(total_M, N)
+
+
+def grouped_gemm_wgrad(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    m_sizes: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    output_accum: bool = False,
+    num_sms: Optional[int] = None,
+) -> torch.Tensor:
+    """Triton port of mslk::bf16bf16bf16_grouped_wgrad.
+
+    Args:
+        x:            [total_M, N], row-major, bf16/fp16
+        w:            [total_M, K], row-major, bf16/fp16 (typically `dy`)
+        m_sizes:      [G], int64 — per-group token counts
+        output:       Optional pre-allocated output [G, N, K]. Required when
+                      output_accum=True (dtype must be float32 in that case).
+        output_accum: If True, accumulate into the pre-allocated fp32 output.
+        num_sms:      Override the launch grid (defaults to all SMs).
+
+    Returns:
+        [G, N, K] tensor. dtype is fp32 if output_accum else x.dtype.
+    """
+    assert x.dim() == 2 and w.dim() == 2, (
+        f"X and W must be 2D, got {x.shape} and {w.shape}"
+    )
+    assert x.is_contiguous() and w.is_contiguous(), "X and W must be contiguous"
+    assert x.shape[0] == w.shape[0], (
+        f"X and W must share dim 0 (total_M); got {x.shape[0]} vs {w.shape[0]}"
+    )
+    assert x.dtype == w.dtype, f"X and W must share dtype, got {x.dtype} vs {w.dtype}"
+    assert x.dtype in (torch.bfloat16, torch.float16), (
+        f"grouped_gemm_wgrad supports bf16/fp16, got {x.dtype}"
+    )
+    assert m_sizes.is_contiguous() and m_sizes.dtype == torch.int64, (
+        "M_sizes must be a contiguous int64 tensor of shape [G]"
+    )
+    assert m_sizes.device == x.device, "M_sizes must be on the same device as X"
+
+    total_M, N = x.shape
+    _, K = w.shape
+    G = m_sizes.shape[0]
+
+    if output_accum:
+        assert output is not None, (
+            "Must provide a pre-allocated output tensor when output_accum=True"
+        )
+        assert output.dtype == torch.float32, (
+            "Output tensor must be Float32 when output_accum=True"
+        )
+        y = output
+    elif output is not None:
+        assert output.dtype in (torch.bfloat16, torch.float16), (
+            "Output tensor must be BFloat16 or Float16 when output_accum=False"
+        )
+        y = output
+    else:
+        y = torch.zeros((G, N, K), device=x.device, dtype=x.dtype)
+
+    assert y.is_contiguous() and y.shape == (G, N, K), (
+        f"Output must be contiguous [G, N, K]={(G, N, K)}, got shape {y.shape}"
+    )
+
+    if total_M == 0:
+        return y
+
+    _assert_m_sizes_min(m_sizes, "grouped_gemm_wgrad")
+
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    NUM_SMS = int(num_sms)
+
+    M_BUCKET_CAP = 16384
+    M_BUCKET = min(triton.next_power_of_2(total_M), M_BUCKET_CAP)
+
+    grid = (NUM_SMS,)
+    _mslk_grouped_gemm_wgrad[grid](
+        x,
+        w,
+        y,
+        m_sizes,
+        G,
+        M_BUCKET,
+        N,
+        K,
+        NUM_SMS,
+        output_accum,
+    )
+
+    return y
+
+
+# ---------------------------------------------------------------------------
+# torch.library.impl registration — wire torch.ops.mslk.bf16bf16bf16_grouped_*
+# to the Triton functions on ROCm. The C++ schemas are declared under
+# #ifdef USE_ROCM in csrc/gemm/gemm_ops.cpp; this module is imported from
+# mslk/gemm/__init__.py so registration happens after the .so is loaded.
+# ---------------------------------------------------------------------------
+
+
+def _register_rocm_grad_ops() -> None:
+    import torch.library  # noqa: F401
+
+    # PyTorch HIP builds surface the CUDA dispatch key for GPU kernels; keep
+    # this on "CUDA" until PyTorch exposes a stable HIP/PrivateUse key.
+    @torch.library.impl("mslk::bf16bf16bf16_grouped_grad", "CUDA")
+    def _bf16_grouped_grad_impl(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        M_sizes: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        num_sms: Optional[int] = None,
+    ) -> torch.Tensor:
+        return grouped_gemm_dgrad(X, W, M_sizes, out=out, num_sms=num_sms)
+
+    @torch.library.impl("mslk::bf16bf16bf16_grouped_wgrad", "CUDA")
+    def _bf16_grouped_wgrad_impl(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        M_sizes: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        output_accum: bool = False,
+        num_sms: Optional[int] = None,
+    ) -> torch.Tensor:
+        return grouped_gemm_wgrad(
+            X, W, M_sizes, output=output, output_accum=output_accum, num_sms=num_sms
+        )
+
+
+# Register immediately on ROCm — the C++ library loads the schemas during
+# import of mslk.gemm, so by the time user code imports from here the ops
+# exist. If registration fails (e.g. schemas not yet present in restricted
+# unit-test environments), defer to a later caller.
+if torch.version.hip is not None:
+    try:
+        _register_rocm_grad_ops()
+    except Exception as exc:
+        warnings.warn(
+            f"Deferring ROCm bf16bf16bf16_grouped_{{grad,wgrad}} registration: {exc}",
+            stacklevel=2,
+        )

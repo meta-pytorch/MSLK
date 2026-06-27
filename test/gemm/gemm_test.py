@@ -1740,24 +1740,43 @@ class BF16Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    def generate_random_splits(G: int, M: int) -> torch.Tensor:
-        if M > 0:
+    def generate_random_splits(G: int, M: int, min_group_size: int = 1) -> torch.Tensor:
+        device = torch.accelerator.current_accelerator()
+        if M <= 0:
+            return torch.zeros((G,), dtype=torch.int32, device=device)
+
+        if min_group_size <= 1:
             m_cumsums = torch.sort(
                 torch.randint(
                     0,
                     M,
                     (G + 1,),
                     dtype=torch.int32,
-                    device=torch.accelerator.current_accelerator(),
+                    device=device,
                 )
             ).values
             m_cumsums[0], m_cumsums[-1] = 0, M
             m_sizes = m_cumsums[1:] - m_cumsums[:-1]
             return m_sizes
-        else:
-            return torch.zeros(
-                (G,), dtype=torch.int32, device=torch.accelerator.current_accelerator()
-            )
+
+        # Constrained splits: every non-empty group must have at least
+        # `min_group_size` rows (the contract enforced by the ROCm grad/wgrad
+        # Triton kernels). We quantize M into blocks of `min_group_size`,
+        # randomly assign those blocks across groups (groups that receive no
+        # block stay empty, which is allowed), then add the leftover remainder
+        # to the first non-empty group so the sizes still sum to exactly M.
+        num_blocks = M // min_group_size
+        remainder = M - num_blocks * min_group_size
+        block_counts = torch.zeros(G, dtype=torch.int64, device=device)
+        if num_blocks > 0:
+            idx = torch.randint(0, G, (num_blocks,), device=device)
+            block_counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.int64))
+        m_sizes = block_counts * min_group_size
+        if remainder > 0:
+            nz = torch.nonzero(m_sizes, as_tuple=False)
+            first = int(nz[0].item()) if nz.numel() > 0 else 0
+            m_sizes[first] += remainder
+        return m_sizes.to(torch.int32)
 
     @parameterized.expand(
         [
@@ -1773,7 +1792,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_wgrad(
         self,
         G: int,
@@ -1792,7 +1810,8 @@ class BF16Tests(unittest.TestCase):
             (M, K), dtype=dtype, device=torch.accelerator.current_accelerator()
         )
 
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm wgrad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         # Test
         if output_accum:
@@ -1881,7 +1900,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_dgrad(
         self,
         G: int,
@@ -1901,7 +1919,8 @@ class BF16Tests(unittest.TestCase):
             dtype=dtype,
             device=torch.accelerator.current_accelerator(),
         )
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm grad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         sm_margin = 0
         num_sms = (
