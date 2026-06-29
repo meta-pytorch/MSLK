@@ -102,6 +102,44 @@ class TestFp8Matmul(unittest.TestCase):
         _test_matmul_fp8_row((3, 4, 5), torch.device("cpu"), False)
         _test_matmul_fp8_row((3, 4, 5), torch.device("cpu"), False, True)
 
+    @unittest.skipIf(
+        not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_properties(torch.cuda.current_device()).major < 9,
+        "Device-side TMA persistent path is CUDA-only (Hopper+)",
+    )
+    def test_matmul_fp8_row_tma_persistent(self) -> None:
+        # Aligned shapes (K % 16 == 0, N % 8 == 0) take the device-side TMA path;
+        # the tiny shapes in test_matmul_fp8_row only hit the fallback. Compare to
+        # a dequantized-fp8 reference to isolate the kernel from quant noise.
+        for M, N, K, fast_accum, use_bias in [
+            (128, 256, 128, True, False),
+            (256, 256, 256, False, False),
+            (512, 512, 256, True, True),
+        ]:
+            a = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+            b = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+            bias = (
+                torch.randn(N, dtype=torch.float32, device="cuda") if use_bias else None
+            )
+            a_fp8, a_scale = quantize_fp8_row(a)
+            b_fp8, b_scale = quantize_fp8_row(b)
+            ref = (a_fp8.to(torch.float32) * a_scale[:, None]) @ (
+                b_fp8.to(torch.float32) * b_scale[:, None]
+            ).T
+            if use_bias:
+                ref = ref + bias
+            out = matmul_fp8_row(
+                a_fp8,
+                b_fp8,
+                a_scale,
+                b_scale,
+                bias=bias,
+                fp8_fast_accum=fast_accum,
+                tma_persistent=True,
+            )
+            torch.testing.assert_close(out.to(torch.float32), ref, atol=1e-1, rtol=2e-2)
+
     def test_matmul_fp8_row_skip_scaling(self) -> None:
         def _fp8_clamp(x: torch.Tensor) -> torch.Tensor:
             fp8_dtype = torch.float8_e4m3fn
