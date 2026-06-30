@@ -903,7 +903,7 @@ def _kernel_quantize_fp8_group(
         # Scale and quantize.
         a_scale = MAX_FP8 / group_max
         scale_chunk_offset = scale_k_offset + k * GROUP_LOAD
-        valid = tl.arange(0, GROUP_LOAD) + k * GROUP_LOAD < NUM_GROUPS
+        valid = scale_chunk_offset < NUM_GROUPS
         if USE_M_MAJOR and G > 0:
             tl.store(
                 A_scale
