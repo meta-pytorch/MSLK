@@ -784,8 +784,27 @@ def _kernel_matmul_fp8_row_tma_persistent(
 
     num_pid_in_group = GROUP_M * num_pid_n
 
-    dtype_fp8 = tl.float8e4nv
-    scale_dtype = tl.float32
+    a_desc = tl.make_tensor_descriptor(
+        A_ptr,
+        shape=[M, K],
+        # pyre-ignore
+        strides=[K, 1],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+    b_desc = tl.make_tensor_descriptor(
+        B_ptr,
+        shape=[N, K],
+        # pyre-ignore
+        strides=[K, 1],
+        block_shape=[BLOCK_N, BLOCK_K],
+    )
+    c_desc = tl.make_tensor_descriptor(
+        C_ptr,
+        shape=[M, N],
+        # pyre-ignore
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
 
     # Outer loop over tiles assigned to this SM
     for tile_id in range(start_pid, num_tiles, NUM_SMS):
@@ -807,12 +826,8 @@ def _kernel_matmul_fp8_row_tma_persistent(
         for ki in range(0, k_tiles):
             offs_k = ki * BLOCK_K
 
-            a = tl._experimental_descriptor_load(
-                A_ptr, [offs_am, offs_k], [BLOCK_M, BLOCK_K], dtype_fp8
-            )
-            b = tl._experimental_descriptor_load(
-                B_ptr, [offs_bn, offs_k], [BLOCK_N, BLOCK_K], dtype_fp8
-            )
+            a = a_desc.load([offs_am, offs_k])
+            b = b_desc.load([offs_bn, offs_k])
 
             if fp8_fast_accum:
                 acc = tl.dot(
@@ -822,24 +837,20 @@ def _kernel_matmul_fp8_row_tma_persistent(
                 acc += tl.dot(a, b.T, out_dtype=dot_out_dtype, allow_tf32=allow_tf32)
 
         # Invert scaling.
-        a_scale = tl._experimental_descriptor_load(
-            A_scale, [offs_am], [BLOCK_M], scale_dtype
-        )
-        b_scale = tl._experimental_descriptor_load(
-            B_scale, [offs_bn], [BLOCK_N], scale_dtype
-        )
+        offs_scale_m = offs_am + tl.arange(0, BLOCK_M)
+        offs_scale_n = offs_bn + tl.arange(0, BLOCK_N)
+        a_scale = tl.load(A_scale + offs_scale_m, mask=offs_scale_m < M, other=0.0)
+        b_scale = tl.load(B_scale + offs_scale_n, mask=offs_scale_n < N, other=0.0)
         scale = a_scale[:, None] * b_scale[None, :]
         acc *= scale
 
         # Load and add bias if specified.
         if USE_BIAS:
-            bias = tl._experimental_descriptor_load(
-                Bias, [offs_bn], [BLOCK_N], bias_dtype
-            )
+            bias = tl.load(Bias + offs_scale_n, mask=offs_scale_n < N, other=0.0)
             acc += bias[None, :]
 
         acc = acc.to(c_dtype)
-        tl._experimental_descriptor_store(C_ptr, acc, [offs_am, offs_bn])
+        c_desc.store([offs_am, offs_bn], acc)
 
 
 has_warp_specialization = hasattr(tl, "async_task")
@@ -1197,6 +1208,10 @@ def matmul_fp8_row(
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
+    # Device-side TMA needs a 16-byte-aligned innermost global stride (K bytes for
+    # fp8 A/B, N*elem_size for C); smaller shapes fall back to the non-TMA kernels.
+    tma_aligned = (K * a.element_size()) % 16 == 0 and (N * c.element_size()) % 16 == 0
+
     def persistent_grid(META: Dict[str, int]) -> Tuple[int]:
         return (
             min(
@@ -1308,8 +1323,6 @@ def matmul_fp8_row(
         desc_a = desc_helper.get_tma_descriptor_kernel_param("a")
         desc_b = desc_helper.get_tma_descriptor_kernel_param("b")
         desc_c = desc_helper.get_tma_descriptor_kernel_param("c")
-        desc_a_scale = desc_helper.get_tma_descriptor_kernel_param("a_scale")
-        desc_b_scale = desc_helper.get_tma_descriptor_kernel_param("b_scale")
         desc_bias = desc_helper.get_tma_descriptor_kernel_param("bias")
 
         bias_dtype_triton = None
@@ -1348,82 +1361,12 @@ def matmul_fp8_row(
             NUM_SMS=NUM_SMS,
             USE_BIAS=bias is not None,
         )
-    elif tma_persistent:
-        # used by TMA persistent kernel
-        desc_helper = TmaAutoTuneHelper()
-        desc_helper.init_tma_descriptor("a")
-        desc_helper.init_tma_descriptor("b")
-        desc_helper.init_tma_descriptor("c")
-        desc_helper.init_tma_descriptor("a_scale")
-        desc_helper.init_tma_descriptor("b_scale")
-        desc_helper.init_tma_descriptor("bias")
+    elif tma_persistent and tma_aligned:
+        # Descriptors are built in-kernel; just register an allocator for them.
+        def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+            return torch.empty(size, device=a.device, dtype=torch.int8)
 
-        def persistent_grid_tma(META: Dict[str, int]) -> Tuple[int]:
-            nonlocal desc_helper  # noqa: F824
-            assert a_scale is not None  # Type narrowing for Pyre
-            desc_helper.fill_2d_tma_descriptor(
-                "a",
-                a.data_ptr(),
-                M,
-                K,
-                META["BLOCK_M"],
-                META["BLOCK_K"],
-                a.element_size(),
-            )
-
-            desc_helper.fill_2d_tma_descriptor(
-                "b",
-                b.data_ptr(),
-                N,
-                K,
-                META["BLOCK_N"],
-                META["BLOCK_K"],
-                b.element_size(),
-            )
-            desc_helper.fill_2d_tma_descriptor(
-                "c",
-                c.data_ptr(),
-                M,
-                N,
-                META["BLOCK_M"],
-                META["BLOCK_N"],
-                c.element_size(),
-            )
-            desc_helper.fill_1d_tma_descriptor(
-                "a_scale",
-                a_scale.data_ptr(),
-                M,
-                META["BLOCK_M"],
-                a_scale.element_size(),
-            )
-            desc_helper.fill_1d_tma_descriptor(
-                "b_scale",
-                b_scale.data_ptr(),
-                N,
-                META["BLOCK_N"],
-                b_scale.element_size(),
-            )
-            if bias is not None:
-                desc_helper.fill_1d_tma_descriptor(
-                    "bias",
-                    bias.data_ptr(),
-                    N,
-                    META["BLOCK_N"],
-                    bias.element_size(),
-                )
-            return (
-                min(
-                    NUM_SMS,
-                    triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
-                ),
-            )
-
-        desc_a = desc_helper.get_tma_descriptor_kernel_param("a")
-        desc_b = desc_helper.get_tma_descriptor_kernel_param("b")
-        desc_c = desc_helper.get_tma_descriptor_kernel_param("c")
-        desc_a_scale = desc_helper.get_tma_descriptor_kernel_param("a_scale")
-        desc_b_scale = desc_helper.get_tma_descriptor_kernel_param("b_scale")
-        desc_bias = desc_helper.get_tma_descriptor_kernel_param("bias")
+        triton.set_allocator(alloc_fn)
 
         bias_dtype_triton = None
         if bias is not None:
@@ -1431,20 +1374,20 @@ def matmul_fp8_row(
 
         # pyre-ignore
         torch._library.capture_triton(_kernel_matmul_fp8_row_tma_persistent)[
-            persistent_grid_tma
+            persistent_grid
         ](
-            desc_a,
-            desc_b,
-            desc_c,
+            a,
+            b,
+            c,
             M,
             N,
             K,
             m_key,
             n_key,
             k_key,
-            desc_a_scale,
-            desc_b_scale,
-            desc_bias,
+            a_scale,
+            b_scale,
+            bias,
             a.stride(0),
             a.stride(1),
             b.stride(0),
