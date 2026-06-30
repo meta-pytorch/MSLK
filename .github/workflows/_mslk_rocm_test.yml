@@ -137,6 +137,9 @@ jobs:
     - name: Install MSLK dependencies (pip)
       run: . $PRELUDE; install_mslk_deps $BUILD_ENV
 
+    - name: Install FlyDSL
+      run: . $PRELUDE; install_flydsl_pip $BUILD_ENV
+
     - name: Download Wheel Artifact from GHA
       if: ${{ inputs.mslk-channel-version == '' }}
       uses: actions/download-artifact@v4

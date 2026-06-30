@@ -700,6 +700,7 @@ def main(argv: List[str]) -> None:
     # where cu126 changes to match the cuda version..
     extras_require = {
         "flash3": ["flash-attn-3"],
+        "flydsl": ["flydsl==0.2.2"],
     }
 
     packages = setuptools.find_packages()
