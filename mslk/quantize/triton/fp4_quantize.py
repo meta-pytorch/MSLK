@@ -12,16 +12,6 @@ from mslk.quantize.triton.legacy import primitives as _primitives
 from mslk.quantize.triton.legacy.fake_quantize import (  # noqa: F401
     triton_fake_quantize_nvfp4_per_tensor,
 )
-from mslk.quantize.triton.legacy.fused_rms import (  # noqa: F401
-    triton_nvfp4_quant_stacked_rms,
-    triton_rms_quantize_mx4_unpack,
-    triton_scale_nvfp4_quant_rms,
-)
-from mslk.quantize.triton.legacy.fused_silu import (  # noqa: F401
-    triton_nvfp4_quant_stacked_silu,
-    triton_scale_nvfp4_quant_silu,
-    triton_silu_quantize_mx4_unpack,
-)
 from mslk.quantize.triton.legacy.global_scale import calculate_group_max  # noqa: F401
 from mslk.quantize.triton.legacy.naive import (  # noqa: F401
     get_nvfp4_global_scales_naive,
@@ -73,12 +63,6 @@ __all__ = [
     "mega_fp4_quantize_kernel",
     "mega_fp4_pack",
     "mega_fp4_unpack",
-    "triton_scale_nvfp4_quant_silu",
-    "triton_scale_nvfp4_quant_rms",
-    "triton_silu_quantize_mx4_unpack",
-    "triton_rms_quantize_mx4_unpack",
-    "triton_nvfp4_quant_stacked_silu",
-    "triton_nvfp4_quant_stacked_rms",
     "get_nvfp4_global_scales_naive",
     "quantize_nvfp4_naive",
     "cal_global_scale_mx4_as_nvfp4",
