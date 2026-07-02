@@ -1408,7 +1408,7 @@ class FP8Int4Tests(unittest.TestCase):
             )
 
 
-@skipUnlessCuda()
+@skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP8Tests(unittest.TestCase):
     @classmethod

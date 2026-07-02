@@ -3127,7 +3127,11 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -3332,7 +3336,11 @@ class CutlassMXFP8GroupwiseGrouped2D2D(GemmOpBase):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
+            Accelerator.AMD_GFX950,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
