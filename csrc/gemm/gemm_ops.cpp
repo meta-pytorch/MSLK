@@ -50,6 +50,15 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // registered by mx8mx4_gemm.py via torch.library.impl.
   m.def(
       "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
+  // FP8 groupwise GEMM: shared schema; CUDA uses CUTLASS, ROCm uses the
+  // Triton implementation registered by fp8_groupwise_gemm.py.
+  m.def(
+      "f8f8bf16_groupwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale) -> Tensor");
+  // FP8 groupwise grouped GEMM: shared schema; CUDA uses CUTLASS, ROCm uses
+  // the Triton implementation registered by fp8_groupwise_grouped_gemm.py.
+  m.def(
+      "f8f8bf16_groupwise_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
+  
 #ifdef USE_ROCM
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
@@ -87,10 +96,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f4f4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, Tensor(a!)? global_scale=None) -> Tensor");
   m.def(
       "f4f4bf16_ultra_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor x_global_scale, Tensor w_global_scale, Tensor(a!)? output=None) -> Tensor");
-  m.def(
-      "f8f8bf16_groupwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale) -> Tensor");
-  m.def(
-      "f8f8bf16_groupwise_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
   m.def("bf16x9_gemm(Tensor A, Tensor B, Tensor(a!)? output=None) -> Tensor");
   m.def(
       "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");

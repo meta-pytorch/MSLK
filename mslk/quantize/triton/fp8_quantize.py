@@ -862,7 +862,7 @@ def _kernel_quantize_fp8_group(
     scale_row_offset = pid * stride_a_scale_m
     k_offset = tl.arange(0, GROUP_LOAD * GROUP_SIZE)
     scale_k_offset = tl.arange(0, GROUP_LOAD)
-    NUM_GROUPS: tl.constexpr = K // GROUP_SIZE
+    NUM_GROUPS = K // GROUP_SIZE
 
     # When dealing with an M-major grouped gemm, we need to figure out
     # which group this thread corresponds to and figure out the corresponding
@@ -903,7 +903,7 @@ def _kernel_quantize_fp8_group(
         # Scale and quantize.
         a_scale = MAX_FP8 / group_max
         scale_chunk_offset = scale_k_offset + k * GROUP_LOAD
-
+        valid = scale_chunk_offset < NUM_GROUPS
         if USE_M_MAJOR and G > 0:
             tl.store(
                 A_scale
@@ -911,7 +911,7 @@ def _kernel_quantize_fp8_group(
                 + (pid - group_cumsum) * stride_a_scale_k
                 + (scale_chunk_offset * group_M),
                 1.0 / a_scale,
-                mask=scale_chunk_offset < NUM_GROUPS,
+                mask=valid,
             )
         else:
             if USE_M_MAJOR:
@@ -920,13 +920,13 @@ def _kernel_quantize_fp8_group(
                     + pid * stride_a_scale_k
                     + scale_chunk_offset * stride_a_scale_m,
                     1.0 / a_scale,
-                    mask=scale_chunk_offset < NUM_GROUPS,
+                    mask=valid,
                 )
             else:
                 tl.store(
                     A_scale + scale_row_offset + scale_chunk_offset * stride_a_scale_k,
                     1.0 / a_scale,
-                    mask=scale_chunk_offset < NUM_GROUPS,
+                    mask=valid,
                 )
         # Apply scale to input.
         a_fp8 = a_grouped * a_scale[:, None]

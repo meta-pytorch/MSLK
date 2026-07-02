@@ -29,4 +29,11 @@ import torch  # noqa: E402
 from . import _meta  # noqa: F401, E402
 
 if torch.version.hip is not None:
-    from .triton import grouped_gemm as _grouped_gemm, mx8mx4_gemm  # noqa: F401, E402
+    # Register the Triton implementation of mx8mx4bf16, f8f8bf16_groupwise_grouped
+    # for ROCm.
+    from .triton import (  # noqa: F401, E402
+        fp8_groupwise_gemm,
+        fp8_groupwise_grouped_gemm,
+        grouped_gemm as _grouped_gemm,
+        mx8mx4_gemm,
+    )
