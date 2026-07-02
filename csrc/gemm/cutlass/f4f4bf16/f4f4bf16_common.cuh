@@ -22,6 +22,50 @@
 #include <cutlass/epilogue/collective/collective_builder.hpp> // @manual
 // clang-format on
 
+// MXFP4 with 1x16 block size (16 elements per scale factor) and E8M0 scales.
+// This is a Meta-internal hybrid format that combines MXFP4's E8M0 scale
+// factor type with NVFP4's 16-element block size. Upstream CUTLASS (e.g.
+// 4.4.2) does not provide this type, so we define it here along with the
+// CollectiveBuilder dispatch specialization required by the SM100 builder.
+//
+// NOTE: `cutlass` is preprocessor-rewritten to `cutlass_mslk` via the
+// CUTLASS_NAMESPACE macro defined above, so these definitions land in the
+// MSLK-private cutlass namespace.
+namespace cutlass {
+
+template <class F4Type>
+struct mx_float4_16_t {
+  static_assert(
+      cute::is_same_v<F4Type, cutlass::float_e2m1_t> ||
+          cute::is_same_v<F4Type, cutlass::type_erased_dynamic_float4_t>,
+      "Only float_e2m1_t or type_erased_dynamic_float4_t can be used for MXFP4-16");
+  using ScaleFactorType =
+      cutlass::float_ue8m0_t; // E8M0 scale factors (same as standard MXFP4)
+  using DataType = F4Type;
+  static constexpr int SFVecSize = 16; // 16 elements per scale factor
+};
+
+namespace gemm::collective::detail::blockscaled {
+
+template <class BuilderScheduleTag, class T>
+struct blockscaled_type<BuilderScheduleTag, cutlass::mx_float4_16_t<T>> {
+  using sf_type = cutlass::float_ue8m0_t;
+  using data_type = T;
+  static constexpr uint32_t SfVectorSize =
+      (cute::is_base_of_v<
+           cutlass::gemm::KernelScheduleBlockScaledSparseGemmSm100,
+           BuilderScheduleTag> ||
+       cute::is_base_of_v<
+           cutlass::gemm::KernelScheduleBlockScaledSparseGemmSm120,
+           BuilderScheduleTag>)
+      ? 32
+      : 16; // Same block size as NVFP4
+};
+
+} // namespace gemm::collective::detail::blockscaled
+
+} // namespace cutlass
+
 namespace mslk::gemm {
 
 namespace cutlass = cutlass_mslk;
