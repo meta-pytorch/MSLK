@@ -322,7 +322,7 @@ class FwOp(AttentionFwOpBase):
             max_chunk_size = 64
             split_k_stop_val = max(1024 / (B * G * H), 1)
             # Largest split_k whose chunk is still >= max_chunk_size keys
-            split_k = max(min(split_k, Mk // max_chunk_size + 1), 1)
+            split_k = max(min(split_k, Mk // max_chunk_size + 1), 1)                
 
             while split_k > split_k_stop_val:
                 split_k = split_k // 2
