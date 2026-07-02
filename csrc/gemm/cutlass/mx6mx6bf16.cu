@@ -669,12 +669,25 @@ Kernel_mx6mx6bf16 get_kernel_via_tuning(
 
 } // namespace
 
+// Internal split-K helper, defined in mx6mx6bf16/mx6mx6bf16_splitk.cu (same
+// target). Writes into `output`.
+at::Tensor mx6mx6bf16_splitk(
+    at::Tensor XQ,
+    at::Tensor WQ,
+    at::Tensor x_scale,
+    at::Tensor w_scale,
+    at::Tensor output,
+    int64_t splits);
+
 at::Tensor mx6mx6bf16(
     at::Tensor XQ, // MX FP6 (e2m3)
     at::Tensor WQ, // MX FP6 (e2m3)
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    // Deep-K split-K control: 0 = heuristic (auto), >0 = force that many
+    // splits.
+    int64_t splits) {
   TORCH_CHECK(XQ.is_cuda() && XQ.is_contiguous());
   TORCH_CHECK(WQ.is_cuda() && WQ.is_contiguous());
   TORCH_CHECK(x_scale.is_cuda() && x_scale.is_contiguous());
@@ -683,7 +696,11 @@ at::Tensor mx6mx6bf16(
   const auto M = XQ.size(0);
   const auto N = WQ.size(0);
   // XQ is packed 6-bit: K elements occupy K*6/8 = K*3/4 bytes, so K = bytes * 4
-  // / 3.
+  // / 3. Require the byte count to be a multiple of 3 so this division is
+  // exact.
+  TORCH_CHECK(
+      XQ.size(1) % 3 == 0,
+      "XQ inner dim (packed 6-bit K bytes) must be a multiple of 3");
   const auto K = XQ.size(1) * 4 / 3;
   TORCH_CHECK(
       K % 32 == 0,
@@ -697,8 +714,32 @@ at::Tensor mx6mx6bf16(
       ? output.value()
       : at::empty({M, N}, XQ.options().dtype(at::kBFloat16));
 
+  // Env kill-switches, read once (std::getenv is not thread-safe vs setenv, and
+  // re-reading per launch is wasted hot-path work).
+  static const bool disable_splitk =
+      std::getenv("MSLK_DISABLE_SPLITK") != nullptr;
+  static const bool autotune_enable =
+      std::getenv("MSLK_AUTOTUNE_ENABLE") != nullptr;
+
+  // Deep-K, low-occupancy shapes route to CUTLASS split-K (parallel K
+  // reduction, CUDA-graph safe; ~1.5x over the single-CTA dense path on GB300).
+  // An explicit `splits` forces that count; splits==0 uses the measured
+  // heuristic (K>=32768 and M*N<=512K). The split-K path writes into `out`, so
+  // it also serves the explicit-`output` case. MSLK_DISABLE_SPLITK is a true
+  // kill-switch: it forces the dense path for both explicit and auto split-K.
+  if (!disable_splitk) {
+    if (splits > 0) {
+      return mx6mx6bf16_splitk(XQ, WQ, x_scale, w_scale, out, splits);
+    }
+    const bool use_split_k = !autotune_enable && K >= 32768 &&
+        static_cast<int64_t>(M) * N <= 524288 && K % (32 * 4) == 0;
+    if (use_split_k) {
+      return mx6mx6bf16_splitk(XQ, WQ, x_scale, w_scale, out, /*splits=*/4);
+    }
+  }
+
   auto kernel = [&]() {
-    if (std::getenv("MSLK_AUTOTUNE_ENABLE")) {
+    if (autotune_enable) {
       return get_kernel_via_tuning(M, N, K, XQ, WQ, x_scale, w_scale, out);
     }
     return get_kernel_via_heuristics(M, N, K);
