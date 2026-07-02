@@ -14,6 +14,7 @@ import torch
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 
 @unittest.skipIf(
@@ -142,8 +143,7 @@ class TestFp8Matmul(unittest.TestCase):
 
     def test_matmul_fp8_row_skip_scaling(self) -> None:
         def _fp8_clamp(x: torch.Tensor) -> torch.Tensor:
-            fp8_dtype = torch.float8_e4m3fn
-            fp8_max = torch.finfo(fp8_dtype).max
+            fp8_dtype, _, fp8_max, _ = get_fp8_constants()
             xq = torch.clamp(x, min=-1 * fp8_max, max=fp8_max).to(fp8_dtype)
             return xq
 

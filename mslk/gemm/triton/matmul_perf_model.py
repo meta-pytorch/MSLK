@@ -33,6 +33,12 @@ def get_clock_rate_in_khz():
     try:
         return nvsmi(["clocks.max.sm"])[0] * 1e3
     except FileNotFoundError:
+        # `nvidia-smi` is unavailable (e.g. on ROCm). On AMD there is no NVML, so
+        # read the clock directly from the torch device properties (in kHz).
+        if torch.version.hip is not None:
+            return torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).clock_rate
         import pynvml  # @manual=fbsource//third-party/pypi/pynvml:pynvml
 
         pynvml.nvmlInit()
