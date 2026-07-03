@@ -42,7 +42,10 @@ class FlyDSLSupportTest(unittest.TestCase):
         flydsl_compiler = mock.Mock(compile=compile_fn)
         with mock.patch.dict(
             "sys.modules",
-            {"flydsl": mock.Mock(compiler=flydsl_compiler), "flydsl.compiler": flydsl_compiler},
+            {
+                "flydsl": mock.Mock(compiler=flydsl_compiler),
+                "flydsl.compiler": flydsl_compiler,
+            },
         ):
             flydsl.run_compiled(launcher, 1, 2)
             # First call compiles with the launcher and args; does not invoke result.
