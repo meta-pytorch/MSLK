@@ -50,6 +50,11 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // registered by mx8mx4_gemm.py via torch.library.impl.
   m.def(
       "mx8mx4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None) -> Tensor");
+  // MXFP8 x MXFP8 grouped GEMM: shared schema; CUDA uses the CUTLASS
+  // implementation, ROCm uses the Triton implementation registered by
+  // mx8mx8_gemm.py via torch.library.impl.
+  m.def(
+      "mx8mx8bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, int? actual_num_tokens=None) -> Tensor");
 #ifdef USE_ROCM
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
@@ -81,8 +86,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "mx6mx6bf16(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? output=None) -> Tensor");
   m.def(
       "f4f4bf16_grouped_stacked(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes, Tensor? global_scale=None, Tensor? starting_row_after_padding=None, bool use_mx=True) -> Tensor");
-  m.def(
-      "mx8mx8bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, int? actual_num_tokens=None) -> Tensor");
   m.def(
       "f4f4bf16_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor(a!)? output=None, Tensor(a!)? global_scale=None) -> Tensor");
   m.def(

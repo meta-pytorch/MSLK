@@ -27,10 +27,6 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_fake_quantize_nvfp4_per_tensor,
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
-    triton_rms_quantize_mx4_unpack,
-    triton_scale_nvfp4_quant_rms,
-    triton_scale_nvfp4_quant_silu,
-    triton_silu_quantize_mx4_unpack,
 )
 from mslk.quantize.triton.fp4_utils import (
     dequantize_nvfp4,
@@ -53,13 +49,6 @@ def supports_mxfp4():
 
 SUPPORTS_NVFP4 = supports_nvfp4()
 SUPPORTS_MXFP4 = supports_mxfp4()
-
-# pyre-fixme [16]
-open_source: bool = getattr(mslk, "open_source", False)
-
-if not open_source:
-    from gen_ai.llm_inference.fb.llm.kernel.rms_norm import rms_norm
-    from gen_ai.llm_inference.fb.llm.kernel.silu_mul import silu_mul
 
 
 def scale_mx4(x: torch.Tensor, exp: torch.Tensor, group_size: int = 32) -> torch.Tensor:
@@ -111,75 +100,6 @@ class TestFp4Quantize:
         xq_float = fp4_to_float(xq)
         xq_dequant = scale_mx4(xq_float, x_scale, group_size).to(torch.bfloat16)
         torch.testing.assert_close(xq_dequant, x, atol=1, rtol=1)
-
-
-@pytest.mark.skipif(
-    not SUPPORTS_MXFP4,
-    reason="Skip if TestFp4RmsQuantize is not supported on this device.",
-)
-class TestFp4RmsQuantize:
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        torch.manual_seed(0)
-
-    # TODO: fix potential bug with large tensors - (4096, 10240) excluded
-    @pytest.mark.parametrize("shape", [(1, 32), (1, 128), (3, 512), (128, 1024)])
-    def test_rms_quantize_fp4(self, shape: Tuple[int, int]) -> None:
-        device = "cuda"
-        M, N = shape
-        group_size = 32
-        rounding_mode = RoundingMode.even
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        w = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        xq, x_scale = triton_rms_quantize_mx4_unpack(
-            x, w, EPS=1e-5, group_size=group_size, rounding_mode=rounding_mode
-        )
-
-        intermediate = (
-            x.to(torch.float32).reshape(-1, group_size)
-            * torch.rsqrt(
-                torch.pow(x.to(torch.float32).reshape(-1, group_size), 2).mean(dim=1)
-                + 1e-5
-            ).unsqueeze(1)
-        ) * w.reshape(-1, group_size).to(torch.float32)
-
-        intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-        # Dequantize and check that results are similar.
-        x_scale = _from_blocked(x_scale, (M, math.ceil(N / group_size)))
-        xq_float = fp4_to_float(xq)
-        xq_dequant = scale_mx4(xq_float, x_scale, group_size).to(torch.bfloat16)
-        torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
-
-
-@pytest.mark.skipif(
-    not SUPPORTS_MXFP4,
-    reason="Skip if TestFp4SiluQuantize is not supported on this device.",
-)
-class TestFp4SiluQuantize:
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        torch.manual_seed(0)
-
-    @pytest.mark.parametrize("shape", [(1, 128), (3, 512), (128, 1024), (10240, 10240)])
-    def test_silu_quantize_fp4(self, shape: Tuple[int, int]) -> None:
-        device = "cuda"
-        M, N = shape
-        group_size = 32
-        rounding_mode = RoundingMode.even
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        w = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        xq, x_scale = triton_silu_quantize_mx4_unpack(
-            x, w, group_size=group_size, rounding_mode=rounding_mode
-        )
-        intermediate = torch.nn.functional.silu(x.to(torch.float32)) * w.to(
-            torch.float32
-        )
-        intermediate = intermediate.to(torch.bfloat16)
-        # Dequantize and check that results are similar.
-        x_scale = _from_blocked(x_scale, (M, math.ceil(N / group_size)))
-        xq_float = fp4_to_float(xq)
-        xq_dequant = scale_mx4(xq_float, x_scale, group_size).to(torch.bfloat16)
-        torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
 
 
 @pytest.mark.skipif(
@@ -330,72 +250,6 @@ class TestNVFp4Quantize:
         x_global_scale = global_scale_nvfp4(x)
         with pytest.raises(AssertionError, match=error_msg):
             triton_quantize_nvfp4(x, x_global_scale)
-
-
-@pytest.mark.skipif(
-    not SUPPORTS_NVFP4,
-    reason="Skip if TestNVFp4SiluQuantize is not supported on this device.",
-)
-class TestNVFp4SiluQuantize:
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        torch.manual_seed(0)
-
-    @pytest.mark.skipif(open_source, reason="silu_mul is not available")
-    @pytest.mark.parametrize("shape", [(1, 128), (4, 512), (128, 1024), (10240, 10240)])
-    def test_silu_quantize_nvfp4(self, shape: Tuple[int, int]) -> None:
-        device = "cuda"
-        M, N = shape
-        group_size = 16
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        w = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        x_global_scale = global_scale_nvfp4(x)
-        xq, x_scale = triton_scale_nvfp4_quant_silu(
-            x,
-            w,
-            x_global_scale,
-            group_size=group_size,
-        )
-
-        intermediate = silu_mul(x.reshape(-1, 16), w.reshape(-1, 16))
-        intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-
-        xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
-        torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
-
-
-@pytest.mark.skipif(
-    not SUPPORTS_NVFP4,
-    reason="Skip if TestNVFp4RmsQuantize is not supported on this device.",
-)
-class TestNVFp4RmsQuantize:
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        torch.manual_seed(0)
-
-    # Note, large testing tensors may lead to slight numerical differences
-    @pytest.mark.skipif(open_source, reason="rms_norm is not available")
-    @pytest.mark.parametrize("shape", [(1, 128), (4, 512), (128, 1024), (1024, 10240)])
-    def test_rms_quantize_nvfp4(self, shape: Tuple[int, int]) -> None:
-        device = "cuda"
-        M, N = shape
-        group_size = 16
-        x = torch.randn(M, N, dtype=torch.bfloat16, device=device)
-        w = torch.randn(group_size, dtype=torch.bfloat16, device=device)
-        x_global_scale = global_scale_nvfp4(x)
-        xq, x_scale = triton_scale_nvfp4_quant_rms(
-            x,
-            w.repeat(M * N // group_size),
-            x_global_scale,
-            group_size=group_size,
-            EPS=1e-5,
-        )
-
-        intermediate = rms_norm(x.reshape(-1, 16), w, eps=1e-5)
-        intermediate = intermediate.to(torch.bfloat16).reshape(M, N)
-
-        xq_dequant = dequantize_nvfp4(xq, x_scale, x_global_scale)
-        torch.testing.assert_close(xq_dequant, intermediate, atol=1, rtol=1)
 
 
 # When the below functions is added to Torch core, remove it and use it there instead.
