@@ -14,6 +14,9 @@
 #include <cutlass/util/device_memory.h>
 #include <cutlass/util/packed_stride.hpp>
 
+#include <type_traits>
+#include <unordered_map>
+
 // clang-format off
 // The fixed ordering of the headers is required for CUTLASS 3.2+
 #include <cute/tensor.hpp>
@@ -30,18 +33,38 @@ using MXFP6 = cutlass::mx_float6_t<cutlass::float_e2m3_t>;
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
+// Cache the hardware info per device: split-K needs the SM count, and
+// query_device_multiprocessor_count() calls cudaGetDeviceProperties (multi-us,
+// uncached), which is significant next to the ~27us target kernel. Host-side
+// GEMM dispatch is single-threaded, so no lock is needed.
+inline const cutlass::KernelHardwareInfo& mx6mx6bf16_hw_info(int device_id) {
+  static std::unordered_map<int, cutlass::KernelHardwareInfo> cache;
+  auto it = cache.find(device_id);
+  if (it == cache.end()) {
+    cutlass::KernelHardwareInfo info;
+    info.device_id = device_id;
+    info.sm_count =
+        cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+            device_id);
+    it = cache.emplace(device_id, info).first;
+  }
+  return it->second;
+}
+
 template <
     int TB_M,
     int TB_N,
     int TBS_M,
     int TBS_N,
-    int TBS_K>
+    int TBS_K,
+    bool USE_SPLITK = false>
 at::Tensor _mx6mx6bf16(
     at::Tensor XQ, // MX FP6 (e2m3)
     at::Tensor WQ, // MX FP6 (e2m3)
     at::Tensor x_scale,
     at::Tensor w_scale,
-    at::Tensor output) {
+    at::Tensor output,
+    int64_t splits = 1) {
   c10::cuda::CUDAGuard deviceGuard(XQ.device());
 
   const int M = XQ.size(0);
@@ -117,11 +140,15 @@ at::Tensor _mx6mx6bf16(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
           cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
+  // Dense path uses the default data-parallel scheduler (void); split-K selects
+  // the CUTLASS Stream-K scheduler. Compile-time dispatch on USE_SPLITK.
+  using TileScheduler =
+      std::conditional_t<USE_SPLITK, cutlass::gemm::StreamKScheduler, void>;
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       cute::Shape<int, int, int, int>,
       CollectiveMainloop,
       CollectiveEpilogue,
-      void>;
+      TileScheduler>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -180,6 +207,19 @@ at::Tensor _mx6mx6bf16(
        reinterpret_cast<ElementOutput*>(output.data_ptr()),
        stride_output}};
 
+  // Split-K scheduler args (compile-time dispatch; dense path leaves the
+  // default data-parallel scheduler untouched).
+  if constexpr (USE_SPLITK) {
+    arguments.hw_info = mx6mx6bf16_hw_info(XQ.device().index());
+    arguments.scheduler.splits = static_cast<int>(splits);
+    arguments.scheduler.decomposition_mode =
+        cutlass::gemm::kernel::detail::DecompositionMode::SplitK;
+    // Deterministic (barrier) reduction: reproducible and exact vs the dense
+    // GEMM.
+    arguments.scheduler.reduction_mode =
+        cutlass::gemm::kernel::detail::ReductionMode::Deterministic;
+  }
+
   Gemm gemm;
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
@@ -192,12 +232,19 @@ at::Tensor _mx6mx6bf16(
     throw std::runtime_error("cutlass cannot implement");
   }
 
-  status = gemm.initialize(arguments, workspace.data_ptr());
+  // Pass the current stream to initialize() so any workspace memset (notably
+  // the Stream-K barrier/lock reset) is issued on — and captured into — the
+  // active stream. Otherwise, under CUDA-graph capture that memset lands on the
+  // legacy stream, is absent from the graph, and the split-K reduction
+  // deadlocks from the 2nd replay onward (stale barrier flags). Harmless for
+  // the dense path.
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error("cutlass cannot initialize");
   }
 
-  status = gemm(at::cuda::getCurrentCUDAStream());
+  status = gemm(stream);
 
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error(

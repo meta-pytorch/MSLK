@@ -236,6 +236,9 @@ at::Tensor mx6mx6bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output = std::nullopt);
+    std::optional<at::Tensor> output = std::nullopt,
+    // Deep-K split-K control: 0 = heuristic (auto), >0 = force that many
+    // splits.
+    int64_t splits = 0);
 
 } // namespace mslk::gemm

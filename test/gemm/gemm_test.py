@@ -3031,6 +3031,44 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx6mx6.shape, torch.Size([M, N]))
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
+    @parameterized.expand(
+        [
+            # K < 32768 so `splits=0` stays on the dense path (the heuristic only
+            # auto-routes K>=32768); forcing `splits>0` exercises CUTLASS split-K
+            # on the same inputs. K divisible by 32*splits.
+            (64, 256, 8192, 4),
+            (64, 256, 8192, 8),
+            (256, 512, 16384, 4),
+        ]
+    )
+    def test_splitk_matches_dense(self, M: int, N: int, K: int, splits: int) -> None:
+        # CUTLASS split-K must match the single-CTA dense path on identical inputs.
+        # Random 6-bit-packed bytes as in test_gemm (no Python MX6 quantizer), so
+        # this is a dense-vs-split-K self-consistency check. The split-K fp32
+        # reduction sums per-chunk partials in a different order than the dense
+        # single-pass accumulation, so results agree only to bf16 tolerance.
+        aq_6 = torch.randint(
+            0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        bq_6 = torch.randint(
+            0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        _, a_scale = triton_quantize_mx4_unpack(
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        )
+        _, b_scale = triton_quantize_mx4_unpack(
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+        )
+
+        out_dense = torch.ops.mslk.mx6mx6bf16(aq_6, bq_6, a_scale, b_scale, None, 0)
+        out_splitk = torch.ops.mslk.mx6mx6bf16(
+            aq_6, bq_6, a_scale, b_scale, None, splits
+        )
+
+        self.assertFalse(out_splitk.isnan().any().item(), "split-K output has NaN")
+        self.assertEqual(out_splitk.shape, torch.Size([M, N]))
+        torch.testing.assert_close(out_splitk, out_dense, rtol=1.6e-2, atol=1e-2)
+
 
 @skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(8)

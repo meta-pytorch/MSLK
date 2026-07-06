@@ -308,6 +308,7 @@ if hasattr(torch.ops.mslk, "mx6mx6bf16"):
         x_scale: torch.Tensor,
         w_scale: torch.Tensor,
         output: Optional[torch.Tensor] = None,
+        splits: int = 0,
     ) -> torch.Tensor:
         M = XQ.shape[0]
         N = WQ.shape[0]
