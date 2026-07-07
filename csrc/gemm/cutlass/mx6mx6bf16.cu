@@ -754,7 +754,8 @@ at::Tensor mx6mx6bf16(
     at::Tensor WQ,
     at::Tensor x_scale,
     at::Tensor w_scale,
-    std::optional<at::Tensor> output) {
+    std::optional<at::Tensor> output,
+    int64_t splits) {
   throw std::runtime_error("CUDA version is older than 12.8");
 }
 
