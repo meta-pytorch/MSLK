@@ -29,7 +29,7 @@ automatically uses the correct hardware format as long as the caller supplies
 tensors produced by quantize_fp8_group / quantize_fp8_block.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 import triton  # @manual
@@ -38,12 +38,6 @@ from triton import Config  # @manual
 
 # Scale group size in K: must match the quantize_fp8_group/block group_size.
 _SCALE_GROUP_K: int = 128
-
-# Module-level cache for CPU-side precomputed values (M_starts, max_M).
-# Keyed by (M_sizes.data_ptr(), G, N, K) so the cache is invalidated if
-# M_sizes changes.  Populated on the first (non-capturing) call; reused
-# inside CUDA graph capture without device-to-host transfers.
-_grouped_precomp_cache: Dict[Tuple, Tuple] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -245,26 +239,18 @@ def matmul_f8f8bf16_groupwise_grouped(
     if TotalM == 0 or N == 0 or K == 0 or G == 0:
         return output
 
-    # Precompute M_starts (cumulative row offsets) and max_M on CPU.
-    # Results are cached so CUDA graph capture (which forbids device-to-host
-    # transfers) can reuse the values computed on the first non-capturing call.
-    cache_key = (M_sizes.data_ptr(), G, N, K)
-    if cache_key not in _grouped_precomp_cache:
-        m_sizes_cpu = M_sizes.cpu()
-        m_starts_cpu = torch.zeros(G, dtype=torch.int64)
-        if G > 1:
-            m_starts_cpu[1:] = m_sizes_cpu[:-1].cumsum(0)
-        max_M = int(m_sizes_cpu.max().item())
-        _grouped_precomp_cache[cache_key] = (
-            m_starts_cpu.to(XQ.device),
-            max_M,
-        )
+    # Derive M_starts (cumulative row offsets) on the GPU -- no device-to-host
+    # sync, so this captures cleanly inside a CUDA graph.
+    # M_starts[g] = sum of M_sizes[:g] = (0, M_sizes[0], M_sizes[0]+M_sizes[1], ...)
+    M_starts = M_sizes.cumsum(0) - M_sizes
 
-    M_starts, max_M = _grouped_precomp_cache[cache_key]
-
+    # The M dimension of the grid is bounded by TotalM (a host int already in
+    # hand) rather than max group size, avoiding a .item() sync.  Tiles that
+    # fall outside their group's M are discarded early in the kernel, so the
+    # extra launches for uneven groups are cheap no-ops.
     grid = lambda meta: (  # noqa: E731
         G,
-        triton.cdiv(max_M, meta["BLOCK_M"]),
+        triton.cdiv(TotalM, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
     )
 
