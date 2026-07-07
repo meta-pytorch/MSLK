@@ -1334,6 +1334,69 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
 
+@skipUnlessRocm()
+class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
+    """
+    Tests for the Triton BF16xINT4 grouped GEMM on AMD GPUs.
+
+    bf16i4bf16_shuffled_grouped is routed through the rowwise kernel on ROCm
+    (the CUTLASS shuffle layout does not exist on AMD).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = "cuda"
+        from mslk.gemm.triton.int4_grouped_gemm import (  # noqa: F401
+            matmul_bf16i4_rowwise_grouped,
+        )
+
+        cls.matmul_grouped = staticmethod(matmul_bf16i4_rowwise_grouped)
+
+    @parameterized.expand(
+        [
+            (2, 64, 512, 256, 128),
+            (2, 128, 1024, 512, 128),
+            (4, 64, 512, 256, 128),
+        ]
+    )
+    def test_grouped_accuracy(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        device = self.device
+        M_sizes = torch.full((G,), M, dtype=torch.int64, device=device)
+        M_total = G * M
+
+        X = torch.randn(M_total, K, dtype=torch.bfloat16, device=device) * 0.1
+
+        wq_list, scale_list, zero_list, w_ref_list = [], [], [], []
+        for _ in range(G):
+            w = torch.randn(N, K, dtype=torch.bfloat16, device=device) * 0.01
+            wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+            wq_list.append(pack_int4(wq).contiguous())
+            scale_list.append(w_scale.contiguous())
+            zero_list.append(w_zp.contiguous())
+            w_ref_list.append(w)
+
+        WQ = torch.stack(wq_list, dim=0)
+        w_scale_group = torch.stack(scale_list, dim=0)
+        w_zero_group = torch.stack(zero_list, dim=0)
+
+        y = self.matmul_grouped(X, WQ, w_scale_group, w_zero_group, M_sizes)
+        self.assertEqual(y.shape, (M_total, N))
+        self.assertEqual(y.dtype, torch.bfloat16)
+
+        x_splits = torch.split(X, M, dim=0)
+        for g in range(G):
+            y_g = y[g * M : (g + 1) * M]
+            y_ref = (x_splits[g].float() @ w_ref_list[g].float().T).to(torch.bfloat16)
+            torch.testing.assert_close(y_g, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
+
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)
 class FP8Int4Tests(unittest.TestCase):
