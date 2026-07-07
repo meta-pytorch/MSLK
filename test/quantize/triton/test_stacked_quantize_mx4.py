@@ -16,10 +16,11 @@ from mslk.quantize.triton.fp4_primitives import RoundingMode
 from mslk.quantize.triton.quantize_kernels.mx4 import quantize_mx4
 from mslk.quantize.triton.quantize_kernels.mx4_stacked import quantize_mx4_stacked
 from mslk.test.quantize.triton._mx4_torch_reference import (
-    is_blackwell_or_newer,
     swizzle_scales_to_blocked,
     torch_quantize_mx4_ref,
 )
+from mslk.testing.device import skipUnlessCudaCapability, skipUnlessGfxArch
+from mslk.utils.device import is_rocm
 from parameterized import parameterized  # @manual
 
 
@@ -49,10 +50,8 @@ def _slice_padded_scales(scales_flat, padded_start, padded_rows, padded_cols):
     return scales_flat[start:end]
 
 
-@unittest.skipUnless(
-    is_blackwell_or_newer(),
-    "Requires Blackwell (SM100+) GPU (matches test_stacked_quantize gating)",
-)
+@skipUnlessGfxArch("gfx950")
+@skipUnlessCudaCapability(10)
 class StackedQuantizeMX4Test(unittest.TestCase):
     """Bitwise-vs-torch-reference tests for stacked (MoE) MX4 quantization."""
 
@@ -105,29 +104,43 @@ class StackedQuantizeMX4Test(unittest.TestCase):
             )
             ref_xq_chunks.append(seg_xq_ref)
 
-            b_seg_slice = _slice_padded_scales(
-                b_scales, padded_start, padded_rows, padded_cols
-            )
+            if is_rocm():
+                # ROCm: plain [M, num_scale_cols] by logical row — compare the
+                # segment's rows directly (no padded slice / swizzle).
+                scales_u8 = b_scales.view(torch.uint8).reshape(-1, num_scale_cols)
+                b_seg_plain = scales_u8[seg_row_start:seg_end]
+                self.assertTrue(
+                    torch.equal(
+                        b_seg_plain.flatten(),
+                        seg_scales_2d.view(torch.uint8).flatten(),
+                    ),
+                    f"Segment {i} (m={m_i}) plain-scale mismatch, "
+                    f"m_sizes={m_sizes_list}",
+                )
+            else:
+                b_seg_slice = _slice_padded_scales(
+                    b_scales, padded_start, padded_rows, padded_cols
+                )
 
-            seg_scales_padded = torch.zeros(
-                (padded_rows, num_scale_cols),
-                dtype=torch.uint8,
-                device=seg.device,
-            )
-            seg_scales_padded[:m_i, :] = seg_scales_2d.view(torch.uint8)
-            seg_swizzled = swizzle_scales_to_blocked(
-                seg_scales_padded,
-                torch.Size([padded_rows * padded_cols]),
-                convention="mslk",
-            )
+                seg_scales_padded = torch.zeros(
+                    (padded_rows, num_scale_cols),
+                    dtype=torch.uint8,
+                    device=seg.device,
+                )
+                seg_scales_padded[:m_i, :] = seg_scales_2d.view(torch.uint8)
+                seg_swizzled = swizzle_scales_to_blocked(
+                    seg_scales_padded,
+                    torch.Size([padded_rows * padded_cols]),
+                    convention="mslk",
+                )
 
-            self.assertTrue(
-                torch.equal(
-                    b_seg_slice.view(torch.uint8).flatten(),
-                    seg_swizzled.view(torch.uint8).flatten(),
-                ),
-                f"Segment {i} (m={m_i}) scale mismatch for m_sizes={m_sizes_list}",
-            )
+                self.assertTrue(
+                    torch.equal(
+                        b_seg_slice.view(torch.uint8).flatten(),
+                        seg_swizzled.view(torch.uint8).flatten(),
+                    ),
+                    f"Segment {i} (m={m_i}) scale mismatch for m_sizes={m_sizes_list}",
+                )
 
         ref_xq = (
             torch.cat(ref_xq_chunks, dim=0)
