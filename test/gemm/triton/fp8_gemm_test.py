@@ -14,6 +14,7 @@ import torch
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 
 @unittest.skipIf(
@@ -142,8 +143,9 @@ class TestFp8Matmul(unittest.TestCase):
 
     def test_matmul_fp8_row_skip_scaling(self) -> None:
         def _fp8_clamp(x: torch.Tensor) -> torch.Tensor:
-            fp8_dtype = torch.float8_e4m3fn
-            fp8_max = torch.finfo(fp8_dtype).max
+            # Use the platform-correct fp8 dtype (e4m3fnuz on AMD MI300/MI350,
+            # e4m3fn on Nvidia) so matmul_fp8_row's dtype assertion is satisfied.
+            fp8_dtype, _, fp8_max, _ = get_fp8_constants()
             xq = torch.clamp(x, min=-1 * fp8_max, max=fp8_max).to(fp8_dtype)
             return xq
 
@@ -219,13 +221,21 @@ class TestFp8Matmul(unittest.TestCase):
             )
 
         _test_matmul_fp8_row_skip_scaling((3, 4, 5), torch.device("cuda"))
-        _test_matmul_fp8_row_skip_scaling((3, 4, 5), torch.device("cuda"), compile=True)
-        _test_matmul_fp8_row_skip_scaling(
-            (5, 4, 5), torch.device("cuda"), transpose_input=True
-        )
-        _test_matmul_fp8_row_skip_scaling(
-            (3, 4, 5), torch.device("cuda"), use_bias=False
-        )
+        # The compile / transposed / no-bias variants each re-trigger the
+        # persistent-path Triton autotune, which is very slow to compile on
+        # ROCm (hipcc). One representative case above already guards the
+        # skip-scaling path on ROCm; run the full matrix only on CUDA to keep
+        # the ROCm CI within its time budget.
+        if torch.version.hip is None:
+            _test_matmul_fp8_row_skip_scaling(
+                (3, 4, 5), torch.device("cuda"), compile=True
+            )
+            _test_matmul_fp8_row_skip_scaling(
+                (5, 4, 5), torch.device("cuda"), transpose_input=True
+            )
+            _test_matmul_fp8_row_skip_scaling(
+                (3, 4, 5), torch.device("cuda"), use_bias=False
+            )
 
     def test_matmul_fp8_block(self) -> None:
         def _test_matmul_fp8_block(
