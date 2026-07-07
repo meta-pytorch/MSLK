@@ -22,6 +22,7 @@ from mslk.quantize.triton.fp4_primitives import (
     RoundingMode,
 )
 from mslk.quantize.triton.quantize_kernels import _resolve_seed
+from mslk.utils.device import is_gfx950, is_rocm
 from triton import language as tl  # @manual=//triton:triton
 
 
@@ -44,6 +45,8 @@ def quantize_mx4_kernel(
     MBITS: tl.constexpr,  # mantissa bits in target FP4 format (1 for E2M1)
     N_COL_BLOCKS: tl.constexpr,  # ceil(num_scale_cols / 4) — blocked layout offset
     STOCHASTIC: tl.constexpr,  # True → enable software stochastic rounding
+    IS_ROCM: tl.constexpr,  # True → plain [M, K//32] scale layout (AMD GEMM contract)
+    IS_GFX950: tl.constexpr,  # True → gfx950 native FP4 packing instruction
 ):
     """MX4 quantization kernel processing [M_PER_BLOCK, 64] tiles.
 
@@ -64,7 +67,7 @@ def quantize_mx4_kernel(
     # Tail-scale zeroing: when M_PER_BLOCK != 128, extra blocks zero out padded
     # scales in the 128-row-aligned tail for tensor core compatibility.
     # ========================================================================
-    if M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
+    if (not IS_ROCM) and M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
         offs_m = tl.arange(0, 128)[:, None]
         logical_col = pid_n * NUM_GROUPS + tl.arange(0, NUM_GROUPS)[None, :]
         num_scale_cols = N // GROUP_SIZE
@@ -138,23 +141,35 @@ def quantize_mx4_kernel(
         # M * (N // GROUP_SIZE) > 2**31; promote like the data-offset paths above.
         logical_row = logical_row.to(tl.int64)
         logical_col = logical_col.to(tl.int64)
-    scale_offs = blocked_scale_offset(
-        logical_row, logical_col, N_COL_BLOCKS, num_scale_cols
-    )
-    # Mask out scale columns beyond num_scale_cols (= N // GROUP_SIZE).
-    # Without this mask, writes for col >= num_scale_cols collide with
-    # valid scales of subsequent rows in the swizzled layout. Rows are
-    # already on-tile by construction in the non-stacked path.
+    if IS_ROCM:
+        # AMD GEMMs consume the plain [M, num_scale_cols] row-major layout (no
+        # swizzle / 128-row pad). The buffer has exactly M rows, so tail rows
+        # from a partial last tile (logical_row >= M) must be masked out.
+        scale_offs = logical_row * num_scale_cols + logical_col
+        scale_store_mask = (logical_col < num_scale_cols) & (logical_row < M)
+    else:
+        scale_offs = blocked_scale_offset(
+            logical_row, logical_col, N_COL_BLOCKS, num_scale_cols
+        )
+        # Mask out scale columns beyond num_scale_cols (= N // GROUP_SIZE).
+        # Without this mask, writes for col >= num_scale_cols collide with
+        # valid scales of subsequent rows in the swizzled layout. Rows are
+        # already on-tile by construction in the non-stacked path.
+        scale_store_mask = logical_col < num_scale_cols
     tl.store(
         s_ptr + scale_offs,
         encoded_scales,
-        mask=(logical_col < num_scale_cols),
+        mask=scale_store_mask,
     )
 
     # ========================================================================
     # Pack to FP4 and store
     # ========================================================================
-    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    x_fp4x2 = convert_fp32_to_fp4_packed(
+        x_blocks.reshape(M_PER_BLOCK, 32, 2).split(),
+        IS_GFX950=IS_GFX950,
+        IS_ROCM=IS_ROCM,
+    )
 
     q_offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
     q_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
@@ -197,15 +212,27 @@ def quantize_mx4(
             reproducibility. Ignored for all deterministic rounding modes.
 
     Returns:
-        xq: Packed FP4 data, dtype uint8, shape [..., N//2]. Leading dims preserved.
-        scales: E8M0 biased exponent bytes, dtype int8, **flattened 1D**.
-            Size = rounded_M × rounded_K, both padded to 128/4 multiples.
-            Layout: Blackwell blocked (swizzled).
+        xq: Packed FP4 data, dtype uint8, shape [..., -1, N//2]. Leading dims preserved.
+        scales: E8M0 biased exponent bytes.
+            NVIDIA: dtype int8, **flattened 1D**, size = padded_M × padded_K
+                (both padded to 128/4 multiples). Layout: Blackwell blocked
+                (swizzled).
+            ROCm: dtype uint8, shape [..., -1, scale_K] where
+                scale_K = N // group_size. Plain row-major, no padding.
 
-    eg. [1, 5120] bf16 -> [1, 2560] uint8 + [128×4] int8 (flattened blocked)
+    eg. [1, 5120] bf16 -> [1, 2560] uint8 xq
+        NVIDIA: + [128×160] int8 scales (flattened blocked)
+        ROCm:   + [1, 160] uint8 scales (row-major)
     """
     stochastic = int(rounding_mode) == int(RoundingMode.stochastic)
     seed_int = _resolve_seed(seed, stochastic, x.device)
+
+    rocm = is_rocm()
+    gfx950 = is_gfx950()
+    if stochastic and rocm:
+        raise NotImplementedError(
+            "quantize_mx4: stochastic rounding is not supported on ROCm."
+        )
 
     orig_leading_dims, orig_N = x.shape[:-2], x.shape[-1]
     x_2d = x.reshape(-1, orig_N)
@@ -217,21 +244,29 @@ def quantize_mx4(
         torch.bfloat16,
     ), f"Expected fp16/bf16, got {x.dtype}"
 
+    scale_K = N // group_size
     # Scale padding (128-row × 4-col alignment for tensor cores).
-    n_col_blocks = triton.cdiv(N // group_size, 4)
-    padded_rows = triton.cdiv(M, 128) * 128
-    padded_cols = n_col_blocks * 4
+    n_col_blocks = triton.cdiv(scale_K, 4)
 
     xq = x.new_empty(M, N // 2, dtype=torch.uint8)
-    # Zero-init so OOB positions (where the kernel does not write) are zero.
-    scales = torch.zeros(padded_rows, padded_cols, dtype=torch.int8, device=x.device)
+    if rocm:
+        # AMD kernels consume the plain [M, K//32] E8M0 layout (no swizzle/pad).
+        scales = torch.zeros(M, scale_K, dtype=torch.int8, device=x.device)
+    else:
+        padded_rows = triton.cdiv(M, 128) * 128
+        padded_cols = n_col_blocks * 4
+        # Zero-init so OOB positions (where the kernel does not write) are zero.
+        scales = torch.zeros(
+            padded_rows, padded_cols, dtype=torch.int8, device=x.device
+        )
 
     # M_PER_BLOCK: rows per program. Capped at 128 (scale layout alignment).
     M_PER_BLOCK = min(triton.next_power_of_2(M), 128)
     USE_MASK = M % M_PER_BLOCK != 0 or N % 64 != 0
     grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
-    # Extra row of blocks to zero out tail scales when M_PER_BLOCK < 128.
-    if M_PER_BLOCK != 128:
+    # Extra row of blocks to zero out tail scales when M_PER_BLOCK < 128
+    # (NVIDIA padded layout only; ROCm has no padded tail).
+    if M_PER_BLOCK != 128 and not rocm:
         grid = (grid[0], grid[1] + 1)
     use_int64 = M * N > 2**31 - 1
 
@@ -262,6 +297,10 @@ def quantize_mx4(
         N_COL_BLOCKS=n_col_blocks,
         # pyre-ignore[6]
         STOCHASTIC=stochastic,
+        # pyre-ignore[6]
+        IS_ROCM=rocm,
+        # pyre-ignore[6]
+        IS_GFX950=gfx950,
         # pyre-ignore[28]
         num_stages=3 if M >= 256 else 1,
         # pyre-ignore[28]
@@ -269,4 +308,7 @@ def quantize_mx4(
     )
 
     xq = xq.view(*orig_leading_dims, -1, N // 2)
+    if rocm:
+        # Plain [..., K//32] uint8 E8M0 layout (matches the legacy ROCm return).
+        return xq, scales.view(torch.uint8).reshape(*orig_leading_dims, -1, scale_K)
     return xq, scales.flatten()
