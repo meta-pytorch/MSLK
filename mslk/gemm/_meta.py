@@ -448,6 +448,21 @@ if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled_batched"):
         return torch.empty((B, M, N), dtype=torch.bfloat16, device=X.device)
 
 
+if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled_grouped"):
+
+    @torch.library.register_fake("mslk::bf16i4bf16_shuffled_grouped")
+    def bf16i4bf16_shuffled_grouped_meta(
+        X: torch.Tensor,
+        WQ: torch.Tensor,
+        w_scale_group: torch.Tensor,
+        w_zero_group: torch.Tensor,
+        M_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        M_total = X.shape[0]
+        N = WQ.shape[1]
+        return torch.empty((M_total, N), dtype=torch.bfloat16, device=X.device)
+
+
 if hasattr(torch.ops.mslk, "bf16i4bf16_rowwise_batched"):
 
     @torch.library.register_fake("mslk::bf16i4bf16_rowwise_batched")

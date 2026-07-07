@@ -63,6 +63,21 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // the Triton implementation registered by fp8_groupwise_grouped_gemm.py.
   m.def(
       "f8f8bf16_groupwise_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
+  // BF16xINT4 GEMMs: shared schema between CUDA and ROCm.  On CUDA the
+  // implementations are CUTLASS-based; on ROCm they are registered by the
+  // Triton modules (int4_gemm.py, int4_grouped_gemm.py) via torch.library.impl
+  // at Python import time.
+  m.def(
+      "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
+  m.def(
+      "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
+  m.def(
+      "bf16i4bf16_shuffled(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
+  m.def(
+      "bf16i4bf16_shuffled_grouped(Tensor X, Tensor WQ, Tensor w_scale_group, Tensor w_zero_group, Tensor M_sizes) -> Tensor");
+  m.def(
+      "bf16i4bf16_shuffled_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
+  m.def("preshuffle_i4(Tensor WQ, Tensor w_scale) -> (Tensor, Tensor)");
 #ifdef USE_ROCM
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
@@ -73,13 +88,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
-  // BF16xINT4 rowwise GEMMs: schema only on ROCm; implementations are
-  // registered by mslk.gemm.triton.int4_gemm via torch.library.impl at
-  // Python import time.
-  m.def(
-      "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
-  m.def(
-      "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
   // INT8 GEMM via Triton — static and dynamic scale variants.
   m.def("i8i8bf16(Tensor XQ, Tensor WQ, float scale, int split_k=1) -> Tensor");
   m.def(
@@ -104,20 +112,9 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f8i4bf16_shuffled(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group) -> Tensor");
   m.def(
-      "bf16i4bf16_shuffled(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
-  m.def(
       "f8i4bf16_shuffled_grouped(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group, Tensor M_sizes) -> Tensor");
   m.def(
-      "bf16i4bf16_shuffled_grouped(Tensor X, Tensor WQ, Tensor w_scale_group, Tensor w_zero_group, Tensor M_sizes) -> Tensor");
-  m.def(
-      "bf16i4bf16_rowwise(Tensor X, Tensor W, Tensor w_scale_group, Tensor w_zero_group) -> Tensor");
-  m.def(
-      "bf16i4bf16_shuffled_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
-  m.def(
-      "bf16i4bf16_rowwise_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
-  m.def(
       "i8i8bf16_dynamic(Tensor XQ, Tensor WQ, Tensor scale, int split_k=1) -> Tensor");
-  m.def("preshuffle_i4(Tensor WQ, Tensor w_scale) -> (Tensor, Tensor)");
 #endif
 }
 
