@@ -94,8 +94,11 @@ class TestFp4Quantize:
         xq, x_scale = triton_quantize_mx4_unpack(
             x, group_size=group_size, rounding_mode=rounding_mode
         )
-        # Convert blocked x_scale format back to (M, num_groups) layout.
-        x_scale = _from_blocked(x_scale, (M, num_groups))
+        # On ROCm the kernel already returns the plain [M, num_groups] scale
+        # layout; only NVIDIA returns the TCGen5 padded/swizzled (blocked)
+        # layout that must be converted back to (M, num_groups).
+        if not is_rocm():
+            x_scale = _from_blocked(x_scale, (M, num_groups))
         # Dequantize and check that results are similar.
         xq_float = fp4_to_float(xq)
         xq_dequant = scale_mx4(xq_float, x_scale, group_size).to(torch.bfloat16)
