@@ -28,7 +28,13 @@ class TestGroupedGEMM(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            [1, 4, 16, 128],  # G
+            # The Triton kernels autotune on key=[G, M_BUCKET, N, K], so every
+            # distinct (G, M, N, K) combo pays a full cold hipcc autotune on
+            # ROCm. Keep single- vs multi-group coverage (G) but drop redundant
+            # group counts; keep the full M sweep here since fp8 has an M>=16384
+            # tolerance branch. Flag axes (fast_accum, fuse_scatter_add) are kept
+            # in full as they exercise distinct kernel code paths. See D110137656.
+            [1, 16],  # G
             [0, 128, 2048, 16384],  # M
             [256],  # N
             [256],  # K
@@ -146,10 +152,15 @@ class TestGroupedGEMM(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            [1, 4, 16, 128],  # G
-            [0, 128, 2048, 16384],  # M
+            # Trim the shape grid to keep the ROCm CI within its time budget: the
+            # kernel autotunes on key=[G, M_BUCKET, N, K], so each combo triggers
+            # a cold hipcc autotune. Keep single- + multi-group (G), one aligned
+            # + one large multi-tile M, aligned + non-aligned N/K for masking
+            # coverage; flag axes are kept in full. See D110137656.
+            [1, 16],  # G
+            [0, 128, 2048],  # M
             [256, 451],  # N
-            [100, 256, 257],  # K
+            [256, 257],  # K
             [False],  # warp_specialization
             [True, False],  # fuse_scatter_add
         )
@@ -248,10 +259,13 @@ class TestGroupedGEMM(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            [1, 4, 16, 128],  # G
-            [0, 128, 2048, 16384],  # M
+            # Trimmed shape grid (see test_grouped_gemm_bf16) to keep the ROCm CI
+            # within its time budget; bias/token-weight flag axes kept in full as
+            # they exercise distinct epilogue code paths. See D110137656.
+            [1, 16],  # G
+            [0, 128, 2048],  # M
             [256, 451],  # N
-            [100, 256, 257],  # K
+            [256, 257],  # K
             [False],  # warp_specialization
             [True, False],  # has_bias
             [True, False],  # has_token_weights
@@ -351,9 +365,12 @@ class TestGroupedGEMM(unittest.TestCase):
 
     @parameterized.expand(
         itertools.product(
-            [1, 4, 16, 128],  # G
-            [0, 128, 2048, 16384],  # M
-            [100, 256, 257],  # K
+            # Trimmed shape grid (see test_grouped_gemm_bf16) to keep the ROCm CI
+            # within its time budget; here N == K, so only K is swept. Bias/
+            # token-weight flag axes kept in full. See D110137656.
+            [1, 16],  # G
+            [0, 128, 2048],  # M
+            [256, 257],  # K
             [False],  # warp_specialization
             [True, False],  # has_bias
             [True, False],  # has_token_weights
