@@ -184,7 +184,7 @@ at::Tensor bf16bf16bf16_grouped_wgrad_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          ElementC, // Use source tensor for epilogue operations.
+          void,
           LayoutC*,
           128 / cutlass::sizeof_bits<ElementC>::value,
           ElementC,
@@ -327,7 +327,7 @@ at::Tensor bf16bf16bf16_grouped_wgrad_impl(
       {kernel_groups, problem_shape_ptr, nullptr},
       {x_ptr, stride_a_ptr, w_ptr, stride_b_ptr},
       {{},
-       (const ElementC**)output_ptr,
+       OUTPUT_ACCUM ? (const ElementC**)output_ptr : nullptr,
        stride_c_ptr,
        output_ptr,
        stride_c_ptr}};
@@ -499,7 +499,7 @@ at::Tensor bf16bf16bf16_grouped_wgrad_sm100_impl(
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementAccumulator,
           ElementAccumulator,
-          ElementC, // Use source tensor for epilogue operations.
+          void,
           LayoutC*,
           128 / cutlass::sizeof_bits<ElementC>::value,
           ElementC,
@@ -642,7 +642,7 @@ at::Tensor bf16bf16bf16_grouped_wgrad_sm100_impl(
       {kernel_groups, problem_shape_ptr, nullptr},
       {x_ptr, stride_a_ptr, w_ptr, stride_b_ptr},
       {{},
-       (const ElementC**)output_ptr,
+       OUTPUT_ACCUM ? (const ElementC**)output_ptr : nullptr,
        stride_c_ptr,
        output_ptr,
        stride_c_ptr}};
