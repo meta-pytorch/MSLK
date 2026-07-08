@@ -26,6 +26,7 @@ from mslk.quantize.triton.fp4_primitives import (
     stacked_segment_map,
 )
 from mslk.quantize.triton.quantize_kernels import _resolve_seed
+from mslk.utils.device import is_gfx950, is_rocm
 from triton import language as tl  # @manual=//triton:triton
 
 
@@ -51,6 +52,8 @@ def quantize_mx4_stacked_kernel(
     MBITS: tl.constexpr,  # mantissa bits in target FP4 format (1 for E2M1)
     N_COL_BLOCKS: tl.constexpr,  # ceil(num_scale_cols / 4) — blocked layout offset
     STOCHASTIC: tl.constexpr,  # True → enable software stochastic rounding
+    IS_ROCM: tl.constexpr,  # True → plain [M, K//32] scale layout (AMD GEMM contract)
+    IS_GFX950: tl.constexpr,  # True → gfx950 native FP4 packing instruction
 ):
     """Stacked MX4 quantization kernel processing [M_PER_BLOCK, 64] tiles.
 
@@ -149,30 +152,45 @@ def quantize_mx4_stacked_kernel(
     # ========================================================================
     logical_col = pid_n * NUM_GROUPS + tl.arange(0, NUM_GROUPS)[None, :]
     num_scale_cols = N // GROUP_SIZE
-    # The grid iterates padded rows directly, so padded_r == padded_rows.
-    padded_r = padded_rows  # [M_PER_BLOCK]
+    if IS_ROCM:
+        # AMD: plain [M, num_scale_cols] row-major, addressed by *logical* row
+        # (padding rows are masked out). No per-segment 128-row pad / swizzle.
+        lrows = logical_rows[:, None]
+        if USE_INT64_INDEXING:
+            lrows = lrows.to(tl.int64)
+        scale_offs = lrows * num_scale_cols + logical_col
+        scale_store_mask = is_valid_row[:, None] & (logical_col < num_scale_cols)
+    else:
+        # The grid iterates padded rows directly, so padded_r == padded_rows.
+        padded_r = padded_rows  # [M_PER_BLOCK]
 
-    seg_block_idx = padded_r // 128  # [M_PER_BLOCK], int64
-    padded_r_local = (padded_r % 128).to(tl.int32)  # [M_PER_BLOCK]
-    local_offs = blocked_scale_offset(
-        padded_r_local[:, None], logical_col, N_COL_BLOCKS, num_scale_cols
-    )
-    scale_offs = seg_block_idx[:, None].to(tl.int64) * (512 * N_COL_BLOCKS) + local_offs
-    # Mask both row and column OOB:
-    # - row: write every padded row in [0, padded_total) (padding rows carry
-    #   zero encoded_scales from scale_mask above).
-    # - column: logical_col >= num_scale_cols would collide with valid scales of
-    #   subsequent rows.
+        seg_block_idx = padded_r // 128  # [M_PER_BLOCK], int64
+        padded_r_local = (padded_r % 128).to(tl.int32)  # [M_PER_BLOCK]
+        local_offs = blocked_scale_offset(
+            padded_r_local[:, None], logical_col, N_COL_BLOCKS, num_scale_cols
+        )
+        scale_offs = (
+            seg_block_idx[:, None].to(tl.int64) * (512 * N_COL_BLOCKS) + local_offs
+        )
+        # Mask both row and column OOB (padding rows carry zero encoded_scales;
+        # logical_col >= num_scale_cols would collide with subsequent rows).
+        scale_store_mask = (padded_rows[:, None] < padded_total) & (
+            logical_col < num_scale_cols
+        )
     tl.store(
         s_ptr + scale_offs,
         encoded_scales,
-        mask=(padded_rows[:, None] < padded_total) & (logical_col < num_scale_cols),
+        mask=scale_store_mask,
     )
 
     # ========================================================================
     # Pack to FP4 and store
     # ========================================================================
-    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    x_fp4x2 = convert_fp32_to_fp4_packed(
+        x_blocks.reshape(M_PER_BLOCK, 32, 2).split(),
+        IS_GFX950=IS_GFX950,
+        IS_ROCM=IS_ROCM,
+    )
 
     q_offs_m = logical_rows[:, None]
     q_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
@@ -215,13 +233,24 @@ def quantize_mx4_stacked(
 
     Returns:
         xq: [M, N//2] packed FP4 data, dtype uint8 (matches ``quantize_mx4``).
-        scales: E8M0 biased exponent bytes, dtype int8, **flattened 1D**.
-            Logical shape is [padded_total_M_ub, padded_cols] in the Blackwell
-            blocked layout, with each segment 128-row aligned. Padding rows
-            between segments are zero.
+        scales: E8M0 biased exponent bytes.
+
+            NVIDIA (Blackwell): dtype int8, **flattened 1D**. Logical shape is
+            [padded_total_M_ub, padded_cols] with each segment 128-row aligned.
+            Padding rows between segments are zero.
+
+            ROCm (gfx950): dtype uint8, 2D shape [M, K//32] addressed by
+            logical row. No per-segment padding or swizzle.
     """
     stochastic = int(rounding_mode) == int(RoundingMode.stochastic)
     seed_int = _resolve_seed(seed, stochastic, x.device)
+
+    rocm = is_rocm()
+    gfx950 = is_gfx950()
+    if stochastic and rocm:
+        raise NotImplementedError(
+            "quantize_mx4_stacked: stochastic rounding is not supported on ROCm."
+        )
 
     x_2d = x.reshape(-1, x.shape[-1])
     M, N = x_2d.shape
@@ -245,17 +274,23 @@ def quantize_mx4_stacked(
 
     n_col_blocks = triton.cdiv(N // group_size, 4)
     padded_cols = n_col_blocks * 4
+    scale_K = N // group_size
 
     xq = torch.empty(M, N // 2, dtype=torch.uint8, device=x.device)
-    # Zero-init the scale buffer. The kernel writes scales only for rows in
-    # ``[0, padded_total)`` where ``padded_total = sum(round_up(m_i, 128))`` is
-    # the exact padded-row count it derives from ``m_sizes``; the CUDA-graph-safe
-    # buffer is over-allocated to the upper bound ``padded_total_M = M +
-    # num_segments * 127`` (to avoid a GPU→CPU sync), so the slack rows
-    # ``[padded_total, padded_total_M)`` are never touched by the kernel and must
-    # be zeroed here (``torch.empty`` leaves them uninitialized → NaN /
-    # non-deterministic).
-    scales = torch.zeros(padded_total_M, padded_cols, dtype=torch.int8, device=x.device)
+    if rocm:
+        # AMD: plain [M, K//32] E8M0 layout, addressed by logical row (padding
+        # rows are masked out by the kernel). No per-segment 128-row pad.
+        scales = torch.zeros(M, scale_K, dtype=torch.int8, device=x.device)
+    else:
+        # Zero-init the scale buffer. The kernel writes scales only for rows in
+        # ``[0, padded_total)`` where ``padded_total = sum(round_up(m_i, 128))``;
+        # the CUDA-graph-safe buffer is over-allocated to the upper bound
+        # ``padded_total_M = M + num_segments * 127`` (to avoid a GPU→CPU sync),
+        # so the slack rows ``[padded_total, padded_total_M)`` are never touched
+        # by the kernel and must be zeroed here.
+        scales = torch.zeros(
+            padded_total_M, padded_cols, dtype=torch.int8, device=x.device
+        )
 
     # M_PER_BLOCK: rows per program. Capped at 128 (scale layout alignment); at
     # M<256, cap at 64 to improve SM occupancy for small-M shapes.
@@ -299,10 +334,17 @@ def quantize_mx4_stacked(
         N_COL_BLOCKS=n_col_blocks,
         # pyre-ignore[6]
         STOCHASTIC=stochastic,
+        # pyre-ignore[6]
+        IS_ROCM=rocm,
+        # pyre-ignore[6]
+        IS_GFX950=gfx950,
         # pyre-ignore[28]
         num_stages=3 if M >= 256 else 1,
         # pyre-ignore[28]
         num_warps=4,
     )
 
+    if rocm:
+        # Plain [M, K//32] uint8 E8M0 layout (matches the non-stacked ROCm return).
+        return xq, scales.view(torch.uint8).reshape(M, scale_K)
     return xq, scales.flatten()

@@ -29,12 +29,13 @@ import torch  # noqa: E402
 from . import _meta  # noqa: F401, E402
 
 if torch.version.hip is not None:
-    # Register the Triton implementation of mx8mx4bf16 for ROCm.  This import
-    # triggers the @torch.library.impl("mslk::mx8mx4bf16", "CUDA") decoration
-    # in mx8mx4_gemm.py, which overrides the default (non-existent) CUDA impl
-    # so that torch.ops.mslk.mx8mx4bf16/_grouped dispatches to the Triton
-    # kernel on AMD.
+    # Register the Triton ROCm implementations for mx8mx4bf16, mx8mx8bf16, and
+    # f8f8bf16_groupwise(_grouped).  Each import triggers a
+    # @torch.library.impl(..., "CUDA") decoration that overrides the default
+    # (non-existent) CUDA impl so the ops dispatch to the Triton kernels on AMD.
     from .triton import (  # noqa: F401
+        fp8_groupwise_gemm,
+        fp8_groupwise_grouped_gemm,
         grouped_gemm as _grouped_gemm,
         mx8mx4_gemm,
         mx8mx8_gemm,

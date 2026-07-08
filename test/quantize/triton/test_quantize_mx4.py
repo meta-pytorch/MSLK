@@ -15,17 +15,16 @@ from mslk.quantize.triton.fp4_primitives import RoundingMode
 from mslk.quantize.triton.quantize_kernels.mx4 import quantize_mx4
 from mslk.test.quantize.triton._mx4_torch_reference import (
     _unblock_mx4_scales,
-    is_blackwell_or_newer,
     swizzle_scales_to_blocked,
     torch_quantize_mx4_ref,
 )
+from mslk.testing.device import skipUnlessCudaCapability, skipUnlessGfxArch
+from mslk.utils.device import is_rocm
 from parameterized import parameterized  # @manual
 
 
-@unittest.skipUnless(
-    is_blackwell_or_newer(),
-    "Requires Blackwell (SM100+) GPU — MX4 PTX paths are SM100-only",
-)
+@skipUnlessGfxArch("gfx950")
+@skipUnlessCudaCapability(10)
 class QuantizeMX4Test(unittest.TestCase):
     """Bitwise-vs-torch-reference + first-principles tests for quantize_mx4."""
 
@@ -68,14 +67,21 @@ class QuantizeMX4Test(unittest.TestCase):
             ),
             f"FP4 data mismatch for shape ({M}, {N}, gs={group_size})",
         )
-        ref_scales_swizzled = swizzle_scales_to_blocked(
-            ref_scales_2d, b_scales.shape, convention="mslk"
-        )
+        if is_rocm():
+            # ROCm returns the plain [M, K//32] layout — compare directly.
+            b_cmp = b_scales.view(torch.uint8).reshape(M, -1).flatten()
+            ref_cmp = ref_scales_2d.view(torch.uint8).reshape(M, -1).flatten()
+        else:
+            b_cmp = b_scales.view(torch.uint8).flatten()
+            ref_cmp = (
+                swizzle_scales_to_blocked(
+                    ref_scales_2d, b_scales.shape, convention="mslk"
+                )
+                .view(torch.uint8)
+                .flatten()
+            )
         self.assertTrue(
-            torch.equal(
-                b_scales.view(torch.uint8).flatten(),
-                ref_scales_swizzled.view(torch.uint8).flatten(),
-            ),
+            torch.equal(b_cmp, ref_cmp),
             f"Scale mismatch for shape ({M}, {N}, gs={group_size})",
         )
 
@@ -94,7 +100,12 @@ class QuantizeMX4Test(unittest.TestCase):
         x = torch.zeros(1, 32, dtype=torch.bfloat16, device="cuda")
         x[0, 0] = group_max
         _, scales = quantize_mx4(x)
-        s = _unblock_mx4_scales(scales, 1, 1)
+        if is_rocm():
+            # ROCm returns the plain [M, K//32] layout (uint8) — no un-blocking.
+            # View as int8 so the byte matches the int8 expected encoding.
+            s = scales.view(torch.int8).reshape(1, -1)
+        else:
+            s = _unblock_mx4_scales(scales.view(torch.int8), 1, 1)
         self.assertEqual(s[0, 0].item(), expected_exp)
 
     @parameterized.expand(

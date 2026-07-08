@@ -702,6 +702,11 @@ def main(argv: List[str]) -> None:
         "flash3": ["flash-attn-3"],
     }
 
+    # FlyDSL is a ROCm-only backend; also offered on variant-agnostic
+    # python-only builds.
+    if _PYTHON_ONLY or build.variant() == "rocm":
+        extras_require["flydsl"] = ["flydsl==0.2.2"]
+
     packages = setuptools.find_packages()
 
     # When building with FB code in python-only mode, include fb/ packages
