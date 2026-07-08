@@ -14,6 +14,7 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from mslk.gemm.triton.matmul_perf_model import early_config_prune, estimate_matmul_time
 from mslk.gemm.triton.utils import map_dtype_to_triton, TmaAutoTuneHelper
+from mslk.utils.device import supports_float8_fnuz
 from mslk.utils.triton.fp8_utils import get_fp8_constants, reinterpret_fp8_type
 from packaging import version
 from torch._tensor import Tensor
@@ -1156,9 +1157,8 @@ def matmul_fp8_row(
     if torch.version.cuda:
         assert a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     elif torch.version.hip:
-        # gfx942 (MI300) reports (9, 4), gfx950 (MI350) reports (9, 5)
-        # Both use fnuz format
-        if torch.cuda.get_device_capability() >= (9, 4):
+        # gfx942 (MI300) uses fnuz FP8; gfx950 (MI350) natively uses OCP FP8.
+        if supports_float8_fnuz():
             assert a.dtype in (
                 torch.float8_e4m3fnuz,
                 torch.float8_e5m2fnuz,
