@@ -34,7 +34,11 @@ from mslk.testing.device import (
 from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
+    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
+    from mslk.quantize.mx_mixed_dtype_utils import (
+        pack_fp6_e2m3,
+        quantize_bf16_to_mx6_e2m3,
+    )
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
 
@@ -1537,7 +1541,6 @@ class MXFP8Tests(unittest.TestCase):
     ) -> None:
         # Simulate 2d-2d grouped gemm in backward pass `grad_weight = grad_output_t @ input`,
         # where we use "K" as the contracting dim which has "G" groups.
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         total_K = K  # Alias for clarity, communicating this consists of several groups along this dim
         input_group_end_offsets = generate_jagged_offs(
@@ -1639,8 +1642,6 @@ class MXFP8Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         # Simulate 2d-3d grouped gemm `out = input @ weight.t()`
         # 2D inputs with groups along M, 3D weights.
         block_size = 32
@@ -1728,7 +1729,6 @@ class MXFP8Tests(unittest.TestCase):
         1. Output with hint matches output without hint (same GEMM, different tile)
         2. Output matches bf16 reference
         """
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         block_size = 32
         actual_total_M = M_per_group * G
@@ -2901,8 +2901,6 @@ class MX8MX4Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
@@ -2941,8 +2939,6 @@ class MX8MX4Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         XS = [
             torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
             for _ in range(G)
@@ -2994,8 +2990,6 @@ class MX8MX4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
 
     def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         G = 8
         N = 1024
         K = 2048
@@ -3062,34 +3056,67 @@ class MX8MX6Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
+        torch.manual_seed(0)
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        # Quantize A to MX8 with blocked scale layout
+        # MX8 activation with blocked scale layout.
         (a_scale_raw, aq) = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
 
-        # Quantize B: use MX8 quantization for scale factors (E8M0 BS32),
-        # then create E2M3 weight data from the MX8 data.
-        # E2M3 is stored as 1 byte per element (6-bit value in uint8).
-        # We use the FP8 data masked to 6 bits as a proxy for E2M3.
-        (b_scale_raw, bq_fp8) = to_mxfp8(B)
+        # MX6 weight: BF16 -> unpacked E2M3 bytes -> bit-packed for the
+        # cutlass 6-bit-stream layout. Scale is E8M0 blocked for TMA.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        bq = pack_fp6_e2m3(wq_unpacked)
         b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
             torch.uint8
         )
-        bq = bq_fp8.view(torch.uint8) & 0x3F  # mask to 6 bits for E2M3 range
 
         out_mx8mx6 = torch.ops.mslk.mx8mx6bf16(aq, bq, a_scale, b_scale)
+        out_bf16 = A @ B.t()
 
-        # Smoke test: no NaN or Inf
         self.assertFalse(out_mx8mx6.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out_mx8mx6.isinf().any().item(), "Output contains Inf")
-        # Output shape check
         self.assertEqual(out_mx8mx6.shape, (M, N))
+        torch.testing.assert_close(out_mx8mx6, out_bf16, atol=1.0e-1, rtol=1.0e-1)
+
+        ref = out_bf16.float()
+        err = out_mx8mx6.float() - ref
+        mask = ref != 0
+        signal_power = (ref[mask] ** 2).sum()
+        noise_power = (err[mask] ** 2).sum().clamp(min=1e-30)
+        sqnr_db = (10.0 * torch.log10(signal_power / noise_power)).item()
+        self.assertGreater(
+            sqnr_db,
+            20.0,
+            f"mx8mx6 SQNR {sqnr_db:.2f} dB below 20 dB floor (M={M}, N={N}, K={K})",
+        )
+
+    def test_unpacked_weight_raises(self) -> None:
+        """Feeding 1-byte-per-element (unpacked) bytes to mx8mx6bf16 must
+        trip the WQ shape TORCH_CHECK in mx8mx6bf16.cu, not silently produce
+        garbage output."""
+        M, N, K = 64, 256, 2048
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
+            torch.uint8
+        )
+
+        # Unpacked weight: 1 byte per element instead of K*6/8 packed bytes.
+        # Exactly what the old test (and any naive caller) would produce.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
+            torch.uint8
+        )
+        self.assertEqual(wq_unpacked.shape, (N, K))  # confirm "wrong" shape
+
+        with self.assertRaisesRegex(RuntimeError, "bit-packed 6-bit"):
+            torch.ops.mslk.mx8mx6bf16(aq, wq_unpacked, a_scale, b_scale)
 
 
 @skipUnlessCuda()
