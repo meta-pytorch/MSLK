@@ -78,6 +78,90 @@ def prefill_1024_shapes() -> list[tuple[int, int]]:
     return shapes
 
 
+@register_shapes("mx4_dense")
+def mx4_dense_shapes() -> list[tuple[int, int]]:
+    # Dense M sweep at the Llama-4 hidden size (K=5120), filling the saturated
+    # region (M >= 4096) that the coarser presets undersample.
+    return [
+        (m, 5120)
+        for m in (
+            1,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            6144,
+            8192,
+            10240,
+            12288,
+            14336,
+            16384,
+        )
+    ]
+
+
+@register_shapes("fp4_default")
+def fp4_default_shapes() -> list[tuple[int, int]]:
+    return [
+        (128, 64),
+        (256, 256),
+        (512, 1024),
+        (1024, 4096),
+        (4096, 4096),
+        (8192, 7168),
+        (8192, 14336),
+    ]
+
+
+# Model-named presets. K = hidden_size: 5120 = Llama-4 Maverick/Scout,
+# 7168 = DeepSeek V3/V3.1/R1, 8192 = Llama-3 70B. Decode M covers the
+# single-token + continuous-batch hot path; prefill M covers small/typical/
+# long-context prompts. Combine, e.g. ``--shapes llama4_decode,llama4_prefill``.
+_DECODE_M: tuple[int, ...] = (1, 16, 32, 64, 128, 256)
+_PREFILL_M: tuple[int, ...] = (1024, 4096, 16384, 32768, 65536)
+
+
+@register_shapes("llama4_decode")
+def llama4_decode_shapes() -> list[tuple[int, int]]:
+    return [(m, 5120) for m in _DECODE_M]
+
+
+@register_shapes("llama4_prefill")
+def llama4_prefill_shapes() -> list[tuple[int, int]]:
+    return [(m, 5120) for m in _PREFILL_M]
+
+
+@register_shapes("deepseek_decode")
+def deepseek_decode_shapes() -> list[tuple[int, int]]:
+    return [(m, 7168) for m in _DECODE_M]
+
+
+@register_shapes("deepseek_prefill")
+def deepseek_prefill_shapes() -> list[tuple[int, int]]:
+    return [(m, 7168) for m in _PREFILL_M]
+
+
+@register_shapes("llama3_70b_decode")
+def llama3_70b_decode_shapes() -> list[tuple[int, int]]:
+    return [(m, 8192) for m in _DECODE_M]
+
+
+@register_shapes("llama3_70b_prefill")
+def llama3_70b_prefill_shapes() -> list[tuple[int, int]]:
+    return [(m, 8192) for m in _PREFILL_M]
+
+
+@register_shapes("squares")
+def squares_shapes() -> list[tuple[int, int]]:
+    # Power-of-2 square (M, K) pairs for synthetic characterization (bandwidth
+    # scaling, launch-vs-throughput crossover). Not a substitute for the
+    # model-named presets: real LLM workloads are rectangular.
+    return [(s, s) for s in (1024, 2048, 4096, 8192, 16384, 32768, 65536)]
+
+
 @dataclass
 class Metrics:
     op: str
