@@ -27,7 +27,7 @@ from triton import language as tl  # @manual
 # ``$1`` -> low nibble [3:0], ``$2`` -> high nibble [7:4]; scale operand 1.0
 # (E8M0=127, no extra scaling — the kernel already group-scaled into [-6, 6]).
 # Rounding: round-to-nearest-even (RNE), per AMD CDNA4 ISA.
-_GFX950_CVT_PK_FP4_F32 = "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0"
+_GFX950_CVT_PK_FP4_F32 = tl.constexpr("v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0")
 
 
 @triton.jit
