@@ -29,7 +29,6 @@ class BenchOptions:
     quantize_bench to maintain consistent benchmarking behavior.
 
     Attributes:
-        num_iters: Number of iterations to repeat each benchmark for averaging.
         cuda_graph: Whether to use CUDA graphs for benchmarking. CUDA graphs
             reduce kernel launch overhead and provide more accurate measurements
             for GPU-bound workloads.
@@ -45,7 +44,6 @@ class BenchOptions:
         torch_compile: Whether to use torch.compile for applicable operations.
     """
 
-    num_iters: int = 1
     cuda_graph: bool = True
     rotating_buffer: bool = False
     rep_ms: int = 200
@@ -163,12 +161,6 @@ def common_bench_options(shape_registry):
                 help="Directory to save plots and csvs to",
             ),
             click.option(
-                "--num-iters",
-                default=1,
-                type=int,
-                help="Number of iterations to repeat each benchmark.",
-            ),
-            click.option(
                 "--export-csv",
                 is_flag=True,
                 help="Export results to a CSV file.",
@@ -194,7 +186,10 @@ def common_bench_options(shape_registry):
             click.option(
                 "--shapes",
                 default=None,
-                help=f"Specific model shapes to use, options: {', '.join(shape_registry.keys())}.",
+                help=(
+                    "Specific model shapes to use, options: "
+                    f"{', '.join(shape_registry.keys())}."
+                ),
             ),
             click.option(
                 "--trace",
