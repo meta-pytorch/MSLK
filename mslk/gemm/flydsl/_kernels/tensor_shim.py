@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import numpy as np
-import flydsl.compiler as flyc
-from itertools import product
 from abc import ABC, abstractmethod
+from itertools import product
+
+import flydsl.compiler as flyc
+import numpy as np
+import torch
+from flydsl._mlir import ir
 
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl._mlir import ir
-from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
+from flydsl.expr import arith, buffer_ops, ptrtoint, range_constexpr, vector
+from flydsl.expr.typing import T
 
 MOE_KERNARG_PRELOAD_COUNT = 16
 
