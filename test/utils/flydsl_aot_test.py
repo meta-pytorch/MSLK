@@ -45,9 +45,10 @@ class _InlineExecutor:
 class FlyDSLAOTTest(unittest.TestCase):
     def test_collect_jobs_is_cartesian_product(self) -> None:
         mod = _fake_kernel_module()
-        with mock.patch.object(
-            flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]
-        ), mock.patch("importlib.import_module", return_value=mod):
+        with (
+            mock.patch.object(flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
+            mock.patch("importlib.import_module", return_value=mod),
+        ):
             jobs = flydsl_aot.collect_aot_jobs()
         # 2 archs x 2 configs = 4 jobs.
         self.assertEqual(len(jobs), 4)
@@ -65,10 +66,10 @@ class FlyDSLAOTTest(unittest.TestCase):
         mod.AOT_CONFIGS = [{"n": 128, "k": 256}]
         mod.compile_aot_config = _record
 
-        with mock.patch.object(
-            flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]
-        ), mock.patch("importlib.import_module", return_value=mod), mock.patch.object(
-            flydsl_aot, "ProcessPoolExecutor", _InlineExecutor
+        with (
+            mock.patch.object(flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
+            mock.patch("importlib.import_module", return_value=mod),
+            mock.patch.object(flydsl_aot, "ProcessPoolExecutor", _InlineExecutor),
         ):
             flydsl_aot.compile_aot("/tmp/mslk_aot_unittest")
 
