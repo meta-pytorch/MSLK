@@ -22,14 +22,20 @@ from triton import language as tl  # @manual=//triton:triton
 # E8M0 / BF16 Constants
 # =============================================================================
 #
-# These are annotated ``tl.constexpr`` at module scope so they remain valid Triton
-# kernel constants in OSS: OSS Triton rejects a plain (non-constexpr) Python global
-# referenced inside a ``@triton.jit`` kernel (triton-lang/triton#3762). The
-# annotation is a no-op for host/Python use (the value is the bare float/int).
-E8M0_EXPONENT_BIAS: tl.constexpr = 127  # type: ignore[Incompatible variable type]
+# These are instantiated as ``tl.constexpr(...)`` at module scope so they remain
+# valid Triton kernel constants in OSS: OSS Triton rejects a plain (non-constexpr)
+# Python global referenced inside a ``@triton.jit`` kernel, and it *only* accepts
+# the assignment form ``x = tl.constexpr(v)`` — the annotation form
+# ``x: tl.constexpr = v`` is unsupported.
+#
+# Inside a ``@triton.jit`` kernel, reference these directly (bare ``VAR``); Triton
+# treats them as compile-time constants. For host/Python use (torch ops, ``math``,
+# etc.) use ``VAR.value`` to recover the bare float/int — a ``tl.constexpr`` object
+# is not a drop-in for the raw number (e.g. ``torch.clamp(min=VAR)`` raises).
+E8M0_EXPONENT_BIAS = tl.constexpr(127)
 """Exponent bias for the E8M0 scale format (same as IEEE 754 FP32 exponent bias)."""
 
-BF16_MIN_NORMAL: tl.constexpr = 2 ** (-126)  # type: ignore[Incompatible variable type]
+BF16_MIN_NORMAL = tl.constexpr(2 ** (-126))
 """Minimum positive normal BF16 value; zero-guard in MX4 scale computation."""
 
 
