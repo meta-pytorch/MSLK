@@ -565,7 +565,7 @@ def compile_preshuffle_gemm_a8(
             _b_n_full_dword_list.append(_n_dword)
 
         _b_dword_stride_k0_c = fx.Index(_b_dword_stride_k0)
-        _c64_elem = fx.Index(64 // elem_bytes * b_elem_vec_pack)
+        _c64_elem = fx.Index(64 // elem_bytes * b_elem_vec_pack)  # noqa: F841
 
         def _extract_b_packs(b16):
             b_i64x2 = Vec(b16).bitcast(fx.Int64)
@@ -903,7 +903,7 @@ def compile_preshuffle_gemm_a8(
                         )
                 return a_scales, b_scales
 
-            def load_fp4_scale_chunk(base_k):
+            def load_fp4_scale_chunk(base_k):  # noqa: F811
                 return load_fp4_scales(base_k // fx.Index(_fp4_scale_chunk_k))
 
         # ── Compute tile (MFMA) ───────────────────────────────────────────
@@ -960,7 +960,7 @@ def compile_preshuffle_gemm_a8(
                 _fp4_pack_N = 2 if is_fp4 else 1
                 _fp4_pack_K = 2 if is_fp4 else 1
                 _quant_block_size = 32
-                _K1 = K // (_quant_block_size * 4 * _fp4_pack_K) if is_fp4 else 1
+                _K1 = K // (_quant_block_size * 4 * _fp4_pack_K) if is_fp4 else 1  # noqa: F841
                 _k_unroll_packed = k_unroll // _fp4_pack_K
                 _m_repeat_packed = m_repeat // _fp4_pack_M
                 _num_acc_n_packed = num_acc_n // _fp4_pack_N
