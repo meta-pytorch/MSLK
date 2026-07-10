@@ -3345,5 +3345,42 @@ class RocmInt8GemmTests(unittest.TestCase):
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
 
 
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+class FlyDSLPreshuffleGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (1, 8192, 1024),
+            (32, 1280, 8192),
+            (128, 7424, 8192),
+            (1024, 8192, 1024),
+            (4096, 1280, 8192),
+        ]
+    )
+    def test_flydsl_preshuffle_gemm(self, M: int, N: int, K: int) -> None:
+        from mslk.utils.flydsl import is_flydsl_available
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+
+        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
+
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = flydsl_preshuffle(wq)
+
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
 if __name__ == "__main__":
     unittest.main()
