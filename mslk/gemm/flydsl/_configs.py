@@ -36,11 +36,7 @@ DEFAULT_CONFIGS_GFX950: dict[int, KernelConfig] = {
 def select_default_config(m: int, n: int, k: int) -> KernelConfig:
     """Select a default FlyDSL tile config based on shape heuristics."""
     configs = DEFAULT_CONFIGS_GFX950
-    fits = [
-        c
-        for c in configs.values()
-        if n % c.tile_n == 0 and k % c.tile_k == 0
-    ]
+    fits = [c for c in configs.values() if n % c.tile_n == 0 and k % c.tile_k == 0]
     if not fits:
         raise RuntimeError(
             f"No FlyDSL preshuffle config fits shape ({m}, {n}, {k}). "

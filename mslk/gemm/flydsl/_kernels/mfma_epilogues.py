@@ -29,8 +29,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Callable
 
-from flydsl._mlir import ir
 import flydsl.expr as fx
+
+from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 

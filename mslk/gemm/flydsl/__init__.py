@@ -60,9 +60,7 @@ def _get_compile_fn():  # type: ignore[return]
     if not is_flydsl_available():
         return None
     try:
-        from mslk.gemm.flydsl._kernels.preshuffle_gemm import (
-            compile_preshuffle_gemm_a8,
-        )
+        from mslk.gemm.flydsl._kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
         _compile_fn = compile_preshuffle_gemm_a8
     except Exception:
@@ -157,9 +155,8 @@ def flydsl_preshuffle_gemm(
         xcd_swizzle=int(xcd_swizzle),
     )
 
-    from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
-
     import flydsl.expr as fx  # pyre-ignore[21]
+    from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
 
     def _as_i8(t: Tensor) -> Tensor:
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
