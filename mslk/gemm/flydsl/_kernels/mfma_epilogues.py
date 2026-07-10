@@ -141,7 +141,7 @@ def c_shuffle_epilog(
         raise ValueError(f"e_vec must be positive, got {e_vec}")
     if (int(tile_n) % (int(cshuffle_nlane) * int(e_vec))) != 0:
         raise ValueError(
-            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane*e_vec}, got tile_n={tile_n}"
+            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane * e_vec}, got tile_n={tile_n}"
         )
 
     # ===================== Split-LDS mode (early return) =====================
