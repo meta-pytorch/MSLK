@@ -108,7 +108,8 @@ class Metrics:
         )
         return (
             f"{self.op:<20} {problem_shape:<50} "
-            f"{self.sim:<10.3f} {self.ms:<10.3f} {self.tflops:<10.2f} {self.gbps:<10.2f}"
+            f"{self.sim:<10.3f} {self.ms:<10.3f} "
+            f"{self.tflops:<10.2f} {self.gbps:<10.2f}"
         )
 
     def as_dict(self) -> dict[str, float]:
@@ -213,44 +214,38 @@ def benchmark(
         p = 1 + (h + 2 * pad - ((r - 1) * dilation + 1)) // stride
         q = 1 + (w + 2 * pad - ((s - 1) * dilation + 1)) // stride
 
-        for _ in range(opts.num_iters):
-            # Now perform benchmark.
-            if bench_quantize:
-                # Benchmark both quantize and compute.
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = conv_op.benchmark(
-                        *preprocessed_args,
-                        opts=opts,
-                        bench_quantize=True,
-                    )
-            else:
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = conv_op.benchmark(
-                        *quantized_vals,
-                        opts=opts,
-                        bench_quantize=False,
-                    )
+        # Now perform benchmark.
+        if bench_quantize:
+            # Benchmark both quantize and compute.
+            with profiler(enabled=opts.trace, with_stack=True):
+                ms_runtime = conv_op.benchmark(
+                    *preprocessed_args,
+                    opts=opts,
+                    bench_quantize=True,
+                )
+        else:
+            with profiler(enabled=opts.trace, with_stack=True):
+                ms_runtime = conv_op.benchmark(
+                    *quantized_vals,
+                    opts=opts,
+                    bench_quantize=False,
+                )
 
-            # Compute performance metrics
-            # FLOPs for convolution: 2 * N * Z * P * Q * K * T * R * S * C
-            flops = 2 * n * z * p * q * k * t * r * s * c
-            metrics.tflops += flops / (ms_runtime / 1e3) / 1e12
+        # Compute performance metrics
+        # FLOPs for convolution: 2 * N * Z * P * Q * K * T * R * S * C
+        flops = 2 * n * z * p * q * k * t * r * s * c
+        metrics.tflops = flops / (ms_runtime / 1e3) / 1e12
 
-            # Compute memory bandwidth
-            # Input: N * D * H * W * C, Filter: K * T * R * S * C, Output: N * Z * P * Q * K
-            input_size = n * d * h * w * c * quantized_vals[0].element_size()
-            filter_size = k * t * r * s * c * quantized_vals[1].element_size()
-            output_size = n * z * p * q * k * output.element_size()
+        # Compute memory bandwidth
+        # Input: N * D * H * W * C, Filter: K * T * R * S * C, Output: N * Z * P * Q * K
+        input_size = n * d * h * w * c * quantized_vals[0].element_size()
+        filter_size = k * t * r * s * c * quantized_vals[1].element_size()
+        output_size = n * z * p * q * k * output.element_size()
 
-            metrics.gbps += (
-                (input_size + filter_size + output_size) / (ms_runtime / 1e3) / 1e9
-            )
-            metrics.ms += ms_runtime
-
-        # Average metrics over iterations.
-        metrics.ms /= opts.num_iters
-        metrics.tflops /= opts.num_iters
-        metrics.gbps /= opts.num_iters
+        metrics.gbps = (
+            (input_size + filter_size + output_size) / (ms_runtime / 1e3) / 1e9
+        )
+        metrics.ms = ms_runtime
 
         results.append(metrics)
 
@@ -263,7 +258,10 @@ def plot_benchmark(results: list[dict[str, Any]], output_dir: str) -> None:
     data = []
     # Extract measurements for each shape.
     for impl in results:
-        shape_str = f"N{impl['N']}_D{impl['D']}_H{impl['H']}_W{impl['W']}_C{impl['C']}_K{impl['K']}"
+        shape_str = (
+            f"N{impl['N']}_D{impl['D']}_H{impl['H']}_W{impl['W']}"
+            f"_C{impl['C']}_K{impl['K']}"
+        )
         # Iterate over keys to find tflops entries.
         for key in impl:
             if "tflops" in key:
@@ -382,7 +380,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[ConvOpBase]:
 )
 def invoke_main(
     output_dir: str,
-    num_iters: int,
     export_csv: bool,
     plot: bool,
     bench_quantize: bool,
@@ -415,15 +412,12 @@ def invoke_main(
         print_kernels(all_kernels)
         sys.exit(1)
 
-    if num_iters < 1:
-        print("Warning: Number of iterations must be at least 1.")
-        num_iters = 1
-
     # Enumerate shapes to benchmark.
     if shapes:
         if shapes not in shape_registry:
             print(
-                f"Shape {shapes} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
+                f"Shape {shapes} not found in shape registry. "
+                f"Valid shapes: {', '.join(shape_registry.keys())}."
             )
             sys.exit(1)
         conv_shapes = shape_registry[shapes]()
@@ -455,7 +449,6 @@ def invoke_main(
     benchmark_results = []
     csv = []
     opts = BenchOptions(
-        num_iters=num_iters,
         cuda_graph=cuda_graph,
         rotating_buffer=rotating_buffer,
         rep_ms=rep_ms,

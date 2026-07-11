@@ -174,13 +174,20 @@ class Metrics:
 
     @staticmethod
     def header() -> str:
-        header = f"{'OpName':<20} {'Problem Shape':<15} {'Sim':<10} {'Us':<10} {'GB/s':<10} {'Mem BW Util %':<10}"
+        header = (
+            f"{'OpName':<20} {'Problem Shape':<15} {'Sim':<10} {'Us':<10} "
+            f"{'GB/s':<10} {'Mem BW Util %':<10}"
+        )
         divider = "-" * len(header)
         return f"Quantize Bench\n{divider}\n{header}\n{divider}"
 
     def __str__(self) -> str:
         problem_shape = f"({self.M}, {self.K})"
-        return f"{self.op:<20} {problem_shape:<15} {self.sim:<10.3f} {self.us:<10.3f} {self.gbps:<10.2f} {self.memory_bw_util:<10.2f}"
+        return (
+            f"{self.op:<20} {problem_shape:<15} {self.sim:<10.3f} "
+            f"{self.us:<10.3f} {self.gbps:<10.2f} "
+            f"{self.memory_bw_util:<10.2f}"
+        )
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -205,7 +212,8 @@ def get_problem_shapes(
         for shape in shapes.strip().split(","):
             if shape not in shape_registry:
                 print(
-                    f"Shape {shape} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
+                    f"Shape {shape} not found in shape registry. "
+                    f"Valid shapes: {', '.join(shape_registry.keys())}."
                 )
                 sys.exit(1)
             all_shapes.update(shape_registry[shape]())
@@ -248,25 +256,19 @@ def benchmark(
         dequantized = quantize_op.dequantize(*quantized)
         metrics.sim = torch.mean(torch.pow(dequantized - input, 2)).item()
 
-        for _ in range(opts.num_iters):
-            with profiler(enabled=opts.trace, with_stack=True):
-                ms_runtime = quantize_op.benchmark(
-                    input,
-                    args,
-                    opts=opts,
-                )
+        with profiler(enabled=opts.trace, with_stack=True):
+            ms_runtime = quantize_op.benchmark(
+                input,
+                args,
+                opts=opts,
+            )
 
-            input_bytes = input.numel() * input.element_size()
-            output_bytes = sum(t.numel() * t.element_size() for t in quantized)
-            total_size_bytes = input_bytes + output_bytes
-            gbps = (total_size_bytes / 1e9) / (ms_runtime / 1e3)
-            metrics.gbps += gbps
-            metrics.us += ms_runtime * 1000
-            metrics.memory_bw_util += (gbps / mem_bw_roofline_gbps) * 100
-
-        metrics.us /= opts.num_iters
-        metrics.gbps /= opts.num_iters
-        metrics.memory_bw_util /= opts.num_iters
+        input_bytes = input.numel() * input.element_size()
+        output_bytes = sum(t.numel() * t.element_size() for t in quantized)
+        total_size_bytes = input_bytes + output_bytes
+        metrics.gbps = (total_size_bytes / 1e9) / (ms_runtime / 1e3)
+        metrics.us = ms_runtime * 1000
+        metrics.memory_bw_util = (metrics.gbps / mem_bw_roofline_gbps) * 100
 
         results.append(metrics)
 
@@ -306,7 +308,10 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
 @click.option(
     "--pair-MK",
     is_flag=True,
-    help="If set, instead of benchmarking cartesian product of M * K, benchmark consecutive MK pairs together.",
+    help=(
+        "If set, instead of benchmarking cartesian product of M * K, "
+        "benchmark consecutive MK pairs together."
+    ),
 )
 @click.option(
     "--num-groups",
@@ -316,7 +321,6 @@ def print_kernels(kernels: Optional[list[str]]) -> None:
 )
 def invoke_main(
     output_dir: str,
-    num_iters: int,
     export_csv: bool,
     kernels: Optional[str],
     m: Optional[str],
@@ -338,15 +342,10 @@ def invoke_main(
         print_kernels(all_kernels)
         sys.exit(1)
 
-    if num_iters < 1:
-        print("Warning: Number of iterations must be at least 1.")
-        num_iters = 1
-
     mem_bw_roofline_gbps = triton.testing.get_dram_gbps()
     MK = get_problem_shapes(shapes, m, k, pair_mk)
 
     opts = BenchOptions(
-        num_iters=num_iters,
         cuda_graph=cuda_graph,
         rotating_buffer=rotating_buffer,
         rep_ms=rep_ms,

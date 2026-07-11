@@ -142,29 +142,20 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         """Function which performs main compute operation."""
         pass
 
-    @abc.abstractmethod
-    def quantize_and_compute(self, *args):
-        """Function which quantizes inputs and performs main compute operation."""
-        pass
-
     def preprocess(self, *args):
-        """Preprocess inputs before benchmarking. These outputs will be passed to quantize."""
+        """Preprocess inputs before benchmarking.
+
+        These outputs will be passed to quantize.
+        """
         return args
 
     def benchmark(
         self,
         *args,
         opts: BenchOptions,
-        bench_quantize: bool,
     ) -> float:
         """Benchmark runtime of this operator."""
-        t = do_bench(
-            lambda *a: self.quantize_and_compute(*a)
-            if bench_quantize
-            else self.compute(*a),
-            args,
-            opts,
-        )
+        t = do_bench(lambda *a: self.compute(*a), args, opts)
         return t
 
     @property
@@ -271,9 +262,6 @@ class TorchFP32(GemmOpBase):
             return output
         return torch.matmul(x, w)
 
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -315,9 +303,6 @@ class TorchTF32(GemmOpBase):
         torch.set_float32_matmul_precision(original_precision)
         return out
 
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -355,9 +340,6 @@ class TorchBF16(GemmOpBase):
             return output
         return torch.matmul(x, w)
 
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -391,10 +373,10 @@ class TorchFP8Tensorwise(GemmOpBase):
         # To make scale dtype to be fp32 for accuracy
         amax = amax.float()
         if float8_dtype == self.fp8_dtype:
-            # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
+            # pyre-fixme[58]: unsupported `/` between float and Tensor.
             res = self.E4M3_MAX_POS / torch.clamp(amax, min=self.EPS)
         else:  # e5m2
-            # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
+            # pyre-fixme[58]: unsupported `/` between float and Tensor.
             res = self.E5M2_MAX_POS / torch.clamp(amax, min=self.EPS)
 
         # pyre-fixme[7]: Expected `Tensor` but got `Union[float, Tensor]`.
@@ -434,9 +416,6 @@ class TorchFP8Tensorwise(GemmOpBase):
         )
         return output
 
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -473,9 +452,6 @@ class CublasBF16X9(GemmOpBase):
                 output.append(torch.ops.mslk.bf16x9_gemm(x[i], w[i]))
             return output
         return torch.ops.mslk.bf16x9_gemm(x, w)
-
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -528,9 +504,6 @@ class TorchFP8Rowwise(GemmOpBase):
             use_fast_accum=self.fast_accum,
         )
 
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -576,9 +549,6 @@ class TorchMXFP8Groupwise(GemmOpBase):
             scale_a=x_scale,
             scale_b=w_scale,
         )
-
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -632,9 +602,6 @@ class TorchNVFP4Groupwise(GemmOpBase):
             scale_a=x_scale,
             scale_b=w_scale,
         )
-
-    def quantize_and_compute(self, x, w):
-        return self.compute(*self.quantize(x, w))
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -714,10 +681,6 @@ class FP8Rowwise(GemmOpBase):
         # Otherwise return normal gemm result.
         return self.gemm_op(xq, wq, x_scale, w_scale, use_fast_accum=self.fast_accum)
 
-    def quantize_and_compute(self, x, wq, w_scale):
-        xq, wq, x_scale, w_scale = self.quantize(x, wq, w_scale)
-        return self.compute(xq, wq, x_scale, w_scale)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -786,10 +749,6 @@ class TritonBF16Grouped(GemmOpBase):
     def compute(self, x, w, m_sizes):
         return grouped_gemm(x, w, m_sizes, _use_warp_specialization=True)
 
-    def quantize_and_compute(self, x, w, m_sizes):
-        x, w, m_sizes = self.quantize(x, w, m_sizes)
-        return self.compute(x, w, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -830,10 +789,6 @@ class TritonBF16GroupedFuseScatterAdd(TritonBF16Grouped):
             _scatter_add_indices=indices,
         )
 
-    def quantize_and_compute(self, x, w, m_sizes, *args):
-        x, w, m_sizes, *ret = self.quantize(x, w, m_sizes, *args)
-        return self.compute(x, w, m_sizes, *ret)
-
 
 @register_gemm_op
 class TritonFP8RowwiseGrouped(GemmOpBase):
@@ -865,10 +820,6 @@ class TritonFP8RowwiseGrouped(GemmOpBase):
         return grouped_gemm_fp8_rowwise(
             xq, wq, m_sizes, x_scale, w_scale, _use_warp_specialization=True
         )
-
-    def quantize_and_compute(self, x, wq, w_scale, m_sizes):
-        xq, wq, x_scale, w_scale, m_sizes = self.quantize(x, wq, w_scale, m_sizes)
-        return self.compute(xq, wq, x_scale, w_scale, m_sizes)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -912,12 +863,6 @@ class TritonFP8RowwiseGroupedFuseScatterAdd(TritonFP8RowwiseGrouped):
             _scatter_add_indices=indices,
         )
 
-    def quantize_and_compute(self, x, wq, w_scale, m_sizes, *args):
-        xq, wq, x_scale, w_scale, m_sizes, *ret = self.quantize(
-            x, wq, w_scale, m_sizes, *args
-        )
-        return self.compute(xq, wq, x_scale, w_scale, m_sizes, *ret)
-
 
 @register_gemm_op
 class DeepGemmFP8GroupwiseGrouped(GemmOpBase):
@@ -957,10 +902,6 @@ class DeepGemmFP8GroupwiseGrouped(GemmOpBase):
             (xq, x_scale), (wq, w_scale), out, m_indices
         )
         return out
-
-    def quantize_and_compute(self, x, wq, w_scale, m_indices):
-        xq, wq, x_scale, w_scale, m_indices = self.quantize(x, wq, w_scale, m_indices)
-        return self.compute(xq, wq, x_scale, w_scale, m_indices)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1032,12 +973,6 @@ class DeepGemmFP8GroupwiseGroupedMasked(DeepGemmFP8GroupwiseGrouped):
         out_list = [out[g, : m_values[g], :] for g in range(num_groups)]
         return out_list
 
-    def quantize_and_compute(self, x, wq, w_scale, masked_m, expected_m, m_values):
-        xq, wq, x_scale, w_scale, masked_m, expected_m = self.quantize(
-            x, wq, w_scale, masked_m, expected_m, m_values
-        )
-        return self.compute(xq, wq, x_scale, w_scale, masked_m, expected_m, m_values)
-
 
 @register_gemm_op
 class DeepGemmFP8Groupwise(GemmOpBase):
@@ -1062,10 +997,6 @@ class DeepGemmFP8Groupwise(GemmOpBase):
     def compute(self, xq, wq, x_scale, w_scale, out):
         gemm_fp8_fp8_bf16_nt((xq, x_scale), (wq, w_scale), out)
         return out
-
-    def quantize_and_compute(self, x, wq, w_scale, out):
-        xq, wq, x_scale, w_scale, out = self.quantize(x, wq, w_scale, out)
-        return self.compute(xq, wq, x_scale, w_scale, out)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1107,10 +1038,6 @@ class DeepGemmFP8Rowwise(GemmOpBase):
     def compute(self, xq, wq, x_scale, w_scale, out):
         gemm_fp8_fp8_bf16_nt((xq, x_scale), (wq, w_scale), out)
         return out
-
-    def quantize_and_compute(self, x, wq, w_scale, out):
-        xq, wq, x_scale, w_scale, out = self.quantize(x, wq, w_scale, out)
-        return self.compute(xq, wq, x_scale, w_scale, out)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1157,10 +1084,6 @@ class FP8RowwiseGrouped(GemmOpBase):
             xq, wq, x_scale, w_scale, m_sizes
         )
 
-    def quantize_and_compute(self, x, wq, w_scale, m_sizes):
-        xq, wq, x_scale, w_scale, m_sizes = self.quantize(x, wq, w_scale, m_sizes)
-        return self.compute(xq, wq, x_scale, w_scale, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -1194,10 +1117,6 @@ class FP8RowwiseGrouped2D3D(FP8RowwiseGrouped):
         return torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
             xq, wq, x_scale, w_scale, offsets, out
         )
-
-    def quantize_and_compute(self, x, wq, w_scale, m_sizes):
-        xq, wq, x_scale, w_scale, offsets, out = self.quantize(x, wq, w_scale, m_sizes)
-        return self.compute(xq, wq, x_scale, w_scale, offsets, out)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1287,10 +1206,6 @@ class FP8GroupwiseGrouped(GemmOpBase):
             xq, wq, x_scale, w_scale, m_sizes
         )
 
-    def quantize_and_compute(self, x, wq, w_scale, m_sizes):
-        xq, wq, x_scale, w_scale, m_sizes = self.quantize(x, wq, w_scale, m_sizes)
-        return self.compute(xq, wq, x_scale, w_scale, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90, Accelerator.AMD_GFX950, Accelerator.AMD_GFX942}
@@ -1326,10 +1241,6 @@ class FP8RowwiseBatched(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1377,10 +1288,6 @@ class TritonFP8Rowwise(GemmOpBase):
             use_warp_specialization=True,
         )
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -1408,10 +1315,6 @@ class TritonFP8Blockwise(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return matmul_fp8_block(xq, wq, x_scale, w_scale, 128, 128, 128)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1447,10 +1350,6 @@ class FP8Blockwise(GemmOpBase):
         return torch.ops.mslk.f8f8bf16_blockwise(
             xq, wq, x_scale, w_scale, 128, 128, 128
         )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1489,10 +1388,6 @@ class FP8Groupwise(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.f8f8bf16_groupwise(xq, wq, x_scale, w_scale)
-
-    def quantize_and_compute(self, x, wq, w_scale):
-        xq, wq, x_scale, w_scale = self.quantize(x, wq, w_scale)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1565,10 +1460,6 @@ class CutlassFP8Int4Rowwise(GemmOpBase):
     def compute(self, xq, wq, x_scale, w_scale, w_zp):
         return torch.ops.mslk.f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, w_zp = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale, w_zp)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -1612,12 +1503,6 @@ class CutlassFP8Int4RowwisePreshuffle(GemmOpBase):
         # Otherwise run gemm normally.
         return torch.ops.mslk.f8i4bf16_shuffled(xq, wq, x_scale, row_scale, group_scale)
 
-    def quantize_and_compute(self, x, wq, row_scale, group_scale):
-        xq, wq, x_scale, row_scale, group_scale = self.quantize(
-            x, wq, row_scale, group_scale
-        )
-        return self.compute(xq, wq, x_scale, row_scale, group_scale)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -1660,10 +1545,6 @@ class CutlassBF16Int4GroupwisePreshuffle(GemmOpBase):
         # Otherwise run Gemm normally.
         return torch.ops.mslk.bf16i4bf16_shuffled(x, wq, group_scale, group_zero)
 
-    def quantize_and_compute(self, x, wq, group_scale, group_zero):
-        x, wq, group_scale, group_zero = self.quantize(x, wq, group_scale, group_zero)
-        return self.compute(x, wq, group_scale, group_zero)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -1703,10 +1584,6 @@ class CutlassBF16Int4GroupwiseBatchedPreshuffle(GemmOpBase):
         return torch.ops.mslk.bf16i4bf16_shuffled_batched(
             x, wq, group_scale, group_zero
         )
-
-    def quantize_and_compute(self, x, wq, group_scale, group_zero):
-        x, wq, group_scale, group_zero = self.quantize(x, wq, group_scale, group_zero)
-        return self.compute(x, wq, group_scale, group_zero)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1762,12 +1639,6 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
         )
         return out
 
-    def quantize_and_compute(self, x, wq, row_scale, group_scale, m_sizes):
-        xq, wq, x_scale, row_scale, group_scale, m_sizes = self.quantize(
-            x, wq, row_scale, group_scale, m_sizes
-        )
-        return self.compute(xq, wq, x_scale, row_scale, group_scale, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -1822,12 +1693,6 @@ class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
             x, wq, group_scale, group_zero, m_sizes
         )
 
-    def quantize_and_compute(self, x, wq, group_scale, group_zero, m_sizes):
-        x, wq, group_scale, group_zero, m_sizes = self.quantize(
-            x, wq, group_scale, group_zero, m_sizes
-        )
-        return self.compute(x, wq, group_scale, group_zero, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -1872,10 +1737,6 @@ class CutlassBF16DGrad(GemmOpBase):
 
     def compute(self, x, w, m_sizes):
         return torch.ops.mslk.bf16bf16bf16_grouped_grad(x, w, m_sizes)
-
-    def quantize_and_compute(self, x, w, m_sizes):
-        x, w, m_sizes = self.quantize(x, w, m_sizes)
-        return self.compute(x, w, m_sizes)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1923,10 +1784,6 @@ class CutlassBF16WGrad(GemmOpBase):
     def compute(self, x, w, k_sizes):
         return torch.ops.mslk.bf16bf16bf16_grouped_wgrad(x, w, k_sizes)
 
-    def quantize_and_compute(self, x, w, k_sizes):
-        x, w, k_sizes = self.quantize(x, w, k_sizes)
-        return self.compute(x, w, k_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -1972,10 +1829,6 @@ class BF16Grouped(GemmOpBase):
     def compute(self, x, w, m_sizes):
         return torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
 
-    def quantize_and_compute(self, x, w, m_sizes):
-        x, w, m_sizes = self.quantize(x, w, m_sizes)
-        return self.compute(x, w, m_sizes)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -2015,10 +1868,6 @@ class CutlassBF16Int4Rowwise(CutlassFP8Int4Rowwise):
     def compute(self, x, wq, w_scale, w_zp):
         return torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
 
-    def quantize_and_compute(self, x, w):
-        x, wq, w_scale, w_zp = self.quantize(x, w)
-        return self.compute(x, wq, w_scale, w_zp)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM90}
@@ -2049,10 +1898,6 @@ class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
 
         return matmul_bf16i4_rowwise(x, wq, w_scale, w_zp)
 
-    def quantize_and_compute(self, x, w):
-        x, wq, w_scale, w_zp = self.quantize(x, w)
-        return self.compute(x, wq, w_scale, w_zp)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.AMD_GFX942}
@@ -2076,10 +1921,6 @@ class TinyGemmBF16Int4Groupwise(GemmOpBase):
         return torch.ops.tinygemm.tinygemm_y_f16RM_x_f16RM_w_int4TC(
             wq, x, 128, scale, False
         )
-
-    def quantize_and_compute(self, x, w):
-        x, wq, scale = self.quantize(x, w)
-        return self.compute(x, wq, scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2113,10 +1954,6 @@ class MarlinBF16Int4Groupwise(GemmOpBase):
 
     def compute(self, x, wq, scale):
         return torch.ops.marlin.marlin_gemm(x, wq, scale)
-
-    def quantize_and_compute(self, x, w):
-        x, wq, scale = self.quantize(x, w)
-        return self.compute(x, wq, scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2156,10 +1993,6 @@ class MacheteBF16Int4Groupwise(GemmOpBase):
 
     def compute(self, x, wq, scale):
         return machete_gemm(x, wq, bits=4, groupsize=128, scales=scale)
-
-    def quantize_and_compute(self, x, w):
-        x, wq, scale = self.quantize(x, w)
-        return self.compute(x, wq, scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2205,10 +2038,6 @@ class CutlassNVFP4Groupwise(GemmOpBase):
             xq, wq, x_scale, w_scale, global_scale=global_scale
         )
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, global_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale, global_scale=global_scale)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
@@ -2235,10 +2064,6 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.f4f4bf16(xq, wq, x_scale, w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2274,10 +2099,6 @@ class MX8MX4Groupwise(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.mx8mx4bf16(xq, wq, x_scale, w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2317,10 +2138,6 @@ class CutlassMX8MX6Groupwise(GemmOpBase):
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.mx8mx6bf16(xq, wq, x_scale, w_scale)
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
@@ -2353,10 +2170,6 @@ class CutlassMX6MX6Groupwise(GemmOpBase):
 
     def compute(self, xq, wq, x_scale, w_scale):
         return torch.ops.mslk.mx6mx6bf16(xq, wq, x_scale, w_scale)
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale = self.quantize(x, w)
-        return self.compute(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2426,14 +2239,6 @@ class CutlassMXFP4GroupwiseGrouped(GemmOpBase):
             starting_row_after_padding=starting_row_after_padding,
         )
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, m_sizes, starting_row_after_padding = self.quantize(
-            x, w
-        )
-        return self.compute(
-            xq, wq, x_scale, w_scale, m_sizes, starting_row_after_padding
-        )
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -2490,10 +2295,6 @@ class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
         return torch.ops.mslk.f4f4bf16_grouped_mm(
             xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
         )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, offsets = self.quantize(*self.preprocess(x, w))
-        return self.compute(xq, wq, x_scale, w_scale, offsets)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2563,7 +2364,7 @@ class CutlassNVFP4GroupwiseGrouped(GemmOpBase):
 
         global_scale = 1.0 / (x_global_scale * w_global_scale)
 
-        # we can optionally set optional_tensor_idx to None to run the alternative method
+        # optional_tensor_idx can be None to run the alternative method.
         xq, x_scale, starting_row_after_padding = mega_fp4_quantize_kernel(
             m_sizes, x, x_global_scale, optional_tensor_idx=tensor_idx
         )
@@ -2600,26 +2401,6 @@ class CutlassNVFP4GroupwiseGrouped(GemmOpBase):
             use_mx=False,
         )
         return gemm_result
-
-    def quantize_and_compute(self, x, wq, w_scale, w_global_scale, m_sizes):
-        (
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            m_sizes,
-            global_scale,
-            starting_row_after_padding,
-        ) = self.quantize(x, wq, w_scale, w_global_scale, m_sizes)
-        return self.compute(
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            m_sizes,
-            global_scale,
-            starting_row_after_padding,
-        )
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -2700,24 +2481,6 @@ class CutlassNVFP4TorchGrouped(GemmOpBase):
             w_scale,
             offsets,
             global_scale=global_scale,
-        )
-
-    def quantize_and_compute(self, x, wq, w_scale, w_global_scale, m_sizes, offsets):
-        (
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            global_scale,
-            offsets,
-        ) = self.quantize(x, wq, w_scale, w_global_scale, m_sizes, offsets)
-        return self.compute(
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            global_scale,
-            offsets,
         )
 
     @property
@@ -2804,28 +2567,6 @@ class NVFP4UltraGroupwise(GemmOpBase):
             w_global_scale_inv,
         )
 
-    def quantize_and_compute(
-        self, x, wq, w_scale, w_global_scale_inv, m_sizes, offsets
-    ):
-        (
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            x_global_scale_inv,
-            w_global_scale_inv,
-            offsets,
-        ) = self.quantize(x, wq, w_scale, w_global_scale_inv, m_sizes, offsets)
-        return self.compute(
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            x_global_scale_inv,
-            w_global_scale_inv,
-            offsets,
-        )
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
@@ -2896,7 +2637,7 @@ class CutlassNVFP4GroupwiseStackedGroupedPackUnpack(GemmOpBase):
         )
 
     def quantize(self, x, wq, w_scale, x_global_scale, global_scale, m_sizes):
-        # alternative packing methods that only uses the overall global scale rather than per tensor
+        # Alternative packing methods use the overall global scale, not per tensor.
         """
         packed = mega_fp4_pack(x, x_global_scale[0])
         """
@@ -2967,34 +2708,6 @@ class CutlassNVFP4GroupwiseStackedGroupedPackUnpack(GemmOpBase):
 
         return gemm_result
 
-    def quantize_and_compute(
-        self, x, wq, w_scale, x_global_scale, global_scale, m_sizes
-    ):
-        (
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            m_sizes,
-            global_scale,
-            starting_row_after_padding,
-            xq_other,
-            x_scale_other,
-            starting_row_after_padding_other,
-        ) = self.quantize(x, wq, w_scale, x_global_scale, global_scale, m_sizes)
-        return self.compute(
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            m_sizes,
-            global_scale,
-            starting_row_after_padding,
-            xq_other,
-            x_scale_other,
-            starting_row_after_padding_other,
-        )
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
@@ -3035,10 +2748,6 @@ class TorchBF16Grouped(GemmOpBase):
             offs=offs,
         )
 
-    def quantize_and_compute(self, x, w, offs):
-        x, w, offs = self.quantize(x, w, offs)
-        return self.compute(x, w, offs)
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return set(Accelerator)
@@ -3074,8 +2783,8 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
             group_size, total_M + 1, group_size, dtype=torch.int32, device=x.device
         )
 
-        # For each constituent 2d subtensor in the 3d weights, quantize and convert scale to blocked format separately,
-        # as they each used for independent gemm in the grouped gemm.
+        # Each constituent 2d subtensor in the 3d weights is quantized and
+        # converted separately because grouped gemm uses them independently.
         wq_list = []
         w_scale_list = []
         for i in range(G):
@@ -3086,8 +2795,8 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
         wq = torch.stack(wq_list, dim=0).contiguous()
         w_scale = torch.stack(w_scale_list, dim=0).contiguous()
 
-        # For each group along `total_M` in the 2D tensor, quantize and convert scale to blocked format separately,
-        # as they each used for independent gemm in the grouped gemm.
+        # Each group along `total_M` in the 2D tensor is quantized and converted
+        # separately because grouped gemm uses them independently.
         xq_list = []
         x_scale_list = []
         for i in range(G):
@@ -3110,16 +2819,6 @@ class CutlassMXFP8GroupwiseGrouped2D3D(GemmOpBase):
         return torch.ops.mslk.mx8mx8bf16_grouped_mm(
             xq,
             wq.transpose(-2, -1),
-            x_scale,
-            w_scale,
-            input_group_end_offsets,
-        )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, input_group_end_offsets = self.quantize(x, w)
-        return self.compute(
-            xq,
-            wq,
             x_scale,
             w_scale,
             input_group_end_offsets,
@@ -3199,16 +2898,6 @@ class MX8MX4GroupwiseGrouped2D3D(GemmOpBase):
             input_group_end_offsets,
         )
 
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, input_group_end_offsets = self.quantize(x, w)
-        return self.compute(
-            xq,
-            wq,
-            x_scale,
-            w_scale,
-            input_group_end_offsets,
-        )
-
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {
@@ -3249,8 +2938,9 @@ class CutlassMXFP8GroupwiseGrouped2D2D(GemmOpBase):
         return x, w, G
 
     def quantize(self, x, w, G):
-        # Simulate 2d-2d grouped gemm in backward pass `grad_weight = grad_output_t @ input`,
-        # where we use "K" as the contracting dim which has "G" groups.
+        # Simulate 2d-2d grouped gemm in backward pass
+        # `grad_weight = grad_output_t @ input`, where "K" is the contracting
+        # dim with "G" groups.
         M, total_K = x.shape
         N, _ = w.shape
         group_size = total_K // G
@@ -3319,16 +3009,6 @@ class CutlassMXFP8GroupwiseGrouped2D2D(GemmOpBase):
         return torch.ops.mslk.mx8mx8bf16_grouped_mm(
             xq,
             wq.transpose(-2, -1),
-            x_scale,
-            w_scale,
-            input_group_end_offsets,
-        )
-
-    def quantize_and_compute(self, x, w):
-        xq, wq, x_scale, w_scale, input_group_end_offsets = self.quantize(x, w)
-        return self.compute(
-            xq,
-            wq,
             x_scale,
             w_scale,
             input_group_end_offsets,
@@ -3451,11 +3131,6 @@ class CuteDSLInt4BF16Groupwise(GemmOpBase):
             scale_granularity_k=self._scale_granularity_k,
             acc_dtype=self._acc_dtype,
         )
-
-    def quantize_and_compute(self, x, w):
-        preprocessed = self.preprocess(x, w)
-        quantized = self.quantize(*preprocessed)
-        return self.compute(*quantized)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
