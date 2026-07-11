@@ -8,10 +8,8 @@ import flydsl.compiler as flyc
 import numpy as np
 import torch
 from flydsl._mlir import ir
-
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-
 from flydsl.expr import arith, buffer_ops, ptrtoint, range_constexpr, vector
 from flydsl.expr.typing import T
 
