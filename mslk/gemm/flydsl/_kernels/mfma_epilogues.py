@@ -30,7 +30,6 @@ from contextlib import contextmanager
 from typing import Callable
 
 import flydsl.expr as fx
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
