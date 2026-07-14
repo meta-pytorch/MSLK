@@ -22,7 +22,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> dispatch_fmha_bwd(
     int64_t window_size_right,
     bool bottom_right,
     bool deterministic) {
-  if (C10_LIKELY(at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None)) {
+  if (at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None) [[likely]] {
     // This workaround initializes the CUDA context to prevent the 201 error
     // (invalid context).  When this function is invoked through PyTorch
     // autograd, it runs on a new thread that hasn't been associated with a CUDA
