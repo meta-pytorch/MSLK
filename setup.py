@@ -735,6 +735,9 @@ def main(argv: List[str]) -> None:
             "ROCm",
         ],
         packages=packages,
+        # Ship the prebuilt FlyDSL AOT cache (populated at build time) so it
+        # is available at runtime; absent when AOT is not run.
+        package_data={"mslk.flydsl": ["aot_artifacts/*"]},
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
             # release version of torch, which is not what we want for the

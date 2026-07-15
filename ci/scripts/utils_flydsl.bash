@@ -56,3 +56,34 @@ install_flydsl_pip () {
   echo "################################################################################"
   echo ""
 }
+
+compile_flydsl_aot () {
+  local env_name="$1"
+  if [ "$env_name" == "" ]; then
+    echo "Usage: ${FUNCNAME[0]} ENV_NAME"
+    echo "Example(s):"
+    echo "    ${FUNCNAME[0]} build_env"
+    return 1
+  else
+    echo "################################################################################"
+    echo "# Pre-compile FlyDSL kernels (AOT)"
+    echo "#"
+    echo "# [$(date --utc +%FT%T.%3NZ)] + ${FUNCNAME[0]} ${*}"
+    echo "################################################################################"
+    echo ""
+  fi
+
+  if [ "$BUILD_VARIANT" != "rocm" ]; then
+    echo "[BUILD] Skipping FlyDSL AOT for BUILD_VARIANT '${BUILD_VARIANT}' (rocm only)"
+    return 0
+  fi
+
+  # shellcheck disable=SC2155
+  local env_prefix=$(env_name_or_prefix "${env_name}")
+
+  # Run under MSLK_PYTHON_ONLY=1 so kernel-module imports don't load the
+  # native library, which is not built at this point in the pipeline.
+  echo "[BUILD] Pre-compiling FlyDSL kernels into the bundled cache ..."
+  # shellcheck disable=SC2086
+  (MSLK_PYTHON_ONLY=1 conda run --no-capture-output ${env_prefix} python -m mslk.utils.flydsl_aot) || return 1
+}

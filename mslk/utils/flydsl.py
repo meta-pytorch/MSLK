@@ -17,6 +17,7 @@ and op-specific logic stays in the kernel modules.
 
 import functools
 import importlib.util
+import os
 from typing import Any, Callable
 
 _INSTALL_HINT: str = (
@@ -50,6 +51,29 @@ def require_flydsl() -> None:
         raise RuntimeError(_INSTALL_HINT)
 
 
+# Bundled AOT cache shipped inside the package (populated at build time).
+# Shared across all FlyDSL kernel categories (gemm, moe, ...), so it lives
+# under a dedicated mslk.flydsl package rather than under any kernel domain.
+_BUNDLED_AOT_CACHE: str = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "flydsl", "aot_artifacts"
+)
+
+
+def configure_runtime_cache() -> None:
+    """Point FlyDSL at the bundled AOT cache, if present and not overridden.
+
+    Cache hits skip the front-end compile; misses fall back to JIT. Set
+    ``MSLK_FLYDSL_DISABLE_JIT=1`` to forbid the JIT fallback (e.g. for CUDA
+    graph capture), which makes FlyDSL raise on a cache miss instead.
+    """
+    if "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ and os.path.isdir(
+        _BUNDLED_AOT_CACHE
+    ):
+        os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _BUNDLED_AOT_CACHE
+    if os.environ.get("MSLK_FLYDSL_DISABLE_JIT", "0") == "1":
+        os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
+
+
 def run_compiled(launcher: Callable[..., Any], *args: Any) -> None:
     """Dispatch a FlyDSL ``@flyc.jit`` host launcher with ``args``.
 
@@ -63,3 +87,6 @@ def run_compiled(launcher: Callable[..., Any], *args: Any) -> None:
         launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]
     else:
         cf(*args)
+
+
+configure_runtime_cache()
