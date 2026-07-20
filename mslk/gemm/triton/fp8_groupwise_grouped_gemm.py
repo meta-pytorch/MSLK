@@ -56,13 +56,13 @@ def _get_configs() -> List[Config]:
     # during Triton do_bench on ROCm CI (see gemm_test.py fp8 groupwise grouped
     # crash). Pin a single conservative config until the hanging config is
     # identified. BLOCK_N=64 <= N for all covered shapes, so pruning never empties.
-    return [
-        Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128},
-            num_warps=4,
-            num_stages=2,
-        )
-    ]
+    # return [
+    #     Config(
+    #         {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128},
+    #         num_warps=4,
+    #         num_stages=2,
+    #     )
+    # ]
     configs = []
     for bm in [16, 32, 64, 128, 256]:
         for bn in [16, 32, 64, 128, 256]:
