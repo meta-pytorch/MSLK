@@ -6,15 +6,19 @@
 name: Build MSLK x86 Linux Wheels
 
 on:
-  pull_request:
-  push:
-    branches:
-      - nightly
-      - main
-    tags:
-      # Release candidate tag look like: v1.11.0-rc1
-      - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
-      - v[0-9]+.[0-9]+.[0-9]+
+  # TEMPORARILY DISABLED: non-ROCm auto-triggers off to isolate ROCm CI.
+  # NOTE: this pipeline DOES build ROCm wheels, but it is a standalone Nova
+  # publish build and is NOT required to run the ROCm unit tests -- those
+  # install the wheel produced by _mslk_rocm_build.yml (via mslk_ci_rocm.yml).
+  # pull_request:
+  # push:
+  #   branches:
+  #     - nightly
+  #     - main
+  #   tags:
+  #     # Release candidate tag look like: v1.11.0-rc1
+  #     - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
+  #     - v[0-9]+.[0-9]+.[0-9]+
   workflow_dispatch:
 
 concurrency:

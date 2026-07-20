@@ -6,15 +6,17 @@
 name: Build MSLK Aarch64 Linux Wheels
 
 on:
-    pull_request:
-    push:
-      branches:
-        - nightly
-        - main
-      tags:
-        # Release candidate tag look like: v1.11.0-rc1
-        - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
-        - v[0-9]+.[0-9]+.[0-9]+
+    # TEMPORARILY DISABLED: non-ROCm auto-triggers off to isolate ROCm CI.
+    # (aarch64 wheels are CUDA-only and not required to run ROCm unit tests.)
+    # pull_request:
+    # push:
+    #   branches:
+    #     - nightly
+    #     - main
+    #   tags:
+    #     # Release candidate tag look like: v1.11.0-rc1
+    #     - v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+
+    #     - v[0-9]+.[0-9]+.[0-9]+
     workflow_dispatch:
 
 concurrency:
