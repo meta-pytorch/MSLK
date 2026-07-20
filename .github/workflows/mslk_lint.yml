@@ -6,18 +6,17 @@
 name: MSLK Lint
 
 on:
-  # TEMPORARILY DISABLED: non-ROCm auto-triggers off to isolate ROCm CI.
-  # # PR Trigger
-  # #
-  # push:
-  #   branches:
-  #     - main
+  # PR Trigger
   #
-  # # Push Trigger (enable to catch errors coming out of multiple merges)
-  # #
-  # pull_request:
-  #   branches:
-  #     - main
+  push:
+    branches:
+      - main
+
+  # Push Trigger (enable to catch errors coming out of multiple merges)
+  #
+  pull_request:
+    branches:
+      - main
 
   # Manual Trigger (for testing only)
   #

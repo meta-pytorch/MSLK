@@ -212,14 +212,13 @@ __configure_mslk_build_rocm () {
     local arch_list="gfx942"
 
   else
-    # TEMPORARILY RESTRICTED: build only gfx950 to speed up ROCm CI iteration.
-    # Original multi-arch defaults preserved below for restore.
-    #   if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
-    #     local arch_list="gfx908,gfx90a,gfx942,gfx950"
-    #   else
-    #     local arch_list="gfx90a,gfx942"
-    #   fi
-    local arch_list="gfx950"
+    # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
+    # sufficient resources, so we can build for more AMD Instinct architectures.
+    if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
+      local arch_list="gfx908,gfx90a,gfx942,gfx950"
+    else
+      local arch_list="gfx90a,gfx942"
+    fi
   fi
 
   echo "[BUILD] Setting the following ROCm targets: ${arch_list}"
