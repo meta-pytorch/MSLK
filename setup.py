@@ -705,7 +705,7 @@ def main(argv: List[str]) -> None:
     # FlyDSL is a ROCm-only backend; also offered on variant-agnostic
     # python-only builds.
     if _PYTHON_ONLY or build.variant() == "rocm":
-        extras_require["flydsl"] = ["flydsl==0.2.2"]
+        extras_require["flydsl"] = ["flydsl==0.2.4"]
 
     packages = setuptools.find_packages()
 

@@ -36,7 +36,7 @@ install_flydsl_pip () {
   fi
 
   # Keep this pin in sync with the `flydsl` extra in setup.py.
-  local flydsl_version="0.2.2"
+  local flydsl_version="0.2.4"
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")

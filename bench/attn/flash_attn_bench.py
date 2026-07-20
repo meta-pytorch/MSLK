@@ -19,6 +19,9 @@ from typing import Callable, Optional
 import click
 import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
+from mslk.utils.flydsl import is_flydsl_available
+
+BACKENDS = ("flash_attn", "flydsl")
 
 type ShapeFunction = Callable[[], list[tuple[int, int, int, int, int]]]
 
@@ -113,20 +116,34 @@ def benchmark(
     D: int,
     causal: bool,
     window_size: int,
+    backend: str,
     opts: BenchOptions,
 ) -> Metrics:
-    """Benchmark flash_attn_func for one configuration."""
-    from mslk.attention.flash_attn import flash_attn_func
-
+    """Benchmark one attention configuration on the selected backend."""
     dtype = torch.bfloat16
     Q = torch.randn(B, N, H, D, device="cuda", dtype=dtype)
     K = torch.randn(B, N, H_kv, D, device="cuda", dtype=dtype)
     V = torch.randn(B, N, H_kv, D, device="cuda", dtype=dtype)
 
-    ws = (window_size, 0) if window_size > 0 else None
+    if backend == "flydsl":
+        # ROCm-only DUALWAVE_SWP forward (gfx950); no sliding-window support.
+        from mslk.attention.flydsl import flydsl_flash_attn_func
 
-    def fn():
-        flash_attn_func(Q, K, V, causal=causal, window_size=ws)
+        if window_size > 0:
+            raise click.ClickException(
+                "the flydsl backend does not support --window-size"
+            )
+
+        def fn():
+            flydsl_flash_attn_func(Q, K, V, causal=causal, num_kv_heads=H_kv)
+
+    else:
+        from mslk.attention.flash_attn import flash_attn_func
+
+        ws = (window_size, 0) if window_size > 0 else None
+
+        def fn():
+            flash_attn_func(Q, K, V, causal=causal, window_size=ws)
 
     ms = do_bench(fn, (), opts)
 
@@ -175,6 +192,12 @@ def benchmark(
     type=int,
     help="Repetition time in ms for triton.testing.do_bench.",
 )
+@click.option(
+    "--backend",
+    default="flash_attn",
+    type=click.Choice(BACKENDS),
+    help="Attention backend: 'flash_attn' (default) or 'flydsl' (ROCm/gfx950).",
+)
 def invoke_main(
     n_str: str,
     b: int,
@@ -188,7 +211,14 @@ def invoke_main(
     output_dir: str,
     shapes: Optional[str],
     rep: int,
+    backend: str,
 ) -> None:
+    if backend == "flydsl" and not is_flydsl_available():
+        raise click.ClickException(
+            "the flydsl backend is unavailable: install it with "
+            "`pip install mslk[flydsl]` and run on a supported GPU arch (gfx950)."
+        )
+
     opts = BenchOptions(
         cuda_graph=not no_cuda_graph,
         rep_ms=rep,
@@ -211,7 +241,7 @@ def invoke_main(
 
     for B, N, H, H_kv, D in shape_list:
         print(f"Benchmarking B={B}, N={N}, H={H}, H_kv={H_kv}, D={D}")
-        m = benchmark(B, N, H, H_kv, D, causal, window_size, opts)
+        m = benchmark(B, N, H, H_kv, D, causal, window_size, backend, opts)
         results.append(m)
         csv_rows.append(m.as_dict())
 
@@ -225,6 +255,7 @@ def invoke_main(
     print(f"Hardware: {torch.cuda.get_device_name()}")
     print("")
     print("Benchmark Settings:")
+    print(f"    Backend: {backend}")
     print(f"    CUDA graph: {not no_cuda_graph}")
     print(f"    Causal: {causal}")
     if window_size > 0:
