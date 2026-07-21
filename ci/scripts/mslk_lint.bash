@@ -151,6 +151,7 @@ lint_mslk_copyright () {
 
   local ignored_paths=(
     mslk/attention/flash_attn
+    mslk/attention/flydsl/_kernels
     mslk/gemm/blackwell_mixed_input_gemm/__init__.py
     mslk/gemm/blackwell_mixed_input_gemm/mixed_input_gemm.py
     test/attention/test_flash_attn.py

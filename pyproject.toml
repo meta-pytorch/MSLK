@@ -15,6 +15,7 @@ sorter = "usort"
 # internal fbcode pyfmt config (which excludes mslk/attention/flash_attn).
 excludes = [
     "mslk/attention/flash_attn",
+    "mslk/attention/flydsl/_kernels",
     "mslk/gemm/blackwell_mixed_input_gemm",
     "test/gemm/test_blackwell_mixed_input_gemm.py",
     "test/attention/test_flash_attn_varlen.py",

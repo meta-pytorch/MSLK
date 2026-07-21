@@ -22,7 +22,6 @@ FlyDSL or on an unsupported GPU arch.
 from typing import Any
 
 import torch
-
 from mslk.utils.flydsl import is_flydsl_available, require_flydsl
 
 __all__ = ["flydsl_flash_attn_func", "is_flydsl_available"]

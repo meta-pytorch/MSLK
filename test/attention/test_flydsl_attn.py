@@ -26,9 +26,8 @@ import math
 import unittest
 
 import torch
-from parameterized import parameterized
-
 from mslk.utils.flydsl import is_flydsl_available
+from parameterized import parameterized
 
 if torch.cuda.is_available() and is_flydsl_available():
     from mslk.attention.flydsl import flydsl_flash_attn_func
@@ -58,8 +57,12 @@ def _reference(
     Skv, Hkv = k.shape[1], k.shape[2]
     sm = _sm_scale(D)
     qf = q.float().permute(0, 2, 1, 3)  # B, H, Sq, D
-    kf = k.float().permute(0, 2, 1, 3).repeat_interleave(H // Hkv, dim=1)  # B, H, Skv, D
-    vf = v.float().permute(0, 2, 1, 3).repeat_interleave(H // Hkv, dim=1)  # B, H, Skv, D
+    kf = (
+        k.float().permute(0, 2, 1, 3).repeat_interleave(H // Hkv, dim=1)
+    )  # B, H, Skv, D
+    vf = (
+        v.float().permute(0, 2, 1, 3).repeat_interleave(H // Hkv, dim=1)
+    )  # B, H, Skv, D
     scores = torch.einsum("bhqd,bhkd->bhqk", qf, kf) * sm  # B, H, Sq, Skv
     if causal:
         qi = torch.arange(Sq, device=q.device).view(Sq, 1)
@@ -85,9 +88,9 @@ def _assert_lse_matches(lse: torch.Tensor, lse_ref: torch.Tensor, atol: float) -
     lse_ref = lse_ref.float()
     finite = torch.isfinite(lse_ref)
     if (~finite).any():
-        assert bool(
-            ((~torch.isfinite(lse)) == (~finite)).all()
-        ), "fully-masked (-inf) rows mismatch"
+        assert bool(((~torch.isfinite(lse)) == (~finite)).all()), (
+            "fully-masked (-inf) rows mismatch"
+        )
     if finite.any():
         diff = (lse[finite] - lse_ref[finite]).abs().max().item()
         assert diff <= atol, f"LSE max abs diff {diff:.3e} exceeds atol {atol:.3e}"
