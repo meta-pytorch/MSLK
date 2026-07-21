@@ -2011,6 +2011,33 @@ class CutlassMXFP4Groupwise(GemmOpBase):
 
 
 @register_gemm_op
+class CutlassMXFP4Groupwise16(GemmOpBase):
+    """
+    MXFP4 matmul with groupwise scaling and a 1x16 block size (MXFP4_16).
+    """
+
+    def quantize(self, x, w):
+        xq, x_scale = triton_quantize_mx4_unpack(x, group_size=16)
+        wq, w_scale = triton_quantize_mx4_unpack(w, group_size=16)
+        return xq, wq, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return torch.ops.mslk.f4f4bf16(xq, wq, x_scale, w_scale, mxfp4_block_size=16)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.NVIDIA_SM100, Accelerator.NVIDIA_SM103}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
+
+@register_gemm_op
 class MX8MX4Groupwise(GemmOpBase):
     """
     MX8 activation x MX4 weight matmul with groupwise scaling.

@@ -19,6 +19,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>     // @manual
 #include <cutlass/gemm/device/gemm_universal_adapter.h>       // @manual
+#include <cutlass/gemm/dispatch_policy.hpp>                   // @manual
 #include <cutlass/epilogue/collective/collective_builder.hpp> // @manual
 // clang-format on
 
@@ -33,13 +34,55 @@ using MXFP4_16 = cutlass::mx_float4_16_t<cutlass::float_e2m1_t>;
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
 
+// Scale-factor vector size for the SM103 ultra block-scaled schedules. NVFP4
+// and MXFP4_16 quantize 1x16 blocks (Vs16); MXFP4 quantizes 1x32 blocks (Vs32).
+// On SM103 the Auto schedule always resolves to Vs32, so the schedule must be
+// named explicitly per format (unlike Sm100, which derives it from the element
+// type).
+template <typename T>
+struct ultra_sf_vec_size;
+template <typename F4>
+struct ultra_sf_vec_size<cutlass::nv_float4_t<F4>> {
+  static constexpr int value = 16;
+};
+template <typename F4>
+struct ultra_sf_vec_size<cutlass::mx_float4_16_t<F4>> {
+  static constexpr int value = 16;
+};
+template <typename F4>
+struct ultra_sf_vec_size<cutlass::mx_float4_t<F4>> {
+  static constexpr int value = 32;
+};
+
+// SM103 ultra schedules require CUDA 13+. Alias them to the Sm100 Auto schedule
+// on older toolkits so UseUltra=true instances still compile (they are never
+// dispatched pre-CUDA-13; see the runtime guard in f4f4bf16.cu).
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 13000)
+using _UltraArchTag = cutlass::arch::Sm103;
+using _Ultra1SmVs16 =
+    cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103;
+using _Ultra2SmVs16 =
+    cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103;
+using _Ultra1SmVs32 =
+    cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs32Sm103;
+using _Ultra2SmVs32 =
+    cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs32Sm103;
+#else
+using _UltraArchTag = cutlass::arch::Sm100;
+using _Ultra1SmVs16 = cutlass::gemm::collective::KernelScheduleAuto;
+using _Ultra2SmVs16 = cutlass::gemm::collective::KernelScheduleAuto;
+using _Ultra1SmVs32 = cutlass::gemm::collective::KernelScheduleAuto;
+using _Ultra2SmVs32 = cutlass::gemm::collective::KernelScheduleAuto;
+#endif
+
 template <
     typename InputType,
     int TB_M,
     int TB_N,
     int TBS_M,
     int TBS_N,
-    int TBS_K>
+    int TBS_K,
+    bool UseUltra = false>
 at::Tensor _f4f4bf16(
     at::Tensor XQ, // FP4
     at::Tensor WQ, // FP4
@@ -53,7 +96,10 @@ at::Tensor _f4f4bf16(
   const int N = WQ.size(0);
   const int K = XQ.size(1) * 2; // Since K is packed
 
-  constexpr int TileShapeK = 128 * 8 / cutlass::sizeof_bits<InputType>::value;
+  // The SM103 ultra block-scaled builder hard-requires TileShape K = 768
+  // (static_assert in sm103_blockscaled_umma_builder.inl); it cannot be tuned.
+  constexpr int TileShapeK =
+      UseUltra ? 768 : (128 * 8 / cutlass::sizeof_bits<InputType>::value);
 
   using ElementA = InputType;
   using LayoutATag = cutlass::layout::RowMajor;
@@ -82,9 +128,31 @@ at::Tensor _f4f4bf16(
           ElementOutput>::value; // Memory access granularity/alignment of C
                                  // matrix in units of elements (up to 16 bytes)
 
-  using ArchTag = cutlass::arch::Sm100; // Tag indicating the minimum SM that
-                                        // supports the intended feature
+  using ArchTag =
+      cute::conditional_t<UseUltra, _UltraArchTag, cutlass::arch::Sm100>;
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+
+  using ElementData = typename InputType::DataType;
+  using ElementSF = typename InputType::ScaleFactorType;
+  using ElementPair = cute::tuple<ElementData, ElementSF>;
+  // The SM103 ultra CollectiveBuilder expects a (data, scale) tuple; the Sm100
+  // builder takes the bare wrapper type and derives the scale type itself.
+  using ElementForBuilder =
+      cute::conditional_t<UseUltra, ElementPair, InputType>;
+
+  // SM103 ultra: name the block-scaled schedule explicitly. Vs is a property of
+  // the format (NVFP4 / MXFP4_16 -> Vs16, MXFP4 -> Vs32); 2SM when TB_M == 256
+  // and cluster M is even, else 1SM. Unused (aliased to Auto) when !UseUltra.
+  constexpr bool kUltra2Sm = (TB_M == 256) && (TBS_M % 2 == 0);
+  constexpr int kUltraVs = ultra_sf_vec_size<InputType>::value;
+  using _UltraSchedule = cute::conditional_t<
+      (kUltraVs == 16),
+      cute::conditional_t<kUltra2Sm, _Ultra2SmVs16, _Ultra1SmVs16>,
+      cute::conditional_t<kUltra2Sm, _Ultra2SmVs32, _Ultra1SmVs32>>;
+  using KernelSchedule = cute::conditional_t<
+      UseUltra,
+      _UltraSchedule,
+      cutlass::gemm::collective::KernelScheduleAuto>;
   using MmaTileShape = cute::Shape<
       cute::Int<TB_M>,
       cute::Int<TB_N>,
@@ -118,10 +186,10 @@ at::Tensor _f4f4bf16(
       typename cutlass::gemm::collective::CollectiveBuilder<
           ArchTag,
           OperatorClass,
-          ElementB,
+          ElementForBuilder,
           LayoutBTag_Transpose,
           AlignmentB,
-          ElementA,
+          ElementForBuilder,
           LayoutATag_Transpose,
           AlignmentA,
           ElementAccumulator,
@@ -129,10 +197,7 @@ at::Tensor _f4f4bf16(
           ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::collective::KernelScheduleAuto // Kernel schedule
-                                                        // policy. Auto or using
-                                                        // targeted scheduling
-                                                        // policy
+          KernelSchedule // Auto on Sm100; explicit ultra schedule on Sm103
           >::CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
