@@ -8,4 +8,5 @@ exclude =
     env,
     .venv,
     mslk/attention/flash_attn,
+    mslk/attention/flydsl/_kernels,
     test/attention,
