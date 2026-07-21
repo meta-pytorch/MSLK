@@ -1828,7 +1828,74 @@ class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX942}
+        return {Accelerator.AMD_MI300X, Accelerator.AMD_GFX950}
+
+
+@register_gemm_op
+class TritonBF16Int4Shuffled(TritonBF16Int4Rowwise):
+    """ROCm Triton BF16xINT4 shuffled GEMM (routes to rowwise on AMD)."""
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X, Accelerator.AMD_GFX950}
+
+
+@register_gemm_op
+class TritonBF16Int4GroupedShuffled(CutlassFP8Int4Rowwise):
+    """ROCm Triton BF16xINT4 grouped shuffled GEMM.
+
+    Inherits _int4_row_quantize and _pack_int4 from CutlassFP8Int4Rowwise.
+    """
+
+    def preprocess(self, x, w):
+        assert isinstance(x, list) and isinstance(w, list)
+        m_values = [i.shape[0] for i in x]
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
+        wq_list, scale_list, zero_list = [], [], []
+        for wi in w:
+            wq_i, s_i, z_i = self._int4_row_quantize(wi)
+            wq_list.append(self._pack_int4(wq_i))
+            scale_list.append(s_i)
+            zero_list.append(z_i)
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        group_scale = torch.stack(scale_list, dim=0).contiguous()
+        group_zero = torch.stack(zero_list, dim=0).contiguous()
+        x = torch.concat(x, dim=0).contiguous()
+        return x, wq, group_scale, group_zero, m_sizes
+
+    def quantize(self, x, wq, group_scale, group_zero, m_sizes):
+        return x, wq, group_scale, group_zero, m_sizes
+
+    def compute(self, x, wq, group_scale, group_zero, m_sizes):
+        from mslk.gemm.triton.int4_grouped_gemm import matmul_bf16i4_rowwise_grouped
+
+        return matmul_bf16i4_rowwise_grouped(x, wq, group_scale, group_zero, m_sizes)
+
+    def quantize_and_compute(self, x, wq, group_scale, group_zero, m_sizes):
+        x, wq, group_scale, group_zero, m_sizes = self.quantize(
+            x, wq, group_scale, group_zero, m_sizes
+        )
+        return self.compute(x, wq, group_scale, group_zero, m_sizes)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X, Accelerator.AMD_GFX950}
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.BF16
+
+    @property
+    def input_bytes_per_element(self) -> float:
+        return 2.0
+
+    @property
+    def weight_bytes_per_element(self) -> float:
+        return 0.5
 
 
 @register_gemm_op
