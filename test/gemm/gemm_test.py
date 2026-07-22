@@ -3389,9 +3389,18 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
     @parameterized.expand(
         [
+            # small M (decode)
+            (16, 1, 1280, 8192),
+            (4, 1, 8192, 1024),
+            # medium M
             (4, 32, 1280, 8192),
             (8, 64, 8192, 1024),
             (2, 128, 7424, 8192),
+            # large M (prefill)
+            (2, 1024, 1280, 8192),
+            (2, 4096, 8192, 1024),
+            # B=1 (degenerate batch)
+            (1, 64, 1280, 8192),
         ]
     )
     def test_flydsl_preshuffle_batched_gemm(
