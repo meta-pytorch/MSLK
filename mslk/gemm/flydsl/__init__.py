@@ -263,16 +263,18 @@ def flydsl_preshuffle_batched_gemm(
     xs_contig = x_scale.contiguous()
     ws_contig = w_scale.contiguous()
 
+    # Pre-build ptr_arg list outside the loop to minimize per-batch overhead
+    out_ptrs = [ptr_arg(out[b].view(-1)) for b in range(B)]
+    a_ptrs = [ptr_arg(XQ_i8[b].view(-1)) for b in range(B)]
+    b_ptrs = [ptr_arg(WQ_i8[b].view(-1)) for b in range(B)]
+    sa_ptrs = [ptr_arg(xs_contig[b].view(-1)) for b in range(B)]
+    sb_ptrs = [ptr_arg(ws_contig[b].view(-1)) for b in range(B)]
+
     for b in range(B):
         _run_compiled(
             exe,
-            ptr_arg(out[b].view(-1)),
-            ptr_arg(XQ_i8[b].view(-1)),
-            ptr_arg(WQ_i8[b].view(-1)),
-            ptr_arg(xs_contig[b].view(-1)),
-            ptr_arg(ws_contig[b].view(-1)),
-            dummy_bias_ptr,
-            M, N, stream,
+            out_ptrs[b], a_ptrs[b], b_ptrs[b], sa_ptrs[b], sb_ptrs[b],
+            dummy_bias_ptr, M, N, stream,
         )
 
     return out
