@@ -182,6 +182,26 @@ def flydsl_preshuffle_gemm(
     return out
 
 
+_batched_graph_cache: dict = {}
+
+
+def _batched_dispatch_loop(
+    exe, out, XQ_i8, WQ_i8, xs, ws, dummy_bias_ptr, B, M, N, stream, ptr_arg,
+    _run_compiled,
+):
+    """Raw per-batch dispatch loop (used for graph capture and non-graphed path)."""
+    for b in range(B):
+        _run_compiled(
+            exe,
+            ptr_arg(out[b].view(-1)),
+            ptr_arg(XQ_i8[b].view(-1)),
+            ptr_arg(WQ_i8[b].view(-1)),
+            ptr_arg(xs[b].view(-1)),
+            ptr_arg(ws[b].view(-1)),
+            dummy_bias_ptr, M, N, stream,
+        )
+
+
 def flydsl_preshuffle_batched_gemm(
     XQ: Tensor,
     WQ: Tensor,
@@ -192,11 +212,14 @@ def flydsl_preshuffle_batched_gemm(
     tile_n: Optional[int] = None,
     tile_k: Optional[int] = None,
     dtype: torch.dtype = torch.bfloat16,
+    use_cuda_graph: bool = True,
 ) -> Tensor:
-    """Batched FP8 preshuffle GEMM via per-batch dispatch.
+    """Batched FP8 preshuffle GEMM with CUDA graph acceleration.
 
-    Pre-compiles the kernel once and dispatches B launches directly via
-    _run_compiled, avoiding per-batch Python overhead from the high-level API.
+    On the first call for a given (B, M, N, K, dtype) shape, captures all B
+    kernel launches into a CUDA graph using static input/output buffers.
+    Subsequent calls copy data into the static buffers and replay the graph
+    with a single CPU-side call, eliminating per-batch Python dispatch overhead.
 
     Args:
         XQ: FP8 activation tensor (B, M, K).
@@ -205,6 +228,7 @@ def flydsl_preshuffle_batched_gemm(
         w_scale: Per-channel weight scale (B, N) or (B, 1, N), float32.
         out: Optional pre-allocated output tensor (B, M, N).
         dtype: Output dtype (bfloat16 or float16).
+        use_cuda_graph: If True, capture and replay via CUDA graph.
 
     Returns:
         Output tensor (B, M, N) in ``dtype``.
@@ -254,27 +278,67 @@ def flydsl_preshuffle_batched_gemm(
     def _as_i8(t: Tensor) -> Tensor:
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
-    dummy_bias = torch.empty(0, dtype=dtype, device=XQ.device)
-    stream = fx.Stream(torch.cuda.current_stream())
-    dummy_bias_ptr = ptr_arg(dummy_bias)
-
     XQ_i8 = _as_i8(XQ.contiguous())
     WQ_i8 = _as_i8(WQ.contiguous())
     xs_contig = x_scale.contiguous()
     ws_contig = w_scale.contiguous()
 
-    # Pre-build ptr_arg list outside the loop to minimize per-batch overhead
-    out_ptrs = [ptr_arg(out[b].view(-1)) for b in range(B)]
-    a_ptrs = [ptr_arg(XQ_i8[b].view(-1)) for b in range(B)]
-    b_ptrs = [ptr_arg(WQ_i8[b].view(-1)) for b in range(B)]
-    sa_ptrs = [ptr_arg(xs_contig[b].view(-1)) for b in range(B)]
-    sb_ptrs = [ptr_arg(ws_contig[b].view(-1)) for b in range(B)]
+    cache_key = (B, M, N, K, str(XQ.dtype), str(dtype), tile_m, tile_n, tile_k)
 
-    for b in range(B):
-        _run_compiled(
-            exe,
-            out_ptrs[b], a_ptrs[b], b_ptrs[b], sa_ptrs[b], sb_ptrs[b],
-            dummy_bias_ptr, M, N, stream,
+    if use_cuda_graph and cache_key in _batched_graph_cache:
+        entry = _batched_graph_cache[cache_key]
+        entry["s_xq"].copy_(XQ_i8)
+        entry["s_wq"].copy_(WQ_i8)
+        entry["s_xs"].copy_(xs_contig)
+        entry["s_ws"].copy_(ws_contig)
+        entry["graph"].replay()
+        out.copy_(entry["s_out"])
+        return out
+
+    dummy_bias = torch.empty(0, dtype=dtype, device=XQ.device)
+    dummy_bias_ptr = ptr_arg(dummy_bias)
+    stream = fx.Stream(torch.cuda.current_stream())
+
+    if not use_cuda_graph:
+        _batched_dispatch_loop(
+            exe, out, XQ_i8, WQ_i8, xs_contig, ws_contig,
+            dummy_bias_ptr, B, M, N, stream, ptr_arg, _run_compiled,
+        )
+        return out
+
+    # First call: allocate static buffers, warmup, capture graph
+    s_xq = XQ_i8.clone()
+    s_wq = WQ_i8.clone()
+    s_xs = xs_contig.clone()
+    s_ws = ws_contig.clone()
+    s_out = torch.empty_like(out)
+
+    # Warmup (required before graph capture)
+    _batched_dispatch_loop(
+        exe, s_out, s_xq, s_wq, s_xs, s_ws,
+        dummy_bias_ptr, B, M, N, stream, ptr_arg, _run_compiled,
+    )
+    torch.cuda.synchronize()
+
+    # Capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        _batched_dispatch_loop(
+            exe, s_out, s_xq, s_wq, s_xs, s_ws,
+            dummy_bias_ptr, B, M, N, stream, ptr_arg, _run_compiled,
         )
 
+    _batched_graph_cache[cache_key] = {
+        "graph": g,
+        "s_xq": s_xq, "s_wq": s_wq, "s_xs": s_xs, "s_ws": s_ws,
+        "s_out": s_out,
+    }
+
+    # First call also needs correct output
+    s_xq.copy_(XQ_i8)
+    s_wq.copy_(WQ_i8)
+    s_xs.copy_(xs_contig)
+    s_ws.copy_(ws_contig)
+    g.replay()
+    out.copy_(s_out)
     return out
