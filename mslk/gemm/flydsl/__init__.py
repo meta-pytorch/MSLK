@@ -212,12 +212,12 @@ def flydsl_preshuffle_batched_gemm(
     tile_n: Optional[int] = None,
     tile_k: Optional[int] = None,
     dtype: torch.dtype = torch.bfloat16,
-    use_cuda_graph: bool = True,
+    use_hip_graph: bool = True,
 ) -> Tensor:
-    """Batched FP8 preshuffle GEMM with CUDA graph acceleration.
+    """Batched FP8 preshuffle GEMM with HIP graph acceleration.
 
     On the first call for a given (B, M, N, K, dtype) shape, captures all B
-    kernel launches into a CUDA graph using static input/output buffers.
+    kernel launches into a HIP graph using static input/output buffers.
     Subsequent calls copy data into the static buffers and replay the graph
     with a single CPU-side call, eliminating per-batch Python dispatch overhead.
 
@@ -228,7 +228,7 @@ def flydsl_preshuffle_batched_gemm(
         w_scale: Per-channel weight scale (B, N) or (B, 1, N), float32.
         out: Optional pre-allocated output tensor (B, M, N).
         dtype: Output dtype (bfloat16 or float16).
-        use_cuda_graph: If True, capture and replay via CUDA graph.
+        use_hip_graph: If True, capture and replay via HIP graph.
 
     Returns:
         Output tensor (B, M, N) in ``dtype``.
@@ -285,7 +285,7 @@ def flydsl_preshuffle_batched_gemm(
 
     cache_key = (B, M, N, K, str(XQ.dtype), str(dtype), tile_m, tile_n, tile_k)
 
-    if use_cuda_graph and cache_key in _batched_graph_cache:
+    if use_hip_graph and cache_key in _batched_graph_cache:
         entry = _batched_graph_cache[cache_key]
         entry["s_xq"].copy_(XQ_i8)
         entry["s_wq"].copy_(WQ_i8)
@@ -299,7 +299,7 @@ def flydsl_preshuffle_batched_gemm(
     dummy_bias_ptr = ptr_arg(dummy_bias)
     stream = fx.Stream(torch.cuda.current_stream())
 
-    if not use_cuda_graph:
+    if not use_hip_graph:
         _batched_dispatch_loop(
             exe, out, XQ_i8, WQ_i8, xs_contig, ws_contig,
             dummy_bias_ptr, B, M, N, stream, ptr_arg, _run_compiled,
