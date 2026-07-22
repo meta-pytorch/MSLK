@@ -195,6 +195,9 @@ def flydsl_preshuffle_batched_gemm(
 ) -> Tensor:
     """Batched FP8 preshuffle GEMM via per-batch dispatch.
 
+    Pre-compiles the kernel once and dispatches B launches directly via
+    _run_compiled, avoiding per-batch Python overhead from the high-level API.
+
     Args:
         XQ: FP8 activation tensor (B, M, K).
         WQ: FP8 weight tensor (B, N, K), pre-shuffled via ``flydsl_preshuffle``.
@@ -206,6 +209,10 @@ def flydsl_preshuffle_batched_gemm(
     Returns:
         Output tensor (B, M, N) in ``dtype``.
     """
+    from mslk.utils.flydsl import require_flydsl
+
+    require_flydsl()
+
     assert XQ.dim() == 3, f"Expected 3D XQ, got {XQ.dim()}D"
     assert WQ.dim() == 3, f"Expected 3D WQ, got {WQ.dim()}D"
     B, M, K = XQ.shape
@@ -214,19 +221,58 @@ def flydsl_preshuffle_batched_gemm(
     if out is None:
         out = torch.empty(B, M, N, dtype=dtype, device=XQ.device)
 
+    compile_fn = _get_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("FlyDSL preshuffle kernel compiler not available")
+
+    if tile_m is None or tile_n is None or tile_k is None:
+        from mslk.gemm.flydsl._configs import select_default_config
+
+        cfg = select_default_config(M, N, K)
+        tile_m = tile_m or cfg.tile_m
+        tile_n = tile_n or cfg.tile_n
+        tile_k = tile_k or cfg.tile_k
+
+    if "float8" in str(XQ.dtype):
+        in_dtype = "fp8"
+    elif XQ.dtype == torch.int8:
+        in_dtype = "int8"
+    else:
+        raise ValueError(f"Unsupported input dtype {XQ.dtype}")
+
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "fp16"
+
+    exe = compile_fn(
+        N=N, K=K,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        in_dtype=in_dtype, out_dtype=out_dtype,
+    )
+
+    import flydsl.expr as fx  # pyre-ignore[21]
+    from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
+
+    def _as_i8(t: Tensor) -> Tensor:
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    dummy_bias = torch.empty(0, dtype=dtype, device=XQ.device)
+    stream = fx.Stream(torch.cuda.current_stream())
+    dummy_bias_ptr = ptr_arg(dummy_bias)
+
+    XQ_i8 = _as_i8(XQ.contiguous())
+    WQ_i8 = _as_i8(WQ.contiguous())
+    xs_contig = x_scale.contiguous()
+    ws_contig = w_scale.contiguous()
+
     for b in range(B):
-        xs_b = x_scale[b].view(-1, 1) if x_scale[b].dim() == 1 else x_scale[b]
-        ws_b = w_scale[b].view(1, -1) if w_scale[b].dim() == 1 else w_scale[b]
-        flydsl_preshuffle_gemm(
-            XQ[b],
-            WQ[b],
-            xs_b,
-            ws_b,
-            out=out[b],
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            dtype=dtype,
+        _run_compiled(
+            exe,
+            ptr_arg(out[b].view(-1)),
+            ptr_arg(XQ_i8[b].view(-1)),
+            ptr_arg(WQ_i8[b].view(-1)),
+            ptr_arg(xs_contig[b].view(-1)),
+            ptr_arg(ws_contig[b].view(-1)),
+            dummy_bias_ptr,
+            M, N, stream,
         )
 
     return out
