@@ -131,20 +131,14 @@ class MSLKBuild:
         # FB_INTERNAL_BUILD is set in build scripts for internal FBPKG build
         # environments
         return any(
-            [
-                os.environ.get(key) is not None
-                for key in ["FB_INTERNAL_BUILD", "UNIFIED_FBPKG_NAME"]
-            ]
+            os.environ.get(key) is not None
+            for key in ("FB_INTERNAL_BUILD", "UNIFIED_FBPKG_NAME")
         )
 
     def nova_flag(self) -> Optional[int]:
-        if "BUILD_FROM_NOVA" in os.environ:
-            if str(os.getenv("BUILD_FROM_NOVA")) == "0":
-                return 0
-            else:
-                return 1
-        else:
+        if "BUILD_FROM_NOVA" not in os.environ:
             return None
+        return 0 if os.getenv("BUILD_FROM_NOVA") == "0" else 1
 
     def debug_level(self) -> int:
         return int(self.args.debug)
@@ -328,18 +322,8 @@ class MSLKBuild:
         print(f"[SETUP.PY] Setting the MSLK build target: {self.target()} ...")
         cmake_args.append(f"-DMSLK_BUILD_TARGET={self.target()}")
 
-        # NOTE: The docs variant is a fake variant that is effectively the
-        # cpu variant, but marks __VARIANT__ as "docs" instead of "cpu".
-        #
-        # This minor change lets the library loader know not throw
-        # exceptions on failed load, which is the workaround for a bug in
-        # the Sphinx documentation generation process, see:
-        #
-        #   https://github.com/pytorch/MSLK/pull/3477
-        #   https://github.com/pytorch/MSLK/pull/3717
-        cmake_bvariant = "cpu" if self.variant() == "docs" else self.variant()
-        print(f"[SETUP.PY] Setting the MSLK build variant: {cmake_bvariant} ...")
-        cmake_args.append(f"-DMSLK_BUILD_VARIANT={cmake_bvariant}")
+        print(f"[SETUP.PY] Setting the MSLK build variant: {self.variant()} ...")
+        cmake_args.append(f"-DMSLK_BUILD_VARIANT={self.variant()}")
 
         if self.args.nvml_lib_path:
             cmake_args.append(f"-DNVML_LIB_PATH={self.args.nvml_lib_path}")
@@ -525,31 +509,13 @@ class MSLKInstall(PipInstall):
     """MSLK PIP Install Routines"""
 
     def print_versions(self) -> None:
-        pytorch_version = (
-            subprocess.run(
-                ["python", "-c", "import torch; print(torch.__version__)"],
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode("utf-8")
-            .strip()
-        )
-
-        cuda_version_declared = (
-            subprocess.run(
-                ["python", "-c", "import torch; print(torch.version.cuda)"],
-                stdout=subprocess.PIPE,
-            )
-            .stdout.decode("utf-8")
-            .strip()
-        )
-
         table = [
             ["", "Version"],
-            ["PyTorch", pytorch_version],
+            ["PyTorch", torch.__version__],
         ]
 
-        if cuda_version_declared != "None":
-            cuda_version = cuda_version_declared.split(".")
+        if torch.version.cuda is not None:
+            cuda_version = torch.version.cuda.split(".")
             cuda_home = CudaUtils.find_cuda(int(cuda_version[0]), int(cuda_version[1]))
 
             actual_cuda_version = (
@@ -563,7 +529,7 @@ class MSLKInstall(PipInstall):
 
             table.extend(
                 [
-                    ["CUDA (Declared by PyTorch)", cuda_version_declared],
+                    ["CUDA (Declared by PyTorch)", torch.version.cuda],
                     ["CUDA (Actual)", actual_cuda_version],
                 ]
             )
