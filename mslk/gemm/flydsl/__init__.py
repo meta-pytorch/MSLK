@@ -11,6 +11,7 @@
 Public API:
     flydsl_preshuffle(src)  -- shuffle weights for the FlyDSL layout
     flydsl_preshuffle_gemm(XQ, WQ, x_scale, w_scale, ...)  -- run the GEMM
+    flydsl_preshuffle_batched_gemm(XQ, WQ, x_scale, w_scale, ...)  -- batched GEMM
 """
 
 from typing import Optional
@@ -181,75 +182,51 @@ def flydsl_preshuffle_gemm(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Register FlyDSL as the ROCm implementation of the mslk rowwise FP8 ops
-# on gfx950, replacing CK.
-# ---------------------------------------------------------------------------
-if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
-    from mslk.utils.flydsl import is_flydsl_available
+def flydsl_preshuffle_batched_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Optional[Tensor] = None,
+    tile_m: Optional[int] = None,
+    tile_n: Optional[int] = None,
+    tile_k: Optional[int] = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Batched FP8 preshuffle GEMM via per-batch dispatch.
 
-    if is_flydsl_available():
+    Args:
+        XQ: FP8 activation tensor (B, M, K).
+        WQ: FP8 weight tensor (B, N, K), pre-shuffled via ``flydsl_preshuffle``.
+        x_scale: Per-token activation scale (B, M) or (B, M, 1), float32.
+        w_scale: Per-channel weight scale (B, N) or (B, 1, N), float32.
+        out: Optional pre-allocated output tensor (B, M, N).
+        dtype: Output dtype (bfloat16 or float16).
 
-        def _flydsl_rowwise_impl(
-            XQ: Tensor,
-            WQ: Tensor,
-            x_scale: Tensor,
-            w_scale: Tensor,
-            bias: Optional[Tensor] = None,
-            use_fast_accum: bool = True,
-            dtype: torch.dtype = torch.bfloat16,
-            output: Optional[Tensor] = None,
-        ) -> Tensor:
-            WQ_shuf = flydsl_preshuffle(WQ)
-            return flydsl_preshuffle_gemm(
-                XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype,
-            )
+    Returns:
+        Output tensor (B, M, N) in ``dtype``.
+    """
+    assert XQ.dim() == 3, f"Expected 3D XQ, got {XQ.dim()}D"
+    assert WQ.dim() == 3, f"Expected 3D WQ, got {WQ.dim()}D"
+    B, M, K = XQ.shape
+    N = WQ.shape[1]
 
-        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
+    if out is None:
+        out = torch.empty(B, M, N, dtype=dtype, device=XQ.device)
 
-            @torch.library.impl("mslk::f8f8bf16_rowwise", "CUDA")
-            def _f8f8bf16_rowwise_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> Tensor:
-                return _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
-                    dtype=torch.bfloat16,
-                )
+    for b in range(B):
+        xs_b = x_scale[b].view(-1, 1) if x_scale[b].dim() == 1 else x_scale[b]
+        ws_b = w_scale[b].view(1, -1) if w_scale[b].dim() == 1 else w_scale[b]
+        flydsl_preshuffle_gemm(
+            XQ[b],
+            WQ[b],
+            xs_b,
+            ws_b,
+            out=out[b],
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            dtype=dtype,
+        )
 
-        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_out"):
-
-            @torch.library.impl("mslk::f8f8bf16_rowwise_out", "CUDA")
-            def _f8f8bf16_rowwise_out_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                output: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> None:
-                _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
-                    dtype=output.dtype, output=output,
-                )
-
-        if hasattr(torch.ops.mslk, "f8f8f16_rowwise"):
-
-            @torch.library.impl("mslk::f8f8f16_rowwise", "CUDA")
-            def _f8f8f16_rowwise_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> Tensor:
-                return _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
-                    dtype=torch.float16,
-                )
+    return out
