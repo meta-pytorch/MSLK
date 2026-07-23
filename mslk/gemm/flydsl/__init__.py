@@ -342,3 +342,32 @@ def flydsl_preshuffle_batched_gemm(
     g.replay()
     out.copy_(s_out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Register FlyDSL as the ROCm implementation of mslk::f8f8bf16_rowwise_batched
+# on gfx950, replacing the CK backend.
+# ---------------------------------------------------------------------------
+if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+    if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
+        from mslk.utils.flydsl import is_flydsl_available
+
+        if is_flydsl_available():
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
+            def _f8f8bf16_rowwise_batched_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+                output: Optional[Tensor] = None,
+            ) -> Tensor:
+                B = XQ.shape[0]
+                WQ_shuf = torch.stack(
+                    [flydsl_preshuffle(WQ[i]) for i in range(B)]
+                )
+                return flydsl_preshuffle_batched_gemm(
+                    XQ, WQ_shuf, x_scale, w_scale, out=output,
+                )
