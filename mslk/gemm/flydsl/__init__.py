@@ -179,3 +179,77 @@ def flydsl_preshuffle_gemm(
         out.copy_(out_contig)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Register FlyDSL as the ROCm implementation of the mslk rowwise FP8 ops
+# on gfx950, replacing CK.
+# ---------------------------------------------------------------------------
+if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+    from mslk.utils.flydsl import is_flydsl_available
+
+    if is_flydsl_available():
+
+        def _flydsl_rowwise_impl(
+            XQ: Tensor,
+            WQ: Tensor,
+            x_scale: Tensor,
+            w_scale: Tensor,
+            bias: Optional[Tensor] = None,
+            use_fast_accum: bool = True,
+            dtype: torch.dtype = torch.bfloat16,
+            output: Optional[Tensor] = None,
+        ) -> Tensor:
+            WQ_shuf = flydsl_preshuffle(WQ)
+            return flydsl_preshuffle_gemm(
+                XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype,
+            )
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise", "CUDA")
+            def _f8f8bf16_rowwise_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> Tensor:
+                return _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=torch.bfloat16,
+                )
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_out"):
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise_out", "CUDA")
+            def _f8f8bf16_rowwise_out_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                output: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> None:
+                _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=output.dtype, output=output,
+                )
+
+        if hasattr(torch.ops.mslk, "f8f8f16_rowwise"):
+
+            @torch.library.impl("mslk::f8f8f16_rowwise", "CUDA")
+            def _f8f8f16_rowwise_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> Tensor:
+                return _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=torch.float16,
+                )
