@@ -126,7 +126,7 @@ def benchmark(
     ws = (window_size, 0) if window_size > 0 else None
 
     def fn():
-        flash_attn_func(Q, K, V, causal=causal, window_size=ws)
+        flash_attn_func(Q, K, V, causal=causal, window_size=ws if ws is not None else (-1, -1))
 
     ms = do_bench(fn, (), opts)
 
