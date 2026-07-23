@@ -56,9 +56,7 @@ class QuantizeMX4Test(unittest.TestCase):
         b_xq, b_scales = quantize_mx4(
             x, group_size=group_size, rounding_mode=RoundingMode.ceil
         )
-        ref_xq, ref_scales_2d = torch_quantize_mx4_ref(
-            x, group_size=group_size, swizzle=False
-        )
+        ref_xq, ref_scales_2d = torch_quantize_mx4_ref(x, group_size=group_size)
 
         self.assertTrue(
             torch.equal(
@@ -74,9 +72,7 @@ class QuantizeMX4Test(unittest.TestCase):
         else:
             b_cmp = b_scales.view(torch.uint8).flatten()
             ref_cmp = (
-                swizzle_scales_to_blocked(
-                    ref_scales_2d, b_scales.shape, convention="mslk"
-                )
+                swizzle_scales_to_blocked(ref_scales_2d, b_scales.shape)
                 .view(torch.uint8)
                 .flatten()
             )

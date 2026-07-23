@@ -100,7 +100,7 @@ class StackedQuantizeMX4Test(unittest.TestCase):
             seg_end = seg_row_start + m_i
             seg = x[seg_row_start:seg_end]
             seg_xq_ref, seg_scales_2d = torch_quantize_mx4_ref(
-                seg, group_size=group_size, swizzle=False
+                seg, group_size=group_size
             )
             ref_xq_chunks.append(seg_xq_ref)
 
@@ -131,7 +131,6 @@ class StackedQuantizeMX4Test(unittest.TestCase):
                 seg_swizzled = swizzle_scales_to_blocked(
                     seg_scales_padded,
                     torch.Size([padded_rows * padded_cols]),
-                    convention="mslk",
                 )
 
                 self.assertTrue(
