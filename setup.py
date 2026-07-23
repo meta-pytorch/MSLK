@@ -33,6 +33,7 @@ def _flydsl_version() -> str:
     with open(_FLYDSL_VERSION_FILE, encoding="utf-8") as f:
         return f.read().strip()
 
+
 if _PYTHON_ONLY:
     _setup_fn = setuptools.setup
 else:
