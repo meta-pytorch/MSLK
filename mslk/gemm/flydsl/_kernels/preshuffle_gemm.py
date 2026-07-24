@@ -19,7 +19,6 @@ from flydsl.expr import buffer_ops, const_expr, gpu, math, range_constexpr, rocd
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     _buffer_load_vec,
