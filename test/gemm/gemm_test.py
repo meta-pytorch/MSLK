@@ -41,6 +41,7 @@ if torch.cuda.is_available():
     )
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.utils.flydsl import is_flydsl_available
 
 from parameterized import parameterized
 
@@ -3343,6 +3344,93 @@ class RocmInt8GemmTests(unittest.TestCase):
         ref = self._reference_bf16(XQ, WQ, scale)
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+class FlyDSLPreshuffleGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+        if not is_flydsl_available():
+            raise unittest.SkipTest("FlyDSL not available")
+        from mslk.gemm.flydsl.preshuffle_gemm import (
+            flydsl_preshuffle,
+            flydsl_preshuffle_gemm,
+        )
+
+        cls.flydsl_preshuffle = staticmethod(flydsl_preshuffle)
+        cls.flydsl_preshuffle_gemm = staticmethod(flydsl_preshuffle_gemm)
+
+    @parameterized.expand(
+        [
+            (1, 8192, 1024),
+            (32, 1280, 8192),
+            (128, 7424, 8192),
+            (1024, 8192, 1024),
+            (4096, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = self.flydsl_preshuffle(wq)
+
+        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+        if not is_flydsl_available():
+            raise unittest.SkipTest("FlyDSL not available")
+        from mslk.gemm.flydsl.preshuffle_gemm import (
+            flydsl_preshuffle,
+            flydsl_preshuffle_batched_gemm,
+        )
+
+        cls.flydsl_preshuffle = staticmethod(flydsl_preshuffle)
+        cls.flydsl_preshuffle_batched_gemm = staticmethod(
+            flydsl_preshuffle_batched_gemm
+        )
+
+    @parameterized.expand(
+        [
+            # small M (decode)
+            (16, 1, 1280, 8192),
+            (4, 1, 8192, 1024),
+            # medium M
+            (4, 32, 1280, 8192),
+            (8, 64, 8192, 1024),
+            (2, 128, 7424, 8192),
+            # large M (prefill)
+            (2, 1024, 1280, 8192),
+            (2, 4096, 8192, 1024),
+            # B=1 (degenerate batch)
+            (1, 64, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, B: int, M: int, N: int, K: int) -> None:
+        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = torch.stack([self.flydsl_preshuffle(wq[i]) for i in range(B)])
+
+        out = self.flydsl_preshuffle_batched_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
 
 if __name__ == "__main__":

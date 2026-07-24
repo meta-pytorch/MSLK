@@ -36,6 +36,7 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_tensor,
 )
 from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
+from mslk.utils.flydsl import is_flydsl_available
 
 try:
     from tinygemm.utils import group_quantize_tensor
@@ -697,6 +698,48 @@ class FP8RowwisePreshuffle(FP8Rowwise):
 
 
 @register_gemm_op
+class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
+    """
+    FP8 matmul with rowwise scaling and FlyDSL preshuffle kernel (gfx950).
+    """
+
+    def __init__(self):
+        self.fast_accum = True
+        self._flydsl_gemm = None
+        if self.supported:
+            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_gemm
+
+            self._flydsl_gemm = flydsl_preshuffle_gemm
+
+    def preprocess(self, x, w):
+        xq, wq, x_scale, w_scale = super().preprocess(x, w)
+        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
+
+        return xq, flydsl_preshuffle(wq), x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return self._flydsl_gemm(xq, wq, x_scale, w_scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_GFX950}
+
+    @property
+    def supported(self) -> bool:
+        if not super().supported:
+            return False
+        return is_flydsl_available()
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.REGULAR}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+
+@register_gemm_op
 class TritonBF16Grouped(GemmOpBase):
     """
     BF16 grouped matmul implemented with triton.
@@ -1227,6 +1270,44 @@ class FP8RowwiseBatched(GemmOpBase):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
+
+
+@register_gemm_op
+class FP8RowwiseBatchedPreshuffleFlyDSL(FP8RowwiseBatched):
+    """
+    FP8 batched matmul with rowwise scaling and FlyDSL preshuffle kernel (gfx950).
+    """
+
+    def __init__(self):
+        self._flydsl_batched_gemm = None
+        if self.supported:
+            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_batched_gemm
+
+            self._flydsl_batched_gemm = flydsl_preshuffle_batched_gemm
+
+    def quantize(self, x, w):
+        xq, wq, x_scale, w_scale = super().quantize(x, w)
+        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
+
+        wq_shuf = torch.stack([flydsl_preshuffle(wq[i]) for i in range(wq.shape[0])])
+        return xq, wq_shuf, x_scale, w_scale
+
+    def compute(self, xq, wq, x_scale, w_scale):
+        return self._flydsl_batched_gemm(xq, wq, x_scale, w_scale)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_GFX950}
+
+    @property
+    def supported(self) -> bool:
+        if get_current_accelerator() not in self.supported_accelerators:
+            return False
+        return is_flydsl_available()
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
 
 
 # This kernel is broken and causes GPU to lock up, needs some investigation
