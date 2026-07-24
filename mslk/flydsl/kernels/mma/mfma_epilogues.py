@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
-
 """Reusable epilogue helpers for MFMA 16x16-based kernels.
 
 This module provides:
@@ -23,23 +20,31 @@ This module provides:
     3) remap threads into (MLane, NLane) = (8,32) and read half2 from LDS,
        then call `store_pair(...)` to emit the final global store/atomic.
 
-  When ``lds_out_split`` is provided, the epilogue runs in split-LDS mode:
-  waves are partitioned into two groups (group A uses ``lds_out``, group B
-  uses ``lds_out_split``), each handling half of the N dimension.
-
 These helpers are intentionally *dialect-agnostic*: callers pass the dialect
 modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Callable
 
-import flydsl.expr as fx
 from flydsl._mlir import ir
+import flydsl.expr as fx
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
-from mslk.flydsl.kernels.common.kernels_common import _if_then
+
+
+@contextmanager
+def _if_then(if_op, scf):
+    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
+    with ir.InsertionPoint(if_op.then_block):
+        try:
+            yield if_op.then_block
+        finally:
+            blk = if_op.then_block
+            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
+                scf.YieldOp([])
 
 
 def default_epilog(
@@ -124,10 +129,14 @@ def c_shuffle_epilog(
     `store_pair` can implement either global stores or atomics.
     """
     if int(block_size) <= 0 or (int(block_size) % int(cshuffle_nlane)) != 0:
-        raise ValueError(f"block_size ({block_size}) must be divisible by cshuffle_nlane ({cshuffle_nlane})")
+        raise ValueError(
+            f"block_size ({block_size}) must be divisible by cshuffle_nlane ({cshuffle_nlane})"
+        )
     cshuffle_mlane = int(block_size) // int(cshuffle_nlane)
     if (int(tile_m) % cshuffle_mlane) != 0:
-        raise ValueError(f"tile_m must be divisible by CShuffleMLane ({cshuffle_mlane}), got tile_m={tile_m}")
+        raise ValueError(
+            f"tile_m must be divisible by CShuffleMLane ({cshuffle_mlane}), got tile_m={tile_m}"
+        )
     if int(e_vec) <= 0:
         raise ValueError(f"e_vec must be positive, got {e_vec}")
     if (int(tile_n) % (int(cshuffle_nlane) * int(e_vec))) != 0:
@@ -150,10 +159,14 @@ def c_shuffle_epilog(
 
         CShuffleNLane_s = min(int(cshuffle_nlane), _half_n // EVec)
         if _half_threads % CShuffleNLane_s != 0:
-            raise ValueError(f"half_threads={_half_threads} not divisible by CShuffleNLane_split={CShuffleNLane_s}")
+            raise ValueError(
+                f"half_threads={_half_threads} not divisible by CShuffleNLane_split={CShuffleNLane_s}"
+            )
         CShuffleMLane_s = _half_threads // CShuffleNLane_s
         if int(tile_m) % CShuffleMLane_s != 0:
-            raise ValueError(f"tile_m={tile_m} not divisible by CShuffleMLane_split={CShuffleMLane_s}")
+            raise ValueError(
+                f"tile_m={tile_m} not divisible by CShuffleMLane_split={CShuffleMLane_s}"
+            )
         m_reps_s = int(tile_m) // CShuffleMLane_s
         n_reps_s = _half_n // (CShuffleNLane_s * EVec)
 
@@ -170,7 +183,7 @@ def c_shuffle_epilog(
 
         def _write_row_split(mi: int, ii: int, row_in_tile, row):
             row_base_lds = row_in_tile * _half_n_idx
-            _if_g = scf.IfOp(_is_group_b)
+            _if_g = scf.IfOp(_is_group_b, has_else=True)
             with ir.InsertionPoint(_if_g.then_block):
                 write_row_to_lds(
                     mi=mi,
@@ -210,7 +223,7 @@ def c_shuffle_epilog(
         # -- read phase (each group reads from its own LDS buffer) --
         tx_local = tx - arith.select(_is_group_b, _half_thr_idx, _zero_idx)
         c_nlane_s = arith.constant(CShuffleNLane_s, index=True)
-        m_lane_s = tx_local / c_nlane_s
+        m_lane_s = tx_local // c_nlane_s
         n_lane_s = tx_local % c_nlane_s
         c_evec = arith.constant(EVec, index=True)
 
@@ -225,10 +238,19 @@ def c_shuffle_epilog(
             row_base_m = arith.constant(mr * CShuffleMLane_s, index=True)
             row_local = row_base_m + m_lane_s
             row = bx_m_v + row_local
-            row_ctx_raw = precompute_row(row_local=row_local, row=row) if precompute_row is not None else None
+            row_ctx_raw = (
+                precompute_row(row_local=row_local, row=row)
+                if precompute_row is not None
+                else None
+            )
             row_ctx = row_ctx_raw
             row_pred = None
-            if scf is not None and row_ctx_raw is not None and isinstance(row_ctx_raw, tuple) and len(row_ctx_raw) == 2:
+            if (
+                scf is not None
+                and row_ctx_raw is not None
+                and isinstance(row_ctx_raw, tuple)
+                and len(row_ctx_raw) == 2
+            ):
                 row_ctx, row_pred = row_ctx_raw
             _precomputed_rows_s.append((row_local, row, row_ctx, row_pred))
 
@@ -238,11 +260,13 @@ def c_shuffle_epilog(
             def _do_store_row_split():
                 row_base_lds = row_local * _half_n_idx
                 for nr in range_constexpr(n_reps_s):
-                    col_base_nr = arith.constant(nr * (CShuffleNLane_s * EVec), index=True)
+                    col_base_nr = arith.constant(
+                        nr * (CShuffleNLane_s * EVec), index=True
+                    )
                     col_pair0_local = col_base_nr + (n_lane_s * c_evec)
                     lds_idx = row_base_lds + col_pair0_local
 
-                    _if_ld = scf.IfOp(_is_group_b, [vec_frag])
+                    _if_ld = scf.IfOp(_is_group_b, [vec_frag], has_else=True)
                     with ir.InsertionPoint(_if_ld.then_block):
                         fb = vector.load_op(vec_frag, lds_out_split, [lds_idx])
                         scf.YieldOp([fb])
@@ -251,7 +275,9 @@ def c_shuffle_epilog(
                         scf.YieldOp([fa])
                     frag = _if_ld.results[0]
 
-                    col_pair0 = col_pair0_local + arith.select(_is_group_b, _half_n_idx, _zero_idx)
+                    col_pair0 = col_pair0_local + arith.select(
+                        _is_group_b, _half_n_idx, _zero_idx
+                    )
                     store_pair(
                         row_local=row_local,
                         row=row,
@@ -277,7 +303,9 @@ def c_shuffle_epilog(
     n_tile_base_v = n_tile_base
     col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
 
-    _lds_row_base_offset = lds_row_offset * tile_n_idx if lds_row_offset is not None else None
+    _lds_row_base_offset = (
+        lds_row_offset * tile_n_idx if lds_row_offset is not None else None
+    )
 
     def _write_row(mi: int, ii: int, row_in_tile, row):
         row_base_lds = row_in_tile * tile_n_idx
@@ -336,13 +364,22 @@ def c_shuffle_epilog(
         row_local = row_base_m + m_lane
         row = bx_m_v + row_local
 
-        row_ctx_raw = precompute_row(row_local=row_local, row=row) if precompute_row is not None else None
+        row_ctx_raw = (
+            precompute_row(row_local=row_local, row=row)
+            if precompute_row is not None
+            else None
+        )
 
         # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)` and `scf`
         # is provided, we can skip the entire N-loop for invalid rows (cheaper than per-store checks).
         row_ctx = row_ctx_raw
         row_pred = None
-        if scf is not None and row_ctx_raw is not None and isinstance(row_ctx_raw, tuple) and len(row_ctx_raw) == 2:
+        if (
+            scf is not None
+            and row_ctx_raw is not None
+            and isinstance(row_ctx_raw, tuple)
+            and len(row_ctx_raw) == 2
+        ):
             row_ctx, row_pred = row_ctx_raw
 
         _precomputed_rows.append((row_local, row, row_ctx, row_pred))
