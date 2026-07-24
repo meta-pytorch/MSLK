@@ -3425,9 +3425,7 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = torch.stack(
-            [self.flydsl_preshuffle(wq[i]) for i in range(B)]
-        )
+        wq_shuffled = torch.stack([self.flydsl_preshuffle(wq[i]) for i in range(B)])
 
         out = self.flydsl_preshuffle_batched_gemm(xq, wq_shuffled, x_scale, w_scale)
 
