@@ -706,13 +706,13 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
         self.fast_accum = True
         self._flydsl_gemm = None
         if self.supported:
-            from mslk.gemm.flydsl import flydsl_preshuffle_gemm
+            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_gemm
 
             self._flydsl_gemm = flydsl_preshuffle_gemm
 
     def preprocess(self, x, w):
         xq, wq, x_scale, w_scale = super().preprocess(x, w)
-        from mslk.gemm.flydsl import flydsl_preshuffle
+        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
 
         return xq, flydsl_preshuffle(wq), x_scale, w_scale
 
@@ -1282,13 +1282,13 @@ class FP8RowwiseBatchedPreshuffleFlyDSL(FP8RowwiseBatched):
     def __init__(self):
         self._flydsl_batched_gemm = None
         if self.supported:
-            from mslk.gemm.flydsl import flydsl_preshuffle_batched_gemm
+            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_batched_gemm
 
             self._flydsl_batched_gemm = flydsl_preshuffle_batched_gemm
 
     def quantize(self, x, w):
         xq, wq, x_scale, w_scale = super().quantize(x, w)
-        from mslk.gemm.flydsl import flydsl_preshuffle
+        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
 
         wq_shuf = torch.stack([flydsl_preshuffle(wq[i]) for i in range(wq.shape[0])])
         return xq, wq_shuf, x_scale, w_scale
@@ -1621,9 +1621,9 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(w, list), (
-            "Only supported for grouped inputs."
-        )
+        assert isinstance(x, list) and isinstance(
+            w, list
+        ), "Only supported for grouped inputs."
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
@@ -1675,9 +1675,9 @@ class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(w, list), (
-            "Only supported for grouped inputs."
-        )
+        assert isinstance(x, list) and isinstance(
+            w, list
+        ), "Only supported for grouped inputs."
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)

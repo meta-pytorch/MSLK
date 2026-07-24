@@ -3351,6 +3351,10 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
+        from mslk.utils.flydsl import is_flydsl_available
+
+        if not is_flydsl_available():
+            raise unittest.SkipTest("FlyDSL not available")
 
     @parameterized.expand(
         [
@@ -3361,13 +3365,11 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
             (4096, 1280, 8192),
         ]
     )
-    def test_flydsl_preshuffle_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.utils.flydsl import is_flydsl_available
-
-        if not is_flydsl_available():
-            self.skipTest("FlyDSL not available")
-
-        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        from mslk.gemm.flydsl.preshuffle_gemm import (
+            flydsl_preshuffle,
+            flydsl_preshuffle_gemm,
+        )
 
         x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
         w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
@@ -3382,10 +3384,16 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
 
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
 class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
+        from mslk.utils.flydsl import is_flydsl_available
+
+        if not is_flydsl_available():
+            raise unittest.SkipTest("FlyDSL not available")
 
     @parameterized.expand(
         [
@@ -3403,15 +3411,8 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
             (1, 64, 1280, 8192),
         ]
     )
-    def test_flydsl_preshuffle_batched_gemm(
-        self, B: int, M: int, N: int, K: int
-    ) -> None:
-        from mslk.utils.flydsl import is_flydsl_available
-
-        if not is_flydsl_available():
-            self.skipTest("FlyDSL not available")
-
-        from mslk.gemm.flydsl import (
+    def test_gemm(self, B: int, M: int, N: int, K: int) -> None:
+        from mslk.gemm.flydsl.preshuffle_gemm import (
             flydsl_preshuffle,
             flydsl_preshuffle_batched_gemm,
         )
@@ -3421,9 +3422,7 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = torch.stack(
-            [flydsl_preshuffle(wq[i]) for i in range(B)]
-        )
+        wq_shuffled = torch.stack([flydsl_preshuffle(wq[i]) for i in range(B)])
 
         out = flydsl_preshuffle_batched_gemm(xq, wq_shuffled, x_scale, w_scale)
 
