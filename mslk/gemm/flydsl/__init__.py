@@ -190,6 +190,18 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
 
     if is_flydsl_available():
 
+        _preshuffle_cache: dict = {}
+
+        def _get_preshuffled(WQ: Tensor) -> Tensor:
+            """Cache preshuffled weights by data pointer. Preshuffle once, reuse."""
+            key = WQ.data_ptr()
+            cached = _preshuffle_cache.get(key)
+            if cached is not None and cached.shape == WQ.shape:
+                return cached
+            shuf = flydsl_preshuffle(WQ)
+            _preshuffle_cache[key] = shuf
+            return shuf
+
         def _flydsl_rowwise_impl(
             XQ: Tensor,
             WQ: Tensor,
@@ -200,7 +212,7 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
             dtype: torch.dtype = torch.bfloat16,
             output: Optional[Tensor] = None,
         ) -> Tensor:
-            WQ_shuf = flydsl_preshuffle(WQ)
+            WQ_shuf = _get_preshuffled(WQ)
             return flydsl_preshuffle_gemm(
                 XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype,
             )
