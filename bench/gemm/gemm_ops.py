@@ -1621,9 +1621,9 @@ class CutlassFP8Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(
-            w, list
-        ), "Only supported for grouped inputs."
+        assert isinstance(x, list) and isinstance(w, list), (
+            "Only supported for grouped inputs."
+        )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
@@ -1675,9 +1675,9 @@ class CutlassBF16Int4GroupwiseGroupedPreshuffle(GemmOpBase):
     """
 
     def preprocess(self, x, w):
-        assert isinstance(x, list) and isinstance(
-            w, list
-        ), "Only supported for grouped inputs."
+        assert isinstance(x, list) and isinstance(w, list), (
+            "Only supported for grouped inputs."
+        )
         m_values = [i.shape[0] for i in x]
         # Convert m_values into offsets into grouped tensor.
         m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device=x[0].device)
