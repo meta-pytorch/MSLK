@@ -189,7 +189,6 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
     from mslk.utils.flydsl import is_flydsl_available
 
     if is_flydsl_available():
-
         _preshuffle_cache: dict = {}
 
         def _get_preshuffled(WQ: Tensor) -> Tensor:
