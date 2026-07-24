@@ -14,10 +14,6 @@ from mslk.quantize.triton.legacy.fake_quantize import (  # noqa: F401
     triton_fake_quantize_nvfp4_per_tensor,
 )
 from mslk.quantize.triton.legacy.global_scale import calculate_group_max  # noqa: F401
-from mslk.quantize.triton.legacy.naive import (  # noqa: F401
-    get_nvfp4_global_scales_naive,
-    quantize_nvfp4_naive,
-)
 from mslk.quantize.triton.legacy.primitives import (  # noqa: F401
     cal_global_scale_mx4_as_nvfp4,
     FP4_E2M1_MAX,
@@ -138,8 +134,6 @@ __all__ = [
     "mega_fp4_quantize_kernel",
     "mega_fp4_pack",
     "mega_fp4_unpack",
-    "get_nvfp4_global_scales_naive",
-    "quantize_nvfp4_naive",
     "cal_global_scale_mx4_as_nvfp4",
     "RoundingMode",
     "get_mx4_exp_bias",
