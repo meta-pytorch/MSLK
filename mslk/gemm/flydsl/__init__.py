@@ -182,6 +182,96 @@ def flydsl_preshuffle_gemm(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Register FlyDSL as the ROCm implementation of the mslk rowwise FP8 ops
+# on gfx950, replacing CK.
+# ---------------------------------------------------------------------------
+if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+    from mslk.utils.flydsl import is_flydsl_available
+
+    if is_flydsl_available():
+
+        _preshuffle_cache: dict = {}
+
+        def _get_preshuffled(WQ: Tensor) -> Tensor:
+            """Cache preshuffled weights by data pointer. Preshuffle once, reuse."""
+            key = WQ.data_ptr()
+            cached = _preshuffle_cache.get(key)
+            if cached is not None and cached.shape == WQ.shape:
+                return cached
+            shuf = flydsl_preshuffle(WQ)
+            _preshuffle_cache[key] = shuf
+            return shuf
+
+        def _flydsl_rowwise_impl(
+            XQ: Tensor,
+            WQ: Tensor,
+            x_scale: Tensor,
+            w_scale: Tensor,
+            bias: Optional[Tensor] = None,
+            use_fast_accum: bool = True,
+            dtype: torch.dtype = torch.bfloat16,
+            output: Optional[Tensor] = None,
+        ) -> Tensor:
+            WQ_shuf = _get_preshuffled(WQ)
+            return flydsl_preshuffle_gemm(
+                XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype,
+            )
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise", "CUDA")
+            def _f8f8bf16_rowwise_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> Tensor:
+                return _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=torch.bfloat16,
+                )
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_out"):
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise_out", "CUDA")
+            def _f8f8bf16_rowwise_out_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                output: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> None:
+                _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=output.dtype, output=output,
+                )
+
+        if hasattr(torch.ops.mslk, "f8f8f16_rowwise"):
+
+            @torch.library.impl("mslk::f8f8f16_rowwise", "CUDA")
+            def _f8f8f16_rowwise_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> Tensor:
+                return _flydsl_rowwise_impl(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    dtype=torch.float16,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Batched GEMM
+# ---------------------------------------------------------------------------
+
 _batched_graph_cache: dict = {}
 
 
@@ -216,11 +306,6 @@ def flydsl_preshuffle_batched_gemm(
 ) -> Tensor:
     """Batched FP8 preshuffle GEMM with HIP graph acceleration.
 
-    On the first call for a given (B, M, N, K, dtype) shape, captures all B
-    kernel launches into a HIP graph using static input/output buffers.
-    Subsequent calls copy data into the static buffers and replay the graph
-    with a single CPU-side call, eliminating per-batch Python dispatch overhead.
-
     Args:
         XQ: FP8 activation tensor (B, M, K).
         WQ: FP8 weight tensor (B, N, K), pre-shuffled via ``flydsl_preshuffle``.
@@ -229,9 +314,6 @@ def flydsl_preshuffle_batched_gemm(
         out: Optional pre-allocated output tensor (B, M, N).
         dtype: Output dtype (bfloat16 or float16).
         use_hip_graph: If True, capture and replay via HIP graph.
-
-    Returns:
-        Output tensor (B, M, N) in ``dtype``.
     """
     from mslk.utils.flydsl import require_flydsl
 
@@ -306,21 +388,18 @@ def flydsl_preshuffle_batched_gemm(
         )
         return out
 
-    # First call: allocate static buffers, warmup, capture graph
     s_xq = XQ_i8.clone()
     s_wq = WQ_i8.clone()
     s_xs = xs_contig.clone()
     s_ws = ws_contig.clone()
     s_out = torch.empty_like(out)
 
-    # Warmup (required before graph capture)
     _batched_dispatch_loop(
         exe, s_out, s_xq, s_wq, s_xs, s_ws,
         dummy_bias_ptr, B, M, N, stream, ptr_arg, _run_compiled,
     )
     torch.cuda.synchronize()
 
-    # Capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         _batched_dispatch_loop(
@@ -334,7 +413,6 @@ def flydsl_preshuffle_batched_gemm(
         "s_out": s_out,
     }
 
-    # First call also needs correct output
     s_xq.copy_(XQ_i8)
     s_wq.copy_(WQ_i8)
     s_xs.copy_(xs_contig)
@@ -345,14 +423,28 @@ def flydsl_preshuffle_batched_gemm(
 
 
 # ---------------------------------------------------------------------------
-# Register FlyDSL as the ROCm implementation of mslk::f8f8bf16_rowwise_batched
-# on gfx950, replacing the CK backend.
+# Register batched op
 # ---------------------------------------------------------------------------
 if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
     if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
-        from mslk.utils.flydsl import is_flydsl_available
+        from mslk.utils.flydsl import is_flydsl_available as _is_flydsl_batched
 
-        if is_flydsl_available():
+        if _is_flydsl_batched():
+
+            _batched_preshuffle_cache: dict = {}
+
+            def _get_batched_preshuffled(WQ: Tensor) -> Tensor:
+                """Cache preshuffled batched weights by data pointer."""
+                key = WQ.data_ptr()
+                cached = _batched_preshuffle_cache.get(key)
+                if cached is not None and cached.shape == WQ.shape:
+                    return cached
+                B = WQ.shape[0]
+                shuf = torch.stack(
+                    [flydsl_preshuffle(WQ[i]) for i in range(B)]
+                )
+                _batched_preshuffle_cache[key] = shuf
+                return shuf
 
             @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
             def _f8f8bf16_rowwise_batched_flydsl(
@@ -364,10 +456,7 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                 use_fast_accum: bool = True,
                 output: Optional[Tensor] = None,
             ) -> Tensor:
-                B = XQ.shape[0]
-                WQ_shuf = torch.stack(
-                    [flydsl_preshuffle(WQ[i]) for i in range(B)]
-                )
+                WQ_shuf = _get_batched_preshuffled(WQ)
                 return flydsl_preshuffle_batched_gemm(
                     XQ, WQ_shuf, x_scale, w_scale, out=output,
                 )
