@@ -13,7 +13,6 @@ import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.quantize.triton.fp4_quantize import (
     calculate_group_max,
-    mega_fp4_quantize_kernel,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
     triton_quantize_nvfp4,
@@ -342,46 +341,6 @@ class TritonNVFP4StackedTokenScale(QuantizeOpBase):
 
     def dequantize(self, *args: Any) -> torch.Tensor:
         # Grouped dequant is complex due to per-segment padding; return zeros.
-        return torch.zeros(
-            self.input_shape, dtype=torch.bfloat16, device=args[0].device
-        )
-
-    @property
-    def hip(self) -> bool:
-        return False
-
-    @property
-    def cuda(self) -> bool:
-        return True
-
-
-@register_op
-class MegaFP4Quantize(QuantizeOpBase):
-    def __init__(self) -> None:
-        super().__init__()
-        self.input_shape: tuple[int, ...] = (0, 0)
-
-    def preprocess(self, input: torch.Tensor, num_groups: int = 1) -> Any:
-        self.input_shape = tuple(input.shape)
-        M = input.shape[0]
-        # Split M evenly across num_groups.
-        base = M // num_groups
-        remainder = M % num_groups
-        sizes = [base + (1 if i < remainder else 0) for i in range(num_groups)]
-        m_sizes = torch.tensor(sizes, dtype=torch.int64, device=input.device)
-        x_global_scale, _ = calculate_group_max(input, m_sizes)
-        return (m_sizes, x_global_scale)
-
-    def quantize(self, input: torch.Tensor, *args: Any) -> Any:
-        m_sizes: torch.Tensor = args[0]
-        x_global_scale: torch.Tensor = args[1]
-        xq, scale, starting_row_after_padding = mega_fp4_quantize_kernel(
-            m_sizes, input, x_global_scale
-        )
-        return xq, scale, starting_row_after_padding
-
-    def dequantize(self, *args: Any) -> torch.Tensor:
-        # Mega kernel output has padded rows; return zeros matching original input shape.
         return torch.zeros(
             self.input_shape, dtype=torch.bfloat16, device=args[0].device
         )
