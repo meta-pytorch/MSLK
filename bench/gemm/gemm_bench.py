@@ -26,7 +26,9 @@ from tabulate import tabulate
 
 
 # Compute theoretical roofline values in TFLOPS for GPU and dtype combinations.
+# Keyed by device name (torch.cuda.get_device_name()) or GPU arch (gcnArchName).
 COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
+    # NVIDIA
     "NVIDIA H100": {
         ComputeDtype.FP8: 1979.0,
         ComputeDtype.BF16: 989.0,
@@ -47,14 +49,45 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
         ComputeDtype.TF32: 1250.0,
         ComputeDtype.FP32: 80.0,  # non-tensorcore
     },
+    # AMD MI300X (gfx942, CDNA3, 304 CUs @ 2100 MHz)
+    "gfx942": {
+        ComputeDtype.FP8: 1307.4,
+        ComputeDtype.BF16: 653.7,
+        ComputeDtype.FP32: 163.4,
+    },
+    # AMD MI350X (gfx950, CDNA4, 256 CUs @ 2000 MHz)
+    "gfx950": {
+        ComputeDtype.FP4: 5220.4,
+        ComputeDtype.FP8: 2610.2,
+        ComputeDtype.BF16: 1305.1,
+        ComputeDtype.FP32: 163.1,
+    },
 }
 
 
-def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
-    gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(torch.cuda.get_device_name())
-    if gpu_rooflines is None:
+def _get_gpu_arch() -> str | None:
+    """Return the AMD GPU arch (e.g. 'gfx942', 'gfx950') or None for NVIDIA."""
+    if not torch.cuda.is_available():
         return None
-    return gpu_rooflines.get(compute_dtype)
+    props = torch.cuda.get_device_properties(0)
+    gcn = getattr(props, "gcnArchName", "")
+    if gcn:
+        return gcn.split(":")[0]
+    return None
+
+
+def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
+    # Try device name first (NVIDIA)
+    gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(torch.cuda.get_device_name())
+    if gpu_rooflines is not None:
+        return gpu_rooflines.get(compute_dtype)
+    # Fall back to GPU arch (AMD)
+    arch = _get_gpu_arch()
+    if arch is not None:
+        gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(arch)
+        if gpu_rooflines is not None:
+            return gpu_rooflines.get(compute_dtype)
+    return None
 
 
 shape_registry = {}
