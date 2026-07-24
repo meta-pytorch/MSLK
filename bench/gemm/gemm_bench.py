@@ -26,7 +26,9 @@ from tabulate import tabulate
 
 
 # Compute theoretical roofline values in TFLOPS for GPU and dtype combinations.
+# Keyed by device name (torch.cuda.get_device_name()) or GPU arch (gcnArchName).
 COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
+    # NVIDIA
     "NVIDIA H100": {
         ComputeDtype.FP8: 1979.0,
         ComputeDtype.BF16: 989.0,
@@ -47,14 +49,40 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
         ComputeDtype.TF32: 1250.0,
         ComputeDtype.FP32: 80.0,  # non-tensorcore
     },
+    # AMD MI300X (gfx942, CDNA3, 304 CUs @ 2100 MHz, 750W)
+    # Source: AMD Instinct MI300X data sheet
+    "gfx942": {
+        ComputeDtype.FP8: 2614.9,
+        ComputeDtype.BF16: 1307.4,
+        ComputeDtype.TF32: 653.7,
+        ComputeDtype.FP32: 163.4,
+    },
+    # AMD MI350X (gfx950, CDNA4, 256 CUs @ 2200 MHz, 1000W)
+    # Source: AMD Instinct MI350X data sheet
+    "gfx950": {
+        ComputeDtype.FP4: 9200.0,
+        ComputeDtype.FP8: 4600.0,
+        ComputeDtype.BF16: 2300.0,
+        ComputeDtype.FP32: 144.2,
+    },
 }
 
 
 def get_compute_roofline_tflops(compute_dtype: ComputeDtype) -> float | None:
+    # Try device name first (NVIDIA)
     gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(torch.cuda.get_device_name())
-    if gpu_rooflines is None:
-        return None
-    return gpu_rooflines.get(compute_dtype)
+    if gpu_rooflines is not None:
+        return gpu_rooflines.get(compute_dtype)
+    # Fall back to GPU arch (AMD — device name is generic "AMD Radeon Graphics")
+    from mslk.utils.device import get_gfx_arch_name
+
+    gcn = get_gfx_arch_name()
+    if gcn:
+        arch = gcn.split(":")[0]
+        gpu_rooflines = COMPUTE_ROOFLINE_TFLOPS.get(arch)
+        if gpu_rooflines is not None:
+            return gpu_rooflines.get(compute_dtype)
+    return None
 
 
 shape_registry = {}
