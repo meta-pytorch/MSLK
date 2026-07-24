@@ -20,6 +20,8 @@ on:
       - '.github/workflows/mslk_ci_rocm.yml'
       - '.github/workflows/_mslk_rocm_test.yml'
       - 'ci/scripts/utils_rocm.bash'
+      - 'ci/scripts/utils_flydsl.bash'
+      - 'setup.py'
       # CMake ROCm/HIP configuration
       - 'cmake/Hip.cmake'
       - 'cmake/RocmSetup.cmake'
@@ -29,6 +31,12 @@ on:
       # Python device-capability utilities
       - 'mslk/utils/device.py'
       - 'mslk/testing/device.py'
+      - 'mslk/utils/flydsl.py'
+      - 'mslk/utils/flydsl_aot.py'
+      # FlyDSL attention kernels and tests
+      - 'mslk/attention/flydsl/**'
+      - 'test/attention/flydsl/**'
+      - 'test/utils/flydsl*_test.py'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels
