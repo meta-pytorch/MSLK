@@ -41,6 +41,7 @@ if torch.cuda.is_available():
     )
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.utils.flydsl import is_flydsl_available
 
 from parameterized import parameterized
 
@@ -3351,8 +3352,6 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
-        from mslk.utils.flydsl import is_flydsl_available
-
         if not is_flydsl_available():
             raise unittest.SkipTest("FlyDSL not available")
         from mslk.gemm.flydsl.preshuffle_gemm import (
@@ -3392,8 +3391,6 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
-        from mslk.utils.flydsl import is_flydsl_available
-
         if not is_flydsl_available():
             raise unittest.SkipTest("FlyDSL not available")
         from mslk.gemm.flydsl.preshuffle_gemm import (
