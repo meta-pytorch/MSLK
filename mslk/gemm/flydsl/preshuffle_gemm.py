@@ -213,7 +213,6 @@ def flydsl_preshuffle_gemm(
     )
 
     import flydsl.expr as fx  # pyre-ignore[21]
-
     from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
 
     out_contig = out.contiguous()
@@ -339,7 +338,6 @@ def flydsl_preshuffle_batched_gemm(
     )
 
     import flydsl.expr as fx  # pyre-ignore[21]
-
     from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
 
     XQ_i8 = _as_i8(XQ.contiguous())
@@ -447,7 +445,6 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
     from mslk.utils.flydsl import is_flydsl_available
 
     if is_flydsl_available():
-
         _preshuffle_cache: dict = {}
 
         def _get_preshuffled(WQ: Tensor) -> Tensor:
@@ -549,7 +546,6 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
         from mslk.utils.flydsl import is_flydsl_available as _is_flydsl_batched
 
         if _is_flydsl_batched():
-
             _batched_preshuffle_cache: dict = {}
 
             def _get_batched_preshuffled(WQ: Tensor) -> Tensor:
