@@ -214,7 +214,12 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
         ) -> Tensor:
             WQ_shuf = _get_preshuffled(WQ)
             return flydsl_preshuffle_gemm(
-                XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype,
+                XQ,
+                WQ_shuf,
+                x_scale,
+                w_scale,
+                out=output,
+                dtype=dtype,
             )
 
         if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
@@ -229,7 +234,12 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                 use_fast_accum: bool = True,
             ) -> Tensor:
                 return _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    bias,
+                    use_fast_accum,
                     dtype=torch.bfloat16,
                 )
 
@@ -246,8 +256,14 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                 use_fast_accum: bool = True,
             ) -> None:
                 _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
-                    dtype=output.dtype, output=output,
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    bias,
+                    use_fast_accum,
+                    dtype=output.dtype,
+                    output=output,
                 )
 
         if hasattr(torch.ops.mslk, "f8f8f16_rowwise"):
@@ -262,6 +278,11 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                 use_fast_accum: bool = True,
             ) -> Tensor:
                 return _flydsl_rowwise_impl(
-                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum,
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    bias,
+                    use_fast_accum,
                     dtype=torch.float16,
                 )
