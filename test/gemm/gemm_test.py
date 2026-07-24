@@ -3351,6 +3351,14 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
+        from mslk.utils.flydsl import is_flydsl_available
+
+        if not is_flydsl_available():
+            raise unittest.SkipTest("FlyDSL not available")
+        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
+
+        cls.flydsl_preshuffle = staticmethod(flydsl_preshuffle)
+        cls.flydsl_preshuffle_gemm = staticmethod(flydsl_preshuffle_gemm)
 
     @parameterized.expand(
         [
@@ -3361,22 +3369,15 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
             (4096, 1280, 8192),
         ]
     )
-    def test_flydsl_preshuffle_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.utils.flydsl import is_flydsl_available
-
-        if not is_flydsl_available():
-            self.skipTest("FlyDSL not available")
-
-        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
-
+    def test_gemm(self, M: int, N: int, K: int) -> None:
         x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
         w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = flydsl_preshuffle(wq)
+        wq_shuffled = self.flydsl_preshuffle(wq)
 
-        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
 
         ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)

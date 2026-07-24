@@ -36,6 +36,7 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_tensor,
 )
 from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
+from mslk.utils.flydsl import is_flydsl_available
 
 try:
     from tinygemm.utils import group_quantize_tensor
@@ -696,6 +697,10 @@ class FP8RowwisePreshuffle(FP8Rowwise):
         return ComputeDtype.FP8
 
 
+if is_flydsl_available():
+    from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
+
+
 @register_gemm_op
 class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
     """
@@ -704,20 +709,13 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
 
     def __init__(self):
         self.fast_accum = True
-        self._flydsl_gemm = None
-        if self.supported:
-            from mslk.gemm.flydsl import flydsl_preshuffle_gemm
-
-            self._flydsl_gemm = flydsl_preshuffle_gemm
 
     def preprocess(self, x, w):
         xq, wq, x_scale, w_scale = super().preprocess(x, w)
-        from mslk.gemm.flydsl import flydsl_preshuffle
-
         return xq, flydsl_preshuffle(wq), x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
-        return self._flydsl_gemm(xq, wq, x_scale, w_scale)
+        return flydsl_preshuffle_gemm(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -727,8 +725,6 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
     def supported(self) -> bool:
         if not super().supported:
             return False
-        from mslk.utils.flydsl import is_flydsl_available
-
         return is_flydsl_available()
 
     @property
