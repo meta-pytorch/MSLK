@@ -197,14 +197,6 @@ __check_package_variant () {
   fi
 }
 
-__mslk_rocm_pip_extra_index_args () {
-  # MSLK ROCm wheels now depend on FlyDSL from PyPI, so installs/downloads that
-  # pin --index-url to the PyTorch ROCm index must also expose PyPI.
-  if [ "${package_name}" == "mslk" ] && [ "${package_variant_type:-}" == "rocm" ]; then
-    echo "--extra-index-url https://pypi.org/simple"
-  fi
-}
-
 install_from_pytorch_pip () {
   env_name="$1"
   package_name_raw="$2"
@@ -235,17 +227,12 @@ install_from_pytorch_pip () {
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
-  # shellcheck disable=SC2155
-  local pip_extra_index_args=$(__mslk_rocm_pip_extra_index_args)
 
   echo "[INSTALL] Attempting to install [${package_name}, ${package_version:-LATEST}] from PyTorch PIP using channel ${pip_channel} ..."
-  if [ -n "${pip_extra_index_args}" ]; then
-    echo "[INSTALL] Adding PyPI fallback for ROCm dependency resolution: ${pip_extra_index_args}"
-  fi
   # shellcheck disable=SC2086
   # NOTE: `python -m pip` (not bare `pip`) ensures we install into the env's own
   # site-packages even if its `pip` resolution falls back to base conda's pip.
-  (exec_with_retries 3 conda run ${env_prefix} python -m pip install ${pip_package} --index-url ${pip_channel} ${pip_extra_index_args}) || return 1
+  (exec_with_retries 3 conda run ${env_prefix} python -m pip install ${pip_package} --index-url ${pip_channel}) || return 1
 
   # Ensure that the correct package variant has been installed
   __check_package_variant || return 1
@@ -313,19 +300,14 @@ download_from_pytorch_pip () {
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
-  # shellcheck disable=SC2155
-  local pip_extra_index_args=$(__mslk_rocm_pip_extra_index_args)
 
   echo "[DOWNLOAD] Removing previously downloaded wheels from current directory ..."
   # shellcheck disable=SC2035
   rm -rf *.whl || return 1
 
   echo "[DOWNLOAD] Attempting to download wheel [${package_name}, ${package_version:-LATEST}] from PyTorch PIP using channel ${pip_channel} ..."
-  if [ -n "${pip_extra_index_args}" ]; then
-    echo "[DOWNLOAD] Adding PyPI fallback for ROCm dependency resolution: ${pip_extra_index_args}"
-  fi
   # shellcheck disable=SC2086
-  (exec_with_retries 3 conda run ${env_prefix} pip download ${pip_package} --index-url ${pip_channel} ${pip_extra_index_args}) || return 1
+  (exec_with_retries 3 conda run ${env_prefix} pip download ${pip_package} --index-url ${pip_channel}) || return 1
 
   # Ensure that the package build is of the correct variant
   # This test usually applies to the nightly builds
