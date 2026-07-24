@@ -9,6 +9,10 @@
 from __future__ import annotations
 
 import torch
+from mslk.quantize.triton.fp4_primitives.scale import (  # noqa: F401
+    _compute_exp,
+    _floor_log2,
+)
 from mslk.quantize.triton.legacy import primitives as _primitives
 from mslk.quantize.triton.legacy.fake_quantize import (  # noqa: F401
     triton_fake_quantize_nvfp4_per_tensor,
@@ -27,10 +31,7 @@ from mslk.quantize.triton.legacy.primitives import (  # noqa: F401
     get_mx4_exp_bias,
     RoundingMode,
 )
-from mslk.quantize.triton.legacy.quantize import (  # noqa: F401
-    _kernel_quantize_mx4_unpack,
-    triton_quantize_nvfp4,
-)
+from mslk.quantize.triton.legacy.quantize import triton_quantize_nvfp4  # noqa: F401
 from mslk.quantize.triton.legacy.quantize_stacked import (  # noqa: F401
     _nvfp4_quantize_stacked_kernel,
     mega_fp4_quantize_kernel,
@@ -117,12 +118,10 @@ def triton_quantize_mx4(
 
 
 # Private symbol aliases (same-object re-exports for internal consumers)
-_compute_exp = _primitives._compute_exp  # noqa: F401
 _fp32_to_e8m0 = _primitives._fp32_to_e8m0  # noqa: F401
 _from_blocked = _primitives._from_blocked  # noqa: F401
 _to_blocked = _primitives._to_blocked  # noqa: F401
 _e2m1_round_to_even = _primitives._e2m1_round_to_even  # noqa: F401
-_floor_log2 = _primitives._floor_log2  # noqa: F401
 unsigned_fp32_to_e8m0 = _primitives.unsigned_fp32_to_e8m0  # noqa: F401
 nvfp4_scale_swizzle = _primitives.nvfp4_scale_swizzle  # noqa: F401
 convert_fp32_to_fp4_packed = _primitives.convert_fp32_to_fp4_packed  # noqa: F401
