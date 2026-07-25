@@ -296,7 +296,6 @@ def benchmark_grouped(
     k: list[int],
     mem_bw_roofline_gbps: float,
     opts: BenchOptions,
-    bench_quantize: bool = False,
     shape_mode: ShapeMode = ShapeMode.GROUPED,
 ) -> list[Metrics]:
     num_groups = len(m)
@@ -375,52 +374,33 @@ def benchmark_grouped(
                 )
         if noise_power > 0:
             metrics.sqnr = float(10 * np.log10(signal_power / noise_power))
-        for _ in range(opts.num_iters):
-            # Now perform benchmark.
-            if bench_quantize:
-                # Benchmark both quantize and compute.
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *preprocessed_args,
-                        opts=opts,
-                        bench_quantize=True,
-                    )
-            else:
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *quantized_vals,
-                        opts=opts,
-                        bench_quantize=False,
-                    )
+        # Now perform benchmark.
+        with profiler(enabled=opts.trace, with_stack=True):
+            ms_runtime = gemm_op.benchmark(*quantized_vals, opts=opts)
 
-            for i in range(num_groups):
-                output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
-                if m[i] > 0:
-                    tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
-                    gbps = (
-                        (
-                            quantized_vals[0][i].numel()
-                            * quantized_vals[0][i].element_size()
-                            + quantized_vals[1][i].numel()
-                            * quantized_vals[1][i].element_size()
-                            + output_multiplier
-                            * output[i].numel()
-                            * output[i].element_size()
-                        )
-                        / (ms_runtime / 1e3)
-                        / 1e9
+        for i in range(num_groups):
+            output_multiplier = 2 if "fuse_scatter_add" in gemm_op.name else 1
+            if m[i] > 0:
+                tflops = 2 * m[i] * n[i] * k[i] / (ms_runtime / 1e3) / 1e12
+                gbps = (
+                    (
+                        quantized_vals[0][i].numel()
+                        * quantized_vals[0][i].element_size()
+                        + quantized_vals[1][i].numel()
+                        * quantized_vals[1][i].element_size()
+                        + output_multiplier
+                        * output[i].numel()
+                        * output[i].element_size()
                     )
-                    metrics.gbps += gbps
-                    metrics.tflops += tflops
-                    metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
-                    if compute_roofline_tflops is not None:
-                        metrics.compute_util += (tflops / compute_roofline_tflops) * 100
-            metrics.ms += ms_runtime
-        metrics.ms /= opts.num_iters
-        metrics.tflops /= opts.num_iters
-        metrics.gbps /= opts.num_iters
-        metrics.mem_bw_util /= opts.num_iters
-        metrics.compute_util /= opts.num_iters
+                    / (ms_runtime / 1e3)
+                    / 1e9
+                )
+                metrics.gbps += gbps
+                metrics.tflops += tflops
+                metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
+                if compute_roofline_tflops is not None:
+                    metrics.compute_util += (tflops / compute_roofline_tflops) * 100
+        metrics.ms = ms_runtime
 
         results.append(metrics)
 
@@ -434,7 +414,6 @@ def benchmark(
     k: int,
     mem_bw_roofline_gbps: float,
     opts: BenchOptions,
-    bench_quantize: bool = False,
     shape_mode: ShapeMode = ShapeMode.REGULAR,
 ) -> list[Metrics]:
     # Create input tensors.
@@ -477,45 +456,23 @@ def benchmark(
         if noise_power > 0:
             metrics.sqnr = (10 * torch.log10(signal_power / noise_power)).item()
 
-        for _ in range(opts.num_iters):
-            # Now perform benchmark.
-            if bench_quantize:
-                # Benchmark both quantize and compute.
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *preprocessed_args,
-                        opts=opts,
-                        bench_quantize=True,
-                    )
-            else:
-                with profiler(enabled=opts.trace, with_stack=True):
-                    ms_runtime = gemm_op.benchmark(
-                        *quantized_vals,
-                        opts=opts,
-                        bench_quantize=False,
-                    )
+        # Now perform benchmark.
+        with profiler(enabled=opts.trace, with_stack=True):
+            ms_runtime = gemm_op.benchmark(*quantized_vals, opts=opts)
 
-            tflops = 2 * m * n * k / (ms_runtime / 1e3) / 1e12
-            metrics.tflops += tflops
-            gbps = (
-                (
-                    quantized_vals[0].numel() * quantized_vals[0].element_size()
-                    + quantized_vals[1].numel() * quantized_vals[1].element_size()
-                    + output.numel() * output.element_size()
-                )
-                / (ms_runtime / 1e3)
-                / 1e9
+        metrics.tflops = 2 * m * n * k / (ms_runtime / 1e3) / 1e12
+        metrics.gbps = (
+            (
+                quantized_vals[0].numel() * quantized_vals[0].element_size()
+                + quantized_vals[1].numel() * quantized_vals[1].element_size()
+                + output.numel() * output.element_size()
             )
-            metrics.gbps += gbps
-            metrics.mem_bw_util += (gbps / mem_bw_roofline_gbps) * 100
-            if compute_roofline_tflops is not None:
-                metrics.compute_util += (tflops / compute_roofline_tflops) * 100
-            metrics.ms += ms_runtime
-        metrics.ms /= opts.num_iters
-        metrics.tflops /= opts.num_iters
-        metrics.gbps /= opts.num_iters
-        metrics.mem_bw_util /= opts.num_iters
-        metrics.compute_util /= opts.num_iters
+            / (ms_runtime / 1e3)
+            / 1e9
+        )
+        metrics.mem_bw_util = (metrics.gbps / mem_bw_roofline_gbps) * 100
+        if compute_roofline_tflops is not None:
+            metrics.compute_util = (metrics.tflops / compute_roofline_tflops) * 100
 
         results.append(metrics)
 
@@ -587,11 +544,6 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
     help="Enable a set of environment variables for AMD GPU performance",
 )
 @click.option(
-    "--bench-quantize",
-    is_flag=True,
-    help="If set, include quantization cost in benchmark.",
-)
-@click.option(
     "--M",
     default=None,
     help="Comma separated list of M values to benchmark.",
@@ -609,7 +561,10 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--pair-NK",
     is_flag=True,
-    help="If set, instead of benchmarking cartesian product of N * K, benchmark consecutive NK pairs together.",
+    help=(
+        "If set, instead of benchmarking cartesian product of N * K, "
+        "benchmark consecutive NK pairs together."
+    ),
 )
 @click.option(
     "--grouped",
@@ -620,7 +575,10 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 @click.option(
     "--groups",
     default=None,
-    help="If set with grouped mode, repeat MNK shapes this many times. Comma separated list of groups to benchmark",
+    help=(
+        "If set with grouped mode, repeat MNK shapes this many times. "
+        "Comma separated list of groups to benchmark"
+    ),
 )
 @click.option(
     "--total-K",
@@ -648,12 +606,10 @@ def print_kernels(kernels: Optional[list[str]]) -> list[GemmOpBase]:
 )
 def invoke_main(
     output_dir: str,
-    num_iters: int,
     export_csv: bool,
     export_scuba: bool,
     plot: bool,
     enable_amd_env_vars: bool,
-    bench_quantize: bool,
     kernels: Optional[str],
     m: Optional[str],
     n: Optional[str],
@@ -693,10 +649,6 @@ def invoke_main(
         print_kernels(all_kernels)
         sys.exit(1)
 
-    if num_iters < 1:
-        print("Warning: Number of iterations must be at least 1.")
-        num_iters = 1
-
     # Enumerate shapes to benchmark.
     if grouped and not groups:
         # In grouped mode, M, N, and K represent the groups of a single gemm.
@@ -714,7 +666,8 @@ def invoke_main(
         if shapes:
             if shapes not in shape_registry:
                 print(
-                    f"Shape {shapes} not found in shape registry. Valid shapes: {', '.join(shape_registry.keys())}."
+                    f"Shape {shapes} not found in shape registry. "
+                    f"Valid shapes: {', '.join(shape_registry.keys())}."
                 )
                 sys.exit(1)
             MNK = shape_registry[shapes]()
@@ -783,7 +736,6 @@ def invoke_main(
     benchmark_func = benchmark_grouped if grouped else benchmark
 
     opts = BenchOptions(
-        num_iters=num_iters,
         cuda_graph=cuda_graph,
         rotating_buffer=rotating_buffer,
         rep_ms=rep_ms,
@@ -800,7 +752,6 @@ def invoke_main(
             k,  # pyre-ignore[6]: Incompatible parameter type [6]
             mem_bw_gbps,
             opts,
-            bench_quantize,
             shape_mode,
         )
         benchmark_results.extend(shape_measurements)

@@ -118,3 +118,30 @@ def dequantize_nvfp4(
     return scale_nvfp4(input_quantized_float, scale, global_scale, group_size).to(
         torch.bfloat16
     )
+
+
+def dequantize_mx4(
+    input_quantized: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int = 32,
+) -> torch.Tensor:
+    """Dequantize an MXFP4 (E2M1 element / E8M0 scale) tensor back to bfloat16.
+
+    Args:
+        input_quantized: Quantized tensor in uint8 format (two FP4 values per byte).
+        scale: Per-group E8M0 scales in blocked format.
+        group_size: Number of elements per scale group.
+
+    Returns:
+        Dequantized tensor in bfloat16 format.
+    """
+    packed = input_quantized.view(torch.uint8)
+    M = packed.shape[0]
+    # Two FP4 values are packed into one uint8.
+    N = packed.shape[1] * 2
+    num_groups = math.ceil(N / group_size)
+    # E8M0 scale byte -> power-of-two multiplier 2 ** (byte - 127).
+    e8m0 = _from_blocked(scale.view(torch.uint8), (M, num_groups)).to(torch.int32)
+    scale_per_group = torch.exp2(e8m0.to(torch.float32) - 127.0)
+    scale_per_elem = scale_per_group.repeat_interleave(group_size, dim=1)[:, :N]
+    return (fp4_to_float(packed) * scale_per_elem).to(torch.bfloat16)

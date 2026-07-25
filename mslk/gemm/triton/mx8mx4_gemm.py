@@ -127,7 +127,7 @@ def _mx8mx4bf16_kernel(
     XQ_ptr,  # [M, K]     float8_e4m3  (raw bytes; reinterpreted in kernel)
     WQ_ptr,  # [N, K//2]  uint8        (two MXFP4 nibbles per byte)
     XS_ptr,  # flat uint8  _to_blocked layout (E8M0 exponents for XQ)
-    WS_ptr,  # flat uint8  _to_blocked layout (E8M0 exponents for WQ)
+    WS_ptr,  # [N, K//32] uint8  plain row-major (E8M0 exponents for WQ)
     Out_ptr,  # [M, N]     bfloat16
     M,
     N,
@@ -136,6 +136,8 @@ def _mx8mx4bf16_kernel(
     stride_xk,
     stride_wn,
     stride_wk,  # strides over WQ in *bytes* (K//2 bytes wide)
+    stride_wsn,  # stride over WS rows (= K//32)
+    stride_wsk,  # stride over WS cols (= 1)
     stride_om,
     stride_on,
     BLOCK_M: tl.constexpr,
@@ -146,7 +148,9 @@ def _mx8mx4bf16_kernel(
     Computes Out[M, N] = dequant(XQ)[M, K] @ dequant(WQ).T[K, N]
     using hardware-accelerated block-scaled tensor operations via tl.dot_scaled.
 
-    XS/WS must be in the _to_blocked flat layout produced by fp4_quantize._to_blocked.
+    XS must be in the _to_blocked flat layout produced by fp4_quantize._to_blocked.
+    WS must be in plain row-major [N, K//32] layout (produced by triton_quantize_mx4_unpack
+    on ROCm).
     Scale semantics:
       tl.dot_scaled expects scales shaped [BLOCK_M, BLOCK_K // 32] for A
       and [BLOCK_N, BLOCK_K // 32] for B (one scale per 32-element MX block).
@@ -186,7 +190,7 @@ def _mx8mx4bf16_kernel(
         )  # dtype: uint8 (two FP4 values per byte)
 
         # ---- load scale tiles ----
-        # XS and WS are in the _to_blocked flat layout produced by fp4_quantize._to_blocked:
+        # XS is in the _to_blocked flat layout produced by fp4_quantize._to_blocked:
         #   padded.view(R//128, 4, 32, C//4, 4).permute(0,3,2,1,4).reshape(-1,32,16).flatten()
         # Inverse mapping for logical (row, col):
         #   flat = (row//128 * n_col_blocks + col//4) * 512
@@ -206,14 +210,13 @@ def _mx8mx4bf16_kernel(
         )
         xs = tl.load(XS_ptr + xs_flat, mask=(m2d < M) & (ks2d < n_scale_cols), other=0)
 
+        # WS is plain [N, K//32] row-major (from triton_quantize_mx4_unpack on ROCm).
         n2d = offs_n[:, None]
-        ws_flat = (
-            (n2d // 128 * n_col_blocks + ks2d // 4) * 512
-            + (n2d % 32) * 16
-            + (n2d % 128 // 32) * 4
-            + ks2d % 4
+        ws = tl.load(
+            WS_ptr + n2d * stride_wsn + ks2d * stride_wsk,
+            mask=(n2d < N) & (ks2d < n_scale_cols),
+            other=0,
         )
-        ws = tl.load(WS_ptr + ws_flat, mask=(n2d < N) & (ks2d < n_scale_cols), other=0)
 
         # ---- block-scaled dot product ----
         # tl.dot_scaled dispatches to mfma_scaled_* on gfx950.
@@ -279,10 +282,9 @@ def matmul_mx8mx4bf16(
 
     wq_raw = WQ.view(torch.uint8).reshape(N, K // 2)
 
-    # Pass blocked scales directly — the kernel reads them via fused
-    # _to_blocked index arithmetic (BLOCKED_SCALES=True path).
     xs_raw = x_scale.view(torch.uint8)
-    ws_raw = w_scale.view(torch.uint8)
+    # w_scale is [N, K//32] plain row-major (from triton_quantize_mx4_unpack on ROCm).
+    ws_raw = w_scale.view(torch.uint8).reshape(N, K // 32)
 
     if output is None:
         output = torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
@@ -310,6 +312,8 @@ def matmul_mx8mx4bf16(
         xq_raw.stride(1),
         wq_raw.stride(0),
         wq_raw.stride(1),
+        ws_raw.stride(0),
+        ws_raw.stride(1),
         output.stride(0),
         output.stride(1),
     )
@@ -331,7 +335,7 @@ def _mx8mx4bf16_grouped_kernel(
     XQ_ptr,  # [total_M, K]   float8_e4m3 bytes
     WQ_ptr,  # [G, K//2, N]   uint8  (two MXFP4 nibbles per byte, col-major W)
     XS_ptr,  # flat uint8  _to_blocked layout, groups concatenated
-    WS_ptr,  # flat uint8  _to_blocked layout, groups stacked (all same N)
+    WS_ptr,  # [G, N, K//32] uint8  plain row-major, groups stacked
     Out_ptr,  # [total_M, N]   bfloat16
     m_sizes_ptr,  # [G]  int32  per-group M size
     m_starts_ptr,  # [G]  int32  per-group absolute M start row in XQ / Out
@@ -343,6 +347,9 @@ def _mx8mx4bf16_grouped_kernel(
     stride_wg,
     stride_wk2,
     stride_wn,
+    stride_wsg,  # stride over WS groups (= N * K//32)
+    stride_wsn,  # stride over WS rows (= K//32)
+    stride_wsk,  # stride over WS cols (= 1)
     stride_om,
     stride_on,
     NUM_SMS: tl.constexpr,
@@ -371,9 +378,6 @@ def _mx8mx4bf16_grouped_kernel(
     N_COL_BLOCKS: tl.constexpr = (K // 32 + 3) // 4
 
     n_scale_cols = tl.cdiv(K, 32)
-    ws_n_row_blocks = tl.cdiv(N, 128)
-    # Byte stride between groups in WS (all groups share the same N).
-    ws_group_stride = ws_n_row_blocks * N_COL_BLOCKS * 512
 
     iterated_tiles = 0
     xs_offset_acc = 0  # running byte offset into XS_ptr for current group
@@ -384,7 +388,6 @@ def _mx8mx4bf16_grouped_kernel(
 
         # Byte offset into XS_ptr for this group (accumulated from previous groups).
         xs_group_offset = xs_offset_acc
-        ws_group_offset = g * ws_group_stride
 
         num_m_tiles = tl.cdiv(m_size, BLOCK_M)
         num_n_tiles = tl.cdiv(N, BLOCK_N)
@@ -445,16 +448,10 @@ def _mx8mx4bf16_grouped_kernel(
                     other=0,
                 )
 
+                # WS is plain [G, N, K//32] row-major.
                 n2d = offs_n[:, None]
-                ws_flat = (
-                    ws_group_offset
-                    + (n2d // 128 * N_COL_BLOCKS + ks2d // 4) * 512
-                    + (n2d % 32) * 16
-                    + (n2d % 128 // 32) * 4
-                    + ks2d % 4
-                )
                 ws = tl.load(
-                    WS_ptr + ws_flat,
+                    WS_ptr + g * stride_wsg + n2d * stride_wsn + ks2d * stride_wsk,
                     mask=(n2d < N) & (ks2d < n_scale_cols),
                     other=0,
                 )
@@ -519,7 +516,8 @@ def matmul_mx8mx4bf16_grouped(
     xq_raw = XQ.view(torch.uint8)
     wq_raw = WQ.view(torch.uint8)  # [G, K//2, N]
     xs_raw = x_scale.view(torch.uint8).contiguous()
-    ws_raw = w_scale.view(torch.uint8).contiguous()
+    # w_scale is [G, N, K//32] plain row-major (from triton_quantize_mx4_unpack on ROCm).
+    ws_raw = w_scale.view(torch.uint8).reshape(G, N, K // 32).contiguous()
 
     # Derive m_sizes and m_starts on the GPU — all async, no CPU sync.
     # m_starts[g] = cumulative row start for group g  (= 0, offsets[0], offsets[1], …)
@@ -548,6 +546,9 @@ def matmul_mx8mx4bf16_grouped(
         wq_raw.stride(0),
         wq_raw.stride(1),
         wq_raw.stride(2),
+        ws_raw.stride(0),
+        ws_raw.stride(1),
+        ws_raw.stride(2),
         output.stride(0),
         output.stride(1),
         NUM_SMS=NUM_SMS,

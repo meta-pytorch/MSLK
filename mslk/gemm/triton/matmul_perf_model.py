@@ -18,6 +18,7 @@ import functools
 import heapq
 
 import torch
+import triton.language as tl  # @manual
 from triton import cdiv  # @manual
 from triton.runtime import driver  # @manual
 from triton.testing import (  # @manual
@@ -33,6 +34,13 @@ def get_clock_rate_in_khz():
     try:
         return nvsmi(["clocks.max.sm"])[0] * 1e3
     except FileNotFoundError:
+        if torch.version.hip is not None:
+            # AMD/ROCm: nvidia-smi and pynvml are both Nvidia-only (pynvml is
+            # not installed in the ROCm CI image). Triton's device properties
+            # expose sm_clock_rate (kHz) on the ROCm backend.
+            device = torch.cuda.current_device()
+            return driver.active.utils.get_device_properties(device)["sm_clock_rate"]
+        # NVIDIA: preserve the original pynvml fallback unchanged.
         import pynvml  # @manual=fbsource//third-party/pypi/pynvml:pynvml
 
         pynvml.nvmlInit()
@@ -42,6 +50,20 @@ def get_clock_rate_in_khz():
 
 def get_tensorcore_tflops(device, num_ctas, num_warps, dtype):
     """return compute throughput in TOPS"""
+    # Triton's upstream get_max_tensorcore_tflops() only recognizes the Nvidia
+    # fp8 dtypes and raises "dtype not supported" for the AMD/ROCm fnuz fp8
+    # dtypes (float8e4b8 == e4m3fnuz, float8e5b16 == e5m2fnuz). These share the
+    # same tensorcore throughput class as their Nvidia counterparts, so map them
+    # to a supported equivalent before querying.
+    amd_fp8_equivalents = {
+        k: v
+        for k, v in [
+            (getattr(tl, "float8e4b8", None), tl.float8e4nv),
+            (getattr(tl, "float8e5b16", None), tl.float8e5),
+        ]
+        if k is not None
+    }
+    dtype = amd_fp8_equivalents.get(dtype, dtype)
     total_warps = num_ctas * min(num_warps, 4)
     num_subcores = (
         driver.active.utils.get_device_properties(device)["multiprocessor_count"] * 4

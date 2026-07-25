@@ -1040,6 +1040,7 @@ def test_flash_attn_kvcache(
             )
             page_table = None
         else:
+            paged_extra_bytes = 16
             (
                 k_cache,
                 v_cache,
@@ -1047,7 +1048,7 @@ def test_flash_attn_kvcache(
                 k_cache_paged,
                 v_cache_paged,
                 num_blocks,
-            ) = _generate_block_kvcache(
+            ) = _generate_page_padded_block_kvcache(
                 seqlen_k,
                 page_size,
                 batch_size_cache,
@@ -1056,7 +1057,17 @@ def test_flash_attn_kvcache(
                 dv,
                 device,
                 dtype,
-                dtype_ref,
+                paged_extra_bytes,
+            )
+            assert (
+                k_cache_paged.stride(0)
+                == page_size * nheads_k * d
+                + paged_extra_bytes // k_cache_paged.element_size()
+            )
+            assert (
+                v_cache_paged.stride(0)
+                == page_size * nheads_k * dv
+                + paged_extra_bytes // v_cache_paged.element_size()
             )
         cache_seqlens = torch.randint(
             0 if new_kv else 1,
@@ -1410,36 +1421,254 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 
 
-def _generate_block_kvcache(
-    seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
+def _make_page_padded_cache(
+    num_blocks,
+    page_size,
+    nheads_k,
+    d,
+    device,
+    dtype,
+    extra_bytes,
+    initialize=True,
+):
+    dtype_size = torch.empty((), device=device, dtype=dtype).element_size()
+    assert extra_bytes % dtype_size == 0
+    extra_elements = extra_bytes // dtype_size
+    page_elements = page_size * nheads_k * d
+    physical_page_elements = page_elements + extra_elements
+    storage = torch.empty(
+        num_blocks * physical_page_elements,
+        device=device,
+        dtype=dtype,
+    )
+    if dtype.is_floating_point:
+        storage.fill_(
+            torch.finfo(dtype).max if dtype == torch.float8_e4m3fn else float("nan")
+        )
+    else:
+        storage.fill_(0x7F807F80)
+    cache = torch.as_strided(
+        storage,
+        (num_blocks, page_size, nheads_k, d),
+        (physical_page_elements, nheads_k * d, d, 1),
+    )
+    if initialize:
+        cache.copy_(torch.randn(cache.shape, device=device, dtype=dtype))
+    return cache
+
+
+def _generate_page_padded_block_kvcache(
+    seqlen_k,
+    page_size,
+    batch_size,
+    nheads_k,
+    d,
+    dv,
+    device,
+    dtype,
+    extra_bytes,
 ):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
-    k_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref)
-        .to(dtype)
-        .to(dtype_ref)
+    k_cache_paged = _make_page_padded_cache(
+        num_blocks,
+        page_size,
+        nheads_k,
+        d,
+        device,
+        dtype,
+        extra_bytes,
     )
-    v_cache_paged = (
-        torch.randn(num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref)
-        .to(dtype)
-        .to(dtype_ref)
+    v_cache_paged = _make_page_padded_cache(
+        num_blocks,
+        page_size,
+        nheads_k,
+        dv,
+        device,
+        dtype,
+        extra_bytes,
     )
+    k_pages = torch.randn(k_cache_paged.shape, device=device, dtype=dtype)
+    v_pages = torch.randn(v_cache_paged.shape, device=device, dtype=dtype)
+    k_cache_paged.copy_(k_pages)
+    v_cache_paged.copy_(v_pages)
     page_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
         b=batch_size,
     )
     k_cache = rearrange(
-        k_cache_paged[page_table.flatten()],
+        k_pages[page_table.flatten()],
         "(b nblocks) block_size ... -> b (nblocks block_size) ...",
         b=batch_size,
     )[:, :seqlen_k]
     v_cache = rearrange(
-        v_cache_paged[page_table.flatten()],
+        v_pages[page_table.flatten()],
         "(b nblocks) block_size ... -> b (nblocks block_size) ...",
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+def _pack_fp8_scale_shift(scale, shift):
+    return (
+        torch.concat([scale.unsqueeze(-1), shift.unsqueeze(-1)], dim=-1)
+        .flatten(-2)
+        .to(torch.float16)
+        .view(torch.int32)
+    )
+
+
+def _quantize_page_padded_cache_fp8(cache, extra_bytes):
+    flat = cache.reshape(-1, cache.shape[-1]).float()
+    shift = flat.mean(dim=-1)
+    centered = flat - shift[..., None]
+    scale = centered.abs().amax(dim=-1) / torch.finfo(torch.float8_e4m3fn).max
+    scale = torch.nan_to_num(scale, nan=1, posinf=1)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    quantized = (centered / scale[..., None]).to(torch.float8_e4m3fn)
+    dequantized = (quantized.float() * scale[..., None] + shift[..., None]).reshape(
+        cache.shape
+    )
+
+    quantized_cache = _make_page_padded_cache(
+        cache.shape[0],
+        cache.shape[1],
+        cache.shape[2],
+        cache.shape[3],
+        cache.device,
+        torch.float8_e4m3fn,
+        extra_bytes,
+        initialize=False,
+    )
+    quantized_cache.copy_(quantized.reshape(cache.shape))
+
+    scale_shift = _pack_fp8_scale_shift(scale, shift).reshape(cache.shape[:-1])
+    scale_shift_cache = _make_page_padded_cache(
+        cache.shape[0],
+        cache.shape[1],
+        cache.shape[2],
+        1,
+        cache.device,
+        torch.int32,
+        extra_bytes,
+        initialize=False,
+    ).squeeze(-1)
+    scale_shift_cache.copy_(scale_shift)
+    return quantized_cache, scale_shift_cache, dequantized.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("extra_bytes", [16])
+@pytest.mark.parametrize(
+    "is_decode,use_fp8_scale_shift",
+    [
+        (False, False),
+        (False, True),
+        (True, False),
+        (True, True),
+    ],
+)
+def test_flash_attn_kvcache_page128_with_physical_padding(
+    extra_bytes, is_decode, use_fp8_scale_shift
+):
+    if IS_SM90:
+        pytest.xfail("SM90 paged KV path does not support split/TMA coverage")
+
+    from mslk.attention.flash_attn.interface import _flash_attn_fwd
+
+    device = "cuda"
+    torch.random.manual_seed(42)
+    batch_size = 3
+    seqlen_q = 1 if is_decode else 16
+    seqlen_k = 1024
+    page_size = 128
+    nheads = 8
+    nheads_k = 2
+    d = 64
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    (
+        k_cache,
+        v_cache,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        _,
+    ) = _generate_page_padded_block_kvcache(
+        seqlen_k,
+        page_size,
+        batch_size,
+        nheads_k,
+        d,
+        d,
+        device,
+        dtype,
+        extra_bytes,
+    )
+    k_scale_shift = None
+    v_scale_shift = None
+    if use_fp8_scale_shift:
+        (
+            k_cache_paged,
+            k_scale_shift,
+            k_cache_paged_ref,
+        ) = _quantize_page_padded_cache_fp8(k_cache_paged, extra_bytes)
+        (
+            v_cache_paged,
+            v_scale_shift,
+            v_cache_paged_ref,
+        ) = _quantize_page_padded_cache_fp8(v_cache_paged, extra_bytes)
+        k_cache = rearrange(
+            k_cache_paged_ref[page_table.flatten(), :page_size],
+            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+            b=batch_size,
+        )[:, :seqlen_k]
+        v_cache = rearrange(
+            v_cache_paged_ref[page_table.flatten(), :page_size],
+            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+            b=batch_size,
+        )[:, :seqlen_k]
+    extra_elements = extra_bytes // q.element_size()
+    if use_fp8_scale_shift:
+        extra_elements = extra_bytes // k_cache_paged.element_size()
+    assert k_cache_paged.shape[1] == page_size
+    assert (
+        k_cache_paged.stride(0) == page_size * nheads_k * d + extra_elements
+    )
+    assert (
+        v_cache_paged.stride(0) == page_size * nheads_k * d + extra_elements
+    )
+    assert k_cache_paged.stride(-1) == 1
+
+    seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
+    out, _ = _flash_attn_fwd(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        page_table=page_table,
+        causal=False,
+        is_decode=is_decode,
+        num_splits=1,
+        return_lse=True,
+        k_scale=k_scale_shift,
+        v_scale=v_scale_shift,
+    )
+    out_ref, _ = attention_ref(q, k_cache, v_cache, causal=is_decode)
+    out_pt, _ = attention_ref(
+        q, k_cache, v_cache, causal=is_decode, upcast=False, reorder_ops=True
+    )
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 1.5 * (
+        out_pt - out_ref
+    ).abs().mean().item()
 
 
 def attention_combine_ref(out_partial, lse_partial):

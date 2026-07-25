@@ -74,9 +74,8 @@ at::Tensor f8f8_rowwise_wrapper(
     std::optional<at::Tensor> output = std::nullopt) {
   // Check that input datatypes are valid.
   TORCH_CHECK(
-      (XQ.dtype() == at::kFloat8_e4m3fnuz) &&
-          (WQ.dtype() == at::kFloat8_e4m3fnuz),
-      "Inputs must be type float8_e4m3fnuz.");
+      XQ.dtype() == WQ.dtype(),
+      "XQ and WQ dtypes must match, got ", XQ.dtype(), " vs ", WQ.dtype());
   TORCH_CHECK(
       (x_scale.dtype() == at::kFloat) && (w_scale.dtype() == at::kFloat),
       "Scales must be float32.");

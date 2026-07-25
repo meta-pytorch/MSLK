@@ -478,17 +478,6 @@ void set_dynamic_kernel_args(
   }
 }
 
-static std::pair<at::ScalarType, std::string> get_float8_e4m3_dtype() {
-  if (at::detail::getCUDAHooks().isGPUArch({"gfx942"})) {
-    return std::make_pair(at::kFloat8_e4m3fnuz, "float8_e4m3fnuz");
-  } else if (at::detail::getCUDAHooks().isGPUArch({"gfx950"})) {
-    return std::make_pair(at::kFloat8_e4m3fn, "float8_e4m3fn");
-  } else {
-    std::string gcn_arch_name = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-    TORCH_CHECK(false, "Unsupported GPU architecture for FP8: ", gcn_arch_name);
-  }
-}
-
 template <typename OutputType>
 OutputType _f8f8bf16_rowwise_grouped(
     at::TensorList XQ,
@@ -497,7 +486,6 @@ OutputType _f8f8bf16_rowwise_grouped(
     at::TensorList w_scale) {
   // Check that input datatypes are valid.
   // First confirm that there are the same number of groups in all inputs.
-  static auto float8_dtype = get_float8_e4m3_dtype();
   TORCH_CHECK(
       XQ.size() == WQ.size() && XQ.size() == x_scale.size() &&
           XQ.size() == w_scale.size(),
@@ -507,16 +495,13 @@ OutputType _f8f8bf16_rowwise_grouped(
   for (at::Tensor x : XQ) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous());
     TORCH_CHECK(x.dim() == 2, "Inputs must be 2D.");
-    TORCH_CHECK(
-        x.dtype() == float8_dtype.first,
-        "Inputs must be type ", float8_dtype.second);
   }
   for (at::Tensor w : WQ) {
     TORCH_CHECK(w.is_cuda() && w.is_contiguous());
     TORCH_CHECK(w.dim() == 2, "Inputs must be 2D.");
     TORCH_CHECK(
-        w.dtype() == float8_dtype.first,
-        "Inputs must be type ", float8_dtype.second);
+        XQ[0].dtype() == w.dtype(),
+        "XQ and WQ dtypes must match, got ", XQ[0].dtype(), " vs ", w.dtype());
     TORCH_CHECK(
         w.size(0) >= 512 && w.size(1) >= 512,
         "N and K must be at least 512 for grouped gemm. For smaller inputs, consider unrolling.");
@@ -584,13 +569,9 @@ void validate_inputs_common(
   TORCH_CHECK(x_scale.is_cuda());
   TORCH_CHECK(w_scale.is_cuda());
 
-  static auto float8_dtype = get_float8_e4m3_dtype();
   TORCH_CHECK(
-      XQ.dtype() == float8_dtype.first,
-      "Input XQ must be type ", float8_dtype.second);
-  TORCH_CHECK(
-      WQ.dtype() == float8_dtype.first,
-      "Input WQ must be type ", float8_dtype.second);
+      XQ.dtype() == WQ.dtype(),
+      "XQ and WQ dtypes must match, got ", XQ.dtype(), " vs ", WQ.dtype());
 
   TORCH_CHECK(x_scale.dtype() == at::kFloat, "Scales must be float32.");
   TORCH_CHECK(w_scale.dtype() == at::kFloat, "Scales must be float32.");

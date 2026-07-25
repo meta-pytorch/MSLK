@@ -76,7 +76,7 @@ Kernel_mx8mx6bf16 get_kernel_via_tuning(
 
 at::Tensor mx8mx6bf16(
     at::Tensor XQ, // MX FP8 (e4m3)
-    at::Tensor WQ, // MX FP6 (e2m3)
+    at::Tensor WQ, // MX FP6 (e2m3) — BIT-PACKED, see TORCH_CHECK below
     at::Tensor x_scale,
     at::Tensor w_scale,
     std::optional<at::Tensor> output) {
@@ -91,6 +91,18 @@ at::Tensor mx8mx6bf16(
   TORCH_CHECK(
       K % 32 == 0,
       "K must be a multiple of block size 32 for MX block-scaled GEMM");
+
+  // ElementB = cutlass::mx_float6_t<float_e2m3_t> has sizeof_bits == 6, so
+  // the kernel reads WQ as a bit-contiguous 6-bit stream (4 unpacked 6-bit
+  // values pack into 3 bytes, LSB-first). WQ sized [N, K*6/8] uint8.
+  TORCH_CHECK(
+      WQ.size(1) * 8 == K * 6,
+      "mx8mx6bf16: WQ must be bit-packed 6-bit (4 unpacked uint8s -> 3 ",
+      "packed bytes, LSB-first). Expected WQ.size(1) == K*6/8 == ",
+      K * 6 / 8,
+      ", got ",
+      WQ.size(1),
+      ". See _pack_fp6_e2m3() in gemm_test.py for the canonical packer.");
 
   if (M == 0 || N == 0 || K == 0) {
     return at::zeros({M, N}, XQ.options().dtype(at::kBFloat16));

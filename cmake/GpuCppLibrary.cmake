@@ -285,7 +285,6 @@ function(gpu_cpp_library)
     # Collect external libraries for linking
     set(library_dependencies
         ${TORCH_LIBRARIES}
-        ${NCCL_LIBRARIES}
         ${CUDA_DRIVER_LIBRARIES}
         ${args_DEPS})
 
@@ -300,9 +299,6 @@ function(gpu_cpp_library)
         ""
         "TORCH_LIBRARIES"
         "${TORCH_LIBRARIES}"
-        ""
-        "NCCL_LIBRARIES"
-        "${NCCL_LIBRARIES}"
         ""
         "CUDA_DRIVER_LIBRARIES"
         "${CUDA_DRIVER_LIBRARIES}"

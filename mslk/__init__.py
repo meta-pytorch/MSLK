@@ -18,7 +18,7 @@ def _load_library(filename: str, version: str, no_throw: bool = False) -> None:
         library_path = os.path.join(os.path.dirname(__file__), filename)
         torch.ops.load_library(library_path)
         torch.classes.load_library(library_path)
-        logging.info(f"Successfully loaded: '{filename}'")
+        logging.debug(f"Successfully loaded: '{filename}'")
 
     except Exception as error:
         logging.error(f"Could not load the library '{filename}'!\n\n\n{error}\n\n\n")

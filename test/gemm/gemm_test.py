@@ -7,6 +7,7 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import os
 import unittest
 from typing import Optional, Union
 
@@ -21,11 +22,10 @@ from mslk.gemm.fp4_autograd import (
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
-    get_nvfp4_global_scales_naive,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
-    quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
+    triton_quantize_nvfp4,
 )
 from mslk.quantize.triton.legacy.fp4_utils import (
     dequantize_nvfp4,
@@ -39,6 +39,7 @@ from mslk.utils.device import (
     is_gfx942,
     is_rocm,
     supports_float8_fnuz,
+from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -49,7 +50,11 @@ from mslk.testing.device import (
 from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
+    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
+    from mslk.quantize.mx_mixed_dtype_utils import (
+        pack_fp6_e2m3,
+        quantize_bf16_to_mx6_e2m3,
+    )
     from mslk.quantize.shuffle import quantize_int4_preshuffle
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
 
@@ -66,6 +71,7 @@ try:
 except ImportError:
     pass
 
+running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
 # Device gating for the GEMM kernels exercised in this file uses the shared skip
 # decorators from mslk.testing.device: the strict platform gates
@@ -220,7 +226,7 @@ def _fp8_gemm_cases() -> list[tuple]:
 
 
 def _fp8_batched_gemm_cases() -> list[tuple]:
-    modes = ["default"] + (["torch_3d3d"] if torch.version.hip else [])
+    modes = ["default", "torch_3d3d"]
     cases = []
     for mode in modes:
         for use_loopover in (True, False):
@@ -240,7 +246,13 @@ class ExportCompileTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+        fp8_dtype = (
+            torch.float8_e4m3fnuz
+            if supports_float8_fnuz(
+                throw_on_hip_incompatibility=(not running_on_github)
+            )
+            else torch.float8_e4m3fn
+        )
         cls.device = torch.accelerator.current_accelerator()
         cls.M = 256
         cls.N = 256
@@ -272,7 +284,7 @@ class ExportCompileTests(unittest.TestCase):
         model = TestModule().cuda()
         M, N, K = 256, 256, 256
         fp8_dtype = torch.float8_e4m3fn
-        if torch.version.hip:
+        if supports_float8_fnuz(throw_on_hip_incompatibility=(not running_on_github)):
             fp8_dtype = torch.float8_e4m3fnuz
         xq = torch.randn(M, K).to(fp8_dtype).cuda()
         wq = torch.randn(N, K).to(fp8_dtype).cuda()
@@ -345,7 +357,7 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
         )
 
 
-@skipUnlessGfxArch("gfx942")
+@skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9, 10)
 class FP8Tests(unittest.TestCase):
     @classmethod
@@ -848,6 +860,102 @@ class FP8Tests(unittest.TestCase):
 
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
+
+
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(9, 10)
+class FP8GroupwiseTests(unittest.TestCase):
+    """Correctness tests for the FP8 groupwise GEMM kernel (f8f8bf16_groupwise).
+
+    On CUDA the CUTLASS implementation is exercised; on ROCm the Triton kernel.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (128, 128, 256),  # small
+            (512, 1024, 2048),  # medium
+            (1, 128, 256),  # M=1 decode
+            (2048, 6144, 3584),  # large
+        ]
+    )
+    def test_f8f8bf16_groupwise(self, M: int, N: int, K: int) -> None:
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize: x_scale [K//128, M], w_scale [K//128, N//128]
+        xq, x_scale = quantize_fp8_group(x, k_major=False)
+        wq, w_scale = quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+
+        out = torch.ops.mslk.f8f8bf16_groupwise(xq, wq, x_scale, w_scale)
+        ref = (x @ w.t()).to(torch.bfloat16)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            # (m_values, N, K)
+            ([128, 64], 128, 256),  # small, 2 groups
+            ([512, 256, 128], 256, 512),  # medium, 3 groups
+            ([1, 128, 256], 128, 256),  # decode + prefill mix
+            ([2048, 1024], 512, 512),  # large, 2 groups
+        ]
+    )
+    def test_f8f8bf16_groupwise_grouped(self, m_values: list, N: int, K: int) -> None:
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        G = len(m_values)
+        device = self.device
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=device)
+        TotalM = sum(m_values)
+
+        x = torch.randn((TotalM, K), dtype=torch.bfloat16, device=device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=device) * 0.01
+            for _ in range(G)
+        ]
+
+        # Quantize weights: each [N, K] -> wq [N, K], w_scale [K//128, N//128].
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()  # [G, N, K]
+        w_scale = torch.stack(ws_list, dim=0).contiguous()  # [G, K//128, N//128]
+
+        # Quantize activations: xq [TotalM, K], x_scale [K//128, TotalM].
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
+            xq, wq, x_scale, w_scale, m_sizes
+        )
+
+        # BF16 reference: compute per group and concatenate.
+        ref_parts = []
+        row = 0
+        for g, m_g in enumerate(m_values):
+            ref_parts.append((x[row : row + m_g] @ ws[g].t()).to(torch.bfloat16))
+            row += m_g
+        ref = torch.cat(ref_parts, dim=0)
+
+        self.assertFalse(out.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out.isinf().any().item(), "Output contains Inf")
+        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
 
 
 @skipUnlessCuda()
@@ -1425,7 +1533,7 @@ class FP8Int4Tests(unittest.TestCase):
             )
 
 
-@skipUnlessCuda()
+@skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP8Tests(unittest.TestCase):
     @classmethod
@@ -1449,7 +1557,6 @@ class MXFP8Tests(unittest.TestCase):
     ) -> None:
         # Simulate 2d-2d grouped gemm in backward pass `grad_weight = grad_output_t @ input`,
         # where we use "K" as the contracting dim which has "G" groups.
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         total_K = K  # Alias for clarity, communicating this consists of several groups along this dim
         input_group_end_offsets = generate_jagged_offs(
@@ -1551,8 +1658,6 @@ class MXFP8Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         # Simulate 2d-3d grouped gemm `out = input @ weight.t()`
         # 2D inputs with groups along M, 3D weights.
         block_size = 32
@@ -1640,7 +1745,6 @@ class MXFP8Tests(unittest.TestCase):
         1. Output with hint matches output without hint (same GEMM, different tile)
         2. Output matches bf16 reference
         """
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
         block_size = 32
         actual_total_M = M_per_group * G
@@ -1757,24 +1861,43 @@ class BF16Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    def generate_random_splits(G: int, M: int) -> torch.Tensor:
-        if M > 0:
+    def generate_random_splits(G: int, M: int, min_group_size: int = 1) -> torch.Tensor:
+        device = torch.accelerator.current_accelerator()
+        if M <= 0:
+            return torch.zeros((G,), dtype=torch.int32, device=device)
+
+        if min_group_size <= 1:
             m_cumsums = torch.sort(
                 torch.randint(
                     0,
                     M,
                     (G + 1,),
                     dtype=torch.int32,
-                    device=torch.accelerator.current_accelerator(),
+                    device=device,
                 )
             ).values
             m_cumsums[0], m_cumsums[-1] = 0, M
             m_sizes = m_cumsums[1:] - m_cumsums[:-1]
             return m_sizes
-        else:
-            return torch.zeros(
-                (G,), dtype=torch.int32, device=torch.accelerator.current_accelerator()
-            )
+
+        # Constrained splits: every non-empty group must have at least
+        # `min_group_size` rows (the contract enforced by the ROCm grad/wgrad
+        # Triton kernels). We quantize M into blocks of `min_group_size`,
+        # randomly assign those blocks across groups (groups that receive no
+        # block stay empty, which is allowed), then add the leftover remainder
+        # to the first non-empty group so the sizes still sum to exactly M.
+        num_blocks = M // min_group_size
+        remainder = M - num_blocks * min_group_size
+        block_counts = torch.zeros(G, dtype=torch.int64, device=device)
+        if num_blocks > 0:
+            idx = torch.randint(0, G, (num_blocks,), device=device)
+            block_counts.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.int64))
+        m_sizes = block_counts * min_group_size
+        if remainder > 0:
+            nz = torch.nonzero(m_sizes, as_tuple=False)
+            first = int(nz[0].item()) if nz.numel() > 0 else 0
+            m_sizes[first] += remainder
+        return m_sizes.to(torch.int32)
 
     @parameterized.expand(
         [
@@ -1790,7 +1913,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_wgrad(
         self,
         G: int,
@@ -1809,7 +1931,8 @@ class BF16Tests(unittest.TestCase):
             (M, K), dtype=dtype, device=torch.accelerator.current_accelerator()
         )
 
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm wgrad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         # Test
         if output_accum:
@@ -1898,7 +2021,6 @@ class BF16Tests(unittest.TestCase):
             ]
         ]
     )
-    @skipUnlessCuda()
     def test_grouped_gemm_dgrad(
         self,
         G: int,
@@ -1918,7 +2040,8 @@ class BF16Tests(unittest.TestCase):
             dtype=dtype,
             device=torch.accelerator.current_accelerator(),
         )
-        m_sizes = BF16Tests.generate_random_splits(G, M)
+        # ROCm grad kernel requires every non-empty group to have >= 8 rows.
+        m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         sm_margin = 0
         num_sms = (
@@ -2183,20 +2306,20 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        global_scales, a_global_scales, b_global_scales = get_nvfp4_global_scales_naive(
-            [A],
-            [B],
-        )
-        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+        a_global_scale = global_scale_nvfp4(A)
+        b_global_scale = global_scale_nvfp4(B)
+        aq, a_scale = triton_quantize_nvfp4(A, a_global_scale)
+        bq, b_scale = triton_quantize_nvfp4(B, b_global_scale)
+        global_scale = torch.reciprocal(a_global_scale * b_global_scale)
 
         out_nvfp4 = torch.ops.mslk.f4f4bf16(
-            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+            aq, bq, a_scale, b_scale, None, global_scale
         )
         out_bf16 = A @ B.t()
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
 
+    # NVFP4 grouped GEMM is CUDA-only (TCGen5-swizzled layout + CUTLASS kernel).
     @parameterized.expand(
         [
             (1, 256, 256, 2048),  # small
@@ -2221,20 +2344,19 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
-        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=0)
         W = torch.stack(WS, dim=0)
+        m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(X, m_sizes)
+        w_cat = W.reshape(G * N, K)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        xq, x_scale = nvfp4_quantize_stacked(m_sizes, X, x_global_scale)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2271,20 +2393,27 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
-        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=1)
         W = torch.cat(WS, dim=1)
+        x_stacked = torch.cat(XS, dim=0)
+        w_stacked = torch.cat(WS, dim=0)
+        x_m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(x_stacked, x_m_sizes)
+        w_global_scale, _ = calculate_group_max(w_stacked, w_m_sizes)
+        xq_stacked, x_scale_2d = nvfp4_quantize_stacked(
+            x_m_sizes, x_stacked, x_global_scale
+        )
+        wq_stacked, w_scale_2d = nvfp4_quantize_stacked(
+            w_m_sizes, w_stacked, w_global_scale
+        )
+        xq = xq_stacked.view(G, M, K // 2).transpose(0, 1).reshape(M, G * K // 2)
+        wq = wq_stacked.view(G, N, K // 2).transpose(0, 1).reshape(N, G * K // 2)
+        padded_M = triton.cdiv(M, 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
+        x_scale = x_scale_2d[: G * padded_M].view(G, padded_M, -1)
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2319,7 +2448,7 @@ class NVFP4Tests(unittest.TestCase):
             w_global_scale,
         )
         wq = wq.view(G, N, K // 2)
-        padded_N = ((N + 127) // 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
         w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
         w_global_scale_inv = torch.reciprocal(w_global_scale)
 
@@ -2381,7 +2510,7 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
-@skipUnlessCuda()
+@skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
     @classmethod
@@ -2469,8 +2598,68 @@ class MXFP4Tests(unittest.TestCase):
             (1, 256, 256, 2048),  # small
             (4, 500, 1024, 2048),  # medium
             (16, 3500, 6144, 3584),  # large
+            (3, None, 512, 2048),  # uneven: m_sizes_list=[64, 232, 600]
         ]
     )
+    def test_grouped_stacked_gemm(
+        self,
+        G: int,
+        M,  # int for even case, None for uneven case
+        N: int,
+        K: int,
+    ) -> None:
+        """f4f4bf16_grouped_stacked uses per-expert M sizes, not offsets."""
+        if M is None:
+            m_sizes_list = [64, 232, 600]
+            assert len(m_sizes_list) == G
+        else:
+            m_sizes_list = [M] * G
+
+        XS = [
+            torch.randn((m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for m in m_sizes_list
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        M_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq, x_scale = triton_quantize_mx4_unpack(x)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            xqs.append(xq)
+            wqs.append(wq)
+            x_scales.append(x_scale)
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.cat(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+        offsets_for_ref = torch.cumsum(M_sizes, dim=0).to(torch.int32)
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets_for_ref, out_dtype=torch.bfloat16
+        )
+
+        out_mxfp4 = torch.ops.mslk.f4f4bf16_grouped_stacked(
+            xq, wq, x_scale, w_scale, M_sizes
+        )
+        self.assertTrue(out_mxfp4.isfinite().all(), "output contains non-finite values")
+        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+
+    @parameterized.expand(
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+        ]
+    )
+    @skipUnlessCuda()
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
@@ -2733,8 +2922,6 @@ class MX8MX4Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
@@ -2773,8 +2960,6 @@ class MX8MX4Tests(unittest.TestCase):
         N: int,
         K: int,
     ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         XS = [
             torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
             for _ in range(G)
@@ -2826,8 +3011,6 @@ class MX8MX4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
 
     def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
         G = 8
         N = 1024
         K = 2048
@@ -2894,34 +3077,67 @@ class MX8MX6Tests(unittest.TestCase):
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
+        torch.manual_seed(0)
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        # Quantize A to MX8 with blocked scale layout
+        # MX8 activation with blocked scale layout.
         (a_scale_raw, aq) = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
 
-        # Quantize B: use MX8 quantization for scale factors (E8M0 BS32),
-        # then create E2M3 weight data from the MX8 data.
-        # E2M3 is stored as 1 byte per element (6-bit value in uint8).
-        # We use the FP8 data masked to 6 bits as a proxy for E2M3.
-        (b_scale_raw, bq_fp8) = to_mxfp8(B)
+        # MX6 weight: BF16 -> unpacked E2M3 bytes -> bit-packed for the
+        # cutlass 6-bit-stream layout. Scale is E8M0 blocked for TMA.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        bq = pack_fp6_e2m3(wq_unpacked)
         b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
             torch.uint8
         )
-        bq = bq_fp8.view(torch.uint8) & 0x3F  # mask to 6 bits for E2M3 range
 
         out_mx8mx6 = torch.ops.mslk.mx8mx6bf16(aq, bq, a_scale, b_scale)
+        out_bf16 = A @ B.t()
 
-        # Smoke test: no NaN or Inf
         self.assertFalse(out_mx8mx6.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out_mx8mx6.isinf().any().item(), "Output contains Inf")
-        # Output shape check
         self.assertEqual(out_mx8mx6.shape, (M, N))
+        torch.testing.assert_close(out_mx8mx6, out_bf16, atol=1.0e-1, rtol=1.0e-1)
+
+        ref = out_bf16.float()
+        err = out_mx8mx6.float() - ref
+        mask = ref != 0
+        signal_power = (ref[mask] ** 2).sum()
+        noise_power = (err[mask] ** 2).sum().clamp(min=1e-30)
+        sqnr_db = (10.0 * torch.log10(signal_power / noise_power)).item()
+        self.assertGreater(
+            sqnr_db,
+            20.0,
+            f"mx8mx6 SQNR {sqnr_db:.2f} dB below 20 dB floor (M={M}, N={N}, K={K})",
+        )
+
+    def test_unpacked_weight_raises(self) -> None:
+        """Feeding 1-byte-per-element (unpacked) bytes to mx8mx6bf16 must
+        trip the WQ shape TORCH_CHECK in mx8mx6bf16.cu, not silently produce
+        garbage output."""
+        M, N, K = 64, 256, 2048
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
+            torch.uint8
+        )
+
+        # Unpacked weight: 1 byte per element instead of K*6/8 packed bytes.
+        # Exactly what the old test (and any naive caller) would produce.
+        wq_unpacked, b_scale_raw = quantize_bf16_to_mx6_e2m3(B, block_size=32)
+        b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
+            torch.uint8
+        )
+        self.assertEqual(wq_unpacked.shape, (N, K))  # confirm "wrong" shape
+
+        with self.assertRaisesRegex(RuntimeError, "bit-packed 6-bit"):
+            torch.ops.mslk.mx8mx6bf16(aq, wq_unpacked, a_scale, b_scale)
 
 
 @skipUnlessCuda()
@@ -2967,6 +3183,44 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertFalse(out_mx6mx6.isinf().any().item(), "Output contains Inf")
         self.assertEqual(out_mx6mx6.shape, torch.Size([M, N]))
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
+
+    @parameterized.expand(
+        [
+            # K < 32768 so `splits=0` stays on the dense path (the heuristic only
+            # auto-routes K>=32768); forcing `splits>0` exercises CUTLASS split-K
+            # on the same inputs. K divisible by 32*splits.
+            (64, 256, 8192, 4),
+            (64, 256, 8192, 8),
+            (256, 512, 16384, 4),
+        ]
+    )
+    def test_splitk_matches_dense(self, M: int, N: int, K: int, splits: int) -> None:
+        # CUTLASS split-K must match the single-CTA dense path on identical inputs.
+        # Random 6-bit-packed bytes as in test_gemm (no Python MX6 quantizer), so
+        # this is a dense-vs-split-K self-consistency check. The split-K fp32
+        # reduction sums per-chunk partials in a different order than the dense
+        # single-pass accumulation, so results agree only to bf16 tolerance.
+        aq_6 = torch.randint(
+            0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        bq_6 = torch.randint(
+            0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        _, a_scale = triton_quantize_mx4_unpack(
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        )
+        _, b_scale = triton_quantize_mx4_unpack(
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+        )
+
+        out_dense = torch.ops.mslk.mx6mx6bf16(aq_6, bq_6, a_scale, b_scale, None, 0)
+        out_splitk = torch.ops.mslk.mx6mx6bf16(
+            aq_6, bq_6, a_scale, b_scale, None, splits
+        )
+
+        self.assertFalse(out_splitk.isnan().any().item(), "split-K output has NaN")
+        self.assertEqual(out_splitk.shape, torch.Size([M, N]))
+        torch.testing.assert_close(out_splitk, out_dense, rtol=1.6e-2, atol=1e-2)
 
 
 @skipUnlessGfxArch("gfx942", "gfx950")

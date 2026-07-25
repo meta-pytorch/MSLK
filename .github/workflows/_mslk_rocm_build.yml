@@ -122,6 +122,9 @@ jobs:
     - name: Prepare MSLK Build
       run: . $PRELUDE; prepare_mslk_build $BUILD_ENV
 
+    - name: Pre-compile FlyDSL kernels (AOT)
+      run: . $PRELUDE; compile_flydsl_aot $BUILD_ENV
+
     - name: Build MSLK Wheel
       run: |
         . $PRELUDE

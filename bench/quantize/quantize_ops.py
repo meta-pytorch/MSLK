@@ -13,12 +13,15 @@ import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.quantize.triton.fp4_quantize import (
     calculate_group_max,
-    mega_fp4_quantize_kernel,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
     triton_quantize_nvfp4,
 )
-from mslk.quantize.triton.fp4_utils import dequantize_nvfp4, global_scale_nvfp4
+from mslk.quantize.triton.fp4_utils import (
+    dequantize_mx4,
+    dequantize_nvfp4,
+    global_scale_nvfp4,
+)
 from mslk.quantize.triton.fp8_quantize import (
     dequantize_fp8_block,
     dequantize_fp8_row,
@@ -27,6 +30,8 @@ from mslk.quantize.triton.fp8_quantize import (
     triton_quantize_fp8_group,
     triton_quantize_fp8_tensor,
 )
+from mslk.quantize.triton.quantize_kernels.mx4 import quantize_mx4
+from mslk.quantize.triton.quantize_kernels.mx4_stacked import quantize_mx4_stacked
 from mslk.utils.device import is_cuda, is_rocm
 
 
@@ -350,7 +355,30 @@ class TritonNVFP4StackedTokenScale(QuantizeOpBase):
 
 
 @register_op
-class MegaFP4Quantize(QuantizeOpBase):
+class TritonMXFP4(QuantizeOpBase):
+    """MXFP4 quantize via quantize_kernels.mx4.quantize_mx4."""
+
+    def quantize(self, input: torch.Tensor, *args: Any) -> Any:
+        xq, scales = quantize_mx4(input)
+        return xq, scales
+
+    def dequantize(self, *args: Any) -> torch.Tensor:
+        xq, scales = args[0], args[1]
+        return dequantize_mx4(xq, scales)
+
+    @property
+    def hip(self) -> bool:
+        return False
+
+    @property
+    def cuda(self) -> bool:
+        return True
+
+
+@register_op
+class TritonMXFP4Stacked(QuantizeOpBase):
+    """Stacked (MoE) MXFP4 quantize via quantize_kernels.mx4_stacked."""
+
     def __init__(self) -> None:
         super().__init__()
         self.input_shape: tuple[int, ...] = (0, 0)
@@ -363,19 +391,15 @@ class MegaFP4Quantize(QuantizeOpBase):
         remainder = M % num_groups
         sizes = [base + (1 if i < remainder else 0) for i in range(num_groups)]
         m_sizes = torch.tensor(sizes, dtype=torch.int64, device=input.device)
-        x_global_scale, _ = calculate_group_max(input, m_sizes)
-        return (m_sizes, x_global_scale)
+        return (m_sizes,)
 
     def quantize(self, input: torch.Tensor, *args: Any) -> Any:
         m_sizes: torch.Tensor = args[0]
-        x_global_scale: torch.Tensor = args[1]
-        xq, scale, starting_row_after_padding = mega_fp4_quantize_kernel(
-            m_sizes, input, x_global_scale
-        )
-        return xq, scale, starting_row_after_padding
+        xq, scales = quantize_mx4_stacked(m_sizes, input)
+        return xq, scales
 
     def dequantize(self, *args: Any) -> torch.Tensor:
-        # Mega kernel output has padded rows; return zeros matching original input shape.
+        # Grouped dequant is complex due to per-segment padding; return zeros.
         return torch.zeros(
             self.input_shape, dtype=torch.bfloat16, device=args[0].device
         )

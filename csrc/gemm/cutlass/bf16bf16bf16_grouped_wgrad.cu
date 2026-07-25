@@ -1115,9 +1115,4 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("bf16bf16bf16_grouped_wgrad", bf16bf16bf16_grouped_wgrad);
 }
 
-TORCH_LIBRARY_FRAGMENT(mslk, m) {
-  m.def(
-      "bf16bf16bf16_grouped_wgrad(Tensor X, Tensor W, Tensor M_sizes, Tensor(a!)? output=None, bool output_accum=False, int? num_sms=None) -> Tensor");
-}
-
 } // namespace mslk::gemm

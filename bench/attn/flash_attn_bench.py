@@ -161,9 +161,6 @@ def benchmark(
 @click.option(
     "--window-size", default=0, type=int, help="Sliding window size (0 = no window)."
 )
-@click.option(
-    "--num-iters", default=1, type=int, help="Number of benchmark iterations."
-)
 @click.option("--no-cuda-graph", is_flag=True, help="Disable CUDA graphs.")
 @click.option("--export-csv", is_flag=True, help="Export results to CSV.")
 @click.option("--output-dir", default="/tmp", help="Directory for output files.")
@@ -186,19 +183,13 @@ def invoke_main(
     d: int,
     causal: bool,
     window_size: int,
-    num_iters: int,
     no_cuda_graph: bool,
     export_csv: bool,
     output_dir: str,
     shapes: Optional[str],
     rep: int,
 ) -> None:
-    if num_iters < 1:
-        print("Warning: Number of iterations must be at least 1.")
-        num_iters = 1
-
     opts = BenchOptions(
-        num_iters=num_iters,
         cuda_graph=not no_cuda_graph,
         rep_ms=rep,
     )
@@ -220,10 +211,9 @@ def invoke_main(
 
     for B, N, H, H_kv, D in shape_list:
         print(f"Benchmarking B={B}, N={N}, H={H}, H_kv={H_kv}, D={D}")
-        for _ in range(num_iters):
-            m = benchmark(B, N, H, H_kv, D, causal, window_size, opts)
-            results.append(m)
-            csv_rows.append(m.as_dict())
+        m = benchmark(B, N, H, H_kv, D, causal, window_size, opts)
+        results.append(m)
+        csv_rows.append(m.as_dict())
 
     # Print results.
     print("")

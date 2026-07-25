@@ -137,6 +137,9 @@ jobs:
     - name: Install MSLK dependencies (pip)
       run: . $PRELUDE; install_mslk_deps $BUILD_ENV
 
+    - name: Install FlyDSL
+      run: . $PRELUDE; install_flydsl_pip $BUILD_ENV
+
     - name: Download Wheel Artifact from GHA
       if: ${{ inputs.mslk-channel-version == '' }}
       uses: actions/download-artifact@v4
@@ -153,7 +156,10 @@ jobs:
 
     - name: Test with PyTest
       if: ${{ inputs.run-target == 'test' }}
-      timeout-minutes: 60
+      # Bumped from 60 -> 90: on ROCm the Triton-autotuned GEMM tests (fp8 and
+      # grouped GEMM) compile many kernels under hipcc, so the full sequential
+      # suite now exceeds 60 min. See D110137656.
+      timeout-minutes: 90
       run: . $PRELUDE; test_all_mslk_modules $BUILD_ENV
 
     - name: Run MSLK Benchmark

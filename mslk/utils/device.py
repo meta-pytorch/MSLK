@@ -20,6 +20,7 @@ feature-support flags), see ``mslk.testing.device``.
 
 import functools
 import logging
+import os
 from collections.abc import Iterable
 
 import torch
@@ -105,6 +106,17 @@ def is_gfx950() -> bool:
     return is_rocm() and gfx_arch_in(["gfx950"])
 
 
+# When set to "1" / "true" / "yes", forces MSLK to use AMD fnuz FP8
+# (torch.float8_e4m3fnuz / tl.float8e4b8) even on gfx950 (MI350X), which
+# natively uses OCP FP8 (torch.float8_e4m3fn).  Useful for debugging or when
+# interoperating with code that always produces fnuz tensors.
+_FORCE_FP8_FNUZ: bool = os.getenv("MSLK_ROCM_FORCE_FP8FNUZ_TYPE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
 @functools.lru_cache
 def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
     """Whether the current device uses the FP8 ``fnuz`` format (ROCm only).
@@ -120,8 +132,11 @@ def supports_float8_fnuz(throw_on_hip_incompatibility: bool = True) -> bool:
         return False
 
     # gfx942 (MI300) reports (9, 4) and gfx950 (MI350) reports (9, 5).
-    if torch.cuda.get_device_capability() >= (9, 4):
-        return True
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability >= (9, 4):
+        if _FORCE_FP8_FNUZ or device_capability == (9, 4):
+            return True
+        return False
 
     msg = f"Unsupported GPU arch: {get_gfx_arch_name()} for FP8"
     if throw_on_hip_incompatibility:

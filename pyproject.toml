@@ -25,3 +25,10 @@ excludes = [
 # not do first-party namespace detection), so disable it here to match.
 [tool.usort]
 first_party_detection = false
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # amdsmi emits DeprecationWarnings on Python 3.14+ that are pre-existing
+    # noise unrelated to mslk; suppress to keep test output clean.
+    "ignore::DeprecationWarning:amdsmi",
+]
