@@ -10,7 +10,7 @@ import os
 import unittest
 from unittest import mock
 
-from mslk.utils import flydsl_aot
+from mslk.flydsl import aot
 
 
 def _fake_kernel_module() -> mock.Mock:
@@ -46,10 +46,10 @@ class FlyDSLAOTTest(unittest.TestCase):
     def test_collect_jobs_is_cartesian_product(self) -> None:
         mod = _fake_kernel_module()
         with (
-            mock.patch.object(flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
+            mock.patch.object(aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
             mock.patch("importlib.import_module", return_value=mod),
         ):
-            jobs = flydsl_aot.collect_aot_jobs()
+            jobs = aot.collect_aot_jobs()
         # 2 archs x 2 configs = 4 jobs.
         self.assertEqual(len(jobs), 4)
         self.assertEqual({arch for _, _, arch in jobs}, {"gfx942", "gfx950"})
@@ -67,19 +67,19 @@ class FlyDSLAOTTest(unittest.TestCase):
         mod.compile_aot_config = _record
 
         with (
-            mock.patch.object(flydsl_aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
+            mock.patch.object(aot, "_AOT_KERNEL_MODULES", ["fake.kernel"]),
             mock.patch("importlib.import_module", return_value=mod),
-            mock.patch.object(flydsl_aot, "ProcessPoolExecutor", _InlineExecutor),
+            mock.patch.object(aot, "ProcessPoolExecutor", _InlineExecutor),
         ):
-            flydsl_aot.compile_aot("/tmp/mslk_aot_unittest")
+            aot.compile_aot("/tmp/mslk_aot_unittest")
 
         self.assertEqual(seen["COMPILE_ONLY"], "1")
         self.assertEqual(seen["cache_dir"], "/tmp/mslk_aot_unittest")
 
     def test_compile_only_env_restored_after(self) -> None:
         before = os.environ.get("COMPILE_ONLY")
-        with mock.patch.object(flydsl_aot, "_AOT_KERNEL_MODULES", []):
-            flydsl_aot.compile_aot("/tmp/mslk_aot_unittest")
+        with mock.patch.object(aot, "_AOT_KERNEL_MODULES", []):
+            aot.compile_aot("/tmp/mslk_aot_unittest")
         self.assertEqual(os.environ.get("COMPILE_ONLY"), before)
 
 

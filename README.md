@@ -13,11 +13,11 @@ primitives for GenAI training and inference.
 # Install MSLK for CUDA
 pip install mslk --index-url https://download.pytorch.org/whl/cu130
 # Install MSLK for ROCm
-pip install mslk --index-url https://download.pytorch.org/whl/rocm7.1/
+pip install mslk --index-url https://download.pytorch.org/whl/rocm7.1/ --extra-index-url https://pypi.org/simple
 # Install a nightly CUDA version
 pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu130
 # Install a nightly ROCm version
-pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm7.1/
+pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm7.1/ --extra-index-url https://pypi.org/simple
 ```
 
 ## Release Compatibility Table
@@ -51,20 +51,38 @@ pytest test/conv/conv_test.py
 
 ## **Build From Source**
 We only support building on Linux. See the release compatibility table above for supported versions of Python, CUDA, ROCm.
+
+First clone the repo and its submodules (shared by all variants):
 ```bash
-# Clone repo
 git clone https://github.com/meta-pytorch/MSLK
 cd MSLK
 git submodule sync
 git submodule update --init --recursive
-# Build and install
-# The script will create a conda environment and install the required dependencies.
-# The conda environment will look something like: build-py3.14-torchnightly-cuda12.9.1
+```
+Then build for your target variant (**CUDA/ROCm**) using one of the sections below.
+
+### **CUDA Build**
+```bash
+# Creates a conda environment and installs dependencies.
+# The conda env will look something like: build-py3.14-torchnightly-cuda12.9.1
 ./ci/integration/mslk_oss_build.bash
-# After the initial environment setup, you can activate the environment and iterate faster:
+# After the initial setup, activate the env and iterate faster:
 conda activate build-py3.14-torchnightly-cuda12.9.1
 python setup.py install
 ```
+
+### **ROCm Build**
+```bash
+# Creates a conda environment and installs dependencies (ROCm variant).
+# BUILD_ROCM_VERSION must match torch.version.hip.
+BUILD_VARIANT=rocm BUILD_ROCM_VERSION=7.1 ./ci/integration/mslk_oss_build.bash
+# After the initial setup, activate the env and iterate faster
+# (gfx942 = MI300, gfx950 = MI350; comma-separate lists for multiple archs):
+conda activate build-py3.14-torchnightly-rocm7.1
+PYTORCH_ROCM_ARCH=gfx942 BUILD_ROCM_VERSION=7.1 \
+  python setup.py install --build-variant=rocm -DAMDGPU_TARGETS=gfx942 -DHIP_ROOT_DIR=/opt/rocm
+```
+The OSS script installs ROCm and breaks if a different ROCm is already present (build directly with `setup.py` instead).
 
 ### **Python-Only Build**
 If you don't need the C++/CUDA kernels (e.g. for testing Python only changes), you can install MSLK in Python-only mode by setting the `MSLK_PYTHON_ONLY` environment variable. This skips the C++/CUDA compilation entirely.

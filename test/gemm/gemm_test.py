@@ -18,12 +18,12 @@ import triton  # noqa: F401
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
-    get_nvfp4_global_scales_naive,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
-    quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
+    triton_quantize_nvfp4,
 )
+from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -2290,15 +2290,14 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        global_scales, a_global_scales, b_global_scales = get_nvfp4_global_scales_naive(
-            [A],
-            [B],
-        )
-        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+        a_global_scale = global_scale_nvfp4(A)
+        b_global_scale = global_scale_nvfp4(B)
+        aq, a_scale = triton_quantize_nvfp4(A, a_global_scale)
+        bq, b_scale = triton_quantize_nvfp4(B, b_global_scale)
+        global_scale = torch.reciprocal(a_global_scale * b_global_scale)
 
         out_nvfp4 = torch.ops.mslk.f4f4bf16(
-            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+            aq, bq, a_scale, b_scale, None, global_scale
         )
         out_bf16 = A @ B.t()
 
@@ -2329,20 +2328,19 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
-        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=0)
         W = torch.stack(WS, dim=0)
+        m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(X, m_sizes)
+        w_cat = W.reshape(G * N, K)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        xq, x_scale = nvfp4_quantize_stacked(m_sizes, X, x_global_scale)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2379,20 +2377,27 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
-        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=1)
         W = torch.cat(WS, dim=1)
+        x_stacked = torch.cat(XS, dim=0)
+        w_stacked = torch.cat(WS, dim=0)
+        x_m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(x_stacked, x_m_sizes)
+        w_global_scale, _ = calculate_group_max(w_stacked, w_m_sizes)
+        xq_stacked, x_scale_2d = nvfp4_quantize_stacked(
+            x_m_sizes, x_stacked, x_global_scale
+        )
+        wq_stacked, w_scale_2d = nvfp4_quantize_stacked(
+            w_m_sizes, w_stacked, w_global_scale
+        )
+        xq = xq_stacked.view(G, M, K // 2).transpose(0, 1).reshape(M, G * K // 2)
+        wq = wq_stacked.view(G, N, K // 2).transpose(0, 1).reshape(N, G * K // 2)
+        padded_M = triton.cdiv(M, 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
+        x_scale = x_scale_2d[: G * padded_M].view(G, padded_M, -1)
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2427,7 +2432,7 @@ class NVFP4Tests(unittest.TestCase):
             w_global_scale,
         )
         wq = wq.view(G, N, K // 2)
-        padded_N = ((N + 127) // 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
         w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
         w_global_scale_inv = torch.reciprocal(w_global_scale)
 

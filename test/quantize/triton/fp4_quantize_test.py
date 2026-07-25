@@ -473,14 +473,22 @@ class TestNVFP4QuantizeStacked:
         cumsum = [0] + [sum(m_sizes_list[: i + 1]) for i in range(num_experts)]
         for i in range(num_experts):
             start, end = cumsum[i], cumsum[i + 1]
+            num_expert_rows = end - start
             expert_data = x[start:end]
             _, scale_ref = triton_quantize_nvfp4(expert_data, global_scales[i])
-            scale_ref_u8 = scale_ref.view(torch.uint8)
 
             ps = padded_cumsum[i]
             pe = padded_cumsum[i + 1]
             scale_expert = scale_stacked_u8[ps:pe, :padded_cols]
-            torch.testing.assert_close(scale_expert, scale_ref_u8)
+            scale_expert = _from_blocked(
+                scale_expert,
+                (num_expert_rows, num_scales_per_row),
+            )
+            scale_ref = _from_blocked(
+                scale_ref.view(torch.uint8),
+                (num_expert_rows, num_scales_per_row),
+            )
+            torch.testing.assert_close(scale_expert, scale_ref)
 
     @pytest.mark.parametrize("num_experts,m_sizes_list,K", MOE_SHAPES)
     def test_dequant_roundtrip(

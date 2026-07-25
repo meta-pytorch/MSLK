@@ -23,6 +23,17 @@ from setuptools.command.install import install as PipInstall
 
 _PYTHON_ONLY = os.environ.get("MSLK_PYTHON_ONLY", "0") == "1"
 
+# Single source of truth for the FlyDSL pin, shared with CI.
+_FLYDSL_VERSION_FILE = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "ci", "flydsl_version.txt"
+)
+
+
+def _flydsl_version() -> str:
+    with open(_FLYDSL_VERSION_FILE, encoding="utf-8") as f:
+        return f.read().strip()
+
+
 if _PYTHON_ONLY:
     _setup_fn = setuptools.setup
 else:
@@ -35,7 +46,22 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _detect_build_variant() -> str:
-    """Auto-detect the build variant based on the installed PyTorch."""
+    """Auto-detect the build variant (cpu/cuda/rocm).
+
+    Uses CU_VERSION when set (the CI signal), otherwise introspects the
+    installed PyTorch. Torch is imported lazily so this also works in
+    python-only source installs, where torch is present in the environment
+    but not imported at module load; it degrades to cpu when torch is absent.
+    """
+    cu_version = os.environ.get("CU_VERSION", "")
+    if cu_version.startswith("rocm"):
+        return "rocm"
+    if cu_version.startswith("cu"):
+        return "cuda"
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
     if torch.version.hip is not None:
         return "rocm"
     if torch.version.cuda is not None:
@@ -668,11 +694,6 @@ def main(argv: List[str]) -> None:
         "flash3": ["flash-attn-3"],
     }
 
-    # FlyDSL is a ROCm-only backend; also offered on variant-agnostic
-    # python-only builds.
-    if _PYTHON_ONLY or build.variant() == "rocm":
-        extras_require["flydsl"] = ["flydsl==0.2.2"]
-
     packages = setuptools.find_packages()
 
     # When building with FB code in python-only mode, include fb/ packages
@@ -709,7 +730,14 @@ def main(argv: List[str]) -> None:
             # release version of torch, which is not what we want for the
             # nightly and test packages
             "numpy",
-        ],
+        ]
+        # FlyDSL is a mandatory ROCm-only backend.
+        + (
+            [f"flydsl=={_flydsl_version()}"]
+            if (build.variant() if not _PYTHON_ONLY else _detect_build_variant())
+            == "rocm"
+            else []
+        ),
         extras_require=extras_require,
         # PyPI package information
         classifiers=[

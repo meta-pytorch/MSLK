@@ -35,8 +35,9 @@ install_flydsl_pip () {
     return 0
   fi
 
-  # Keep this pin in sync with the `flydsl` extra in setup.py.
-  local flydsl_version="0.2.2"
+  # Single source of truth for the FlyDSL pin, shared with setup.py.
+  # shellcheck disable=SC2155
+  local flydsl_version=$(tr -d '[:space:]' < "$( dirname -- "$BASH_SOURCE"; )/../flydsl_version.txt")
 
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
@@ -85,5 +86,5 @@ compile_flydsl_aot () {
   # native library, which is not built at this point in the pipeline.
   echo "[BUILD] Pre-compiling FlyDSL kernels into the bundled cache ..."
   # shellcheck disable=SC2086
-  (MSLK_PYTHON_ONLY=1 conda run --no-capture-output ${env_prefix} python -m mslk.utils.flydsl_aot) || return 1
+  (MSLK_PYTHON_ONLY=1 conda run --no-capture-output ${env_prefix} python -m mslk.flydsl.aot) || return 1
 }
