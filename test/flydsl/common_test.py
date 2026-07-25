@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import importlib
 import unittest
 from unittest import mock
 
@@ -31,6 +32,16 @@ class FlyDSLCommonTest(unittest.TestCase):
     def test_require_passes_when_available(self) -> None:
         with mock.patch.object(common, "is_flydsl_available", return_value=True):
             common.require_flydsl()
+
+    def test_attention_wrapper_is_lazy_when_flydsl_unavailable(self) -> None:
+        with mock.patch.object(common, "is_flydsl_available", return_value=False):
+            attention_flydsl = importlib.import_module("mslk.attention.flydsl")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"Install it with `pip install flydsl`",
+            ):
+                attention_flydsl.flydsl_flash_attn_func()
 
 
 if __name__ == "__main__":
