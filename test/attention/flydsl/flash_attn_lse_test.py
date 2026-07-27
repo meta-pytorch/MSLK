@@ -15,18 +15,37 @@ import torch
 from mslk.attention.flydsl import flydsl_flash_attn_func
 from mslk.flydsl.common import is_flydsl_available
 
+# The MSLK attention port requires the FlyDSL API introduced in 0.2.3
+# (e.g. flydsl._mlir.dialects.fly_rocdl.TargetAddressSpace). Older wheels
+# are skipped rather than failing with an ImportError at call time.
+_MIN_FLYDSL_VERSION = (0, 2, 3)
+
+
+def _flydsl_version_at_least(minimum: tuple) -> bool:
+    try:
+        import flydsl
+    except Exception:
+        return False
+    parts = []
+    for token in getattr(flydsl, "__version__", "0").split("."):
+        if not token.isdigit():
+            break
+        parts.append(int(token))
+    return tuple(parts) >= minimum
+
 
 def _has_supported_flydsl_environment() -> bool:
     return (
         torch.cuda.is_available()
         and torch.version.hip is not None
         and is_flydsl_available()
+        and _flydsl_version_at_least(_MIN_FLYDSL_VERSION)
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_flydsl_environment(),
-    reason="requires a ROCm GPU supported by FlyDSL",
+    reason="requires a ROCm GPU and FlyDSL >= 0.2.3",
 )
 
 DEVICE = torch.device("cuda")
