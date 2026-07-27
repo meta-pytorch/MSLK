@@ -37,11 +37,6 @@ on:
         type: string
         required: false
         default: ""
-      publish-to-pypi:
-        description: Publish Artifact to PyPI
-        type: boolean
-        required: false
-        default: false
 
 concurrency:
   # Cancel previous runs in the PR if a new commit is pushed
@@ -84,7 +79,3 @@ jobs:
       matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
       repo-ref: ${{ (github.event_name == 'schedule' && 'nightly') || github.ref }}
       pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
-      publish-to-pypi: ${{ (github.event_name == 'schedule') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true') }}
-      cuda-version-publish: 12.8.1
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
