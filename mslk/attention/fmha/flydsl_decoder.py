@@ -12,18 +12,56 @@ import torch
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, Context, Inputs
 from .utils.op_common import get_operator, register_operator
+from mslk.flydsl.common import require_flydsl
+
+
+def _flydsl_decode_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seq_positions: Optional[torch.Tensor],
+    scale: float,
+    use_fp8_kv: bool = False,
+) -> torch.Tensor:
+    from .flydsl.pa_decode_dense import pa_decode_launch
+    from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
+
+    q5, k5, v5 = canonicalize_qkv_5d(query, key, value)
+    B = q5.shape[0]
+    KV_MAX = k5.shape[1]
+    seq = normalize_seq_positions(seq_positions, B, KV_MAX, q5.device)
+
+    if use_fp8_kv:
+        # Per-call opt-in (inp.quantize_kv_to_fp8): quantize dense f16/bf16 KV to
+        # native fp8 and run the paged fp8 decode.  Lossy + per-call quant cost;
+        # gfx950 only (MQA + GQA; the adapter pads short contexts).
+        from .flydsl.pa_decode_fp8_dispatch import is_fp8_paged_decode_available
+
+        if is_fp8_paged_decode_available():
+            from .flydsl.fp8_paged_adapter import fp8_paged_decode_from_dense
+
+            return fp8_paged_decode_from_dense(q5, k5, v5, seq, scale)
+    # split_k=0 -> the kernel's auto split-K heuristic (auto_split_k_hp), which fills
+    # the GPU with enough KV partitions to hide memory latency.  The previous split_k=1
+    # forced a single partition (no parallelism), leaving the single-step decoder ~1.3x
+    # slower than CK; auto split-K brings it in line with the split-K decode op.  The
+    # kernel combines the partitions internally and returns a single output tensor.
+    return pa_decode_launch(q5, k5, v5, seq, scale, split_k=0)
 
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """
-    An operator optimized for K=256 (so the contiguous dim fits into registers).
-    Tested to work on MI250x.
+    """FlyDSL dense decode op (gfx942/gfx950).
+
+    FlyDSL is the sole backend: the CK operator path has been removed.  Requires
+    FlyDSL (raises via require_flydsl on an unsupported arch).  Supports f16 / bf16
+    / f32 KV in a dense padded layout with GQA/MQA.  Keeps the xformers op name and
+    API so existing callers are unchanged.
     """
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16, torch.float}
+    SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     # pyrefly: ignore [bad-override-mutable-attribute]
     SUPPORTED_MAX_K: int = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
@@ -33,7 +71,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_BMGHK = True
-    NAME = "ck_decoderF"
+    NAME = "flydsl_decoderF"
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:  # noqa: C901
@@ -132,11 +170,17 @@ class FwOp(AttentionFwOpBase):
                 torch.tensor(key.shape[-1], dtype=torch.float32)
             ).item()
 
-        out = cls.OPERATOR(
+        # FlyDSL is the sole decode backend (the CK operator path was removed): it
+        # covers f16/bf16 KV across gfx942 + gfx950 and outperforms the old CK
+        # kernel (which used no matrix cores) on every measured shape.  The op name
+        # and API are unchanged, so callers are unaffected.
+        require_flydsl()
+        out = _flydsl_decode_forward(
             query=query,
             key=key,
             value=value,
             seq_positions=seq_positions_gpu,
             scale=qk_scale,
+            use_fp8_kv=getattr(inp, "quantize_kv_to_fp8", False),
         )
         return out, None

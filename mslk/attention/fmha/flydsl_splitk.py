@@ -12,6 +12,37 @@ import torch
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
 from .utils.op_common import get_operator, register_operator
+from mslk.flydsl.common import is_flydsl_available, require_flydsl
+
+
+def _flydsl_splitk_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seq_positions: Optional[torch.Tensor],
+    scale: float,
+    split_k: int,
+    use_fp8_kv: bool = False,
+) -> torch.Tensor:
+    from .flydsl.pa_decode_dense import pa_decode_launch
+    from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
+
+    q5, k5, v5 = canonicalize_qkv_5d(query, key, value)
+    B = q5.shape[0]
+    KV_MAX = k5.shape[1]
+    seq = normalize_seq_positions(seq_positions, B, KV_MAX, q5.device)
+
+    if use_fp8_kv:
+        # Opt-in fp8-KV: quantize dense KV to native fp8 per call (lossy, gfx950 only).
+        from .flydsl.pa_decode_fp8_dispatch import is_fp8_paged_decode_available
+
+        if is_fp8_paged_decode_available():
+            from .flydsl.fp8_paged_adapter import fp8_paged_decode_from_dense
+
+            return fp8_paged_decode_from_dense(q5, k5, v5, seq, scale)
+        # else fall through to dense (off-gfx950 / fp8 unavailable).
+
+    return pa_decode_launch(q5, k5, v5, seq, scale, split_k=split_k)
 
 
 @register_operator
@@ -21,7 +52,6 @@ class FwOp(AttentionFwOpBase):
     SUPPORTED_DTYPES = {
         torch.half,
         torch.bfloat16,
-        torch.float,
     }  # Those are dtypes of Q. In the quantized case K/V has dtype int32
     SUPPORTED_MAX_K = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
@@ -31,7 +61,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_BMGHK = True
-    NAME = "ck_splitKF"
+    NAME = "flydsl_splitKF"
 
     SPLIT_K: Optional[int] = None
     BLOCK_M = 16
@@ -55,14 +85,9 @@ class FwOp(AttentionFwOpBase):
         if d.key.dtype != torch.int32:
             check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
             check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
-        if cls.OPERATOR is None:
-            reasons.append("triton is not available")
-        if d.device.type == "cuda":
-            # Has only been tested on 8.0 / 9.0.
-            if torch.cuda.get_device_capability(d.device) < (7, 0):
-                reasons.append(
-                    "requires GPU with sm80 minimum compute capacity, e.g., A100/H100/L4"
-                )
+        # FlyDSL is the sole backend now; it must be importable + support this arch.
+        if not is_flydsl_available():
+            reasons.append("FlyDSL is not available for this GPU architecture")
 
         q_len = d.query.shape[1]
         if isinstance(d.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):
@@ -152,13 +177,17 @@ class FwOp(AttentionFwOpBase):
                 torch.tensor(k.shape[-1], dtype=torch.float32)
             ).item()
 
-        out = cls.OPERATOR(
+        require_flydsl()
+        # fp8-KV opt-in: per-call via inp.quantize_kv_to_fp8 (lossy, gfx950 only).
+        use_fp8_kv = getattr(inp, "quantize_kv_to_fp8", False)
+        out = _flydsl_splitk_forward(
             query=query,
             key=key,
             value=value,
             seq_positions=seq_positions_gpu,
             scale=qk_scale,
             split_k=split_k,
+            use_fp8_kv=use_fp8_kv,
         )
 
         return out, None
@@ -166,39 +195,39 @@ class FwOp(AttentionFwOpBase):
 
 class FwOp_S1(FwOp):
     SPLIT_K = 1
-    NAME = "ck_splitK1"
+    NAME = "flydsl_splitK1"
 
 
 class FwOp_S2(FwOp):
     SPLIT_K = 2
-    NAME = "ck_splitK2"
+    NAME = "flydsl_splitK2"
 
 
 class FwOp_S4(FwOp):
     SPLIT_K = 4
-    NAME = "ck_splitK4"
+    NAME = "flydsl_splitK4"
 
 
 class FwOp_S8(FwOp):
     SPLIT_K = 8
-    NAME = "ck_splitK8"
+    NAME = "flydsl_splitK8"
 
 
 class FwOp_S16(FwOp):
     SPLIT_K = 16
-    NAME = "ck_splitK16"
+    NAME = "flydsl_splitK16"
 
 
 class FwOp_S32(FwOp):
     SPLIT_K = 32
-    NAME = "ck_splitK32"
+    NAME = "flydsl_splitK32"
 
 
 class FwOp_S64(FwOp):
     SPLIT_K = 64
-    NAME = "ck_splitK64"
+    NAME = "flydsl_splitK64"
 
 
 class FwOp_S128(FwOp):
     SPLIT_K = 128
-    NAME = "ck_splitK128"
+    NAME = "flydsl_splitK128"
