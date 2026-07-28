@@ -201,8 +201,6 @@ def unsigned_fp32_to_e8m0(
     e8m0_values = torch.pow(2.0, exponent.float() - E8M0_EXPONENT_BIAS)
     unscale = e8m0_values
 
-    unscale = e8m0_values
-
     return unscale
 
 
