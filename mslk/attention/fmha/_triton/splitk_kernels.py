@@ -959,7 +959,9 @@ def _process_fp8_quantization(
     k_scale, k_shift = _extract_scale_shift(k_scale_shift, IS_HIP, USE_FP32_SCALES)
     if IS_HIP:
         if not QUANTIZE_QK_TO_FP8:
-            k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL, FP8_FNUZ).to(q_dtype)
+            k = dequantize_k_hip(k, k_scale, k_shift, PACKED_PER_VAL, FP8_FNUZ).to(
+                q_dtype
+            )
         else:
             # For QUANTIZE_QK_TO_FP8, unpack int32 to 8-bit entries and interpret as fp8
             tl.static_assert(PACKED_PER_VAL == 4, "Assert: int32 packs four FP8 values")

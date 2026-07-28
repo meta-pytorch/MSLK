@@ -38,7 +38,7 @@ def _pertoken_quant_symmetric(
 
 
 def dense_kv_to_fp8_paged(
-    key: torch.Tensor,    # [B, padding, G, Hkv, D] f16/bf16
+    key: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
     value: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
     block_size: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -120,9 +120,9 @@ def dense_kv_to_fp8_paged(
 
 
 def fp8_paged_decode_from_dense(
-    query: torch.Tensor,   # [B, q_seqlen, G, Hq, D] f16/bf16
-    key: torch.Tensor,     # [B, padding, G, Hkv, D] f16/bf16
-    value: torch.Tensor,   # [B, padding, G, Hkv, D] f16/bf16
+    query: torch.Tensor,  # [B, q_seqlen, G, Hq, D] f16/bf16
+    key: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
+    value: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
     seq_positions: torch.Tensor,  # [B] int32 context lengths (or None)
     scale: float,
     *,
@@ -140,8 +140,8 @@ def fp8_paged_decode_from_dense(
     dev = query.device
     BG = B * G
 
-    key_cache, value_cache, key_scale, value_scale, block_tables = dense_kv_to_fp8_paged(
-        key, value, block_size=block_size
+    key_cache, value_cache, key_scale, value_scale, block_tables = (
+        dense_kv_to_fp8_paged(key, value, block_size=block_size)
     )
 
     # GQA: fold (B, G) into the sequence axis (matching dense_kv_to_fp8_paged's B*G
@@ -151,7 +151,11 @@ def fp8_paged_decode_from_dense(
     else:
         # seq_positions [B] -> [B, G] -> [B*G]
         context_lengths = (
-            seq_positions.to(torch.int32).view(B, 1).expand(B, G).reshape(BG).contiguous()
+            seq_positions.to(torch.int32)
+            .view(B, 1)
+            .expand(B, G)
+            .reshape(BG)
+            .contiguous()
         )
 
     # Kernel query layout [num_seqs=B*G, Hq, D]: fold group into the sequence axis to

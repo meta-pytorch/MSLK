@@ -1076,7 +1076,12 @@ def test_cutlass_blackwell_decoder(
 
 @rocm_only
 @pytest.mark.parametrize(
-    "op", [fmha.flydsl_splitk.FwOp_S1, fmha.flydsl_splitk.FwOp_S2, fmha.flydsl_splitk.FwOp_S4]
+    "op",
+    [
+        fmha.flydsl_splitk.FwOp_S1,
+        fmha.flydsl_splitk.FwOp_S2,
+        fmha.flydsl_splitk.FwOp_S4,
+    ],
 )
 @pytest.mark.parametrize("dtype", ["f32"])
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)

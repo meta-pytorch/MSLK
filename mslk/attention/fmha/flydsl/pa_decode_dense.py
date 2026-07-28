@@ -25,8 +25,8 @@ import torch
 
 from .utils import WARP_SIZE
 
-NUM_WARPS  = 4
-BLOCK_SIZE = NUM_WARPS * WARP_SIZE   # 256
+NUM_WARPS = 4
+BLOCK_SIZE = NUM_WARPS * WARP_SIZE  # 256
 
 # Approximate CU count for auto split_k. Will be updated at first launch.
 _CU_COUNT: Optional[int] = None
@@ -44,7 +44,9 @@ def _get_cu_count() -> int:
     return _CU_COUNT
 
 
-def auto_split_k(B: int, G: int, H_q: int, KV_MAX: int, num_warps: int = NUM_WARPS) -> int:
+def auto_split_k(
+    B: int, G: int, H_q: int, KV_MAX: int, num_warps: int = NUM_WARPS
+) -> int:
     """Default split_k: target ~4 waves (4× CU count CTAs) to hide memory latency.
 
     Total CTAs = B*G*Hq*sk. Tuned for the low-register generic fallback; the coop
@@ -128,15 +130,19 @@ def pa_decode_launch(
     ratio 1..16) or gfx950_coop, both falling back to generic off-gfx950."""
     _, _, _, H_q, _ = Q.shape
     H_kv = K.shape[3]
-    B = Q.shape[0]
-    KV = K.shape[1]
     ratio = H_q // H_kv if H_kv > 0 else 0
-    use_hp = (H_kv > 0 and H_q % H_kv == 0 and 1 <= ratio <= 16)
+    use_hp = H_kv > 0 and H_q % H_kv == 0 and 1 <= ratio <= 16
     if use_hp:
         from .pa_decode_gfx950 import pa_decode_gfx950_launch
-        return pa_decode_gfx950_launch(Q, K, V, seq_positions, softmax_scale, split_k, output_dtype)
+
+        return pa_decode_gfx950_launch(
+            Q, K, V, seq_positions, softmax_scale, split_k, output_dtype
+        )
     from .pa_decode_gfx950_coop import pa_decode_gfx950_coop_launch
-    return pa_decode_gfx950_coop_launch(Q, K, V, seq_positions, softmax_scale, split_k, output_dtype)
+
+    return pa_decode_gfx950_coop_launch(
+        Q, K, V, seq_positions, softmax_scale, split_k, output_dtype
+    )
 
 
 # ── AOT interface ─────────────────────────────────────────────────────────────
@@ -152,10 +158,10 @@ _SPLIT_KS = (1, 2, 4, 8, 16, 32, 64)
 
 AOT_CONFIGS: List[Dict[str, Any]] = [
     {
-        "head_size":        hs,
-        "kv_dtype_str":     kv,
+        "head_size": hs,
+        "kv_dtype_str": kv,
         "output_dtype_str": ("f32" if sk > 1 else kv),
-        "split_k":          sk,
+        "split_k": sk,
     }
     for hs in _HEAD_SIZES
     for kv in _KV_DTYPES
@@ -173,17 +179,29 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
     sk = config["split_k"]
 
     compile_pa_decode_generic(
-        head_size=hs, kv_dtype_str=kv, output_dtype_str=od, split_k=sk, arch=arch,
+        head_size=hs,
+        kv_dtype_str=kv,
+        output_dtype_str=od,
+        split_k=sk,
+        arch=arch,
     )
 
     if arch.startswith("gfx950"):
-        from .pa_decode_gfx950_coop import compile_pa_decode_gfx950_coop
         from .pa_decode_gfx950 import compile_pa_decode_gfx950
+        from .pa_decode_gfx950_coop import compile_pa_decode_gfx950_coop
 
         # coop = small-shape fallback; gfx950 = primary head-packed fast path.
         compile_pa_decode_gfx950_coop(
-            head_size=hs, kv_dtype_str=kv, output_dtype_str=od, split_k=sk, arch=arch,
+            head_size=hs,
+            kv_dtype_str=kv,
+            output_dtype_str=od,
+            split_k=sk,
+            arch=arch,
         )
         compile_pa_decode_gfx950(
-            head_size=hs, kv_dtype_str=kv, output_dtype_str=od, split_k=sk, arch=arch,
+            head_size=hs,
+            kv_dtype_str=kv,
+            output_dtype_str=od,
+            split_k=sk,
+            arch=arch,
         )

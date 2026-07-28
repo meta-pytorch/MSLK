@@ -34,13 +34,12 @@ Usage:
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import click
 import torch
-
 # --------------------------------------------------------------------------- #
 # Utilities
 # --------------------------------------------------------------------------- #
@@ -67,7 +66,7 @@ def _bench_ms_eager_events(fn: Callable, warmup: int = 25, rep: int = 100) -> fl
     torch.cuda.synchronize()
 
     start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev   = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
     start_ev.record()
     for _ in range(rep):
         fn()
@@ -115,7 +114,7 @@ def _bench_ms_graph(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     torch.cuda.synchronize()
 
     start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev   = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
 
     start_ev.record()
     for _ in range(rep):
@@ -130,7 +129,7 @@ def _bench_ms_graph(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     # launch) — the sub-µs "time" is noise, not a real speedup.
     if ms < 0.15 * eager_ref:
         raise EmptyGraphError(
-            f"graph replay {ms*1e3:.1f}us << eager {eager_ref*1e3:.1f}us — "
+            f"graph replay {ms * 1e3:.1f}us << eager {eager_ref * 1e3:.1f}us — "
             "kernel launched off the capture stream (nothing captured)"
         )
     return ms
@@ -149,8 +148,9 @@ def _bench_ms(fn: Callable, rep_ms: int = 200, use_cuda_graph: bool = False) -> 
     return _bench_ms_eager(fn, rep_ms=rep_ms)
 
 
-def _bytes_read_write(B: int, Hq: int, Hkv: int, kv_seqlen: int, D: int,
-                      dtype: torch.dtype) -> int:
+def _bytes_read_write(
+    B: int, Hq: int, Hkv: int, kv_seqlen: int, D: int, dtype: torch.dtype
+) -> int:
     """Approximate HBM traffic for one decode step (bytes)."""
     elem = 2 if dtype in (torch.float16, torch.bfloat16) else 4
     # Q read: B * 1 * Hq * D
@@ -175,6 +175,7 @@ def register_shapes(name: str):
     def deco(fn: Callable[[], ShapeList]) -> Callable[[], ShapeList]:
         _shape_registry[name] = fn
         return fn
+
     return deco
 
 
@@ -184,10 +185,10 @@ def _shapes_default() -> ShapeList:
     shapes = []
     # (B, Hq, Hkv, kv_seqlen, D)
     for kv_len in [512, 2048, 4096, 8192]:
-        shapes.append((1,  32, 8,  kv_len, 128))   # Llama3-8B  MQA-like
-        shapes.append((8,  32, 8,  kv_len, 128))
-        shapes.append((1,  64, 8,  kv_len, 128))   # Llama3-70B GQA
-        shapes.append((8,  64, 8,  kv_len, 128))
+        shapes.append((1, 32, 8, kv_len, 128))  # Llama3-8B  MQA-like
+        shapes.append((8, 32, 8, kv_len, 128))
+        shapes.append((1, 64, 8, kv_len, 128))  # Llama3-70B GQA
+        shapes.append((8, 64, 8, kv_len, 128))
     return shapes
 
 
@@ -196,16 +197,16 @@ def _shapes_decode_llm() -> ShapeList:
     """Common LLM decode shapes with various GQA ratios."""
     return [
         # (B,  Hq,   Hkv, kv_len, D)
-        (1,   32,   8,    512,   128),
-        (1,   32,   8,   2048,   128),
-        (1,   32,   8,   4096,   128),
-        (8,   32,   8,   2048,   128),
-        (16,  32,   8,   2048,   128),
-        (1,   64,   8,   2048,   128),
-        (1,   64,  16,   2048,   128),
-        (1,  128,  16,   2048,   128),  # large model
-        (1,   32,   4,   2048,   256),  # D=256
-        (8,   32,   4,   2048,   256),
+        (1, 32, 8, 512, 128),
+        (1, 32, 8, 2048, 128),
+        (1, 32, 8, 4096, 128),
+        (8, 32, 8, 2048, 128),
+        (16, 32, 8, 2048, 128),
+        (1, 64, 8, 2048, 128),
+        (1, 64, 16, 2048, 128),
+        (1, 128, 16, 2048, 128),  # large model
+        (1, 32, 4, 2048, 256),  # D=256
+        (8, 32, 4, 2048, 256),
     ]
 
 
@@ -241,14 +242,22 @@ def _shapes_ck_test() -> ShapeList:
 # Backend runners
 # --------------------------------------------------------------------------- #
 
-def _make_tensors(B: int, Hq: int, Hkv: int, kv_seqlen: int, D: int,
-                  dtype: torch.dtype, device: str = "cuda"):
+
+def _make_tensors(
+    B: int,
+    Hq: int,
+    Hkv: int,
+    kv_seqlen: int,
+    D: int,
+    dtype: torch.dtype,
+    device: str = "cuda",
+):
     """Allocate Q/K/V tensors in the canonical 5D BMGHK layout."""
     q = torch.randn(B, 1, 1, Hq, D, dtype=dtype, device=device)
     k = torch.randn(B, kv_seqlen, 1, Hkv, D, dtype=dtype, device=device)
     v = torch.randn(B, kv_seqlen, 1, Hkv, D, dtype=dtype, device=device)
     seq = torch.full((B,), kv_seqlen, dtype=torch.int32, device=device)
-    scale = float(D ** -0.5)
+    scale = float(D**-0.5)
     return q, k, v, seq, scale
 
 
@@ -257,6 +266,7 @@ def _run_flydsl(q, k, v, seq, scale) -> Optional[Callable]:
     try:
         from mslk.attention.fmha.flydsl.pa_decode_dense import pa_decode_launch
         from mslk.flydsl.common import is_flydsl_available
+
         if not is_flydsl_available():
             return None
         B, _, G, H_q, D = q.shape
@@ -270,8 +280,9 @@ def _run_flydsl(q, k, v, seq, scale) -> Optional[Callable]:
         return None
 
 
-def _run_triton(q, k, v, seq, scale,
-                disable_autotune: bool = False) -> Optional[Callable]:
+def _run_triton(
+    q, k, v, seq, scale, disable_autotune: bool = False
+) -> Optional[Callable]:
     """Build a callable that runs the Triton split-K kernel for one shape.
 
     On ROCm/gfx950, Triton's intermediate buffers (o_splitk, lse_splitk) can be
@@ -282,9 +293,12 @@ def _run_triton(q, k, v, seq, scale,
     ``disable_autotune=True`` uses FwOp_S1 (split_k=1) to skip autotuning.
     """
     try:
-        from mslk.attention.fmha.triton_splitk import FwOp, FwOp_S1
+        from mslk.attention.fmha.attn_bias import (
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        )
         from mslk.attention.fmha.common import Inputs
-        from mslk.attention.fmha.attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
+        from mslk.attention.fmha.triton_splitk import FwOp, FwOp_S1
+
         op = FwOp_S1 if disable_autotune else FwOp
         if not op.is_available():
             return None
@@ -320,6 +334,7 @@ def _make_attn_bias(B: int, KV: int, seq):
     from mslk.attention.fmha.attn_bias import (
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
     )
+
     ab = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
         q_seqlen=[1] * B,
         kv_seqlen=[int(s) for s in seq.cpu().tolist()],
@@ -339,18 +354,22 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
     """
     try:
         import flydsl.compiler as flyc
+        from mslk.attention.fmha.flydsl.fp8_paged_adapter import dense_kv_to_fp8_paged
+        from mslk.attention.fmha.flydsl.pa_decode_fp8 import (
+            _get_output_dtype_str,
+            _get_query_input_dtype,
+            compile_pa_decode_ps,
+            compile_pa_decode_ps_reduce,
+            get_recommended_splits,
+            KV_COMPUTE_BLOCK,
+        )
         from mslk.attention.fmha.flydsl.pa_decode_fp8_dispatch import (
             is_fp8_paged_decode_available,
         )
-        from mslk.attention.fmha.flydsl.fp8_paged_adapter import dense_kv_to_fp8_paged
-        from mslk.attention.fmha.flydsl.pa_decode_fp8 import (
-            get_recommended_splits, KV_COMPUTE_BLOCK,
-            compile_pa_decode_ps, compile_pa_decode_ps_reduce,
-            _get_query_input_dtype, _get_output_dtype_str,
-        )
+
         if not is_fp8_paged_decode_available():
             return None
-        B, _, G, Hq, D = q.shape          # bench tensors: G == 1, Hkv in the H slot
+        B, _, G, Hq, D = q.shape  # bench tensors: G == 1, Hkv in the H slot
         _, _, _, Hkv, _ = k.shape
 
         # One-time quant + paging (realistic fp8-resident KV cache).
@@ -366,7 +385,7 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
 
         num_kv_heads = key_cache.shape[1]
         query_group_size = Hq // num_kv_heads
-        eqgs = query_group_size          # query_length == 1 for decode
+        eqgs = query_group_size  # query_length == 1 for decode
         block_size = key_cache.shape[-2]
         trans_v = len(value_cache.shape) == 5
         per_token_kv = key_scale.ndim > 1
@@ -376,10 +395,18 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         dev = q.device
         # Preallocate the partition scratch ONCE (the launcher otherwise allocates
         # exp_sums/max_logits/temporary_output on every call).
-        exp_sums = torch.zeros(BG, num_kv_heads, mcpn, eqgs, device=dev, dtype=torch.float32)
-        max_logits = torch.full((BG, num_kv_heads, mcpn, eqgs), float("-inf"),
-                                device=dev, dtype=torch.float32)
-        tmp_out = torch.zeros(BG, num_kv_heads, mcpn, eqgs, D, device=dev, dtype=torch.bfloat16)
+        exp_sums = torch.zeros(
+            BG, num_kv_heads, mcpn, eqgs, device=dev, dtype=torch.float32
+        )
+        max_logits = torch.full(
+            (BG, num_kv_heads, mcpn, eqgs),
+            float("-inf"),
+            device=dev,
+            dtype=torch.float32,
+        )
+        tmp_out = torch.zeros(
+            BG, num_kv_heads, mcpn, eqgs, D, device=dev, dtype=torch.bfloat16
+        )
         out_5d = out.reshape(BG, 1, num_kv_heads, query_group_size, D)
 
         # Build the compute + reduce kernels once (lru_cached), then cache their
@@ -388,12 +415,20 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         # dominates — ~0.38ms/call of pure Python, hiding the real ~0.02ms GPU time.
         # This mirrors what mslk.flydsl.jit.run_compiled does for the dense path.
         compute = compile_pa_decode_ps(
-            block_size=block_size, max_context_partition_num=mcpn, softmax_scale=scale,
-            trans_v=trans_v, query_group_size=query_group_size, per_token_kv=per_token_kv,
-            query_length=1, query_input_dtype=_get_query_input_dtype(q_flat), head_dim=D,
+            block_size=block_size,
+            max_context_partition_num=mcpn,
+            softmax_scale=scale,
+            trans_v=trans_v,
+            query_group_size=query_group_size,
+            per_token_kv=per_token_kv,
+            query_length=1,
+            query_input_dtype=_get_query_input_dtype(q_flat),
+            head_dim=D,
         )
         reduce = compile_pa_decode_ps_reduce(
-            head_dim=D, eqgs=eqgs, max_parts=mcpn,
+            head_dim=D,
+            eqgs=eqgs,
+            max_parts=mcpn,
             output_dtype_str=_get_output_dtype_str(out),
         )
         # Everything except the trailing stream slot is fixed per shape.  The stream
@@ -401,24 +436,53 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         # side stream, and both kernels must launch onto THAT stream to be recorded —
         # a build-time snapshot of the default stream would make capture see nothing.
         compute_head = (
-            exp_sums, max_logits, tmp_out, q_flat, key_cache, value_cache,
-            block_tables, context_lengths, key_scale, value_scale,
-            q_flat.stride(0), q_flat.stride(1),
-            key_cache.stride(0), key_cache.stride(1),
-            value_cache.stride(0), value_cache.stride(1),
-            exp_sums.stride(0), exp_sums.stride(1), exp_sums.stride(2),
-            tmp_out.stride(0), tmp_out.stride(1), tmp_out.stride(2), tmp_out.stride(3),
+            exp_sums,
+            max_logits,
+            tmp_out,
+            q_flat,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            q_flat.stride(0),
+            q_flat.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+            exp_sums.stride(2),
+            tmp_out.stride(0),
+            tmp_out.stride(1),
+            tmp_out.stride(2),
+            tmp_out.stride(3),
             block_tables.stride(0),
             key_scale.stride(0) if per_token_kv else 0,
             key_scale.stride(1) if per_token_kv else 0,
-            BG, num_kv_heads, mcpn,
+            BG,
+            num_kv_heads,
+            mcpn,
         )
         reduce_head = (
-            out_5d, exp_sums, max_logits, tmp_out,
-            num_kv_heads * eqgs * D, eqgs * D,
-            exp_sums.stride(0), exp_sums.stride(1), exp_sums.stride(2),
-            tmp_out.stride(0), tmp_out.stride(1), tmp_out.stride(2), tmp_out.stride(3),
-            num_kv_heads, BG, num_kv_heads,
+            out_5d,
+            exp_sums,
+            max_logits,
+            tmp_out,
+            num_kv_heads * eqgs * D,
+            eqgs * D,
+            exp_sums.stride(0),
+            exp_sums.stride(1),
+            exp_sums.stride(2),
+            tmp_out.stride(0),
+            tmp_out.stride(1),
+            tmp_out.stride(2),
+            tmp_out.stride(3),
+            num_kv_heads,
+            BG,
+            num_kv_heads,
         )
         # Compile once against a representative stream (the default stream is fine;
         # the CompiledFunction is keyed on arg TYPES, not the stream pointer value).
@@ -427,9 +491,12 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         cf_reduce = flyc.compile(reduce["launch"], *reduce_head, s0)
 
         def _call():
-            s = torch.cuda.current_stream()  # live stream — the capture stream during graph capture
+            s = (
+                torch.cuda.current_stream()
+            )  # live stream — the capture stream during graph capture
             cf_compute(*compute_head, s)
             cf_reduce(*reduce_head, s)
+
         _call()
         torch.cuda.synchronize()
         return _call
@@ -447,6 +514,7 @@ def _quant_pack_triton_fp8(x: torch.Tensor):
     ``get_fp8_constants`` (e4m3fn on gfx950).
     """
     from mslk.utils.triton.fp8_utils import get_fp8_constants
+
     fp8_dtype = get_fp8_constants()[0]
     fmax = torch.finfo(fp8_dtype).max
 
@@ -457,10 +525,14 @@ def _quant_pack_triton_fp8(x: torch.Tensor):
     s = torch.nan_to_num(xc.abs().max(-1)[0] / fmax, posinf=1)
     xq = (xc / s[..., None]).to(fp8_dtype)
     packed = xq.view(torch.uint8).reshape(Bx, M, G, H, Dx).view(torch.int32)
-    ss = torch.concat(
-        [s.reshape(Bx, M, G, H, 1).half(), shift.reshape(Bx, M, G, H, 1).half()],
-        dim=-1,
-    ).flatten(-2).view(torch.int32)
+    ss = (
+        torch.concat(
+            [s.reshape(Bx, M, G, H, 1).half(), shift.reshape(Bx, M, G, H, 1).half()],
+            dim=-1,
+        )
+        .flatten(-2)
+        .view(torch.int32)
+    )
     return packed, ss
 
 
@@ -472,8 +544,9 @@ def _run_triton_fp8(q, k, v, seq, scale) -> Optional[Callable]:
     this is timed in a subprocess per shape (allocator scratch-freeing fault).
     """
     try:
-        from mslk.attention.fmha.triton_splitk import FwOp
         from mslk.attention.fmha.common import InputsFp8
+        from mslk.attention.fmha.triton_splitk import FwOp
+
         if not FwOp.is_available():
             return None
         B, _, G, Hq, D = q.shape
@@ -484,8 +557,15 @@ def _run_triton_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         v_flat = v.reshape(1, B * KV, 1, Hkv, D).contiguous()
         ki, ks = _quant_pack_triton_fp8(k_flat)
         vi, vs = _quant_pack_triton_fp8(v_flat)
-        inp = InputsFp8(q_flat, ki, vi, attn_bias=attn_bias, scale=scale,
-                        k_fp8_scale_shift=ks, v_fp8_scale_shift=vs)
+        inp = InputsFp8(
+            q_flat,
+            ki,
+            vi,
+            attn_bias=attn_bias,
+            scale=scale,
+            k_fp8_scale_shift=ks,
+            v_fp8_scale_shift=vs,
+        )
         reasons = FwOp.not_supported_reasons(inp)
         if reasons:
             return None
@@ -513,8 +593,15 @@ _RUNNERS: Dict[str, Callable] = {
 
 def _bench_subproc(
     backend: str,
-    B: int, Hq: int, Hkv: int, kv_seqlen: int, D: int, dtype: str,
-    rep_ms: int, disable_autotune: bool, use_graph: bool = False,
+    B: int,
+    Hq: int,
+    Hkv: int,
+    kv_seqlen: int,
+    D: int,
+    dtype: str,
+    rep_ms: int,
+    disable_autotune: bool,
+    use_graph: bool = False,
 ) -> Tuple[float, str]:
     """Time one backend+shape in a fresh subprocess; return ``(ms, status)``.
 
@@ -528,21 +615,30 @@ def _bench_subproc(
     import json
     import subprocess
 
-    payload = json.dumps({
-        "backend": backend, "B": B, "Hq": Hq, "Hkv": Hkv,
-        "kv_seqlen": kv_seqlen, "D": D, "dtype": dtype,
-        "rep_ms": rep_ms, "disable_autotune": disable_autotune,
-        "use_graph": use_graph,
-    })
+    payload = json.dumps(
+        {
+            "backend": backend,
+            "B": B,
+            "Hq": Hq,
+            "Hkv": Hkv,
+            "kv_seqlen": kv_seqlen,
+            "D": D,
+            "dtype": dtype,
+            "rep_ms": rep_ms,
+            "disable_autotune": disable_autotune,
+            "use_graph": use_graph,
+        }
+    )
     proc = subprocess.run(
         [sys.executable, __file__, "--worker", payload],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     # The worker prints exactly one line: ``RESULT <json>`` on success.
     for line in proc.stdout.splitlines():
         if line.startswith("RESULT "):
             try:
-                res = json.loads(line[len("RESULT "):])
+                res = json.loads(line[len("RESULT ") :])
                 return float(res["ms"]), res["status"]
             except Exception:
                 break
@@ -559,9 +655,9 @@ def _worker_main(payload: str) -> None:
     import json
 
     spec = json.loads(payload)
-    torch_dtype = {
-        "f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32
-    }[spec["dtype"]]
+    torch_dtype = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[
+        spec["dtype"]
+    ]
     q, k, v, seq, scale = _make_tensors(
         spec["B"], spec["Hq"], spec["Hkv"], spec["kv_seqlen"], spec["D"], torch_dtype
     )
@@ -575,7 +671,9 @@ def _worker_main(payload: str) -> None:
         return
     try:
         ms = _bench_ms(
-            fn, rep_ms=spec["rep_ms"], use_cuda_graph=spec.get("use_graph", False),
+            fn,
+            rep_ms=spec["rep_ms"],
+            use_cuda_graph=spec.get("use_graph", False),
         )
     except EmptyGraphError:
         print(f"RESULT {json.dumps({'ms': 0.0, 'status': 'skip'})}")
@@ -586,6 +684,7 @@ def _worker_main(payload: str) -> None:
 # --------------------------------------------------------------------------- #
 # Metrics and formatting
 # --------------------------------------------------------------------------- #
+
 
 @dataclass
 class Result:
@@ -603,8 +702,10 @@ class Result:
 
 # Short column labels per backend.
 _BACKEND_LABEL = {
-    "flydsl": "FlyDSL", "triton": "Triton",
-    "flydsl_fp8": "FlyDSL-f8", "triton_fp8": "Triton-f8",
+    "flydsl": "FlyDSL",
+    "triton": "Triton",
+    "flydsl_fp8": "FlyDSL-f8",
+    "triton_fp8": "Triton-f8",
 }
 
 
@@ -620,8 +721,14 @@ def _header(run_backends: List[str]) -> str:
 
 
 def _result_row(
-    B: int, Hq: int, Hkv: int, kv_seqlen: int, D: int, dtype: str,
-    results: Dict[str, Optional[Result]], run_backends: List[str],
+    B: int,
+    Hq: int,
+    Hkv: int,
+    kv_seqlen: int,
+    D: int,
+    dtype: str,
+    results: Dict[str, Optional[Result]],
+    run_backends: List[str],
 ) -> str:
     def fmt_ms(r):
         if r is None or r.status != "ok":
@@ -646,30 +753,75 @@ def _result_row(
 # Main benchmark
 # --------------------------------------------------------------------------- #
 
+
 @click.command()
-@click.option("--shapes", default="default", type=click.Choice(list(_shape_registry)),
-              show_default=True, help="Shape set to benchmark.")
-@click.option("--dtype", default="f16", type=click.Choice(["f16", "bf16", "f32"]),
-              show_default=True, help="KV/Q dtype.")
-@click.option("--rep-ms", default=200, show_default=True,
-              help="Target benchmark duration per shape (ms).")
-@click.option("--cuda-graph/--no-cuda-graph", default=False, show_default=True,
-              help="Time via real CUDA-graph replay (removes launch overhead). "
-                   "Triton is skipped in this mode (un-graphable on gfx950); use "
-                   "--both-graph-modes to get graphed FlyDSL + eager Triton together.")
-@click.option("--both-graph-modes", is_flag=True, default=False,
-              help="Run each shape with AND without CUDA graph, writing both to CSV.")
-@click.option("--backends", default="flydsl,triton",
-              help="Comma-separated backends: flydsl, triton, flydsl_fp8, triton_fp8.")
-@click.option("--output", default=None,
-              help="Write CSV results to this path. Defaults to bench/attn/results/<shapes>_<dtype>_<device>_<timestamp>.csv")
-@click.option("--disable-triton-autotune", is_flag=True, default=False,
-              help="Pin Triton to split_k=1 (avoids GPU hang during autotuning on some configs).")
-@click.option("--worker", default=None, hidden=True,
-              help="Internal: JSON spec to time one backend+shape in this subprocess.")
-def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_graph_modes: bool,
-         backends: str, output: Optional[str], disable_triton_autotune: bool,
-         worker: Optional[str]) -> None:
+@click.option(
+    "--shapes",
+    default="default",
+    type=click.Choice(list(_shape_registry)),
+    show_default=True,
+    help="Shape set to benchmark.",
+)
+@click.option(
+    "--dtype",
+    default="f16",
+    type=click.Choice(["f16", "bf16", "f32"]),
+    show_default=True,
+    help="KV/Q dtype.",
+)
+@click.option(
+    "--rep-ms",
+    default=200,
+    show_default=True,
+    help="Target benchmark duration per shape (ms).",
+)
+@click.option(
+    "--cuda-graph/--no-cuda-graph",
+    default=False,
+    show_default=True,
+    help="Time via real CUDA-graph replay (removes launch overhead). "
+    "Triton is skipped in this mode (un-graphable on gfx950); use "
+    "--both-graph-modes to get graphed FlyDSL + eager Triton together.",
+)
+@click.option(
+    "--both-graph-modes",
+    is_flag=True,
+    default=False,
+    help="Run each shape with AND without CUDA graph, writing both to CSV.",
+)
+@click.option(
+    "--backends",
+    default="flydsl,triton",
+    help="Comma-separated backends: flydsl, triton, flydsl_fp8, triton_fp8.",
+)
+@click.option(
+    "--output",
+    default=None,
+    help="Write CSV results to this path. Defaults to bench/attn/results/<shapes>_<dtype>_<device>_<timestamp>.csv",
+)
+@click.option(
+    "--disable-triton-autotune",
+    is_flag=True,
+    default=False,
+    help="Pin Triton to split_k=1 (avoids GPU hang during autotuning on some configs).",
+)
+@click.option(
+    "--worker",
+    default=None,
+    hidden=True,
+    help="Internal: JSON spec to time one backend+shape in this subprocess.",
+)
+def invoke_main(
+    shapes: str,
+    dtype: str,
+    rep_ms: int,
+    cuda_graph: bool,
+    both_graph_modes: bool,
+    backends: str,
+    output: Optional[str],
+    disable_triton_autotune: bool,
+    worker: Optional[str],
+) -> None:
     """Decode attention benchmark: FlyDSL vs Triton."""
     if worker is not None:
         _worker_main(worker)
@@ -678,7 +830,9 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
     import csv as _csv
     import os
 
-    torch_dtype = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[dtype]
+    torch_dtype = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[
+        dtype
+    ]
     run_backends = [b.strip() for b in backends.split(",")]
     shape_list = _shape_registry[shapes]()
 
@@ -689,7 +843,9 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
         dev_slug = device_name.replace(" ", "_").replace("/", "_")[:30]
-        output = os.path.join(results_dir, f"{shapes}_{dtype}_{dev_slug}_{timestamp}.csv")
+        output = os.path.join(
+            results_dir, f"{shapes}_{dtype}_{dev_slug}_{timestamp}.csv"
+        )
 
     graph_modes = [True, False] if both_graph_modes else [cuda_graph]
 
@@ -701,9 +857,9 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
     print(f"Output CSV: {output}")
 
     runner_map = {
-        "flydsl":     _run_flydsl,
+        "flydsl": _run_flydsl,
         "flydsl_fp8": _run_flydsl_fp8,
-        "triton":     lambda q, k, v, seq, scale: _run_triton(
+        "triton": lambda q, k, v, seq, scale: _run_triton(
             q, k, v, seq, scale, disable_autotune=disable_triton_autotune
         ),
         "triton_fp8": _run_triton_fp8,
@@ -728,16 +884,20 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
 
     for use_graph in graph_modes:
         graph_label = "cuda_graph" if use_graph else "no_graph"
-        timing_note = ("CUDA-graph replay (launch overhead removed)"
-                       if use_graph else
-                       "shared do_bench eager launch (per-call dispatch included)")
-        print(f"\n{'='*80}")
+        timing_note = (
+            "CUDA-graph replay (launch overhead removed)"
+            if use_graph
+            else "shared do_bench eager launch (per-call dispatch included)"
+        )
+        print(f"\n{'=' * 80}")
         print(f"  Mode: {graph_label}")
         print(f"  Timing: {timing_note}.")
         if use_graph and any(b in _NO_GRAPH_BACKENDS for b in run_backends):
             skipped = [b for b in run_backends if b in _NO_GRAPH_BACKENDS]
-            print(f"  Note: {', '.join(skipped)} skipped in graph mode (un-graphable on gfx950).")
-        print(f"{'='*80}")
+            print(
+                f"  Note: {', '.join(skipped)} skipped in graph mode (un-graphable on gfx950)."
+            )
+        print(f"{'=' * 80}")
         print(_header(run_backends))
         print("-" * len(_header(run_backends)))
 
@@ -765,7 +925,13 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
                 # in eager mode — it is graph-skipped above).
                 if backend in _SUBPROC_BACKENDS:
                     ms, status = _bench_subproc(
-                        backend, B, Hq, Hkv, kv_seqlen, D, dtype,
+                        backend,
+                        B,
+                        Hq,
+                        Hkv,
+                        kv_seqlen,
+                        D,
+                        dtype,
                         rep_ms=rep_ms,
                         disable_autotune=disable_triton_autotune,
                         use_graph=use_graph,
@@ -775,8 +941,11 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
                         B, Hq, Hkv, kv_seqlen, D, dtype, backend, ms, bw, status
                     )
                     if status == "err":
-                        click.echo(f"  [{backend}] B={B} Hq={Hq} KV={kv_seqlen} D={D}: "
-                                   f"subprocess crashed", err=True)
+                        click.echo(
+                            f"  [{backend}] B={B} Hq={Hq} KV={kv_seqlen} D={D}: "
+                            f"subprocess crashed",
+                            err=True,
+                        )
                     continue
 
                 try:
@@ -801,36 +970,43 @@ def invoke_main(shapes: str, dtype: str, rep_ms: int, cuda_graph: bool, both_gra
                         click.echo(
                             f"  [{backend}] not graph-capturable on this stack "
                             "(launches on default stream); reported as skip in graph mode.",
-                            err=True)
+                            err=True,
+                        )
                         invoke_main._warned_empty_graph = True
                 except Exception as e:
                     row_results[backend] = Result(
                         B, Hq, Hkv, kv_seqlen, D, dtype, backend, 0.0, 0.0, "err"
                     )
-                    click.echo(f"  [{backend}] B={B} Hq={Hq} KV={kv_seqlen} D={D}: {e}",
-                               err=True)
+                    click.echo(
+                        f"  [{backend}] B={B} Hq={Hq} KV={kv_seqlen} D={D}: {e}",
+                        err=True,
+                    )
 
-            print(_result_row(B, Hq, Hkv, kv_seqlen, D, dtype, row_results, run_backends))
+            print(
+                _result_row(B, Hq, Hkv, kv_seqlen, D, dtype, row_results, run_backends)
+            )
 
             for bk, r in row_results.items():
                 if r is not None:
-                    all_csv_rows.append({
-                        "device":    device_name,
-                        "timestamp": timestamp,
-                        "shapes":    shapes,
-                        "dtype":     dtype,
-                        "cuda_graph": use_graph,
-                        "B":         B,
-                        "Hq":        Hq,
-                        "Hkv":       Hkv,
-                        "kv_seqlen": kv_seqlen,
-                        "D":         D,
-                        "GQA_ratio": Hq // Hkv if Hkv > 0 else 1,
-                        "backend":   bk,
-                        "ms":        r.ms if r.status == "ok" else "",
-                        "bw_gbs":    r.bw_gbs if r.status == "ok" else "",
-                        "status":    r.status,
-                    })
+                    all_csv_rows.append(
+                        {
+                            "device": device_name,
+                            "timestamp": timestamp,
+                            "shapes": shapes,
+                            "dtype": dtype,
+                            "cuda_graph": use_graph,
+                            "B": B,
+                            "Hq": Hq,
+                            "Hkv": Hkv,
+                            "kv_seqlen": kv_seqlen,
+                            "D": D,
+                            "GQA_ratio": Hq // Hkv if Hkv > 0 else 1,
+                            "backend": bk,
+                            "ms": r.ms if r.status == "ok" else "",
+                            "bw_gbs": r.bw_gbs if r.status == "ok" else "",
+                            "status": r.status,
+                        }
+                    )
 
     with open(output, "w", newline="") as f:
         if all_csv_rows:

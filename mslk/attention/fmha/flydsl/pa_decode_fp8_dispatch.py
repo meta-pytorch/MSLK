@@ -30,7 +30,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-
 from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
 
@@ -48,7 +47,7 @@ def is_fp8_paged_decode_available() -> bool:
 
 def csr_to_block_tables(
     kv_page_indices: torch.Tensor,  # [total_pages] int32 — flat physical page ids
-    kv_indptr: torch.Tensor,        # [num_seqs + 1] int32 — prefix sum of pages/seq
+    kv_indptr: torch.Tensor,  # [num_seqs + 1] int32 — prefix sum of pages/seq
 ) -> torch.Tensor:
     """Convert ragged CSR paging into a dense padded `block_tables`.
 
@@ -64,13 +63,14 @@ def csr_to_block_tables(
     dev = kv_page_indices.device
     indptr = kv_indptr.to(torch.long)
     num_seqs = indptr.numel() - 1
-    counts = (indptr[1:] - indptr[:-1])           # pages per sequence
+    counts = indptr[1:] - indptr[:-1]  # pages per sequence
     max_blocks = int(counts.max().item()) if num_seqs > 0 else 0
     max_blocks = max(max_blocks, 1)
     block_tables = torch.zeros((num_seqs, max_blocks), dtype=torch.int32, device=dev)
     # num_seqs is small (batch), so a Python loop avoids a ragged gather.
     for b in range(num_seqs):
-        lo = int(indptr[b].item()); hi = int(indptr[b + 1].item())
+        lo = int(indptr[b].item())
+        hi = int(indptr[b + 1].item())
         n = hi - lo
         if n > 0:
             block_tables[b, :n] = kv_page_indices[lo:hi]
@@ -84,7 +84,7 @@ def paged_attention_decode_fp8_csr(
     value_cache: torch.Tensor,
     context_lengths: torch.Tensor,
     kv_page_indices: torch.Tensor,  # [total_pages] int32
-    kv_indptr: torch.Tensor,        # [num_seqs + 1] int32
+    kv_indptr: torch.Tensor,  # [num_seqs + 1] int32
     softmax_scale: float,
     key_scale: torch.Tensor,
     value_scale: torch.Tensor,

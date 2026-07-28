@@ -15,7 +15,6 @@ import pytest
 import torch
 from mslk.attention import fmha
 from mslk.attention.fmha import Inputs
-from mslk.utils.triton.fp8_utils import get_fp8_constants
 from mslk.attention.fmha.attn_bias import (
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
@@ -26,6 +25,7 @@ from mslk.attention.fmha.attn_bias_utils import (
     ref_attention_bmhk,
 )
 from mslk.attention.fmha.triton_splitk import InputsFp8
+from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 IN_RE_WORKER: bool = os.environ.get("INSIDE_RE_WORKER") is not None
 

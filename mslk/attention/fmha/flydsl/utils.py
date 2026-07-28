@@ -13,12 +13,13 @@ Only pip `flydsl==0.2.2` is imported (no ~/FlyDSL/kernels imports).
 
 from typing import Optional
 
-import flydsl.compiler as flyc  # pyre-ignore[21]
 import flydsl.expr as fx  # pyre-ignore[21]
 from flydsl._mlir import ir  # pyre-ignore[21]
-from flydsl._mlir.dialects import llvm  # pyre-ignore[21]
-from flydsl._mlir.dialects import math as mlir_math  # pyre-ignore[21]
-from flydsl.expr import arith, buffer_ops, const_expr, rocdl, vector  # pyre-ignore[21]
+from flydsl._mlir.dialects import (  # pyre-ignore[21]  # pyre-ignore[21]
+    llvm,
+    math as mlir_math,
+)
+from flydsl.expr import arith, buffer_ops, rocdl  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP  # pyre-ignore[21]
@@ -65,7 +66,11 @@ def exp_f32(value):  # pyre-ignore[2,3]
     Matches CK's natural-exp softmax; use this (not exp2) for numerics that must
     agree with the CK decoder op.
     """
-    raw = arith.unwrap(value) if hasattr(value, "ir_value") or hasattr(value, "type") else value
+    raw = (
+        arith.unwrap(value)
+        if hasattr(value, "ir_value") or hasattr(value, "type")
+        else value
+    )
     return mlir_math.exp(raw)
 
 
@@ -73,7 +78,9 @@ def exp2_f32(value):  # pyre-ignore[2,3]
     """Scalar `2^value` via `llvm.amdgcn.exp2.f32` (single v_exp_f32). Used by the
     exp2-domain softmax in the MFMA decode kernels."""
     raw = arith.unwrap(value) if hasattr(value, "ir_value") else value
-    return fx.Float32(llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [raw], [], []))
+    return fx.Float32(
+        llvm.call_intrinsic(ir.F32Type.get(), "llvm.amdgcn.exp2.f32", [raw], [], [])
+    )
 
 
 def maxnumf(a, b):  # pyre-ignore[2,3]
@@ -105,22 +112,26 @@ def _dpp_xor_i32_raw(src_i32, offset: int):  # pyre-ignore[2,3]
         return _llvm.call_intrinsic(
             T.i32,
             "llvm.amdgcn.update.dpp.i32",
-            [old, src,
-             arith.unwrap(arith.constant(ctrl,  type=T.i32)),
-             arith.unwrap(arith.constant(rmask, type=T.i32)),
-             arith.unwrap(arith.constant(bmask, type=T.i32)),
-             bound_false],
-            [], [],
+            [
+                old,
+                src,
+                arith.unwrap(arith.constant(ctrl, type=T.i32)),
+                arith.unwrap(arith.constant(rmask, type=T.i32)),
+                arith.unwrap(arith.constant(bmask, type=T.i32)),
+                bound_false,
+            ],
+            [],
+            [],
         )
 
     if offset == 8:
         out = _upd(src_i32, src_i32, 280, 0xF, 0xC)
-        out = _upd(src_i32, out,     264, 0xF, 0x3)
+        out = _upd(src_i32, out, 264, 0xF, 0x3)
     elif offset == 4:
         out = _upd(src_i32, src_i32, 276, 0xF, 0xA)
-        out = _upd(src_i32, out,     260, 0xF, 0x5)
+        out = _upd(src_i32, out, 260, 0xF, 0x5)
     elif offset == 2:
-        out = _upd(src_i32, src_i32, 78,  0xF, 0xF)
+        out = _upd(src_i32, src_i32, 78, 0xF, 0xF)
     elif offset == 1:
         out = _upd(src_i32, src_i32, 177, 0xF, 0xF)
     else:
@@ -134,7 +145,7 @@ def dpp_xor_f32(src, offset: int):  # pyre-ignore[2,3]
 
     raw = arith.unwrap(src) if hasattr(src, "ir_value") else src
     src_i32 = _arith_dialect.BitcastOp(T.i32, raw).result
-    out_i32  = _dpp_xor_i32_raw(src_i32, offset)
+    out_i32 = _dpp_xor_i32_raw(src_i32, offset)
     return fx.Float32(_arith_dialect.BitcastOp(T.f32, out_i32).result)
 
 
@@ -152,7 +163,9 @@ def wave_reduce_max_f32(val):  # pyre-ignore[2,3]
 def wave_reduce_sum_f32(val):  # pyre-ignore[2,3]
     """Full wave64 warp-level sum reduction."""
     for sh in (8, 4, 2, 1):
-        val = fx.Float32(arith.addf(arith.unwrap(val), arith.unwrap(dpp_xor_f32(val, sh))))
+        val = fx.Float32(
+            arith.addf(arith.unwrap(val), arith.unwrap(dpp_xor_f32(val, sh)))
+        )
     c_w = arith.constant(WARP_SIZE, type=T.i32)
     for sh in (32, 16):
         other = val.shuffle_xor(arith.constant(sh, type=T.i32), c_w)

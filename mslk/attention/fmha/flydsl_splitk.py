@@ -8,11 +8,11 @@
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
+from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
 from .utils.op_common import get_operator, register_operator
-from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
 
 def _flydsl_splitk_forward(
@@ -24,8 +24,8 @@ def _flydsl_splitk_forward(
     split_k: int,
     use_fp8_kv: bool = False,
 ) -> torch.Tensor:
-    from .flydsl.pa_decode_dense import pa_decode_launch
     from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
+    from .flydsl.pa_decode_dense import pa_decode_launch
 
     q5, k5, v5 = canonicalize_qkv_5d(query, key, value)
     B = q5.shape[0]
