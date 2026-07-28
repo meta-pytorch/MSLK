@@ -204,8 +204,8 @@ integration_mslk_pip_install_matrix_run () {
     )
   elif [ "$variant_type" == "rocm" ]; then
     local variant_versions=(
-      6.3
-      6.4
+      7.1
+      7.2
     )
   else
     echo "[TEST] Invalid variant type: ${variant_type}"
