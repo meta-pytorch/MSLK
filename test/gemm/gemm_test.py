@@ -3356,7 +3356,7 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
-        from mslk.utils.flydsl import is_flydsl_available
+        from mslk.flydsl.common import is_flydsl_available
 
         if not is_flydsl_available():
             raise unittest.SkipTest("FlyDSL not available")

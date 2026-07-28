@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
-from mslk.utils.flydsl import is_flydsl_available, require_flydsl
+from mslk.flydsl.common import is_flydsl_available, require_flydsl
 from torch import Tensor
 
 
