@@ -281,10 +281,7 @@ class BuildConfigScheme:
         return ["13.0.2"]
 
     def rocm_versions(self) -> List[str]:
-        if GitRepo.ref() == REFS_MAIN and GitRepo.event_name() == EVENT_NAME_PUSH:
-            return ["7.1"]
-        else:
-            return ["7.0", "7.1"]
+        return ["7.1", "7.2"]
 
     def host_machines(self) -> List[Dict[str, str]]:
         # For the list of available instance types:

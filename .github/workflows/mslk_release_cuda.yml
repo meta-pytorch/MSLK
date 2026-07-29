@@ -3,8 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This workflow is used for building and publishing MSLK-CUDA release
-# builds against PyTorch-CUDA Release to public PyPI.
+# This workflow is used for building and testing MSLK-CUDA release builds
+# against PyTorch-CUDA Release.
 name: MSLK-CUDA Release Build
 
 on:
@@ -30,17 +30,6 @@ on:
         required: false
         options: [ "nightly", "test", "release" ]
         default: "test"
-      cuda-version-publish:
-        description: CUDA Version to Use for Building Artifact
-        type: choice
-        required: false
-        options: [ "13.0.2" ]
-        default: "13.0.2"
-      publish-to-pypi:
-        description: Publish Artifact to PyPI
-        type: boolean
-        required: false
-        default: false
 
 concurrency:
   # Cancel previous runs in the PR if a new commit is pushed
@@ -83,7 +72,3 @@ jobs:
       matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
       repo-ref: ${{ github.ref }}
       pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel) || 'release' }}
-      publish-to-pypi: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-to-pypi == 'true' }}
-      cuda-version-publish: ${{ github.event.inputs.cuda-version-publish }}
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}

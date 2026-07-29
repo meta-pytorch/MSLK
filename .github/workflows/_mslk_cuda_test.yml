@@ -3,8 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# This callable workflow is used for testing MSLK CUDA wheels
-# as well as optionally publish the wheels to PyPI after a successful test.
+# This callable workflow is used for testing MSLK CUDA wheels.
 name: MSLK CUDA Test
 
 on:
@@ -33,16 +32,6 @@ on:
         type: string
         required: false
         default: ""
-      publish-to-pypi:
-        description: Publish Artifact to PyPI
-        type: boolean
-        required: false
-        default: false
-      cuda-version-publish:
-        description: CUDA Target Version for Artifact Publishing
-        type: string
-        required: false
-        default: ""
       mslk-channel-version:
         description: PIP channel + version to install MSLK (if not specified, the GitHub artifact will be used instead)
         type: string
@@ -53,13 +42,8 @@ on:
         type: string
         required: false
         default: test
-    secrets:
-      PYPI_TOKEN:
-        # The PyPI token is only needed if publishing the artifact to PyPI is desired
-        required: false
-
 jobs:
-  # Download the built artifact from GHA, test on GPU, and push to PyPI
+  # Download the built artifact from GHA and test on GPU
   test_and_publish_artifact:
     # Use available instance types - https://github.com/pytorch/test-infra/blob/main/.github/scale-config.yml
     runs-on: ${{ matrix.host-machine.instance }}
@@ -180,18 +164,3 @@ jobs:
         name: mslk_traces_${{ matrix.host-machine.arch }}_${{ matrix.compiler }}_py${{ matrix.python-version }}_cu${{ matrix.cuda-version }}.zip
         path: mslk/bench/*.json
         if-no-files-found: error
-
-    - name: Push Wheel to PyPI
-      if: ${{ inputs.publish-to-pypi && matrix.cuda-version == inputs.cuda-version-publish }}
-      env:
-        PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      run: |
-        . $PRELUDE;
-
-        if [[ -z "$PYPI_TOKEN" ]]; then
-          echo "PYPI_TOKEN is not set!" >&2
-          echo "NOTE that secrets will not be available if the workflow is triggered by a PR from a fork." >&2
-          exit 1
-        fi
-
-        publish_to_pypi $BUILD_ENV "$PYPI_TOKEN" *.whl
