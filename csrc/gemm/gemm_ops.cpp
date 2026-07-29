@@ -70,6 +70,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // module via torch.library.impl at Python import time.
   m.def(
       "f8f8bf16_groupwise_grouped_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
+  // Sibling of f8f8bf16_rowwise_grouped_stacked taking weights already swizzled
+  // into the MFMA B layout; schema only on ROCm, implemented by
+  // mslk/gemm/flydsl/fp8_rowwise_grouped_gemm.py via torch.library.impl at
+  // Python import time.
+  m.def(
+      "f8f8bf16_rowwise_grouped_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(
@@ -135,7 +141,11 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);
   m.impl("f8f8bf16_rowwise_grouped", f8f8bf16_rowwise_grouped);
   m.impl("f8f8bf16_rowwise_grouped_cat", f8f8bf16_rowwise_grouped_cat);
+  // ROCm binds this from Python (fp8_rowwise_grouped_gemm.py), which needs the
+  // slot free; the same registration serves CUTLASS on CUDA.
+#ifndef USE_ROCM
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
+#endif
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
@@ -194,7 +204,6 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);
   m.impl("f8f8bf16_rowwise_grouped", f8f8bf16_rowwise_grouped);
   m.impl("f8f8bf16_rowwise_grouped_cat", f8f8bf16_rowwise_grouped_cat);
-  m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
@@ -206,9 +215,10 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
-  // i8i8bf16 / i8i8bf16_dynamic: Python Triton dispatch; no CPU fallback
-  // needed.
+  // i8i8bf16 / i8i8bf16_dynamic and f8f8bf16_rowwise_grouped_stacked: Python
+  // dispatch; no CPU fallback needed.
 #else
+  m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);
