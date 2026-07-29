@@ -140,6 +140,7 @@ def compile_preshuffle_gemm_a8(
     dvmem_preload: int = -1,
     epilogue: str = "none",  # "none", "bias", "bias_relu", "bias_silu", "bias_gelu"
     xcd_swizzle: int = 0,
+    batched: bool = False,
 ):
     """Compile the preshuffle GEMM kernel using the @flyc.kernel API.
 
@@ -199,6 +200,8 @@ def compile_preshuffle_gemm_a8(
         KERNEL_NAME += f"_ep_{epilogue}"
     if xcd_swizzle > 0:
         KERNEL_NAME += f"_xcd{xcd_swizzle}"
+    if batched:
+        KERNEL_NAME += "_batched"
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
 
@@ -395,6 +398,8 @@ def compile_preshuffle_gemm_a8(
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
+        if const_expr(batched):
+            bz = gpu.block_id("z")
 
         bx, by = xcd_remap_bx_by(
             bx,
@@ -460,17 +465,33 @@ def compile_preshuffle_gemm_a8(
         _a_nrec = fx.Int64(c_m * (K * elem_bytes // a_elem_vec_pack))
         _c_nrec = fx.Int64(c_m * c_n * 2)
 
-        def _ptr_buffer_resource(ptr, num_records_bytes=None):
+        # Grid-Z batch offset: each pointer advances by bz * batch_stride_bytes
+        _off_a = None
+        _off_b = None
+        _off_c = None
+        _off_sa = None
+        _off_sb = None
+        if const_expr(batched):
+            _bz_i64 = fx.Int64(bz)
+            _off_a = _bz_i64 * _a_nrec
+            _off_b = _bz_i64 * fx.Int64(fx.Index(N * K * elem_bytes // b_elem_vec_pack))
+            _off_c = _bz_i64 * _c_nrec
+            _off_sa = _bz_i64 * fx.Int64(c_m * fx.Index(4))
+            _off_sb = _bz_i64 * fx.Int64(fx.Index(N * 4))
+
+        def _ptr_buffer_resource(ptr, num_records_bytes=None, byte_offset=None):
             addr = fx.ptrtoint(ptr)
             addr_i64 = fx.arith.index_cast(T.i64, addr)
+            if byte_offset is not None:
+                addr_i64 = addr_i64 + byte_offset
             if num_records_bytes is None:
                 return buffer_ops.create_buffer_resource_from_addr(addr_i64)
             return buffer_ops.create_buffer_resource_from_addr(
                 addr_i64, num_records_bytes=num_records_bytes
             )
 
-        a_rsrc = _ptr_buffer_resource(arg_a, _a_nrec)
-        c_rsrc = _ptr_buffer_resource(arg_c, _c_nrec)
+        a_rsrc = _ptr_buffer_resource(arg_a, _a_nrec, byte_offset=_off_a)
+        c_rsrc = _ptr_buffer_resource(arg_c, _c_nrec, byte_offset=_off_c)
         _needs_per_token_scale = not is_f16_or_bf16 and not is_fp4
         scale_a_rsrc = None
         if const_expr(not is_f16_or_bf16):
@@ -482,7 +503,7 @@ def compile_preshuffle_gemm_a8(
                 )
             else:
                 _scale_a_nrec = fx.Int64(c_m * fx.Index(4))
-            scale_a_rsrc = _ptr_buffer_resource(arg_scale_a, _scale_a_nrec)
+            scale_a_rsrc = _ptr_buffer_resource(arg_scale_a, _scale_a_nrec, byte_offset=_off_sa)
 
         # ---- Bias buffer resource (for fused epilogue) ----
         # Use max_size=True so the buffer descriptor's size is taken from the
@@ -491,8 +512,8 @@ def compile_preshuffle_gemm_a8(
         bias_rsrc = None
         if const_expr(_has_bias):
             bias_rsrc = _ptr_buffer_resource(arg_bias)
-        b_rsrc = _ptr_buffer_resource(arg_b)
-        scale_b_rsrc = None if (is_f16_or_bf16) else _ptr_buffer_resource(arg_scale_b)
+        b_rsrc = _ptr_buffer_resource(arg_b, byte_offset=_off_b)
+        scale_b_rsrc = None if (is_f16_or_bf16) else _ptr_buffer_resource(arg_scale_b, byte_offset=_off_sb)
 
         bx_m = bx * tile_m
         by_n = by * tile_n
@@ -2147,49 +2168,95 @@ def compile_preshuffle_gemm_a8(
             store_output(final_accs, scales)
 
     # ── Host launcher ──────────────────────────────────────────────────────
-    @flyc.jit
-    def launch_gemm(
-        arg_c: fx.Pointer,
-        arg_a: fx.Pointer,
-        arg_b: fx.Pointer,
-        arg_scale_a: fx.Pointer,
-        arg_scale_b: fx.Pointer,
-        arg_bias: fx.Pointer,
-        i32_m: fx.Int32,
-        i32_n: fx.Int32,
-        stream: fx.Stream,
-    ):
-        allocator_pong.finalized = False
-        allocator_ping.finalized = False
-        ctx = CompilationContext.get_current()
-        from flydsl._mlir import ir
+    if batched:
+        @flyc.jit
+        def launch_gemm(
+            arg_c: fx.Pointer,
+            arg_a: fx.Pointer,
+            arg_b: fx.Pointer,
+            arg_scale_a: fx.Pointer,
+            arg_scale_b: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+            i32_b: fx.Int32,
+            stream: fx.Stream,
+        ):
+            allocator_pong.finalized = False
+            allocator_ping.finalized = False
+            ctx = CompilationContext.get_current()
+            from flydsl._mlir import ir
 
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator_pong.finalize()
-            allocator_ping.finalize()
+            with ir.InsertionPoint(ctx.gpu_module_body):
+                allocator_pong.finalize()
+                allocator_ping.finalize()
 
-        gx = (i32_m + (tile_m - 1)) // tile_m
-        gy = i32_n // tile_n
+            gx = (i32_m + (tile_m - 1)) // tile_m
+            gy = i32_n // tile_n
 
-        kernel_gemm._func.__name__ = KERNEL_NAME
-        launcher = kernel_gemm(
-            arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_bias, i32_m, i32_n
-        )
-        if const_expr(waves_per_eu is not None):
-            _wpe = int(waves_per_eu)
-            if const_expr(_wpe >= 1):
-                for op in ctx.gpu_module_body.operations:
-                    if const_expr(
-                        hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
-                    ):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            fx.Int32.ir_type, _wpe
-                        )
-        launcher.launch(
-            grid=(gx, gy, 1),
-            block=(256, 1, 1),
-            stream=stream,
-        )
+            kernel_gemm._func.__name__ = KERNEL_NAME
+            launcher = kernel_gemm(
+                arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_bias, i32_m, i32_n
+            )
+            if const_expr(waves_per_eu is not None):
+                _wpe = int(waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    for op in ctx.gpu_module_body.operations:
+                        if const_expr(
+                            hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+                        ):
+                            op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                                fx.Int32.ir_type, _wpe
+                            )
+            launcher.launch(
+                grid=(gx, gy, i32_b),
+                block=(256, 1, 1),
+                stream=stream,
+            )
+    else:
+        @flyc.jit
+        def launch_gemm(
+            arg_c: fx.Pointer,
+            arg_a: fx.Pointer,
+            arg_b: fx.Pointer,
+            arg_scale_a: fx.Pointer,
+            arg_scale_b: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+            stream: fx.Stream,
+        ):
+            allocator_pong.finalized = False
+            allocator_ping.finalized = False
+            ctx = CompilationContext.get_current()
+            from flydsl._mlir import ir
+
+            with ir.InsertionPoint(ctx.gpu_module_body):
+                allocator_pong.finalize()
+                allocator_ping.finalize()
+
+            gx = (i32_m + (tile_m - 1)) // tile_m
+            gy = i32_n // tile_n
+
+            kernel_gemm._func.__name__ = KERNEL_NAME
+            launcher = kernel_gemm(
+                arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_bias, i32_m, i32_n
+            )
+            if const_expr(waves_per_eu is not None):
+                _wpe = int(waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    for op in ctx.gpu_module_body.operations:
+                        if const_expr(
+                            hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+                        ):
+                            op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                                fx.Int32.ir_type, _wpe
+                            )
+            launcher.launch(
+                grid=(gx, gy, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
 
     return launch_gemm
 
