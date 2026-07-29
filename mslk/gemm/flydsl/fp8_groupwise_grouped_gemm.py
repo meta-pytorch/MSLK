@@ -96,6 +96,7 @@ def _launch_kernel(
         scale_block_n=_SCALE_BLOCK,
         out_dtype="bf16",
         b_preshuffled=b_preshuffled,
+        blockscale=True,
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The

@@ -57,9 +57,22 @@ CompileConstants = namedtuple(
 )
 
 
-def validate_params(*, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_dtype):
+def validate_params(
+    *, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_dtype, blockscale=False
+):
     """Validate the divisibility constraints and out_dtype choice shared by
-    both grouped GEMM blockscale kernels."""
+    the grouped GEMM kernels.
+
+    scale_block_k splits a K tile into the sub-blocks the MFMA schedule steps
+    through, so tile_k must cover a whole number of them under either scaling
+    scheme -- a tile_k below scale_block_k yields zero sub-blocks and a compute
+    loop that never runs.
+
+    scale_block_n only matters to block scaling, where a tile must not straddle
+    a scale block. Rowwise scaling carries one scale per row of A and per column
+    of B and applies it in the epilogue, so tile_n is free of that alignment and
+    may be smaller than scale_block_n.
+    """
     if k % tile_k != 0:
         raise ValueError(f"k ({k}) must be divisible by tile_k ({tile_k})")
     if n % tile_n != 0:
@@ -68,7 +81,7 @@ def validate_params(*, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_d
         raise ValueError(
             f"tile_k ({tile_k}) must be divisible by scale_block_k ({scale_block_k})"
         )
-    if tile_n % scale_block_n != 0:
+    if blockscale and tile_n % scale_block_n != 0:
         raise ValueError(
             f"tile_n ({tile_n}) must be divisible by scale_block_n ({scale_block_n})"
         )
@@ -744,6 +757,7 @@ def make_compute_tile(
     sa_group_off=None,
     group_m_start=None,
     group_m_size=None,
+    blockscale=False,
 ):
     """Build the per-K-tile compute closure.
 
@@ -756,6 +770,14 @@ def make_compute_tile(
     `sa_group_off` is None for the contig path (no addition emitted)
     and `group_idx * c_scale_k * m_in` for the masked path; only the
     gfx942 SW path uses it.
+
+    Where the scales are applied follows from how they vary. Block scaling has a
+    distinct scale per (scale_block_k x scale_block_n) block, so each block's
+    partial sum needs its own factor and the scaling happens here, per block,
+    inside the K loop. Rowwise scaling has one scale per row of A and one per
+    column of B, both constant along K, so they factor out of the reduction and
+    the K loop accumulates unscaled, leaving a single scaling in the epilogue
+    (see `make_rowwise_scaler`).
     """
 
     def compute_tile(
@@ -768,7 +790,7 @@ def make_compute_tile(
 
             s_a_vecs = []
             s_b_vals = []
-            if not _use_hw_scale:
+            if blockscale and not _use_hw_scale:
                 if group_m_start is not None:
                     # quantize_fp8_group(m_sizes=...) stores scale_a as per-group
                     # blocks: group g starts at M_start*scale_k and holds element
@@ -854,24 +876,29 @@ def make_compute_tile(
                         )
             elif _is_gfx950:
                 # gfx950: use the wide 16x16x128 MFMA with a neutral E8M0 scale
-                # (0x7F7F7F7F = no-op hardware scaling), accumulate a whole
-                # scale-block into block_accs, then apply the FP32 scales in
-                # software once per scale-block. This avoids both the 4x-narrower
-                # 16x16x32 MFMA and the per-K-step VALU scale cost of the path
-                # below.
-                combined_scales = []
-                for mi in range_constexpr(m_repeat):
-                    mi_combined = []
-                    for ni in range_constexpr(num_acc_n):
-                        s_b_bc = Vector.filled(
-                            (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                        )
-                        mi_combined.append(
-                            ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
-                        )
-                    combined_scales.append(mi_combined)
-
-                block_accs = [acc_init] * (num_acc_n * m_repeat)
+                # (0x7F7F7F7F = no-op hardware scaling), which avoids the
+                # 4x-narrower 16x16x32 MFMA of the path below.
+                #
+                # Block scaling accumulates a whole scale block into block_accs
+                # and folds it into current_accs with the FP32 scales once per
+                # block, keeping the VALU scale cost off the per-K-step path.
+                # Rowwise scaling has nothing to fold in per block, so the MFMAs
+                # accumulate straight into current_accs.
+                if blockscale:
+                    combined_scales = []
+                    for mi in range_constexpr(m_repeat):
+                        mi_combined = []
+                        for ni in range_constexpr(num_acc_n):
+                            s_b_bc = Vector.filled(
+                                (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                            )
+                            mi_combined.append(
+                                ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
+                            )
+                        combined_scales.append(mi_combined)
+                    mfma_accs = [acc_init] * (num_acc_n * m_repeat)
+                else:
+                    mfma_accs = current_accs
                 ku0 = sb * ku_per_sb
                 ku1 = ku0 + 1
                 b0_packs0, b0_packs1 = b_tile_in[ku0]
@@ -893,12 +920,12 @@ def make_compute_tile(
                             b0_packs0[ni], b0_packs1[ni], b1_packs0[ni], b1_packs1[ni]
                         )
                         acc_idx = mi * num_acc_n + ni
-                        block_accs[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_accs[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                             mfma_res_ty,
                             [
                                 a128,
                                 b128,
-                                block_accs[acc_idx],
+                                mfma_accs[acc_idx],
                                 0,
                                 0,
                                 0,
@@ -908,14 +935,15 @@ def make_compute_tile(
                             ],
                         )
 
-                for mi in range_constexpr(m_repeat):
-                    for ni in range_constexpr(num_acc_n):
-                        acc_idx = mi * num_acc_n + ni
-                        current_accs[acc_idx] = math_dialect.fma(
-                            block_accs[acc_idx],
-                            combined_scales[mi][ni],
-                            current_accs[acc_idx],
-                        )
+                if blockscale:
+                    for mi in range_constexpr(m_repeat):
+                        for ni in range_constexpr(num_acc_n):
+                            acc_idx = mi * num_acc_n + ni
+                            current_accs[acc_idx] = math_dialect.fma(
+                                mfma_accs[acc_idx],
+                                combined_scales[mi][ni],
+                                current_accs[acc_idx],
+                            )
             else:
                 for ku_local in range_constexpr(ku_per_sb):
                     ku = sb * ku_per_sb + ku_local
@@ -941,27 +969,108 @@ def make_compute_tile(
 
                         for ni in range_constexpr(num_acc_n):
                             acc_idx = mi * num_acc_n + ni
-
                             mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
-                            mfma_mid = mfma_fn(
-                                T.f32x4, [a0, b_packs0[ni], acc_init, 0, 0, 0]
-                            )
-                            mfma_result = mfma_fn(
-                                T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
-                            )
 
-                            s_a_v4 = s_a_vecs[mi]
-                            s_b_bc = Vector.filled(
-                                (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                            )
-                            scaled = ArithValue(mfma_result) * ArithValue(s_a_v4)
-                            current_accs[acc_idx] = math_dialect.fma(
-                                scaled, s_b_bc, current_accs[acc_idx]
-                            )
+                            if blockscale:
+                                # This block's partial sum starts from zero so it
+                                # can be scaled on its own before joining the
+                                # running accumulator.
+                                mfma_mid = mfma_fn(
+                                    T.f32x4, [a0, b_packs0[ni], acc_init, 0, 0, 0]
+                                )
+                                mfma_result = mfma_fn(
+                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                )
+
+                                s_a_v4 = s_a_vecs[mi]
+                                s_b_bc = Vector.filled(
+                                    (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                                )
+                                scaled = ArithValue(mfma_result) * ArithValue(s_a_v4)
+                                current_accs[acc_idx] = math_dialect.fma(
+                                    scaled, s_b_bc, current_accs[acc_idx]
+                                )
+                            else:
+                                # Nothing to scale per block, so chain the MFMAs
+                                # straight onto the running accumulator.
+                                mfma_mid = mfma_fn(
+                                    T.f32x4,
+                                    [a0, b_packs0[ni], current_accs[acc_idx], 0, 0, 0],
+                                )
+                                current_accs[acc_idx] = mfma_fn(
+                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                )
 
         return current_accs
 
     return compute_tile
+
+
+def make_rowwise_scaler(
+    *,
+    sa_rsrc,
+    sb_rsrc,
+    group_idx,
+    n_in,
+    by_n,
+    n_tile_base,
+    bx_m,
+    lane_mod_16,
+    lane_div_16,
+    m_repeat,
+    num_acc_n,
+):
+    """Build the closure that applies rowwise scales to the finished accumulators.
+
+    Rowwise scaling multiplies each output element by ``scale_a[row]`` and
+    ``scale_b[group, col]``, both constant along K, so this runs once after the
+    K loop rather than inside it.
+
+    The MFMA 16x16 C fragment holds four f32 per lane that share a column and
+    differ by row, which is exactly how the two scales vary: scale_b contributes
+    one value broadcast across the fragment, and scale_a contributes a vector of
+    the fragment's four rows. Unlike the block-scale lookup, the column here
+    includes ``lane_mod_16``, so scale_b is not wave-uniform and must not be
+    routed through readfirstlane.
+
+    Returns ``apply_rowwise_scales(accs)``.
+    """
+
+    def apply_rowwise_scales(accs):
+        scaled = list(accs)
+
+        # scale_a is [total_M]: one value per global row.
+        row_off_base = lane_div_16 * fx.Index(4)
+        s_a_vecs = []
+        for mi in range_constexpr(m_repeat):
+            s_a_row = []
+            for ii in range_constexpr(4):
+                row_global = bx_m + (mi * 16) + row_off_base + fx.Index(ii)
+                s_a_row.append(
+                    buffer_ops.buffer_load(
+                        sa_rsrc, row_global, vec_width=1, dtype=T.f32
+                    )
+                )
+            s_a_vecs.append(Vector.from_elements(s_a_row, fx.Float32))
+
+        # scale_b is [num_groups, n]: element (g, col) at g*n + col.
+        group_n_off = group_idx * n_in
+        s_b_bcs = []
+        for ni in range_constexpr(num_acc_n):
+            col_global = group_n_off + by_n + n_tile_base + (ni * 16) + lane_mod_16
+            s_b_val = buffer_ops.buffer_load(
+                sb_rsrc, col_global, vec_width=1, dtype=T.f32
+            )
+            s_b_bcs.append(Vector.filled((4,), fx.Float32(s_b_val), fx.Float32))
+
+        for mi in range_constexpr(m_repeat):
+            for ni in range_constexpr(num_acc_n):
+                acc_idx = mi * num_acc_n + ni
+                v = ArithValue(scaled[acc_idx]) * ArithValue(s_a_vecs[mi])
+                scaled[acc_idx] = v * ArithValue(s_b_bcs[ni])
+        return scaled
+
+    return apply_rowwise_scales
 
 
 def make_kloop_plain(

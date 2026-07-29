@@ -69,6 +69,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     make_pingpong_kloop,
     make_plain_b_tile,
     make_prefetch_scales,
+    make_rowwise_scaler,
     out_mlir_for,
     setup_lds_allocation,
     setup_lds_allocation_plain,
@@ -93,6 +94,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     out_dtype: str = "bf16",
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
+    blockscale: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -110,8 +112,17 @@ def compile_grouped_gemm_blockscale_contiguous(
             MFMA layout and loaded HBM->registers (no B LDS). When False, B is
             plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
             like A. The two paths share the entire kernel body (tile-map group
-            dispatch, FP32 block scaling, wide-MFMA, CShuffle epilogue); only the
-            B load stage and its LDS allocation differ.
+            dispatch, scaling, wide-MFMA, CShuffle epilogue); only the B load
+            stage and its LDS allocation differ.
+        blockscale: Selects the scaling scheme, which sets the expected layout of
+            scale_a / scale_b and where the scales are applied.
+            False (default) is rowwise: scale_a is [M_total] and scale_b is
+            [num_groups, N], one factor per row of A and per column of B, applied
+            once in the epilogue. Tiles are then free of scale-block alignment,
+            so tile_n may be smaller than scale_block_n.
+            True is block scaling: scale_a is per-group [M_g, scale_k] blocks and
+            scale_b is [num_groups, scale_k, scale_n], applied per scale block
+            inside the K loop, which requires the tile to align to the blocks.
 
     Returns:
         JIT launcher function.
@@ -133,6 +144,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         k=k,
         tile_n=tile_n,
         tile_k=tile_k,
+        blockscale=blockscale,
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
@@ -199,8 +211,9 @@ def compile_grouped_gemm_blockscale_contiguous(
 
     # Module name for caching
     _variant = "contiguous_pingpong" if b_preshuffled else "plain"
+    _scaling = "blockscale" if blockscale else "rowwise"
     module_name = (
-        f"grouped_gemm_blockscale_{_variant}_{out_dtype}"
+        f"grouped_gemm_{_scaling}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
     ).replace("-", "_")
@@ -291,14 +304,19 @@ def compile_grouped_gemm_blockscale_contiguous(
         # pre-packed on host); gfx942 SW path consumes f32.
         scale_byte_size = 1 if _use_hw_scale else 4
 
-        # scale_a: [scale_k, M] - transposed layout
-        sa_nbytes = fx.Index(scale_k) * m_in * fx.Index(scale_byte_size)
+        if const_expr(blockscale):
+            # scale_a: per-group [M_g, scale_k] blocks, scale_k values per row.
+            sa_nbytes = fx.Index(scale_k) * m_in * fx.Index(scale_byte_size)
+            # scale_b: [num_groups, scale_k, scale_n]
+            sb_nbytes = num_groups_in * fx.Index(scale_n * scale_k * scale_byte_size)
+        else:
+            # scale_a: [M_total], one value per row.
+            sa_nbytes = m_in * fx.Index(scale_byte_size)
+            # scale_b: [num_groups, N], one value per column of each group.
+            sb_nbytes = num_groups_in * n_in * fx.Index(scale_byte_size)
         sa_rsrc = buffer_ops.create_buffer_resource(
             arg_scale_a, max_size=False, num_records_bytes=sa_nbytes
         )
-
-        # scale_b: [num_groups, scale_n, scale_k]
-        sb_nbytes = num_groups_in * fx.Index(scale_n * scale_k * scale_byte_size)
         sb_rsrc = buffer_ops.create_buffer_resource(
             arg_scale_b, max_size=False, num_records_bytes=sb_nbytes
         )
@@ -530,6 +548,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 acc_init=acc_init,
                 group_m_start=fx.Index(group_m_start_i32),
                 group_m_size=fx.Index(group_m_size_i32),
+                blockscale=blockscale,
             )
 
             if const_expr(b_preshuffled):
@@ -563,6 +582,23 @@ def compile_grouped_gemm_blockscale_contiguous(
                     lds_base_b=lds_base_b,
                 )
             accs = run_kloop(accs)
+
+            if const_expr(not blockscale):
+                # Rowwise scales are constant along K, so the whole reduction is
+                # scaled here in one pass rather than per K tile.
+                accs = make_rowwise_scaler(
+                    sa_rsrc=sa_rsrc,
+                    sb_rsrc=sb_rsrc,
+                    group_idx=group_idx,
+                    n_in=n_in,
+                    by_n=by_n,
+                    n_tile_base=n_tile_base,
+                    bx_m=bx_m,
+                    lane_mod_16=lane_mod_16,
+                    lane_div_16=lane_div_16,
+                    m_repeat=m_repeat,
+                    num_acc_n=num_acc_n,
+                )(accs)
 
             # ===== Epilogue: CShuffle vectorized stores =====
             c_n = n_in
