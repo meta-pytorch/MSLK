@@ -503,7 +503,9 @@ def compile_preshuffle_gemm_a8(
                 )
             else:
                 _scale_a_nrec = fx.Int64(c_m * fx.Index(4))
-            scale_a_rsrc = _ptr_buffer_resource(arg_scale_a, _scale_a_nrec, byte_offset=_off_sa)
+            scale_a_rsrc = _ptr_buffer_resource(
+                arg_scale_a, _scale_a_nrec, byte_offset=_off_sa
+            )
 
         # ---- Bias buffer resource (for fused epilogue) ----
         # Use max_size=True so the buffer descriptor's size is taken from the
@@ -513,7 +515,11 @@ def compile_preshuffle_gemm_a8(
         if const_expr(_has_bias):
             bias_rsrc = _ptr_buffer_resource(arg_bias)
         b_rsrc = _ptr_buffer_resource(arg_b, byte_offset=_off_b)
-        scale_b_rsrc = None if (is_f16_or_bf16) else _ptr_buffer_resource(arg_scale_b, byte_offset=_off_sb)
+        scale_b_rsrc = (
+            None
+            if (is_f16_or_bf16)
+            else _ptr_buffer_resource(arg_scale_b, byte_offset=_off_sb)
+        )
 
         bx_m = bx * tile_m
         by_n = by * tile_n
@@ -2169,6 +2175,7 @@ def compile_preshuffle_gemm_a8(
 
     # ── Host launcher ──────────────────────────────────────────────────────
     if batched:
+
         @flyc.jit
         def launch_gemm(
             arg_c: fx.Pointer,
@@ -2203,7 +2210,8 @@ def compile_preshuffle_gemm_a8(
                 if const_expr(_wpe >= 1):
                     for op in ctx.gpu_module_body.operations:
                         if const_expr(
-                            hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+                            hasattr(op, "attributes")
+                            and op.OPERATION_NAME == "gpu.func"
                         ):
                             op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                                 fx.Int32.ir_type, _wpe
@@ -2214,6 +2222,7 @@ def compile_preshuffle_gemm_a8(
                 stream=stream,
             )
     else:
+
         @flyc.jit
         def launch_gemm(
             arg_c: fx.Pointer,
@@ -2247,7 +2256,8 @@ def compile_preshuffle_gemm_a8(
                 if const_expr(_wpe >= 1):
                     for op in ctx.gpu_module_body.operations:
                         if const_expr(
-                            hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+                            hasattr(op, "attributes")
+                            and op.OPERATION_NAME == "gpu.func"
                         ):
                             op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                                 fx.Int32.ir_type, _wpe
