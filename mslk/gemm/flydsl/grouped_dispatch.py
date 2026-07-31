@@ -49,7 +49,9 @@ def _tiles(tile_ns):
 BLOCKSCALE_TILES = _tiles((128, 256))
 ROWWISE_TILES = _tiles((64, 128, 256))
 
-_PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
+# Only tile_n has to divide the problem: a tile_k that overruns K compiles the
+# tail-masked variant instead of being invalid.
+_PRUNE = prune_by_divisibility({"tile_n": "n"})
 _KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "masked"]
 
 
@@ -86,6 +88,12 @@ def launch(
 
     total_M, K = XQ.shape
     G, N, _ = WQ.shape
+    if b_preshuffled and K % tile_k != 0:
+        raise ValueError(
+            f"k ({K}) must be divisible by tile_k ({tile_k}) for preshuffled B: "
+            "the MFMA B layout interleaves K, so a partial tile cannot be masked "
+            "a load at a time"
+        )
     if masked:
         # One z slice per group, so the M axis only spans a single group's slab.
         num_m_tiles = -(-(total_M // G) // tile_m)
@@ -108,6 +116,10 @@ def launch(
         b_preshuffled=b_preshuffled,
         blockscale=blockscale,
         masked=masked,
+        # Compile the tail-masked variant only when K stops mid-tile, so shapes
+        # that divide keep the cheaper unmasked loads. This mirrors how CK picks
+        # between its KPadding and Default specialisations on the host.
+        k_padding=(K % tile_k != 0),
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The

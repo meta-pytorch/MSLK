@@ -62,6 +62,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     make_compute_tile,
     make_epilogue_writers,
     make_hot_loop_scheduler,
+    make_k_tail_mask,
     make_kloop_plain,
     make_lds_b_loader,
     make_lds_loader,
@@ -96,6 +97,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     b_preshuffled: bool = True,
     blockscale: bool = False,
     masked: bool = False,
+    k_padding: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -146,6 +148,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         tile_n=tile_n,
         tile_k=tile_k,
         blockscale=blockscale,
+        k_padding=k_padding,
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
@@ -173,6 +176,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         tile_k=tile_k,
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
+        k_padding=k_padding,
     )
     total_threads = _c.total_threads
     elem_bytes = _c.elem_bytes
@@ -214,10 +218,11 @@ def compile_grouped_gemm_blockscale_contiguous(
     _variant = "contiguous_pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
     _layout = "masked" if masked else "contig"
+    _kpad = "_kpad" if k_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{_layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -429,6 +434,16 @@ def compile_grouped_gemm_blockscale_contiguous(
             n_intra_list = _nb.n_intra_list
             c_scale_k = _nb.c_scale_k
 
+            # Predicate for the partial final K tile; a no-op unless k_padding is
+            # on and K stops mid-tile.
+            k_tail_mask = make_k_tail_mask(
+                k_padding=k_padding,
+                num_k_tiles=num_k_tiles,
+                k=k,
+                tile_k=tile_k,
+                k_in=k_in,
+            )
+
             (
                 prefetch_a_tile,
                 store_a_tile_to_lds,
@@ -450,6 +465,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 total_threads=total_threads,
                 elem_bytes=elem_bytes,
                 k_in=k_in,
+                k_tail_mask=k_tail_mask,
             )
 
             lds_load_packs_k64 = make_lds_loader(
@@ -500,6 +516,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                     elem_bytes=elem_bytes,
                     n_in=n_in,
                     k_in=k_in,
+                    k_tail_mask=k_tail_mask,
                 )
                 lds_load_b_packs_k64 = make_lds_b_loader(
                     lds_b=lds_b,

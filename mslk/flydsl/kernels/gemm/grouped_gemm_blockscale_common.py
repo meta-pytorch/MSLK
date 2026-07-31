@@ -33,6 +33,41 @@ from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     tile_chunk_coord_i32,
 )
 
+# FP8 elements covered by one 16-byte vectorised load. With k_padding the tail K
+# tile is masked a whole load at a time, so this is the finest K granularity the
+# kernel can end on.
+K_LOAD_ELEMS = 16
+
+
+def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in):
+    """Build the per-load K-range predicate used by the A and B tile loaders.
+
+    Returns ``mask(k_tile_idx_py, base_k_div4, col_local_i32)`` yielding None
+    wherever no masking is needed, so every tile but the last emits exactly the
+    code it did before.
+
+    A masked ``buffer_load`` reads out of the buffer's range and so returns zero,
+    which is what a K tail needs: the excess lanes contribute nothing to the sum.
+    A plain out-of-range offset would not do, since reading past K within a row
+    lands on the next row's data rather than outside the buffer.
+    """
+    tail = k_padding and (k % tile_k != 0)
+
+    def mask(k_tile_idx_py, base_k_div4, col_local_i32):
+        if not tail or k_tile_idx_py != num_k_tiles - 1:
+            return None
+        # Loads are 16-byte aligned and K is a multiple of that width, so a chunk
+        # is either wholly inside K or wholly outside it.
+        chunk_start_div4 = base_k_div4 + col_local_i32
+        return arith.cmpi(
+            arith.CmpIPredicate.ult,
+            arith.index_cast(T.i32, chunk_start_div4),
+            arith.index_cast(T.i32, k_in // fx.Index(4)),
+        )
+
+    return mask
+
+
 CompileConstants = namedtuple(
     "CompileConstants",
     [
@@ -58,7 +93,16 @@ CompileConstants = namedtuple(
 
 
 def validate_params(
-    *, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_dtype, blockscale=False
+    *,
+    n,
+    k,
+    tile_n,
+    tile_k,
+    scale_block_k,
+    scale_block_n,
+    out_dtype,
+    blockscale=False,
+    k_padding=False,
 ):
     """Validate the divisibility constraints and out_dtype choice shared by
     the grouped GEMM kernels.
@@ -73,7 +117,15 @@ def validate_params(
     of B and applies it in the epilogue, so tile_n is free of that alignment and
     may be smaller than scale_block_n.
     """
-    if k % tile_k != 0:
+    if k_padding:
+        # The tail K tile is masked off per 16-byte load, so K only has to land on
+        # a load boundary rather than a whole tile.
+        if k % K_LOAD_ELEMS != 0:
+            raise ValueError(
+                f"k ({k}) must be divisible by {K_LOAD_ELEMS} (the vectorised "
+                "load width) even with k_padding"
+            )
+    elif k % tile_k != 0:
         raise ValueError(f"k ({k}) must be divisible by tile_k ({tile_k})")
     if n % tile_n != 0:
         raise ValueError(f"n ({n}) must be divisible by tile_n ({tile_n})")
@@ -181,7 +233,7 @@ def out_mlir_for(out_dtype):
 
 
 def compute_compile_constants(
-    *, n, k, tile_m, tile_n, tile_k, scale_block_k, scale_block_n
+    *, n, k, tile_m, tile_n, tile_k, scale_block_k, scale_block_n, k_padding=False
 ):
     """Compute the compile-time scalar constants shared by both kernels.
 
@@ -189,7 +241,9 @@ def compute_compile_constants(
     """
     total_threads = 256
     elem_bytes = 1  # FP8
-    num_k_tiles = k // tile_k
+    # With k_padding the last tile is only partly covered by K; it still runs, with
+    # its out-of-range loads masked to zero, which contribute nothing to the sum.
+    num_k_tiles = -(-k // tile_k) if k_padding else k // tile_k
     scale_k = k // scale_block_k
     scale_n = n // scale_block_n
     sb_per_tile = tile_k // scale_block_k  # scale blocks per K-tile
@@ -299,6 +353,7 @@ def make_a_tile_loaders(
     k_in,
     m_in=None,
     group_idx=None,
+    k_tail_mask=None,
 ):
     """Build the prefetch + LDS-store closures for the A tile.
 
@@ -310,6 +365,7 @@ def make_a_tile_loaders(
     code so the resulting MLIR (and ISA) is byte-identical. `k_blocks16`
     is returned for reuse by the downstream LDS-load helper.
     """
+    _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_a_tile_div4 = fx.make_layout(
         (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
     )
@@ -352,7 +408,13 @@ def make_a_tile_loaders(
                     + base_k_div4
                     + a_col_local_i32[i]
                 )
-            a_vec = buffer_ops.buffer_load(a_rsrc, idx_i32, vec_width=4, dtype=T.i32)
+            a_vec = buffer_ops.buffer_load(
+                a_rsrc,
+                idx_i32,
+                vec_width=4,
+                dtype=T.i32,
+                mask=_k_tail_mask(k_tile_idx_py, base_k_div4, a_col_local_i32[i]),
+            )
             parts.append(Vector(a_vec).bitcast(fx.Int32))
         return parts
 
@@ -401,6 +463,7 @@ def make_b_tile_loaders(
     elem_bytes,
     n_in,
     k_in,
+    k_tail_mask=None,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
@@ -413,6 +476,7 @@ def make_b_tile_loaders(
     swizzle as A. Returns `(prefetch_b_tile, store_b_tile_to_lds, b_row_local,
     b_col_local_i32, k_blocks16_b)`.
     """
+    _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_b_tile_div4 = fx.make_layout(
         (tile_n, tile_k_dwords), stride=(tile_k_dwords, 1)
     )
@@ -450,7 +514,13 @@ def make_b_tile_loaders(
                 + base_k_div4
                 + b_col_local_i32[i]
             )
-            b_vec = buffer_ops.buffer_load(b_rsrc, idx_i32, vec_width=4, dtype=T.i32)
+            b_vec = buffer_ops.buffer_load(
+                b_rsrc,
+                idx_i32,
+                vec_width=4,
+                dtype=T.i32,
+                mask=_k_tail_mask(k_tile_idx_py, base_k_div4, b_col_local_i32[i]),
+            )
             parts.append(Vector(b_vec).bitcast(fx.Int32))
         return parts
 
