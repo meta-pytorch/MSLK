@@ -113,6 +113,119 @@ def matmul_f8f8bf16_rowwise_grouped(
     )
 
 
+def _dispatch_rowwise_grouped_dynamic(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    zero_start_index_M: torch.Tensor,
+    zeroing_output_tensor: bool,
+    *,
+    b_preshuffled: bool,
+) -> torch.Tensor:
+    """Shared dispatch for the padded-layout ops.
+
+    Each group owns a fixed slab of ``expected_m`` rows and only the first
+    ``zero_start_index_M[g]`` of them hold real tokens, so the caller never has to
+    compact tokens into one buffer. The slabs are contiguous, so the kernel sees
+    the flattened ``[G * expected_m, ...]`` views and treats the group as a grid
+    axis rather than resolving it from row counts.
+    """
+    assert XQ.ndim == 3, f"XQ must be [G, M, K], got {XQ.shape}"
+    assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
+    assert zero_start_index_M.ndim == 1, (
+        f"zero_start_index_M must be [G], got {zero_start_index_M.shape}"
+    )
+    G, expected_m, K = XQ.shape
+    Gw, N, Kw = WQ.shape
+    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert Gw == G, f"group mismatch: XQ G={G}, WQ G={Gw}"
+    assert zero_start_index_M.shape[0] == G, (
+        f"zero_start_index_M length {zero_start_index_M.shape[0]} must equal G={G}"
+    )
+    # The MFMA instructions read the operands in the arch's native FP8 format, and
+    # the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would
+    # be applied with the wrong exponent bias rather than rejected.
+    expected_fp8 = (
+        torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
+    )
+    assert XQ.dtype == expected_fp8, f"XQ must be {expected_fp8}, got {XQ.dtype}"
+    assert WQ.dtype == expected_fp8, f"WQ must be {expected_fp8}, got {WQ.dtype}"
+    assert zero_start_index_M.dtype == torch.int64, (
+        f"zero_start_index_M must be int64, got {zero_start_index_M.dtype}"
+    )
+    assert x_scale.numel() == G * expected_m, (
+        f"x_scale must hold one scale per row ({G * expected_m}), got {x_scale.numel()}"
+    )
+    assert w_scale.numel() == G * N, (
+        f"w_scale must hold one scale per group column ({G * N}), got {w_scale.numel()}"
+    )
+
+    # Rows past a group's valid count are never written, so they carry whatever the
+    # buffer already held. Zero them up front when the caller asks for it, matching
+    # the CK implementation's separate zeroing pass.
+    alloc = torch.zeros if zeroing_output_tensor else torch.empty
+    out = alloc((G, expected_m, N), dtype=torch.bfloat16, device=XQ.device)
+
+    grouped_dispatch.dispatch(
+        XQ.contiguous().view(G * expected_m, K),
+        WQ,
+        x_scale,
+        w_scale,
+        zero_start_index_M,
+        b_preshuffled=b_preshuffled,
+        blockscale=False,
+        masked=True,
+        out=out.view(G * expected_m, N),
+    )
+    return out
+
+
+def matmul_f8f8bf16_rowwise_grouped_dynamic(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    zero_start_index_M: torch.Tensor,
+    zeroing_output_tensor: bool = True,
+) -> torch.Tensor:
+    """Padded-layout rowwise grouped GEMM with plain row-major weights."""
+    return _dispatch_rowwise_grouped_dynamic(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        zero_start_index_M,
+        zeroing_output_tensor,
+        b_preshuffled=False,
+    )
+
+
+def matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    zero_start_index_M: torch.Tensor,
+    zeroing_output_tensor: bool = True,
+) -> torch.Tensor:
+    """Preshuffled-B padded-layout rowwise grouped GEMM (WQ already
+    MFMA-preshuffled).
+
+    Loads B straight to registers rather than staging it through LDS, in
+    exchange for the caller shuffling the weights once at load time.
+    """
+    return _dispatch_rowwise_grouped_dynamic(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        zero_start_index_M,
+        zeroing_output_tensor,
+        b_preshuffled=True,
+    )
+
+
 def matmul_f8f8bf16_rowwise_grouped_preshuffle(
     XQ: torch.Tensor,
     WQ: torch.Tensor,

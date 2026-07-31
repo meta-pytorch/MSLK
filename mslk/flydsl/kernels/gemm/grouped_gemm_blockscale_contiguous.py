@@ -95,6 +95,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
     blockscale: bool = False,
+    masked: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -212,8 +213,9 @@ def compile_grouped_gemm_blockscale_contiguous(
     # Module name for caching
     _variant = "contiguous_pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
+    _layout = "masked" if masked else "contig"
     module_name = (
-        f"grouped_gemm_{_scaling}_{_variant}_{out_dtype}"
+        f"grouped_gemm_{_scaling}_{_layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
     ).replace("-", "_")
@@ -241,6 +243,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         tx = gpu.thread_id("x")
         by = gpu.block_id("x")  # N-block index
         bx = gpu.block_id("y")  # M-tile index (into the per-tile dispatch map)
+        bz = gpu.block_id("z")  # group index; carries the group in the padded layout
 
         # N-block position; bx_m (global row base) is loaded from the tile map below.
         by_n = by * fx.Index(tile_n)
@@ -321,13 +324,6 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_scale_b, max_size=False, num_records_bytes=sb_nbytes
         )
 
-        # Resolve which group owns this flat M-tile id (bx) from m_sizes. Doing it
-        # here rather than from a host-built dispatch map keeps the launch free of
-        # helper kernels, which matters under CUDA-graph capture where each one is
-        # replayed per call. num_groups is a compile-time constant, so the loop
-        # unrolls to a few scalar ops. acc_m/acc_t are the running m_start and
-        # tile_start prefixes; tiles beyond the real tile count (the grid extent is
-        # an upper bound) match no group and stay marked -1.
         ms_rsrc = buffer_ops.create_buffer_resource(
             arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(8)
         )
@@ -338,35 +334,63 @@ def compile_grouped_gemm_blockscale_contiguous(
         bx_i32 = arith.index_cast(T.i32, bx)
         tile_m_c = _i32(tile_m)
         tile_m_bump = _i32(tile_m - 1)
-        acc_m = _i32(0)  # cumulative rows before group g (m_starts[g])
-        acc_t = _i32(0)  # cumulative tiles before group g (tile_starts[g])
-        group_id_i32 = _i32(-1)
-        row_start_i32 = _i32(0)
-        row_limit_i32 = _i32(0)
-        group_m_start_i32 = _i32(0)  # first global row of the owning group
-        group_m_size_i32 = _i32(0)  # row count of the owning group
-        for _g in range_constexpr(num_groups):
-            # m_sizes is int64; read the low dword of element _g (index _g*2 in
-            # dwords). Row counts fit in int32, so the high dword is always zero
-            # and no host-side narrowing kernel is needed.
-            m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
-            tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
-            acc_t_next = arith.addi(acc_t, tiles_g)
-            in_grp = arith.andi(
-                arith.cmpi(arith.CmpIPredicate.sge, bx_i32, acc_t),
-                arith.cmpi(arith.CmpIPredicate.slt, bx_i32, acc_t_next),
-            )
-            rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
-            rl = arith.addi(acc_m, m_g)
-            group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
-            row_start_i32 = arith.select(in_grp, rs, row_start_i32)
-            row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
-            group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
-            group_m_size_i32 = arith.select(in_grp, m_g, group_m_size_i32)
-            acc_m = arith.addi(acc_m, m_g)
-            acc_t = acc_t_next
 
-        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0))
+        if const_expr(masked):
+            # Padded layout: every group owns a fixed slab of expected_m rows, so
+            # the group is a grid axis and needs no resolution. m_sizes holds the
+            # count of rows in each slab that carry real data; the rest is padding
+            # the epilogue must not write.
+            group_id_i32 = arith.index_cast(T.i32, bz)
+            expected_m_i32 = arith.divui(
+                arith.index_cast(T.i32, m_in), _i32(num_groups)
+            )
+            group_m_start_i32 = arith.muli(group_id_i32, expected_m_i32)
+            group_m_size_i32 = expected_m_i32
+            row_start_i32 = arith.addi(group_m_start_i32, arith.muli(bx_i32, tile_m_c))
+            valid_m = buffer_ops.buffer_load(ms_rsrc, bz * 2, vec_width=1, dtype=T.i32)
+            row_limit_i32 = arith.addi(group_m_start_i32, valid_m)
+            # Skip whole tiles that start past this group's valid rows.
+            is_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
+            )
+        else:
+            # Packed layout: groups are concatenated along M, so resolve which one
+            # owns this flat M-tile id (bx) from m_sizes. Doing it here rather than
+            # from a host-built dispatch map keeps the launch free of helper
+            # kernels, which matters under CUDA-graph capture where each one is
+            # replayed per call. num_groups is a compile-time constant, so the loop
+            # unrolls to a few scalar ops. acc_m/acc_t are the running m_start and
+            # tile_start prefixes; tiles beyond the real tile count (the grid extent
+            # is an upper bound) match no group and stay marked -1.
+            acc_m = _i32(0)  # cumulative rows before group g (m_starts[g])
+            acc_t = _i32(0)  # cumulative tiles before group g (tile_starts[g])
+            group_id_i32 = _i32(-1)
+            row_start_i32 = _i32(0)
+            row_limit_i32 = _i32(0)
+            group_m_start_i32 = _i32(0)  # first global row of the owning group
+            group_m_size_i32 = _i32(0)  # row count of the owning group
+            for _g in range_constexpr(num_groups):
+                # m_sizes is int64; read the low dword of element _g (index _g*2 in
+                # dwords). Row counts fit in int32, so the high dword is always zero
+                # and no host-side narrowing kernel is needed.
+                m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
+                tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
+                acc_t_next = arith.addi(acc_t, tiles_g)
+                in_grp = arith.andi(
+                    arith.cmpi(arith.CmpIPredicate.sge, bx_i32, acc_t),
+                    arith.cmpi(arith.CmpIPredicate.slt, bx_i32, acc_t_next),
+                )
+                rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
+                rl = arith.addi(acc_m, m_g)
+                group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
+                row_start_i32 = arith.select(in_grp, rs, row_start_i32)
+                row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
+                group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
+                group_m_size_i32 = arith.select(in_grp, m_g, group_m_size_i32)
+                acc_m = arith.addi(acc_m, m_g)
+                acc_t = acc_t_next
+
+            is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0))
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
@@ -666,12 +690,15 @@ def compile_grouped_gemm_blockscale_contiguous(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        # Grid dimensions. The M axis enumerates output M-tiles; its extent is a
-        # host-known upper bound on the tile count, and tiles past the real count
-        # match no group and exit early.
+        # Grid dimensions. In the packed layout the M axis enumerates output
+        # M-tiles across all groups; its extent is a host-known upper bound on the
+        # tile count, and tiles past the real count match no group and exit early.
+        # The padded layout instead gives each group its own z slice, so the M axis
+        # only has to cover one group's slab and tiles past its valid rows exit.
         n_in = fx.Index(i32_n)
         gx = n_in // fx.Index(tile_n)  # N-blocks
         gy = fx.Index(i32_num_m_tiles)  # M-tiles
+        gz = fx.Index(i32_num_groups) if const_expr(masked) else fx.Index(1)
 
         launcher = grouped_gemm_blockscale_contiguous_kernel(
             arg_d,
@@ -693,6 +720,6 @@ def compile_grouped_gemm_blockscale_contiguous(
                         op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                             T.i32, _wpe
                         )
-        launcher.launch(grid=(gx, gy, 1), block=(total_threads, 1, 1), stream=stream)
+        launcher.launch(grid=(gx, gy, gz), block=(total_threads, 1, 1), stream=stream)
 
     return launch_grouped_gemm_blockscale_contiguous

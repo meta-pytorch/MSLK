@@ -50,7 +50,7 @@ BLOCKSCALE_TILES = _tiles((128, 256))
 ROWWISE_TILES = _tiles((64, 128, 256))
 
 _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale"]
+_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "masked"]
 
 
 def launch(
@@ -65,12 +65,16 @@ def launch(
     k,
     b_preshuffled,
     blockscale,
+    masked=False,
     *,
     tile_m,
     tile_n,
     tile_k,
 ):
     """Compile (cached) and launch the grouped GEMM for one tile config.
+
+    ``XQ`` is [total_M, K] with groups packed along M, or the flattened
+    [G * expected_m, K] view of the padded layout when ``masked``.
 
     ``m_bucket`` only feeds the autotune key: bucketing total_M keeps nearby token
     counts on one tuned config. ``n``/``k`` are likewise passed for the key and
@@ -82,10 +86,15 @@ def launch(
 
     total_M, K = XQ.shape
     G, N, _ = WQ.shape
-    # Grid M-extent: host-known upper bound (each group wastes at most one partial
-    # tile). The kernel resolves group ownership from m_sizes and self-skips
-    # surplus tiles, so this needs no device sync and holds under graph capture.
-    num_m_tiles = total_M // tile_m + G
+    if masked:
+        # One z slice per group, so the M axis only spans a single group's slab.
+        num_m_tiles = -(-(total_M // G) // tile_m)
+    else:
+        # Grid M-extent: host-known upper bound (each group wastes at most one
+        # partial tile). The kernel resolves group ownership from m_sizes and
+        # self-skips surplus tiles, so this needs no device sync and holds under
+        # graph capture.
+        num_m_tiles = total_M // tile_m + G
     launcher = compile_grouped_gemm_blockscale_contiguous(
         n=N,
         k=K,
@@ -98,6 +107,7 @@ def launch(
         out_dtype="bf16",
         b_preshuffled=b_preshuffled,
         blockscale=blockscale,
+        masked=masked,
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The
@@ -131,16 +141,29 @@ _launch_rowwise = tunable(
 )(launch)
 
 
-def dispatch(XQ, WQ, x_scale, w_scale, M_sizes, *, b_preshuffled, blockscale):
-    """Allocate the output and run the grouped GEMM with a selected tile.
+def dispatch(
+    XQ,
+    WQ,
+    x_scale,
+    w_scale,
+    M_sizes,
+    *,
+    b_preshuffled,
+    blockscale,
+    masked=False,
+    out=None,
+):
+    """Allocate the output if needed and run the grouped GEMM with a selected tile.
 
     Callers validate their own operand contract first; this only handles the
-    parts every variant shares.
+    parts every variant shares. ``XQ``/``out`` are the flattened 2D views in the
+    padded layout, so the shape handling below is common to both.
     """
     total_M, K = XQ.shape
     G, N, _ = WQ.shape
 
-    out = torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+    if out is None:
+        out = torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
     if total_M == 0 or N == 0 or K == 0 or G == 0:
         return out
 
@@ -157,4 +180,5 @@ def dispatch(XQ, WQ, x_scale, w_scale, M_sizes, *, b_preshuffled, blockscale):
         K,
         b_preshuffled,
         blockscale,
+        masked,
     )
