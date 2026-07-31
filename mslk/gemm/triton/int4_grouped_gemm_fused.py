@@ -288,18 +288,16 @@ def matmul_bf16i4_rowwise_grouped_fused(
     assert WQ.dtype == torch.int8, "WQ must be int8"
     assert X.is_contiguous(), "X must be contiguous"
     assert group_size % 64 == 0, f"group_size={group_size} must be divisible by 64"
-
-    # M_sizes must be on device and int64 for pointer arithmetic in kernel
-    if M_sizes.dtype != torch.int64:
-        M_sizes = M_sizes.to(torch.int64)
-    if not M_sizes.is_cuda:
-        M_sizes = M_sizes.to(X.device)
-
-    # Scale/zero: ensure float32
-    if w_scale_group.dtype != torch.float32:
-        w_scale_group = w_scale_group.to(torch.float32)
-    if w_zero_group.dtype != torch.float32:
-        w_zero_group = w_zero_group.to(torch.float32)
+    assert M_sizes.dtype == torch.int64, f"M_sizes must be int64, got {M_sizes.dtype}"
+    assert M_sizes.is_cuda, "M_sizes must be on the GPU"
+    assert w_scale_group.dtype == torch.float32, (
+        f"w_scale_group must be float32, got {w_scale_group.dtype}"
+    )
+    assert w_zero_group.dtype == torch.float32, (
+        f"w_zero_group must be float32, got {w_zero_group.dtype}"
+    )
+    assert w_scale_group.is_contiguous(), "w_scale_group must be contiguous"
+    assert w_zero_group.is_contiguous(), "w_zero_group must be contiguous"
 
     Y = torch.empty((M_total, N), dtype=torch.bfloat16, device=X.device)
 
