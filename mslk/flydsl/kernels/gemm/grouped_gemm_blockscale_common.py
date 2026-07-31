@@ -38,6 +38,11 @@ from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
 # kernel can end on.
 K_LOAD_ELEMS = 16
 
+# Widest vectorised epilogue store, in output columns. With n_padding the tail N
+# block is suppressed a whole store at a time, so this is the finest N
+# granularity the kernel can end on.
+N_STORE_ELEMS = 8
+
 
 def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in):
     """Build the per-load K-range predicate used by the A and B tile loaders.
@@ -103,6 +108,7 @@ def validate_params(
     out_dtype,
     blockscale=False,
     k_padding=False,
+    n_padding=False,
 ):
     """Validate the divisibility constraints and out_dtype choice shared by
     the grouped GEMM kernels.
@@ -127,7 +133,15 @@ def validate_params(
             )
     elif k % tile_k != 0:
         raise ValueError(f"k ({k}) must be divisible by tile_k ({tile_k})")
-    if n % tile_n != 0:
+    if n_padding:
+        # The tail N block is masked per store, whose widest form covers
+        # N_STORE_ELEMS columns, so N only has to land on that boundary.
+        if n % N_STORE_ELEMS != 0:
+            raise ValueError(
+                f"n ({n}) must be divisible by {N_STORE_ELEMS} (the widest "
+                "vectorised store) even with n_padding"
+            )
+    elif n % tile_n != 0:
         raise ValueError(f"n ({n}) must be divisible by tile_n ({tile_n})")
     if tile_k % scale_block_k != 0:
         raise ValueError(
@@ -464,6 +478,7 @@ def make_b_tile_loaders(
     n_in,
     k_in,
     k_tail_mask=None,
+    n_padding=False,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
@@ -514,12 +529,21 @@ def make_b_tile_loaders(
                 + base_k_div4
                 + b_col_local_i32[i]
             )
+            kmask = _k_tail_mask(k_tile_idx_py, base_k_div4, b_col_local_i32[i])
+            if n_padding:
+                # Rows past N hold the next group's weights, so read zero instead.
+                nmask = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, row_global),
+                    arith.index_cast(T.i32, n_in),
+                )
+                kmask = nmask if kmask is None else arith.andi(kmask, nmask)
             b_vec = buffer_ops.buffer_load(
                 b_rsrc,
                 idx_i32,
                 vec_width=4,
                 dtype=T.i32,
-                mask=_k_tail_mask(k_tile_idx_py, base_k_div4, b_col_local_i32[i]),
+                mask=kmask,
             )
             parts.append(Vector(b_vec).bitcast(fx.Int32))
         return parts
@@ -1306,6 +1330,7 @@ def make_epilogue_writers(
     e_vec,
     c_n,
     d_group_off=None,
+    n_padding=False,
 ):
     """Build the CShuffle-epilogue writer closures.
 
@@ -1343,13 +1368,25 @@ def make_epilogue_writers(
         else:
             idx_out = d_group_off + row * c_n + col_g0
         byte_off = idx_out * 2
+        col_mask = None
+        if n_padding:
+            # Columns past N belong to the next output row; drop the whole store.
+            col_mask = arith.cmpi(
+                arith.CmpIPredicate.ult,
+                arith.index_cast(T.i32, col_g0),
+                arith.index_cast(T.i32, c_n),
+            )
         if e_vec == 4:
             frag_i32x2 = Vector(frag).bitcast(fx.Int32)
-            buffer_ops.buffer_store(frag_i32x2, d_rsrc, byte_off, offset_is_bytes=True)
+            buffer_ops.buffer_store(
+                frag_i32x2, d_rsrc, byte_off, mask=col_mask, offset_is_bytes=True
+            )
         else:
             frag_i32x1 = Vector(frag).bitcast(fx.Int32)
             frag_i32 = frag_i32x1[0]
-            buffer_ops.buffer_store(frag_i32, d_rsrc, byte_off, offset_is_bytes=True)
+            buffer_ops.buffer_store(
+                frag_i32, d_rsrc, byte_off, mask=col_mask, offset_is_bytes=True
+            )
 
     return write_row_to_lds, store_pair
 

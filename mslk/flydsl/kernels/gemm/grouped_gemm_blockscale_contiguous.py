@@ -98,6 +98,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     blockscale: bool = False,
     masked: bool = False,
     k_padding: bool = False,
+    n_padding: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -149,6 +150,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         tile_k=tile_k,
         blockscale=blockscale,
         k_padding=k_padding,
+        n_padding=n_padding,
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
@@ -219,10 +221,11 @@ def compile_grouped_gemm_blockscale_contiguous(
     _scaling = "blockscale" if blockscale else "rowwise"
     _layout = "masked" if masked else "contig"
     _kpad = "_kpad" if k_padding else ""
+    _npad = "_npad" if n_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{_layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -517,6 +520,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                     n_in=n_in,
                     k_in=k_in,
                     k_tail_mask=k_tail_mask,
+                    n_padding=n_padding,
                 )
                 lds_load_b_packs_k64 = make_lds_b_loader(
                     lds_b=lds_b,
@@ -651,6 +655,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 out_mlir=out_mlir,
                 e_vec=e_vec,
                 c_n=c_n,
+                n_padding=n_padding,
             )
 
             # Mask the partial-tile tail: skip stores for global rows at or beyond
@@ -713,7 +718,11 @@ def compile_grouped_gemm_blockscale_contiguous(
         # The padded layout instead gives each group its own z slice, so the M axis
         # only has to cover one group's slab and tiles past its valid rows exit.
         n_in = fx.Index(i32_n)
-        gx = n_in // fx.Index(tile_n)  # N-blocks
+        gx = (
+            (n_in + fx.Index(tile_n - 1)) // fx.Index(tile_n)
+            if const_expr(n_padding)
+            else n_in // fx.Index(tile_n)
+        )  # N-blocks
         gy = fx.Index(i32_num_m_tiles)  # M-tiles
         gz = fx.Index(i32_num_groups) if const_expr(masked) else fx.Index(1)
 
