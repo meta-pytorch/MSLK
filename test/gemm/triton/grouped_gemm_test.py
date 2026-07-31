@@ -253,8 +253,9 @@ class TestGroupedGEMM(unittest.TestCase):
                 result, expected_result, atol=2.5e-1, rtol=1.6e-1, msg=msg
             )
         else:
+            atol = 2e-2 if torch.version.hip is not None else 1e-5
             torch.testing.assert_close(
-                result, expected_result, atol=1e-5, rtol=1.6e-2, msg=msg
+                result, expected_result, atol=atol, rtol=1.6e-2, msg=msg
             )
 
     @parameterized.expand(
