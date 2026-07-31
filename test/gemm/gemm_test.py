@@ -1346,11 +1346,6 @@ class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.device = "cuda"
-        from mslk.gemm.triton.int4_grouped_gemm import (  # noqa: F401
-            matmul_bf16i4_rowwise_grouped,
-        )
-
-        cls.matmul_grouped = staticmethod(matmul_bf16i4_rowwise_grouped)
 
     @parameterized.expand(
         [
@@ -1386,7 +1381,9 @@ class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
         w_scale_group = torch.stack(scale_list, dim=0)
         w_zero_group = torch.stack(zero_list, dim=0)
 
-        y = self.matmul_grouped(X, WQ, w_scale_group, w_zero_group, M_sizes)
+        y = torch.ops.mslk.bf16i4bf16_shuffled_grouped(
+            X, WQ, w_scale_group, w_zero_group, M_sizes
+        )
         self.assertEqual(y.shape, (M_total, N))
         self.assertEqual(y.dtype, torch.bfloat16)
 
