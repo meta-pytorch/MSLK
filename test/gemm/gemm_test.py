@@ -850,6 +850,65 @@ class FP8Tests(unittest.TestCase):
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
+    @parameterized.expand(
+        [
+            (1, 512, 512, 512, True),  # small MNK (also small G)
+            (16, 256, 1024, 2048, True),  # medium MNK
+            (64, 128, 6144, 3584, True),  # large MNK
+            (16, 512, 512, 512, True),  # medium G
+            (64, 512, 512, 512, True),  # large G
+            (4, 256, 1024, 512, False),  # padding left uninitialised
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_dynamic(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        zeroing_output_tensor: bool,
+    ) -> None:
+        """Padded per-group layout: [G, M, K] with a runtime valid row count.
+
+        Unlike the stacked variant the groups do not share one packed buffer;
+        each gets a fixed slab of M rows of which only the first
+        zero_start_index_M[g] hold real tokens. The rest is padding, so the
+        reference only covers the valid rows, and the padded output rows are
+        checked separately.
+        """
+        # Cover empty, partially filled and completely filled groups.
+        valid_m = torch.randint(0, M + 1, (G,), dtype=torch.int64)
+        valid_m[0] = 0
+        valid_m[-1] = M
+        valid_m_gpu = valid_m.to(device=self.device)
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
+            xq, wq, x_scale, w_scale, valid_m_gpu, zeroing_output_tensor
+        )
+        self.assertEqual(tuple(y.shape), (G, M, N))
+
+        # Only the valid rows of each group are defined by the op, so compare
+        # those and leave the padding to the check below.
+        x_group = [X[g, : valid_m[g]] for g in range(G)]
+        w_group = [W[g] for g in range(G)]
+        y_group = [y[g, : valid_m[g]] for g in range(G)]
+        self.bf16_loopover_validate(x_group, w_group, y_group)
+
+        if zeroing_output_tensor:
+            for g in range(G):
+                padding = y[g, valid_m[g] :]
+                self.assertTrue(
+                    (padding == 0).all().item(),
+                    f"group {g} padding rows must be zeroed",
+                )
+
 
 @skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9, 10)
