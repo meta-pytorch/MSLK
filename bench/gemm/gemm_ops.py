@@ -1838,7 +1838,7 @@ class TritonBF16Int4Shuffled(TritonBF16Int4Rowwise):
 
 
 @register_gemm_op
-class TritonBF16Int4GroupedShuffled(CutlassFP8Int4Rowwise):
+class TritonBF16Int4GroupedShuffled(GemmOpBase):
     """ROCm Triton BF16xINT4 grouped shuffled GEMM."""
 
     def preprocess(self, x, w):
