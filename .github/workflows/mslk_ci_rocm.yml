@@ -37,6 +37,8 @@ on:
       - 'mslk/attention/flydsl/**'
       - 'test/attention/flydsl/**'
       - 'test/flydsl/**'
+      # FlyDSL GEMM ops
+      - 'mslk/gemm/flydsl/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels
