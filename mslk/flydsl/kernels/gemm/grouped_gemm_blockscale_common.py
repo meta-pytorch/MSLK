@@ -365,6 +365,7 @@ def resolve_group_rows(
     tile_m,
     num_groups,
     layout,
+    group_id=None,
 ):
     """Work out which group owns this M-tile and where its rows begin and end.
 
@@ -373,12 +374,15 @@ def resolve_group_rows(
     ``layout`` argument of the kernel factory for what each encoding means.
 
     ``m_tile_idx`` is the M-tile block id, and ``slab_idx`` the group block id
-    that only the slab layouts use. ``is_valid`` comes back as a Python ``True``
+    that only the slab layouts use. ``group_id`` supplies the group when it has
+    already been resolved elsewhere, as the N-grouped layout does: its rows form
+    a full per-group slab exactly as the batched layout's do, but the group
+    follows from the column partition rather than from a grid axis. ``is_valid`` comes back as a Python ``True``
     when the grid cannot place a tile outside its group, so the caller's guard
     disappears at trace time rather than becoming a branch on a constant.
     """
-    reads_group_meta = layout != "batched"
-    slab_layout = layout in ("padded", "batched")
+    reads_group_meta = layout not in ("batched", "n_offsets")
+    slab_layout = layout in ("padded", "batched", "n_offsets")
 
     # Group metadata is INT32 when it holds cumulative offsets and INT64 when it
     # holds row counts. "batched" carries none, so no resource is built for it
@@ -401,7 +405,9 @@ def resolve_group_rows(
     if slab_layout:
         # Every group owns a fixed slab of expected_m rows, so the group is a
         # grid axis and needs no resolution.
-        group_id_i32 = arith.index_cast(T.i32, slab_idx)
+        group_id_i32 = (
+            group_id if group_id is not None else arith.index_cast(T.i32, slab_idx)
+        )
         expected_m_i32 = arith.divui(arith.index_cast(T.i32, m_in), _i32(num_groups))
         group_m_start_i32 = arith.muli(group_id_i32, expected_m_i32)
         group_m_size_i32 = expected_m_i32
@@ -483,6 +489,65 @@ def resolve_group_rows(
         group_m_start=group_m_start_i32,
         group_m_size=group_m_size_i32,
         is_valid=is_valid,
+    )
+
+
+GroupColResolution = namedtuple(
+    "GroupColResolution", ["group_id", "col_base", "col_limit", "is_valid"]
+)
+
+
+def resolve_group_cols(*, arg_offsets, num_groups_in, n_block_idx, tile_n, num_groups):
+    """Work out which group owns this N-block and where its columns end.
+
+    The mirror of ``resolve_group_rows`` for weights concatenated along N, where
+    the groups partition the output's columns instead of its rows, so the group
+    follows from the N-block index. ``arg_offsets`` is [num_groups] INT32
+    cumulative column ends -- the same encoding the "offsets" layout reads on
+    the M axis.
+
+    Returns the owning group, the global first column of this block, and the
+    group's exclusive column end, which is the bound the N tail masks against.
+    Blocks past the last group match none and come back invalid, the same way
+    surplus M-tiles do in the packed layouts.
+    """
+    off_rsrc = buffer_ops.create_buffer_resource(
+        arg_offsets, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+    )
+
+    def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+        return arith.constant(int(v), type=T.i32)
+
+    by_i32 = arith.index_cast(T.i32, n_block_idx)
+    tile_n_c = _i32(tile_n)
+    tile_n_bump = _i32(tile_n - 1)
+
+    acc_n = _i32(0)  # cumulative columns before group g
+    acc_b = _i32(0)  # cumulative N-blocks before group g
+    group_id_i32 = _i32(-1)
+    col_base_i32 = _i32(0)
+    col_limit_i32 = _i32(0)
+    for _g in range_constexpr(num_groups):
+        end_g = buffer_ops.buffer_load(off_rsrc, _g, vec_width=1, dtype=T.i32)
+        n_g = arith.subi(end_g, acc_n)
+        blocks_g = arith.divui(arith.addi(n_g, tile_n_bump), tile_n_c)
+        acc_b_next = arith.addi(acc_b, blocks_g)
+        in_grp = arith.andi(
+            arith.cmpi(arith.CmpIPredicate.sge, by_i32, acc_b),
+            arith.cmpi(arith.CmpIPredicate.slt, by_i32, acc_b_next),
+        )
+        cb = arith.addi(acc_n, arith.muli(arith.subi(by_i32, acc_b), tile_n_c))
+        group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
+        col_base_i32 = arith.select(in_grp, cb, col_base_i32)
+        col_limit_i32 = arith.select(in_grp, end_g, col_limit_i32)
+        acc_n = end_g
+        acc_b = acc_b_next
+
+    return GroupColResolution(
+        group_id=group_id_i32,
+        col_base=col_base_i32,
+        col_limit=col_limit_i32,
+        is_valid=arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0)),
     )
 
 
@@ -616,6 +681,8 @@ def make_b_tile_loaders(
     k_in,
     k_tail_mask=None,
     n_padding=False,
+    b_group_off=None,
+    n_bound=None,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
@@ -623,7 +690,11 @@ def make_b_tile_loaders(
     Mirror of `make_a_tile_loaders` with N in place of M. B is `[G, N, K]`
     row-major, so the per-tile global base adds the group offset
     `group_idx * n_in * (k_in/4)` (always present — B is always grouped) plus
-    the N-tile base `by_n` (the block's N-block start). Coalesced 16-byte
+    the N-tile base `by_n` (the block's N-block start). `b_group_off` replaces
+    that leading offset where B is one flat [total_N, K] matrix and the group is
+    already folded into `by_n`, and `n_bound` replaces the row bound the tail
+    masks against, which is then the group's column end rather than N.
+    Coalesced 16-byte
     (dwordx4) loads via `tile_chunk_coord_i32`; LDS store uses the same XOR16
     swizzle as A. Returns `(prefetch_b_tile, store_b_tile_to_lds, b_row_local,
     b_col_local_i32, k_blocks16_b)`.
@@ -636,7 +707,10 @@ def make_b_tile_loaders(
     tx_i32_base = tx * c_chunk_b
     _k_div4_factor = k_in // fx.Index(4)
     # B is [G, N, K]: leading offset selects this tile's group and N-block base.
-    b_tile_offset_div4 = group_idx * n_in * _k_div4_factor
+    b_tile_offset_div4 = (
+        b_group_off if b_group_off is not None else group_idx * n_in * _k_div4_factor
+    )
+    _n_bound = n_in if n_bound is None else n_bound
     k_blocks16_b = arith.index(tile_k_bytes // 16)
     c4_bytes = fx.Index(4)
 
@@ -672,7 +746,7 @@ def make_b_tile_loaders(
                 nmask = arith.cmpi(
                     arith.CmpIPredicate.ult,
                     arith.index_cast(T.i32, row_global),
-                    arith.index_cast(T.i32, n_in),
+                    arith.index_cast(T.i32, _n_bound),
                 )
                 kmask = nmask if kmask is None else arith.andi(kmask, nmask)
             b_vec = buffer_ops.buffer_load(
@@ -1250,6 +1324,7 @@ def make_rowwise_scaler(
     lane_div_16,
     m_repeat,
     num_acc_n,
+    group_n_off=None,
 ):
     """Build the closure that applies rowwise scales to the finished accumulators.
 
@@ -1284,11 +1359,13 @@ def make_rowwise_scaler(
                 )
             s_a_vecs.append(Vector.from_elements(s_a_row, fx.Float32))
 
-        # scale_b is [num_groups, n]: element (g, col) at g*n + col.
-        group_n_off = group_idx * n_in
+        # scale_b is [num_groups, n]: element (g, col) at g*n + col. Where it is
+        # instead one flat [total_N] vector the group is already folded into
+        # by_n, and the caller passes a zero base.
+        _group_n_off = group_idx * n_in if group_n_off is None else group_n_off
         s_b_bcs = []
         for ni in range_constexpr(num_acc_n):
-            col_global = group_n_off + by_n + n_tile_base + (ni * 16) + lane_mod_16
+            col_global = _group_n_off + by_n + n_tile_base + (ni * 16) + lane_mod_16
             s_b_val = buffer_ops.buffer_load(
                 sb_rsrc, col_global, vec_width=1, dtype=T.f32
             )
@@ -1468,6 +1545,7 @@ def make_epilogue_writers(
     c_n,
     d_group_off=None,
     n_padding=False,
+    n_bound=None,
 ):
     """Build the CShuffle-epilogue writer closures.
 
@@ -1476,6 +1554,11 @@ def make_epilogue_writers(
     addition emitted) and `group_idx * m_in * n_in` for the masked
     path. Using a Python `is None` guard keeps the contig MLIR
     identical to the pre-extraction code.
+
+    `c_n` is the output's leading dimension, and normally also bounds the column
+    mask, since a group's columns run to the end of its row. Where groups sit
+    side by side along N the row spans all of them, so `n_bound` gives the
+    owning group's column end instead.
     """
 
     def write_row_to_lds(
@@ -1507,11 +1590,12 @@ def make_epilogue_writers(
         byte_off = idx_out * 2
         col_mask = None
         if n_padding:
-            # Columns past N belong to the next output row; drop the whole store.
+            # Columns past the bound belong to the next output row, or to the
+            # next group where the groups share one; drop the whole store.
             col_mask = arith.cmpi(
                 arith.CmpIPredicate.ult,
                 arith.index_cast(T.i32, col_g0),
-                arith.index_cast(T.i32, c_n),
+                arith.index_cast(T.i32, c_n if n_bound is None else n_bound),
             )
         if e_vec == 4:
             frag_i32x2 = Vector(frag).bitcast(fx.Int32)
