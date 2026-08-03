@@ -15,6 +15,10 @@ exactly one group, so a tile never spans a group boundary. The kernel resolves
 the owning group for its M-tile from m_sizes, and rows at or beyond that group's
 end are the partial-tile tail and are masked out of the store.
 
+The `layout` argument selects how the group geometry is encoded; groups may also
+occupy fixed per-group slabs rather than being packed. Only the resolution step
+differs, so the loaders, the K loop and the epilogue are shared by all of them.
+
 Scales are FP32 (software scaling) on all architectures.
 
 Tensors:
@@ -80,6 +84,9 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
 )
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 
+# Supported encodings of the group geometry; see the ``layout`` argument below.
+LAYOUTS = ("sizes", "padded")
+
 
 @functools.lru_cache(maxsize=128)
 def compile_grouped_gemm_blockscale_contiguous(
@@ -96,7 +103,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
     blockscale: bool = False,
-    masked: bool = False,
+    layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
 ):
@@ -127,10 +134,24 @@ def compile_grouped_gemm_blockscale_contiguous(
             True is block scaling: scale_a is per-group [M_g, scale_k] blocks and
             scale_b is [num_groups, scale_k, scale_n], applied per scale block
             inside the K loop, which requires the tile to align to the blocks.
+        layout: How the kernel learns which rows belong to which group. The
+            encodings differ only in that resolution step; the loaders, the K
+            loop and the epilogue are shared.
+            "sizes" (default): rows of every group are packed into one [M_total,
+            K] buffer and m_sizes is [num_groups] INT64 per-group row counts.
+            "padded": each group owns a fixed slab of M_total/num_groups rows and
+            m_sizes is [num_groups] INT64 counts of the rows per slab that hold
+            real data; the rest is padding the epilogue must not write.
 
     Returns:
         JIT launcher function.
     """
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
+    # Each group owns a fixed slab of rows, so the group is a grid axis and does
+    # not have to be resolved from the row counts.
+    slab_layout = layout == "padded"
+
     gpu_arch = get_hip_arch()
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
     # helpers' hardware E8M0 microscaling path is not used here.
@@ -219,11 +240,10 @@ def compile_grouped_gemm_blockscale_contiguous(
     # Module name for caching
     _variant = "contiguous_pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
-    _layout = "masked" if masked else "contig"
     _kpad = "_kpad" if k_padding else ""
     _npad = "_npad" if n_padding else ""
     module_name = (
-        f"grouped_gemm_{_scaling}_{_layout}_{_variant}_{out_dtype}"
+        f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
         f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}"
     ).replace("-", "_")
@@ -343,7 +363,7 @@ def compile_grouped_gemm_blockscale_contiguous(
         tile_m_c = _i32(tile_m)
         tile_m_bump = _i32(tile_m - 1)
 
-        if const_expr(masked):
+        if const_expr(slab_layout):
             # Padded layout: every group owns a fixed slab of expected_m rows, so
             # the group is a grid axis and needs no resolution. m_sizes holds the
             # count of rows in each slab that carry real data; the rest is padding
@@ -724,7 +744,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             else n_in // fx.Index(tile_n)
         )  # N-blocks
         gy = fx.Index(i32_num_m_tiles)  # M-tiles
-        gz = fx.Index(i32_num_groups) if const_expr(masked) else fx.Index(1)
+        gz = fx.Index(i32_num_groups) if const_expr(slab_layout) else fx.Index(1)
 
         launcher = grouped_gemm_blockscale_contiguous_kernel(
             arg_d,

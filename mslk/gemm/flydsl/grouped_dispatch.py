@@ -55,7 +55,7 @@ ROWWISE_TILES = _tiles((64, 128, 256))
 # case that needs padding, prune_by_divisibility falls back to the full list and
 # the shape still gets tuned.
 _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "masked"]
+_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
 
 
 def launch(
@@ -70,7 +70,7 @@ def launch(
     k,
     b_preshuffled,
     blockscale,
-    masked=False,
+    layout="sizes",
     *,
     tile_m,
     tile_n,
@@ -79,7 +79,8 @@ def launch(
     """Compile (cached) and launch the grouped GEMM for one tile config.
 
     ``XQ`` is [total_M, K] with groups packed along M, or the flattened
-    [G * expected_m, K] view of the padded layout when ``masked``.
+    [G * expected_m, K] view of the per-group slabs. ``layout`` says which, and
+    how ``m_sizes`` encodes the group geometry; see the kernel factory.
 
     ``m_bucket`` only feeds the autotune key: bucketing total_M keeps nearby token
     counts on one tuned config. ``n``/``k`` are likewise passed for the key and
@@ -97,7 +98,7 @@ def launch(
             f"tile_k ({tile_k}) for preshuffled B: the MFMA B layout interleaves "
             "both, so a partial tile cannot be masked a load at a time"
         )
-    if masked:
+    if layout == "padded":
         # One z slice per group, so the M axis only spans a single group's slab.
         num_m_tiles = -(-(total_M // G) // tile_m)
     else:
@@ -118,7 +119,7 @@ def launch(
         out_dtype="bf16",
         b_preshuffled=b_preshuffled,
         blockscale=blockscale,
-        masked=masked,
+        layout=layout,
         # Compile the tail-masked variant only when K stops mid-tile, so shapes
         # that divide keep the cheaper unmasked loads. This mirrors how CK picks
         # between its KPadding and Default specialisations on the host.
@@ -166,14 +167,14 @@ def dispatch(
     *,
     b_preshuffled,
     blockscale,
-    masked=False,
+    layout="sizes",
     out=None,
 ):
     """Allocate the output if needed and run the grouped GEMM with a selected tile.
 
     Callers validate their own operand contract first; this only handles the
     parts every variant shares. ``XQ``/``out`` are the flattened 2D views in the
-    padded layout, so the shape handling below is common to both.
+    slab layouts, so the shape handling below is common to all of them.
     """
     total_M, K = XQ.shape
     G, N, _ = WQ.shape
@@ -196,5 +197,5 @@ def dispatch(
         K,
         b_preshuffled,
         blockscale,
-        masked,
+        layout,
     )

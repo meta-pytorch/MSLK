@@ -175,7 +175,7 @@ def _dispatch_rowwise_grouped_dynamic(
         zero_start_index_M,
         b_preshuffled=b_preshuffled,
         blockscale=False,
-        masked=True,
+        layout="padded",
         out=out.view(G * expected_m, N),
     )
     return out
