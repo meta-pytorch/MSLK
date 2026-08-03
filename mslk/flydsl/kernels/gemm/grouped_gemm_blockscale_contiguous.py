@@ -29,8 +29,8 @@ Tensors:
     local_m + k_block * M_g. This is not a global [scale_k, M_total] transpose.
   - B: [num_groups, N, K] FP8 - one weight matrix per group, preshuffled
   - scale_b: [num_groups, scale_k, scale_n] FP32 - per-block scales
-  - m_sizes: [num_groups] INT64 - rows per group (sum to M_total), or unused
-    when the layout carries no per-group metadata
+  - m_sizes: [num_groups] - the group geometry, whose encoding the `layout`
+    argument selects: INT64 row counts, INT32 cumulative offsets, or unused
   - D: [M_total, N] BF16 - output
 
 Block scaling granularity:
@@ -86,7 +86,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 
 # Supported encodings of the group geometry; see the ``layout`` argument below.
-LAYOUTS = ("sizes", "padded", "batched")
+LAYOUTS = ("sizes", "offsets", "padded", "batched")
 
 
 @functools.lru_cache(maxsize=128)
@@ -140,6 +140,8 @@ def compile_grouped_gemm_blockscale_contiguous(
             loop and the epilogue are shared.
             "sizes" (default): rows of every group are packed into one [M_total,
             K] buffer and m_sizes is [num_groups] INT64 per-group row counts.
+            "offsets": same packed buffer, but m_sizes is [num_groups] INT32
+            cumulative row ends, i.e. the inclusive prefix sum of the sizes.
             "padded": each group owns a fixed slab of M_total/num_groups rows and
             m_sizes is [num_groups] INT64 counts of the rows per slab that hold
             real data; the rest is padding the epilogue must not write.
@@ -360,13 +362,15 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_scale_b, max_size=False, num_records_bytes=sb_nbytes
         )
 
-        # "batched" carries no group metadata, so no resource is built for it
-        # and arg_m_sizes goes unread.
+        # Group metadata is INT32 when it holds cumulative offsets and INT64
+        # when it holds row counts. "batched" carries none, so no resource is
+        # built for it and arg_m_sizes goes unread.
         if const_expr(reads_group_meta):
+            meta_bytes = 4 if layout == "offsets" else 8
             ms_rsrc = buffer_ops.create_buffer_resource(
                 arg_m_sizes,
                 max_size=False,
-                num_records_bytes=num_groups_in * fx.Index(8),
+                num_records_bytes=num_groups_in * fx.Index(meta_bytes),
             )
 
         def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
@@ -422,10 +426,22 @@ def compile_grouped_gemm_blockscale_contiguous(
             group_m_start_i32 = _i32(0)  # first global row of the owning group
             group_m_size_i32 = _i32(0)  # row count of the owning group
             for _g in range_constexpr(num_groups):
-                # m_sizes is int64; read the low dword of element _g (index _g*2 in
-                # dwords). Row counts fit in int32, so the high dword is always zero
-                # and no host-side narrowing kernel is needed.
-                m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
+                if const_expr(layout == "offsets"):
+                    # Cumulative int32 row ends. acc_m is already the running
+                    # prefix, so a group's own row count is the step between them;
+                    # decoding here costs a subtract and saves the caller a whole
+                    # kernel launch to difference the offsets host-side.
+                    m_g = arith.subi(
+                        buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32),
+                        acc_m,
+                    )
+                else:
+                    # m_sizes is int64; read the low dword of element _g (index
+                    # _g*2 in dwords). Row counts fit in int32, so the high dword
+                    # is always zero and no host-side narrowing kernel is needed.
+                    m_g = buffer_ops.buffer_load(
+                        ms_rsrc, _g * 2, vec_width=1, dtype=T.i32
+                    )
                 tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
                 acc_t_next = arith.addi(acc_t, tiles_g)
                 in_grp = arith.andi(
