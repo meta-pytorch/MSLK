@@ -23,6 +23,13 @@ _INSTALL_HINT: str = (
     "Install it with `pip install flydsl`."
 )
 
+# Minimum FlyDSL release the MSLK kernels are written against. Keep in sync
+# with ``ci/flydsl_version.txt`` (the version setup.py pins for OSS installs).
+# Older releases are missing APIs the kernels use (e.g. ``flydsl.expr.Pointer``
+# and ``flydsl.compiler.protocol.extract_to_ir_values``) and fail at compile
+# time rather than at import, so callers must gate on the version explicitly.
+MIN_FLYDSL_VERSION: str = "0.2.4"
+
 # Bundled AOT cache shipped inside the package (populated at build time).
 # Shared across all FlyDSL kernel categories (gemm, moe, ...), so it lives
 # under the dedicated mslk.flydsl package rather than under any kernel domain.
@@ -52,3 +59,45 @@ def require_flydsl() -> None:
     """Raise ``RuntimeError`` with an install hint when FlyDSL is unavailable."""
     if not is_flydsl_available():
         raise RuntimeError(_INSTALL_HINT)
+
+
+@functools.lru_cache(maxsize=None)
+def flydsl_version() -> str | None:
+    """Installed FlyDSL version, or ``None`` when it cannot be determined."""
+    try:
+        import flydsl  # pyre-ignore[21]
+
+        return flydsl.__version__
+    except Exception:
+        return None
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Leading numeric components of a version, e.g. ``"0.2.4rc1" -> (0, 2, 4)``."""
+    parts = []
+    for part in version.split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def is_flydsl_version_at_least(minimum: str = MIN_FLYDSL_VERSION) -> bool:
+    """True when FlyDSL is available and at least ``minimum``.
+
+    ``is_flydsl_available()`` only checks importability, which is not enough:
+    the kernels resolve most FlyDSL APIs lazily at compile time, so an
+    out-of-date FlyDSL imports cleanly and then fails deep inside kernel
+    compilation. Callers that need those APIs should gate on this instead.
+    """
+    if not is_flydsl_available():
+        return False
+    current = flydsl_version()
+    if current is None:
+        return False
+    return _version_tuple(current) >= _version_tuple(minimum)
