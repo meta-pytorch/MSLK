@@ -8,15 +8,23 @@
 
 """FP8 rowwise-scaled grouped GEMM via FlyDSL.
 
-Registers two ops, both backed by the same kernel as the groupwise sibling in
-fp8_groupwise_grouped_gemm.py, compiled for rowwise scaling instead:
+Every entry point here is backed by the same kernel as the groupwise sibling in
+fp8_groupwise_grouped_gemm.py, compiled for rowwise scaling instead. The
+variants differ only in how the caller lays out the groups, which the kernel
+takes as a compile-time ``layout``:
 
-* ``mslk::f8f8bf16_rowwise_grouped_stacked`` -- the ROCm implementation, taking
-  row-major ``[G, N, K]`` weights.
-* ``mslk::f8f8bf16_rowwise_grouped_preshuffle`` -- a sibling that consumes
-  weights already in the MFMA B-preshuffle layout (see
-  ``mslk.quantize.shuffle.preshuffle_b_mfma``). Callers shuffle once at load
-  time; the op does no shuffling.
+* ``mslk::f8f8bf16_rowwise_grouped_stacked`` -- groups packed along M with a
+  ``[G]`` int64 row count per group, and row-major ``[G, N, K]`` weights.
+* ``mslk::f8f8bf16_rowwise_grouped_dynamic`` -- one fixed ``[G, M, K]`` slab per
+  group, of which the first ``zero_start_index_M[g]`` rows hold real tokens.
+* ``mslk::f8f8bf16_rowwise_grouped_mm`` -- the torch-native API, where the
+  operand ranks pick the grouped axis.
+* ``..._preshuffle`` siblings of the first two consume weights already in the
+  MFMA B-preshuffle layout (see ``mslk.quantize.shuffle.preshuffle_b_mfma``).
+  Callers shuffle once at load time; the op does no shuffling.
+
+Only ``_stacked`` and its preshuffle sibling are registered; the others are
+reachable as plain functions.
 
 Rowwise scaling carries one scale per row of A and per column of B, both
 constant along K, so they factor out of the reduction and the kernel applies
@@ -34,12 +42,38 @@ Tensor contract:
   out[m, n] = (sum_k XQ[m, k] * WQ[g, n, k]) * x_scale[m] * w_scale[g, n]
 """
 
+import functools
+
 import torch
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.flydsl import grouped_dispatch
 from mslk.utils.device import supports_float8_fnuz
 
 _PRESHUFFLE_OP_NAME = "mslk::f8f8bf16_rowwise_grouped_preshuffle"
+
+
+def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
+    """Reject a mismatched FP8 flavour.
+
+    The MFMA instructions read the operands in the arch's native FP8 format, and
+    the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would be
+    applied with the wrong exponent bias rather than rejected.
+    """
+    expected = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
+    assert XQ.dtype == expected, f"XQ must be {expected}, got {XQ.dtype}"
+    assert WQ.dtype == expected, f"WQ must be {expected}, got {WQ.dtype}"
+
+
+@functools.lru_cache(maxsize=8)
+def _unused_group_meta(device: torch.device) -> torch.Tensor:
+    """Stand-in for the group-metadata operand under the batched layout.
+
+    That layout carries no per-group metadata and the kernel never reads the
+    argument, but the launcher's argument list is fixed at compile time. Caching
+    keeps a call free of an allocation and holds the address stable, which
+    CUDA-graph capture requires.
+    """
+    return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
 def _f8f8bf16_rowwise_grouped_preshuffle_meta(
@@ -73,14 +107,7 @@ def _dispatch_rowwise_grouped(
     G, N, Kw = WQ.shape
     assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
     assert M_sizes.shape[0] == G, f"M_sizes length {M_sizes.shape[0]} must equal G={G}"
-    # The MFMA instructions read the operands in the arch's native FP8 format, and
-    # the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would
-    # be applied with the wrong exponent bias rather than rejected.
-    expected_fp8 = (
-        torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    )
-    assert XQ.dtype == expected_fp8, f"XQ must be {expected_fp8}, got {XQ.dtype}"
-    assert WQ.dtype == expected_fp8, f"WQ must be {expected_fp8}, got {WQ.dtype}"
+    _assert_fp8_operands(XQ, WQ)
     assert M_sizes.dtype == torch.int64, f"M_sizes must be int64, got {M_sizes.dtype}"
     assert x_scale.numel() == total_M, (
         f"x_scale must hold one scale per row ({total_M}), got {x_scale.numel()}"
@@ -143,14 +170,7 @@ def _dispatch_rowwise_grouped_dynamic(
     assert zero_start_index_M.shape[0] == G, (
         f"zero_start_index_M length {zero_start_index_M.shape[0]} must equal G={G}"
     )
-    # The MFMA instructions read the operands in the arch's native FP8 format, and
-    # the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would
-    # be applied with the wrong exponent bias rather than rejected.
-    expected_fp8 = (
-        torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    )
-    assert XQ.dtype == expected_fp8, f"XQ must be {expected_fp8}, got {XQ.dtype}"
-    assert WQ.dtype == expected_fp8, f"WQ must be {expected_fp8}, got {WQ.dtype}"
+    _assert_fp8_operands(XQ, WQ)
     assert zero_start_index_M.dtype == torch.int64, (
         f"zero_start_index_M must be int64, got {zero_start_index_M.dtype}"
     )
@@ -240,6 +260,113 @@ def matmul_f8f8bf16_rowwise_grouped_preshuffle(
     """
     return _dispatch_rowwise_grouped(
         XQ, WQ, x_scale, w_scale, M_sizes, b_preshuffled=True
+    )
+
+
+def _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out):
+    """Groups packed along M, addressed by cumulative offsets rather than sizes.
+
+    Same operand layout as the stacked variant; only the group metadata differs,
+    so the kernel decodes the offsets in its resolution loop.
+    """
+    assert offsets is not None, "2D-3D grouped mm requires offsets for XQ"
+    assert offsets.dtype == torch.int32, f"offsets must be int32, got {offsets.dtype}"
+    total_M, K = XQ.shape
+    G, N, Kw = WQ.shape
+    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert offsets.shape[0] == G, f"offsets length {offsets.shape[0]} must equal G={G}"
+    assert x_scale.numel() == total_M, (
+        f"x_scale must hold one scale per row ({total_M}), got {x_scale.numel()}"
+    )
+    assert w_scale.numel() == G * N, (
+        f"w_scale must hold one scale per group column ({G * N}), got {w_scale.numel()}"
+    )
+    assert tuple(out.shape) == (total_M, N), (
+        f"out must be [total_M, N] = {(total_M, N)}, got {tuple(out.shape)}"
+    )
+    _assert_fp8_operands(XQ, WQ)
+
+    grouped_dispatch.dispatch(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        offsets,
+        b_preshuffled=False,
+        blockscale=False,
+        layout="offsets",
+        out=out,
+    )
+    return out
+
+
+def _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out):
+    """Plain batched GEMM: fixed per-group slabs with every row carrying data.
+
+    This is the padded layout with nothing to mask, so the kernel skips both the
+    metadata load and the epilogue's row predicate.
+    """
+    assert offsets is None, "3D-3D is a batched GEMM and takes no offsets"
+    G, M, K = XQ.shape
+    Gw, N, Kw = WQ.shape
+    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert Gw == G, f"group mismatch: XQ G={G}, WQ G={Gw}"
+    assert x_scale.numel() == G * M, (
+        f"x_scale must hold one scale per row ({G * M}), got {x_scale.numel()}"
+    )
+    assert w_scale.numel() == G * N, (
+        f"w_scale must hold one scale per group column ({G * N}), got {w_scale.numel()}"
+    )
+    assert tuple(out.shape) == (G, M, N), (
+        f"out must be [G, M, N] = {(G, M, N)}, got {tuple(out.shape)}"
+    )
+    # The kernel writes out in place, so it has to be the caller's buffer; a
+    # contiguity fixup would silently write to a copy instead.
+    assert out.is_contiguous(), "out must be contiguous"
+    _assert_fp8_operands(XQ, WQ)
+
+    grouped_dispatch.dispatch(
+        XQ.contiguous().view(G * M, K),
+        WQ,
+        x_scale,
+        w_scale,
+        _unused_group_meta(XQ.device),
+        b_preshuffled=False,
+        blockscale=False,
+        layout="batched",
+        out=out.view(G * M, N),
+    )
+    return out
+
+
+def matmul_f8f8bf16_rowwise_grouped_mm(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    offsets: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Torch-native grouped GEMM, where the operand ranks pick the grouped axis.
+
+    2D-3D groups along M, 3D-2D along N, 2D-2D along K, and 3D-3D is an ordinary
+    batched GEMM. ``offsets`` gives the cumulative int32 end of each group along
+    whichever axis is grouped, and is None for 3D-3D. ``out`` is written in place
+    and returned.
+    """
+    ranks = (XQ.ndim, WQ.ndim)
+    if ranks == (2, 3):
+        return _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out)
+    if ranks == (3, 3):
+        return _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out)
+    if ranks in ((3, 2), (2, 2)):
+        raise NotImplementedError(
+            f"grouped mm with XQ {XQ.ndim}D and WQ {WQ.ndim}D groups along "
+            f"{'N' if ranks == (3, 2) else 'K'}, which this kernel does not yet "
+            "support"
+        )
+    raise ValueError(
+        f"XQ must be 2D or 3D and WQ 2D or 3D, got {XQ.ndim}D and {WQ.ndim}D"
     )
 
 
