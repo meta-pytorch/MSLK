@@ -58,6 +58,18 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 _KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
 
 
+def _group_and_n(WQ, group_meta, layout):
+    """Group count and total N, which the weights only carry for some layouts.
+
+    Weights are a stack of per-group [N, K] matrices except where the groups
+    divide N, in which case they are one [total_N, K] matrix and the group count
+    comes from the offsets instead.
+    """
+    if layout == "n_offsets":
+        return group_meta.shape[0], WQ.shape[0]
+    return WQ.shape[0], WQ.shape[1]
+
+
 def launch(
     XQ,
     WQ,
@@ -91,15 +103,17 @@ def launch(
     )
 
     total_M, K = XQ.shape
-    G, N, _ = WQ.shape
+    G, N = _group_and_n(WQ, m_sizes, layout)
     if b_preshuffled and (K % tile_k != 0 or N % tile_n != 0):
         raise ValueError(
             f"n ({N}) and k ({K}) must be divisible by tile_n ({tile_n}) and "
             f"tile_k ({tile_k}) for preshuffled B: the MFMA B layout interleaves "
             "both, so a partial tile cannot be masked a load at a time"
         )
-    if layout in ("padded", "batched"):
-        # One z slice per group, so the M axis only spans a single group's slab.
+    if layout in ("padded", "batched", "n_offsets"):
+        # Each group owns a slab, so the M axis only spans a single one. Under
+        # n_offsets the group rides the N axis instead of z, but its rows are
+        # still one slab.
         num_m_tiles = -(-(total_M // G) // tile_m)
     else:
         # Grid M-extent: host-known upper bound (each group wastes at most one
@@ -124,7 +138,9 @@ def launch(
         # that divide keep the cheaper unmasked loads. This mirrors how CK picks
         # between its KPadding and Default specialisations on the host.
         k_padding=(K % tile_k != 0),
-        n_padding=(N % tile_n != 0),
+        # A group's column end is a runtime value when the groups divide N, so
+        # the tail mask is always needed there.
+        n_padding=(N % tile_n != 0) or layout == "n_offsets",
     )
     # Operands keep their natural shape: argument marshalling packs each memref
     # extent as int32, which a flattened view overflows at 2**31 elements. The
@@ -177,12 +193,20 @@ def dispatch(
     slab layouts, so the shape handling below is common to all of them.
     """
     total_M, K = XQ.shape
-    G, N, _ = WQ.shape
+    G, N = _group_and_n(WQ, M_sizes, layout)
 
     if out is None:
         out = torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
     if total_M == 0 or N == 0 or K == 0 or G == 0:
         return out
+
+    # Tune on the shape of one group rather than of the concatenation, so that
+    # the key describes the work a block actually does. Only the grouped axis
+    # needs normalising; the others are already per-group.
+    if layout == "n_offsets":
+        m_key, n_key = total_M // G, N // G
+    else:
+        m_key, n_key = total_M, N
 
     tuned_launch = _launch_blockscale if blockscale else _launch_rowwise
     return tuned_launch(
@@ -192,8 +216,8 @@ def dispatch(
         w_scale,
         M_sizes,
         out,
-        next_pow2(total_M),
-        N,
+        next_pow2(m_key),
+        n_key,
         K,
         b_preshuffled,
         blockscale,

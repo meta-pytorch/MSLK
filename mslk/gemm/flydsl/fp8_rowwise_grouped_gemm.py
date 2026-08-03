@@ -339,6 +339,51 @@ def _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out):
     return out
 
 
+def _rowwise_grouped_mm_3d2d(XQ, WQ, x_scale, w_scale, offsets, out):
+    """Groups divide the output's columns rather than its rows.
+
+    Each group still multiplies its own activation slab by its own weights; the
+    results are packed side by side into [M, total_N] instead of end to end, so
+    the weights arrive as one [total_N, K] matrix whose rows the offsets divide.
+
+    Every group's column count must be a multiple of 8, the width of the
+    vectorised epilogue store, so that no store straddles a group boundary. The
+    offsets live on the device, so like CK this cannot be checked on the host;
+    unlike CK, which asserts on the device, a violation here silently leaves the
+    straddling columns unwritten.
+    """
+    assert offsets is not None, "3D-2D grouped mm requires offsets for WQ"
+    assert offsets.dtype == torch.int32, f"offsets must be int32, got {offsets.dtype}"
+    G, M, K = XQ.shape
+    total_N, Kw = WQ.shape
+    assert Kw == K, f"K mismatch: XQ K={K}, WQ K={Kw}"
+    assert offsets.shape[0] == G, f"offsets length {offsets.shape[0]} must equal G={G}"
+    assert x_scale.numel() == G * M, (
+        f"x_scale must hold one scale per row ({G * M}), got {x_scale.numel()}"
+    )
+    assert w_scale.numel() == total_N, (
+        f"w_scale must hold one scale per column ({total_N}), got {w_scale.numel()}"
+    )
+    assert tuple(out.shape) == (M, total_N), (
+        f"out must be [M, total_N] = {(M, total_N)}, got {tuple(out.shape)}"
+    )
+    assert out.is_contiguous(), "out must be contiguous"
+    _assert_fp8_operands(XQ, WQ)
+
+    grouped_dispatch.dispatch(
+        XQ.contiguous().view(G * M, K),
+        WQ,
+        x_scale,
+        w_scale,
+        offsets,
+        b_preshuffled=False,
+        blockscale=False,
+        layout="n_offsets",
+        out=out,
+    )
+    return out
+
+
 def matmul_f8f8bf16_rowwise_grouped_mm(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -359,11 +404,12 @@ def matmul_f8f8bf16_rowwise_grouped_mm(
         return _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out)
     if ranks == (3, 3):
         return _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out)
-    if ranks in ((3, 2), (2, 2)):
+    if ranks == (3, 2):
+        return _rowwise_grouped_mm_3d2d(XQ, WQ, x_scale, w_scale, offsets, out)
+    if ranks == (2, 2):
         raise NotImplementedError(
-            f"grouped mm with XQ {XQ.ndim}D and WQ {WQ.ndim}D groups along "
-            f"{'N' if ranks == (3, 2) else 'K'}, which this kernel does not yet "
-            "support"
+            "grouped mm with 2D XQ and 2D WQ groups along K, which this kernel "
+            "does not yet support"
         )
     raise ValueError(
         f"XQ must be 2D or 3D and WQ 2D or 3D, got {XQ.ndim}D and {WQ.ndim}D"
