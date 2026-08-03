@@ -349,6 +349,143 @@ def setup_lds_allocation_plain(
     return lds_alloc_offset, lds_tile_elems, lds_b_offset_elems
 
 
+GroupResolution = namedtuple(
+    "GroupResolution",
+    ["group_id", "row_start", "row_limit", "group_m_start", "group_m_size", "is_valid"],
+)
+
+
+def resolve_group_rows(
+    *,
+    arg_m_sizes,
+    num_groups_in,
+    m_in,
+    m_tile_idx,
+    slab_idx,
+    tile_m,
+    num_groups,
+    layout,
+):
+    """Work out which group owns this M-tile and where its rows begin and end.
+
+    This is the only part of the kernel that the group layout changes;
+    everything downstream consumes the returned coordinates unchanged. See the
+    ``layout`` argument of the kernel factory for what each encoding means.
+
+    ``m_tile_idx`` is the M-tile block id, and ``slab_idx`` the group block id
+    that only the slab layouts use. ``is_valid`` comes back as a Python ``True``
+    when the grid cannot place a tile outside its group, so the caller's guard
+    disappears at trace time rather than becoming a branch on a constant.
+    """
+    reads_group_meta = layout != "batched"
+    slab_layout = layout in ("padded", "batched")
+
+    # Group metadata is INT32 when it holds cumulative offsets and INT64 when it
+    # holds row counts. "batched" carries none, so no resource is built for it
+    # and arg_m_sizes goes unread.
+    if reads_group_meta:
+        meta_bytes = 4 if layout == "offsets" else 8
+        ms_rsrc = buffer_ops.create_buffer_resource(
+            arg_m_sizes,
+            max_size=False,
+            num_records_bytes=num_groups_in * fx.Index(meta_bytes),
+        )
+
+    def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+        return arith.constant(int(v), type=T.i32)
+
+    bx_i32 = arith.index_cast(T.i32, m_tile_idx)
+    tile_m_c = _i32(tile_m)
+    tile_m_bump = _i32(tile_m - 1)
+
+    if slab_layout:
+        # Every group owns a fixed slab of expected_m rows, so the group is a
+        # grid axis and needs no resolution.
+        group_id_i32 = arith.index_cast(T.i32, slab_idx)
+        expected_m_i32 = arith.divui(arith.index_cast(T.i32, m_in), _i32(num_groups))
+        group_m_start_i32 = arith.muli(group_id_i32, expected_m_i32)
+        group_m_size_i32 = expected_m_i32
+        row_start_i32 = arith.addi(group_m_start_i32, arith.muli(bx_i32, tile_m_c))
+        if reads_group_meta:
+            # m_sizes holds the count of rows in each slab that carry real
+            # data; the rest is padding the epilogue must not write.
+            valid_m = buffer_ops.buffer_load(
+                ms_rsrc, slab_idx * 2, vec_width=1, dtype=T.i32
+            )
+            # A group can hold fewer valid rows than the grid has tiles for
+            # it, so skip whole tiles that start past them.
+            is_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
+            )
+        else:
+            # The slab is full, so every row of it carries data and the grid
+            # is exactly ceil(slab / tile_m) tiles: no tile starts past the
+            # slab, and the guard is dropped rather than emitted always-true.
+            # The rows of the tile past the slab still carry nothing, though:
+            # tile_m need not divide it, and the overrun lands on the next
+            # group, so the epilogue still masks by row.
+            valid_m = expected_m_i32
+            is_valid = True
+        row_limit_i32 = arith.addi(group_m_start_i32, valid_m)
+    else:
+        # Packed layout: groups are concatenated along M, so resolve which one
+        # owns this flat M-tile id from m_sizes. Doing it here rather than
+        # from a host-built dispatch map keeps the launch free of helper
+        # kernels, which matters under CUDA-graph capture where each one is
+        # replayed per call. num_groups is a compile-time constant, so the loop
+        # unrolls to a few scalar ops. acc_m/acc_t are the running m_start and
+        # tile_start prefixes; tiles beyond the real tile count (the grid extent
+        # is an upper bound) match no group and stay marked -1.
+        acc_m = _i32(0)  # cumulative rows before group g (m_starts[g])
+        acc_t = _i32(0)  # cumulative tiles before group g (tile_starts[g])
+        group_id_i32 = _i32(-1)
+        row_start_i32 = _i32(0)
+        row_limit_i32 = _i32(0)
+        group_m_start_i32 = _i32(0)  # first global row of the owning group
+        group_m_size_i32 = _i32(0)  # row count of the owning group
+        for _g in range_constexpr(num_groups):
+            if layout == "offsets":
+                # Cumulative int32 row ends. acc_m is already the running
+                # prefix, so a group's own row count is the step between them;
+                # decoding here costs a subtract and saves the caller a whole
+                # kernel launch to difference the offsets host-side.
+                m_g = arith.subi(
+                    buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32),
+                    acc_m,
+                )
+            else:
+                # m_sizes is int64; read the low dword of element _g (index
+                # _g*2 in dwords). Row counts fit in int32, so the high dword
+                # is always zero and no host-side narrowing kernel is needed.
+                m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
+            tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
+            acc_t_next = arith.addi(acc_t, tiles_g)
+            in_grp = arith.andi(
+                arith.cmpi(arith.CmpIPredicate.sge, bx_i32, acc_t),
+                arith.cmpi(arith.CmpIPredicate.slt, bx_i32, acc_t_next),
+            )
+            rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
+            rl = arith.addi(acc_m, m_g)
+            group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
+            row_start_i32 = arith.select(in_grp, rs, row_start_i32)
+            row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
+            group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
+            group_m_size_i32 = arith.select(in_grp, m_g, group_m_size_i32)
+            acc_m = arith.addi(acc_m, m_g)
+            acc_t = acc_t_next
+
+        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0))
+
+    return GroupResolution(
+        group_id=group_id_i32,
+        row_start=row_start_i32,
+        row_limit=row_limit_i32,
+        group_m_start=group_m_start_i32,
+        group_m_size=group_m_size_i32,
+        is_valid=is_valid,
+    )
+
+
 def make_a_tile_loaders(
     *,
     a_rsrc,
