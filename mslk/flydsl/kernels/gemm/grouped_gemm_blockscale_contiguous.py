@@ -29,7 +29,8 @@ Tensors:
     local_m + k_block * M_g. This is not a global [scale_k, M_total] transpose.
   - B: [num_groups, N, K] FP8 - one weight matrix per group, preshuffled
   - scale_b: [num_groups, scale_k, scale_n] FP32 - per-block scales
-  - m_sizes: [num_groups] INT64 - rows per group (sum to M_total)
+  - m_sizes: [num_groups] INT64 - rows per group (sum to M_total), or unused
+    when the layout carries no per-group metadata
   - D: [M_total, N] BF16 - output
 
 Block scaling granularity:
@@ -85,7 +86,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 
 # Supported encodings of the group geometry; see the ``layout`` argument below.
-LAYOUTS = ("sizes", "padded")
+LAYOUTS = ("sizes", "padded", "batched")
 
 
 @functools.lru_cache(maxsize=128)
@@ -142,6 +143,10 @@ def compile_grouped_gemm_blockscale_contiguous(
             "padded": each group owns a fixed slab of M_total/num_groups rows and
             m_sizes is [num_groups] INT64 counts of the rows per slab that hold
             real data; the rest is padding the epilogue must not write.
+            "batched": fixed slabs as in "padded" but every row holds real
+            data, so the row count is implied and m_sizes is never read. Rows
+            still need masking, since a tile that overruns the slab would spill
+            into the next group.
 
     Returns:
         JIT launcher function.
@@ -150,7 +155,10 @@ def compile_grouped_gemm_blockscale_contiguous(
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     # Each group owns a fixed slab of rows, so the group is a grid axis and does
     # not have to be resolved from the row counts.
-    slab_layout = layout == "padded"
+    slab_layout = layout in ("padded", "batched")
+    # Only the batched layout implies its row counts; the rest read them from
+    # the group metadata.
+    reads_group_meta = layout != "batched"
 
     gpu_arch = get_hip_arch()
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
@@ -352,9 +360,14 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_scale_b, max_size=False, num_records_bytes=sb_nbytes
         )
 
-        ms_rsrc = buffer_ops.create_buffer_resource(
-            arg_m_sizes, max_size=False, num_records_bytes=num_groups_in * fx.Index(8)
-        )
+        # "batched" carries no group metadata, so no resource is built for it
+        # and arg_m_sizes goes unread.
+        if const_expr(reads_group_meta):
+            ms_rsrc = buffer_ops.create_buffer_resource(
+                arg_m_sizes,
+                max_size=False,
+                num_records_bytes=num_groups_in * fx.Index(8),
+            )
 
         def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
             return arith.constant(int(v), type=T.i32)
@@ -364,10 +377,8 @@ def compile_grouped_gemm_blockscale_contiguous(
         tile_m_bump = _i32(tile_m - 1)
 
         if const_expr(slab_layout):
-            # Padded layout: every group owns a fixed slab of expected_m rows, so
-            # the group is a grid axis and needs no resolution. m_sizes holds the
-            # count of rows in each slab that carry real data; the rest is padding
-            # the epilogue must not write.
+            # Every group owns a fixed slab of expected_m rows, so the group is a
+            # grid axis and needs no resolution.
             group_id_i32 = arith.index_cast(T.i32, bz)
             expected_m_i32 = arith.divui(
                 arith.index_cast(T.i32, m_in), _i32(num_groups)
@@ -375,9 +386,22 @@ def compile_grouped_gemm_blockscale_contiguous(
             group_m_start_i32 = arith.muli(group_id_i32, expected_m_i32)
             group_m_size_i32 = expected_m_i32
             row_start_i32 = arith.addi(group_m_start_i32, arith.muli(bx_i32, tile_m_c))
-            valid_m = buffer_ops.buffer_load(ms_rsrc, bz * 2, vec_width=1, dtype=T.i32)
+            if const_expr(reads_group_meta):
+                # m_sizes holds the count of rows in each slab that carry real
+                # data; the rest is padding the epilogue must not write.
+                valid_m = buffer_ops.buffer_load(
+                    ms_rsrc, bz * 2, vec_width=1, dtype=T.i32
+                )
+            else:
+                # The slab is full, so every row of it carries data. The rows of
+                # the tile past it still do not: tile_m need not divide the slab,
+                # and the overrun lands on the next group.
+                valid_m = expected_m_i32
             row_limit_i32 = arith.addi(group_m_start_i32, valid_m)
-            # Skip whole tiles that start past this group's valid rows.
+            # Skip whole tiles that start past this group's valid rows. A full
+            # slab leaves no such tile, but the guard still has to be emitted as
+            # a branch: hoisting the body out of it to run unconditionally races
+            # against the K loop's LDS staging and corrupts the result.
             is_valid = arith.cmpi(
                 arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
             )

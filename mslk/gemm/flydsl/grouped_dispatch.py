@@ -98,7 +98,7 @@ def launch(
             f"tile_k ({tile_k}) for preshuffled B: the MFMA B layout interleaves "
             "both, so a partial tile cannot be masked a load at a time"
         )
-    if layout == "padded":
+    if layout in ("padded", "batched"):
         # One z slice per group, so the M axis only spans a single group's slab.
         num_m_tiles = -(-(total_M // G) // tile_m)
     else:
