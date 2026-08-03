@@ -396,19 +396,21 @@ def compile_grouped_gemm_blockscale_contiguous(
                 valid_m = buffer_ops.buffer_load(
                     ms_rsrc, bz * 2, vec_width=1, dtype=T.i32
                 )
+                # A group can hold fewer valid rows than the grid has tiles for
+                # it, so skip whole tiles that start past them.
+                is_valid = arith.cmpi(
+                    arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
+                )
             else:
-                # The slab is full, so every row of it carries data. The rows of
-                # the tile past it still do not: tile_m need not divide the slab,
-                # and the overrun lands on the next group.
+                # The slab is full, so every row of it carries data and the grid
+                # is exactly ceil(slab / tile_m) tiles: no tile starts past the
+                # slab, and the guard is dropped rather than emitted always-true.
+                # The rows of the tile past the slab still carry nothing, though:
+                # tile_m need not divide it, and the overrun lands on the next
+                # group, so the epilogue still masks by row.
                 valid_m = expected_m_i32
+                is_valid = True
             row_limit_i32 = arith.addi(group_m_start_i32, valid_m)
-            # Skip whole tiles that start past this group's valid rows. A full
-            # slab leaves no such tile, but the guard still has to be emitted as
-            # a branch: hoisting the body out of it to run unconditionally races
-            # against the K loop's LDS staging and corrupts the result.
-            is_valid = arith.cmpi(
-                arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
-            )
         else:
             # Packed layout: groups are concatenated along M, so resolve which one
             # owns this flat M-tile id (bx) from m_sizes. Doing it here rather than
