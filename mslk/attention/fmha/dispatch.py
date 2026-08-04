@@ -6,6 +6,8 @@
 # pyre-unsafe
 
 
+import logging
+import os
 import textwrap
 from collections import deque
 from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
@@ -16,6 +18,17 @@ from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, triton_splitk
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# When set to "1" / "true" / "yes", logs the operator selected by
+# `_run_priority_list` (e.g. Flash3/Flash/Cutlass/Triton-splitk/CK) so that
+# the chosen FMHA kernel can be inspected at runtime for debugging.
+_LOG_DISPATCH: bool = os.getenv("MSLK_FMHA_LOG_DISPATCH", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 try:
@@ -87,6 +100,8 @@ def _run_priority_list(
     for op in priority_list:
         not_supported = op.not_supported_reasons(inp)
         if not not_supported:
+            if _LOG_DISPATCH:
+                logger.debug("MSLK dispatch (%s): selected op=%s", name, op.NAME)
             return op
         not_supported_reasons.append(not_supported)
 
