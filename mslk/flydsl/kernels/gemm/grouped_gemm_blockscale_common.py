@@ -44,12 +44,17 @@ K_LOAD_ELEMS = 16
 N_STORE_ELEMS = 8
 
 
-def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in):
+def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in, always=False):
     """Build the per-load K-range predicate used by the A and B tile loaders.
 
     Returns ``mask(k_tile_idx_py, base_k_div4, col_local_i32)`` yielding None
     wherever no masking is needed, so every tile but the last emits exactly the
     code it did before.
+
+    ``always`` drops that last-tile test and emits the predicate on every tile.
+    A rolled K loop traces its body once, so which iteration is the last is no
+    longer a Python-level fact; the predicate is correct on every tile either
+    way, since it compares against K rather than against the tile index.
 
     A masked ``buffer_load`` reads out of the buffer's range and so returns zero,
     which is what a K tail needs: the excess lanes contribute nothing to the sum.
@@ -59,7 +64,7 @@ def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in):
     tail = k_padding and (k % tile_k != 0)
 
     def mask(k_tile_idx_py, base_k_div4, col_local_i32):
-        if not tail or k_tile_idx_py != num_k_tiles - 1:
+        if not tail or not (always or k_tile_idx_py == num_k_tiles - 1):
             return None
         # Loads are 16-byte aligned and K is a multiple of that width, so a chunk
         # is either wholly inside K or wholly outside it.

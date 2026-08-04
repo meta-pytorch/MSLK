@@ -55,7 +55,7 @@ ROWWISE_TILES = _tiles((64, 128, 256))
 # case that needs padding, prune_by_divisibility falls back to the full list and
 # the shape still gets tuned.
 _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout"]
+_KEY = ["m_bucket", "n", "k", "b_preshuffled", "blockscale", "layout", "roll_k"]
 
 
 def _group_and_n(WQ, group_meta, layout):
@@ -83,6 +83,7 @@ def launch(
     b_preshuffled,
     blockscale,
     layout="sizes",
+    roll_k=False,
     *,
     tile_m,
     tile_n,
@@ -134,6 +135,7 @@ def launch(
         b_preshuffled=b_preshuffled,
         blockscale=blockscale,
         layout=layout,
+        roll_k=roll_k,
         # Compile the tail-masked variant only when K stops mid-tile, so shapes
         # that divide keep the cheaper unmasked loads. This mirrors how CK picks
         # between its KPadding and Default specialisations on the host.
@@ -184,6 +186,7 @@ def dispatch(
     b_preshuffled,
     blockscale,
     layout="sizes",
+    roll_k=False,
     out=None,
 ):
     """Allocate the output if needed and run the grouped GEMM with a selected tile.
@@ -222,4 +225,5 @@ def dispatch(
         b_preshuffled,
         blockscale,
         layout,
+        roll_k,
     )

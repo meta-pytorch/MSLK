@@ -54,7 +54,7 @@ from flydsl.expr import (
     rocdl,
     vector,
 )
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
@@ -109,6 +109,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
+    roll_k: bool = False,
 ):
     """Compile grouped FP8 GEMM kernel and return the JIT launcher.
 
@@ -157,9 +158,22 @@ def compile_grouped_gemm_blockscale_contiguous(
             [M, total_N] with the groups side by side, and m_sizes is
             [num_groups] INT32 cumulative column ends. Rowwise plain-B only.
 
+        roll_k: Emit the K loop once as a real loop instead of unrolling it over
+            every K tile. The unrolled form folds the tile index into every
+            address and keeps the pipeline free of loop overhead, but the traced
+            IR, the compile time and the final code all then grow linearly with
+            K. Rolling holds them constant, at the cost of carrying the
+            accumulators and the prefetched tiles as loop state. Only the plain-B
+            K loop can be rolled today.
+
     Returns:
         JIT launcher function.
     """
+    if roll_k and b_preshuffled:
+        raise ValueError(
+            "roll_k applies to the plain-B K loop; the preshuffled path uses the "
+            "two-deep ping-pong loop, which is still unrolled"
+        )
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     # Each group owns a fixed slab of rows and rides the grid's z axis, so it
@@ -269,11 +283,12 @@ def compile_grouped_gemm_blockscale_contiguous(
     _variant = "contiguous_pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
     _kpad = "_kpad" if k_padding else ""
+    _roll = "_rollk" if roll_k else ""
     _npad = "_npad" if n_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
@@ -485,6 +500,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 k=k,
                 tile_k=tile_k,
                 k_in=k_in,
+                always=roll_k,
             )
 
             (
@@ -668,7 +684,55 @@ def compile_grouped_gemm_blockscale_contiguous(
                     lds_base_pong=lds_base_pong,
                     lds_base_b=lds_base_b,
                 )
-            accs = run_kloop(accs)
+
+            if const_expr(roll_k):
+                # Rolled K loop. The body is traced once, so it has to live here
+                # rather than behind a helper: only the kernel function's own
+                # source is AST-rewritten, and fx.range/yield is a rewritten
+                # construct. The pipeline is the same as the unrolled form --
+                # the next tile's global loads are issued before the current
+                # tile computes -- which is why the prefetched registers ride
+                # the loop next to the accumulators. The final tile is peeled,
+                # having no successor to prefetch.
+                _a_regs = prefetch_a_tile(0)
+                _b_regs = prefetch_b_tile(0)
+                _n_acc = len(accs)
+                _n_a = len(_a_regs)
+                if const_expr(num_k_tiles > 1):
+                    for _kt, _st in fx.range(
+                        0,
+                        num_k_tiles - 1,
+                        1,
+                        init=list(accs) + list(_a_regs) + list(_b_regs),
+                    ):
+                        _accs = [Vector(v) for v in _st[:_n_acc]]
+                        _a_cur = [Vector(v) for v in _st[_n_acc : _n_acc + _n_a]]
+                        _b_cur = [Vector(v) for v in _st[_n_acc + _n_a :]]
+                        store_a_tile_to_lds(_a_cur, lds_base_pong)
+                        store_b_tile_to_lds(_b_cur, lds_base_b)
+                        _scales = prefetch_scales(_kt)
+                        gpu.barrier()
+                        _a_nxt = prefetch_a_tile(_kt + 1)
+                        _b_nxt = prefetch_b_tile(_kt + 1)
+                        _b_tile = load_b_tile_from_lds(lds_base_b)
+                        _accs = compute_tile(
+                            _accs, _kt, lds_base_pong, _b_tile, _scales
+                        )
+                        gpu.barrier()
+                        _res = yield list(_accs) + list(_a_nxt) + list(_b_nxt)
+                    accs = [Vector(v) for v in _res[:_n_acc]]
+                    _a_regs = [Vector(v) for v in _res[_n_acc : _n_acc + _n_a]]
+                    _b_regs = [Vector(v) for v in _res[_n_acc + _n_a :]]
+                _last = num_k_tiles - 1
+                store_a_tile_to_lds(_a_regs, lds_base_pong)
+                store_b_tile_to_lds(_b_regs, lds_base_b)
+                _scales = prefetch_scales(_last)
+                gpu.barrier()
+                _b_tile = load_b_tile_from_lds(lds_base_b)
+                accs = compute_tile(accs, _last, lds_base_pong, _b_tile, _scales)
+                gpu.barrier()
+            else:
+                accs = run_kloop(accs)
 
             if const_expr(not blockscale):
                 # Rowwise scales are constant along K, so the whole reduction is
