@@ -67,7 +67,10 @@ def make_k_tail_mask(
     A plain out-of-range offset would not do, since reading past K within a row
     lands on the next row's data rather than outside the buffer.
     """
-    tail = k_padding and (k % tile_k != 0)
+    # A supplied bound is a per-group K end, so whether the whole K is tile
+    # aligned says nothing about whether a group's slice is: the tail can land
+    # anywhere inside it, and the predicate is always needed.
+    tail = k_padding and (k_bound is not None or k % tile_k != 0)
     _bound = k_in if k_bound is None else k_bound
 
     def mask(k_tile_idx_py, base_k_div4, col_local_i32):
