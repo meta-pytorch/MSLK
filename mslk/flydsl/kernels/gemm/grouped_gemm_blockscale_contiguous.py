@@ -72,7 +72,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     make_lds_b_loader,
     make_lds_loader,
     make_n_block_coords,
-    make_pingpong_kloop,
+    make_pingpong_stages,
     make_plain_b_tile,
     make_prefetch_scales,
     make_rowwise_scaler,
@@ -163,19 +163,15 @@ def compile_grouped_gemm_blockscale_contiguous(
             address and keeps the pipeline free of loop overhead, but the traced
             IR, the compile time and the final code all then grow linearly with
             K. Rolling holds them constant, at the cost of carrying the
-            accumulators and the prefetched tiles as loop state. Only the plain-B
-            K loop can be rolled today. This is the kernel's mechanism and
-            defaults off; the host dispatch sets the policy and turns it on
-            wherever it applies.
+            accumulators and the prefetched tiles as loop state. Both K loops
+            can be rolled: the plain one a tile at a time, the ping-pong one a
+            pair at a time so its buffer alternation stays compile-time inside
+            the body. This is the kernel's mechanism and defaults off; the host
+            dispatch sets the policy.
 
     Returns:
         JIT launcher function.
     """
-    if roll_k and b_preshuffled:
-        raise ValueError(
-            "roll_k applies to the plain-B K loop; the preshuffled path uses the "
-            "two-deep ping-pong loop, which is still unrolled"
-        )
     if layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     # Each group owns a fixed slab of rows and rides the grid's z axis, so it
@@ -657,7 +653,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             )
 
             if const_expr(b_preshuffled):
-                run_kloop = make_pingpong_kloop(
+                pingpong_prologue, pingpong_pair = make_pingpong_stages(
                     num_k_tiles=num_k_tiles,
                     tile_k=tile_k,
                     prefetch_a_tile=prefetch_a_tile,
@@ -687,7 +683,61 @@ def compile_grouped_gemm_blockscale_contiguous(
                     lds_base_b=lds_base_b,
                 )
 
-            if const_expr(roll_k):
+            # The ping-pong state is nested (a B tile is k_unroll pairs of
+            # num_acc_n packs); a loop carries a flat list, so convert both ways.
+            # The prefetched scales are always None on this software-scaling
+            # path, so they are rebuilt rather than carried.
+            def _flatten_pp(st):
+                b_tile, _sc, a0 = st
+                flat = []
+                for _p0, _p1 in b_tile:
+                    flat.extend(_p0)
+                    flat.extend(_p1)
+                flat.extend(a0)
+                return flat
+
+            def _unflatten_pp(vals):
+                vals = [fx.Int64(v) for v in vals]
+                b_tile = []
+                _i = 0
+                for _ in range_constexpr(k_unroll):
+                    _p0 = vals[_i : _i + num_acc_n]
+                    _i += num_acc_n
+                    _p1 = vals[_i : _i + num_acc_n]
+                    _i += num_acc_n
+                    b_tile.append((_p0, _p1))
+                return (b_tile, None, tuple(vals[_i : _i + 2]))
+
+            if const_expr(b_preshuffled and roll_k):
+                # Rolled ping-pong loop. Two K tiles per iteration, which keeps
+                # the ping/pong alternation compile-time inside the body while
+                # the loop itself rolls; the pairs that have no successor to
+                # prefetch are peeled off the end and walked unrolled, so the
+                # rolled body needs no tail tests. The B tile and the first A
+                # pack ride the loop, being produced one pair ahead of use.
+                _st0 = pingpong_prologue()
+                _pairs = max((num_k_tiles - 1) // 2, 0)
+                _n_acc = len(accs)
+                if const_expr(_pairs > 0):
+                    for _it, _sv in fx.range(
+                        0,
+                        _pairs,
+                        1,
+                        init=list(accs) + _flatten_pp(_st0),
+                    ):
+                        _accs = [Vector(v) for v in _sv[:_n_acc]]
+                        _cur = _unflatten_pp(_sv[_n_acc:])
+                        _accs, _cur = pingpong_pair(_accs, _it * 2, _cur, steady=True)
+                        _res = yield list(_accs) + _flatten_pp(_cur)
+                    accs = [Vector(v) for v in _res[:_n_acc]]
+                    _st0 = _unflatten_pp(_res[_n_acc:])
+                for _kp in range_constexpr(2 * _pairs, num_k_tiles, 2):
+                    accs, _st0 = pingpong_pair(accs, _kp, _st0)
+            elif const_expr(b_preshuffled):
+                _st0 = pingpong_prologue()
+                for _kp in range_constexpr(0, num_k_tiles, 2):
+                    accs, _st0 = pingpong_pair(accs, _kp, _st0)
+            elif const_expr(roll_k):
                 # Rolled K loop. The body is traced once, so it has to live here
                 # rather than behind a helper: only the kernel function's own
                 # source is AST-rewritten, and fx.range/yield is a rewritten

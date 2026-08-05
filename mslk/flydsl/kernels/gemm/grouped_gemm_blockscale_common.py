@@ -1439,7 +1439,7 @@ def make_kloop_plain(
     return run_kloop
 
 
-def make_pingpong_kloop(
+def make_pingpong_stages(
     *,
     num_k_tiles,
     tile_k,
@@ -1455,90 +1455,101 @@ def make_pingpong_kloop(
     row_a_lds_base,
     col_offset_base_bytes,
 ):
-    """Build the ping-pong K-loop driver.
+    """Build the prologue and the per-pair body of the ping-pong K loop.
 
-    Returns `run_kloop(accs)` which advances `accs` through all
-    K-tiles using the prologue + alternating ping/pong stages.
-    Loop body is byte-identical between contig and masked, so this
-    factory has no offset parameters.
+    Returns ``(prologue, pair)``. ``prologue()`` fills the pong buffer and
+    returns the state the first pair consumes; ``pair(accs, k_pair, state)``
+    advances two K tiles and returns the state the next pair consumes.
+
+    Splitting the body out lets the loop itself be written either way. The
+    unrolled form walks it with a compile-time index; the rolled form can only
+    be written in the kernel's own source, since the loop construct is
+    AST-rewritten, and calls the same body from there. ``steady`` says the pair
+    is known to have both of its tiles and a successor to prefetch, which is
+    what a rolled body needs: with a runtime index the tail tests are not
+    Python-level facts.
     """
 
-    def run_kloop(accs):
-        # Prologue: prefetch first A tile into VGPRs, store to LDS, load B + scales
+    def prologue():
+        # Prefetch first A tile into VGPRs, store to LDS, load B + scales
         a_regs0 = prefetch_a_tile(0)
         store_a_tile_to_lds(a_regs0, lds_base_pong)
         b_tile_pong = load_b_tile(fx.Index(0))
         scales_pong_pf = prefetch_scales(0)
         gpu.barrier()
-
         # Prefetch first A pack from pong (hides LDS latency behind upcoming VMEM)
         a0_prefetch_pong = lds_load_packs_k64(
             row_a_lds_base, col_offset_base_bytes, lds_base_pong
         )
+        return (b_tile_pong, scales_pong_pf, a0_prefetch_pong)
 
-        for k_pair in range_constexpr(0, num_k_tiles, 2):
-            # Prefetch the next scales before the B-tile VMEM so the scale-load
-            # latency hides behind it; then the A+B registers.
-            if k_pair + 1 < num_k_tiles:
-                scales_ping_pf = prefetch_scales(k_pair + 1)
-                a_regs_ping = prefetch_a_tile(k_pair + 1)
-                b_tile_ping = load_b_tile(fx.Index((k_pair + 1) * tile_k))
+    def pair(accs, k_pair, state, *, steady=False):
+        b_tile_pong, scales_pong_pf, a0_prefetch_pong = state
+        has_odd = True if steady else (k_pair + 1 < num_k_tiles)
+        has_next = True if steady else (k_pair + 2 < num_k_tiles)
 
-            # Compute current tile from pong LDS
+        # Prefetch the next scales before the B-tile VMEM so the scale-load
+        # latency hides behind it; then the A+B registers.
+        if has_odd:
+            scales_ping_pf = prefetch_scales(k_pair + 1)
+            a_regs_ping = prefetch_a_tile(k_pair + 1)
+            b_tile_ping = load_b_tile(fx.Index((k_pair + 1) * tile_k))
+
+        # Compute current tile from pong LDS
+        accs = compute_tile(
+            accs,
+            k_pair,
+            lds_base_pong,
+            b_tile_pong,
+            scales_pong_pf,
+            a0_prefetch=a0_prefetch_pong,
+        )
+        a0_prefetch_pong = None
+
+        # Store next A to LDS (ds_write after compute, overlaps with trailing MFMAs)
+        if has_odd:
+            store_a_tile_to_lds(a_regs_ping, lds_base_ping)
+            hot_loop_scheduler()
+        gpu.barrier()
+
+        if has_odd:
+            # Prefetch first A pack from ping
+            a0_prefetch_ping = lds_load_packs_k64(
+                row_a_lds_base, col_offset_base_bytes, lds_base_ping
+            )
+
+            # Prefetch next scales + A+B
+            if has_next:
+                scales_pong_pf = prefetch_scales(k_pair + 2)
+                a_regs_pong = prefetch_a_tile(k_pair + 2)
+                b_tile_pong = load_b_tile(fx.Index((k_pair + 2) * tile_k))
+
+            # Compute current tile from ping LDS
             accs = compute_tile(
                 accs,
-                k_pair,
-                lds_base_pong,
-                b_tile_pong,
-                scales_pong_pf,
-                a0_prefetch=a0_prefetch_pong,
+                k_pair + 1,
+                lds_base_ping,
+                b_tile_ping,
+                scales_ping_pf,
+                a0_prefetch=a0_prefetch_ping,
             )
-            a0_prefetch_pong = None
+            a0_prefetch_ping = None
 
-            # Store next A to LDS (ds_write after compute, overlaps with trailing MFMAs)
-            if k_pair + 1 < num_k_tiles:
-                store_a_tile_to_lds(a_regs_ping, lds_base_ping)
+            # Store next A to LDS
+            if has_next:
+                store_a_tile_to_lds(a_regs_pong, lds_base_pong)
                 hot_loop_scheduler()
             gpu.barrier()
 
-            if k_pair + 1 < num_k_tiles:
-                # Prefetch first A pack from ping
-                a0_prefetch_ping = lds_load_packs_k64(
-                    row_a_lds_base, col_offset_base_bytes, lds_base_ping
+            # Prefetch first A pack from pong for next iteration
+            if has_next:
+                a0_prefetch_pong = lds_load_packs_k64(
+                    row_a_lds_base, col_offset_base_bytes, lds_base_pong
                 )
 
-                # Prefetch next scales + A+B
-                if k_pair + 2 < num_k_tiles:
-                    scales_pong_pf = prefetch_scales(k_pair + 2)
-                    a_regs_pong = prefetch_a_tile(k_pair + 2)
-                    b_tile_pong = load_b_tile(fx.Index((k_pair + 2) * tile_k))
+        return accs, (b_tile_pong, scales_pong_pf, a0_prefetch_pong)
 
-                # Compute current tile from ping LDS
-                accs = compute_tile(
-                    accs,
-                    k_pair + 1,
-                    lds_base_ping,
-                    b_tile_ping,
-                    scales_ping_pf,
-                    a0_prefetch=a0_prefetch_ping,
-                )
-                a0_prefetch_ping = None
-
-                # Store next A to LDS
-                if k_pair + 2 < num_k_tiles:
-                    store_a_tile_to_lds(a_regs_pong, lds_base_pong)
-                    hot_loop_scheduler()
-                gpu.barrier()
-
-                # Prefetch first A pack from pong for next iteration
-                if k_pair + 2 < num_k_tiles:
-                    a0_prefetch_pong = lds_load_packs_k64(
-                        row_a_lds_base, col_offset_base_bytes, lds_base_pong
-                    )
-
-        return accs
-
-    return run_kloop
+    return prologue, pair
 
 
 def make_epilogue_writers(

@@ -138,9 +138,7 @@ def launch(
         b_preshuffled=b_preshuffled,
         blockscale=blockscale,
         layout=layout,
-        # Only the plain-B K loop can be rolled; the preshuffled path still runs
-        # the two-deep ping-pong loop, which is unrolled.
-        roll_k=roll_k and not b_preshuffled,
+        roll_k=roll_k,
         # Compile the tail-masked variant only when K stops mid-tile, so shapes
         # that divide keep the cheaper unmasked loads. This mirrors how CK picks
         # between its KPadding and Default specialisations on the host.
