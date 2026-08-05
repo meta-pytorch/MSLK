@@ -29,6 +29,8 @@ import torch  # noqa: E402
 from . import _meta  # noqa: F401, E402
 
 if torch.version.hip is not None:
+    from mslk.flydsl.common import is_flydsl_available
+
     # Register the Triton ROCm implementations for mx8mx4bf16, mx8mx8bf16, and
     # f8f8bf16_groupwise(_grouped).  Each import triggers a
     # @torch.library.impl(..., "CUDA") decoration that overrides the default
@@ -40,3 +42,10 @@ if torch.version.hip is not None:
         mx8mx4_gemm,
         mx8mx8_gemm,
     )
+
+    if is_flydsl_available():
+        # Registers mslk::f8f8bf16_groupwise_grouped and its _preshuffle
+        # sibling (FlyDSL).
+        from .flydsl import (  # noqa: F401
+            fp8_groupwise_grouped_gemm as _flydsl_groupwise_grouped,
+        )
