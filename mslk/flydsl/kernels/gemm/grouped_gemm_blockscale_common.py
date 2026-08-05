@@ -44,12 +44,18 @@ K_LOAD_ELEMS = 16
 N_STORE_ELEMS = 8
 
 
-def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in, always=False):
+def make_k_tail_mask(
+    *, k_padding, num_k_tiles, k, tile_k, k_in, always=False, k_bound=None
+):
     """Build the per-load K-range predicate used by the A and B tile loaders.
 
     Returns ``mask(k_tile_idx_py, base_k_div4, col_local_i32)`` yielding None
     wherever no masking is needed, so every tile but the last emits exactly the
     code it did before.
+
+    ``k_bound`` replaces K as the bound the predicate compares against, which is
+    what the layouts that let the groups divide K need: a load belongs to the
+    group only while it stays inside that group's slice.
 
     ``always`` drops that last-tile test and emits the predicate on every tile.
     A rolled K loop traces its body once, so which iteration is the last is no
@@ -62,6 +68,7 @@ def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in, always=False):
     lands on the next row's data rather than outside the buffer.
     """
     tail = k_padding and (k % tile_k != 0)
+    _bound = k_in if k_bound is None else k_bound
 
     def mask(k_tile_idx_py, base_k_div4, col_local_i32):
         if not tail or not (always or k_tile_idx_py == num_k_tiles - 1):
@@ -72,7 +79,7 @@ def make_k_tail_mask(*, k_padding, num_k_tiles, k, tile_k, k_in, always=False):
         return arith.cmpi(
             arith.CmpIPredicate.ult,
             arith.index_cast(T.i32, chunk_start_div4),
-            arith.index_cast(T.i32, k_in // fx.Index(4)),
+            arith.index_cast(T.i32, _bound // fx.Index(4)),
         )
 
     return mask
@@ -497,6 +504,34 @@ def resolve_group_rows(
     )
 
 
+GroupKSlice = namedtuple("GroupKSlice", ["k_start", "k_end"])
+
+
+def resolve_group_k(*, arg_offsets, num_groups_in, slab_idx):
+    """Read the K slice this group contracts over.
+
+    Where the groups divide K every group produces a full output, so the group
+    is a grid axis and nothing has to be resolved from the tile index -- only
+    the ends of its slice, which are two adjacent cumulative offsets. Group 0
+    starts at zero, so its lower end is not read.
+    """
+    off_rsrc = buffer_ops.create_buffer_resource(
+        arg_offsets, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+    )
+    g_i32 = arith.index_cast(T.i32, slab_idx)
+    zero = arith.constant(0, type=T.i32)
+    is_first = arith.cmpi(arith.CmpIPredicate.eq, g_i32, zero)
+    prev = buffer_ops.buffer_load(
+        off_rsrc,
+        arith.subi(g_i32, arith.constant(1, type=T.i32)),
+        vec_width=1,
+        dtype=T.i32,
+    )
+    k_start = arith.select(is_first, zero, prev)
+    k_end = buffer_ops.buffer_load(off_rsrc, g_i32, vec_width=1, dtype=T.i32)
+    return GroupKSlice(k_start=k_start, k_end=k_end)
+
+
 GroupColResolution = namedtuple(
     "GroupColResolution", ["group_id", "col_base", "col_limit", "is_valid"]
 )
@@ -575,6 +610,7 @@ def make_a_tile_loaders(
     m_in=None,
     group_idx=None,
     k_tail_mask=None,
+    k_base_div4=None,
 ):
     """Build the prefetch + LDS-store closures for the A tile.
 
@@ -584,7 +620,10 @@ def make_a_tile_loaders(
     (masked path), `group_idx * m_in * (k_in/4)` is added as the leading
     term inside `prefetch_a_tile`, exactly matching the original masked
     code so the resulting MLIR (and ISA) is byte-identical. `k_blocks16`
-    is returned for reuse by the downstream LDS-load helper.
+    is returned for reuse by the downstream LDS-load helper. `k_base_div4`
+    shifts every load to the start of this group's K slice, for the layouts
+    where the groups divide K rather than an output axis; the row stride stays
+    the full K, since the slice is a column block of a wider matrix.
     """
     _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_a_tile_div4 = fx.make_layout(
@@ -617,6 +656,8 @@ def make_a_tile_loaders(
     def prefetch_a_tile(k_tile_idx_py):
         """Load A tile from global memory into VGPRs."""
         base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        if k_base_div4 is not None:
+            base_k_div4 = k_base_div4 + base_k_div4
         parts = []
         for i in range_constexpr(num_a_loads):
             row_global = bx_m + a_row_local[i]
@@ -688,6 +729,7 @@ def make_b_tile_loaders(
     n_padding=False,
     b_group_off=None,
     n_bound=None,
+    k_base_div4=None,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
@@ -736,6 +778,8 @@ def make_b_tile_loaders(
     def prefetch_b_tile(k_tile_idx_py):
         """Load plain B tile from global memory into VGPRs (coalesced dwordx4)."""
         base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        if k_base_div4 is not None:
+            base_k_div4 = k_base_div4 + base_k_div4
         parts = []
         for i in range_constexpr(num_b_loads):
             row_global = by_n + b_row_local[i]  # global N row

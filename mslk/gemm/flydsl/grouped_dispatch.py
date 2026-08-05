@@ -68,7 +68,9 @@ def _group_and_n(WQ, group_meta, layout):
     divide N, in which case they are one [total_N, K] matrix and the group count
     comes from the offsets instead.
     """
-    if layout == "n_offsets":
+    if layout in ("n_offsets", "k_offsets"):
+        # One matrix rather than a stack, so the group count comes from the
+        # offsets; N is its row count either way.
         return group_meta.shape[0], WQ.shape[0]
     return WQ.shape[0], WQ.shape[1]
 
@@ -114,7 +116,10 @@ def launch(
             f"tile_k ({tile_k}) for preshuffled B: the MFMA B layout interleaves "
             "both, so a partial tile cannot be masked a load at a time"
         )
-    if layout in ("padded", "batched", "n_offsets"):
+    if layout == "k_offsets":
+        # Every group produces a whole output, so the grid covers M exactly.
+        num_m_tiles = -(-total_M // tile_m)
+    elif layout in ("padded", "batched", "n_offsets"):
         # Each group owns a slab, so the M axis only spans a single one. Under
         # n_offsets the group rides the N axis instead of z, but its rows are
         # still one slab.
@@ -213,6 +218,8 @@ def dispatch(
         m_key, n_key = total_M // G, N // G
     else:
         m_key, n_key = total_M, N
+    # The groups divide K, so one group contracts over a fraction of it.
+    k_key = K // G if layout == "k_offsets" else K
 
     tuned_launch = _launch_blockscale if blockscale else _launch_rowwise
     return tuned_launch(
@@ -224,7 +231,7 @@ def dispatch(
         out,
         next_pow2(m_key),
         n_key,
-        K,
+        k_key,
         b_preshuffled,
         blockscale,
         layout,

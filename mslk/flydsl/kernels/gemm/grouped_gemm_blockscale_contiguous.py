@@ -78,6 +78,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
     make_rowwise_scaler,
     out_mlir_for,
     resolve_group_cols,
+    resolve_group_k,
     resolve_group_rows,
     setup_lds_allocation,
     setup_lds_allocation_plain,
@@ -88,7 +89,7 @@ from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 
 # Supported encodings of the group geometry; see the ``layout`` argument below.
-LAYOUTS = ("sizes", "offsets", "padded", "batched", "n_offsets")
+LAYOUTS = ("sizes", "offsets", "padded", "batched", "n_offsets", "k_offsets")
 
 
 @functools.lru_cache(maxsize=128)
@@ -157,6 +158,12 @@ def compile_grouped_gemm_blockscale_contiguous(
             [total_N, K] matrix whose rows the groups divide, the output is
             [M, total_N] with the groups side by side, and m_sizes is
             [num_groups] INT32 cumulative column ends. Rowwise plain-B only.
+            "k_offsets": the groups divide the CONTRACTION. A is [M, total_K]
+            and B is [N, total_K], each group taking a column slice, and every
+            group produces a full [M, N] so the output is [G, M, N] with nothing
+            packed. m_sizes is [num_groups] INT32 cumulative K ends. The slice
+            length is a runtime value, so this layout always rolls the K loop.
+            Rowwise plain-B only.
 
         roll_k: Emit the K loop once as a real loop instead of unrolling it over
             every K tile. The unrolled form folds the tile index into every
@@ -180,12 +187,29 @@ def compile_grouped_gemm_blockscale_contiguous(
     # Groups divide the output's columns, so the group follows from the N-block
     # index and B is one matrix rather than a stack of per-group ones.
     n_grouped = layout == "n_offsets"
+    # Groups divide the contraction: every group owns a K slice of both operands
+    # and produces a whole output of its own.
+    k_grouped = layout == "k_offsets"
+    if k_grouped:
+        if blockscale or b_preshuffled:
+            raise ValueError(
+                "layout 'k_offsets' supports only rowwise scaling with plain B: "
+                "a scale block cannot straddle a group's K slice, and the "
+                "preshuffled layout swizzles K across the whole matrix"
+            )
+        # A group's K length is only known on the device, so the trip count
+        # cannot be a compile-time constant and the loop cannot be unrolled.
+        roll_k = True
     if n_grouped and (blockscale or b_preshuffled):
         raise ValueError(
             "layout 'n_offsets' supports only rowwise scaling with plain B: "
             "ragged N would need per-group scale blocks, and the preshuffled "
             "layout swizzles N across the whole matrix"
         )
+    if k_grouped:
+        # Every tile is bounded by the group's K end, which is a runtime value,
+        # so the predicate cannot be confined to a compile-time last tile.
+        k_padding = True
     if n_grouped:
         # A group's column end is a runtime value, so unlike a compile-time N
         # remainder the tail mask cannot be elided; N only has to reach a store
@@ -357,6 +381,8 @@ def compile_grouped_gemm_blockscale_contiguous(
         ).get()
 
         # Buffer resources
+        # Where the groups divide K, A is [M, total_K] -- one set of rows shared
+        # by every group -- while the output and scale_a hold a slab per group.
         a_nbytes = m_in * k_in
         a_rsrc = buffer_ops.create_buffer_resource(
             arg_a, max_size=False, num_records_bytes=a_nbytes
@@ -364,14 +390,24 @@ def compile_grouped_gemm_blockscale_contiguous(
 
         # B is one [total_N, K] matrix when the groups divide N, and a stack of
         # num_groups [N, K] ones otherwise.
-        b_nbytes = (n_in if const_expr(n_grouped) else num_groups_in * n_in) * k_in
+        if const_expr(n_grouped or k_grouped):
+            # One matrix the groups divide, by row under n_offsets and by column
+            # under k_offsets.
+            b_nbytes = n_in * k_in
+        else:
+            b_nbytes = num_groups_in * n_in * k_in
         b_rsrc = buffer_ops.create_buffer_resource(
             arg_b, max_size=False, num_records_bytes=b_nbytes
         )
 
         # The output is [M, total_N] when the groups divide N: m_in counts the
         # rows of every group's slab, but they share the output's rows.
-        d_rows = m_in // num_groups_in if const_expr(n_grouped) else m_in
+        if const_expr(n_grouped):
+            d_rows = m_in // num_groups_in
+        elif const_expr(k_grouped):
+            d_rows = num_groups_in * m_in
+        else:
+            d_rows = m_in
         d_nbytes = d_rows * n_in * fx.Index(2)  # bf16/f16 = 2 bytes
         d_rsrc = buffer_ops.create_buffer_resource(
             arg_d, max_size=False, num_records_bytes=d_nbytes
@@ -387,8 +423,10 @@ def compile_grouped_gemm_blockscale_contiguous(
             # scale_b: [num_groups, scale_k, scale_n]
             sb_nbytes = num_groups_in * fx.Index(scale_n * scale_k * scale_byte_size)
         else:
-            # scale_a: [M_total], one value per row.
-            sa_nbytes = m_in * fx.Index(scale_byte_size)
+            # scale_a: [M_total], one value per row, or one per row per group
+            # where the groups divide K and each quantised its own slice.
+            sa_rows = num_groups_in * m_in if const_expr(k_grouped) else m_in
+            sa_nbytes = sa_rows * fx.Index(scale_byte_size)
             # scale_b: [num_groups, N], one value per column of each group, or
             # a flat [total_N] when the groups divide N.
             sb_cols = n_in if const_expr(n_grouped) else num_groups_in * n_in
@@ -400,6 +438,16 @@ def compile_grouped_gemm_blockscale_contiguous(
             arg_scale_b, max_size=False, num_records_bytes=sb_nbytes
         )
 
+        if const_expr(k_grouped):
+            # The group is the grid axis, so only the ends of its K slice have
+            # to be read. Group 0 starts at zero and is not read.
+            _ks = resolve_group_k(
+                arg_offsets=arg_m_sizes,
+                num_groups_in=num_groups_in,
+                slab_idx=bz,
+            )
+            k_start_i32 = _ks.k_start
+            k_end_i32 = _ks.k_end
         if const_expr(n_grouped):
             _col = resolve_group_cols(
                 arg_offsets=arg_m_sizes,
@@ -412,6 +460,9 @@ def compile_grouped_gemm_blockscale_contiguous(
         else:
             _col = None
             _col_group_id = None
+
+        def _i32k(v):  # raw i32 constant
+            return arith.constant(int(v), type=T.i32)
 
         _grp = resolve_group_rows(
             arg_m_sizes=arg_m_sizes,
@@ -431,7 +482,17 @@ def compile_grouped_gemm_blockscale_contiguous(
         group_m_size_i32 = _grp.group_m_size
         # Rows are always whole slabs when the groups divide N, so validity is
         # entirely a question of whether this N-block belongs to a group.
-        is_valid = _col.is_valid if const_expr(n_grouped) else _grp.is_valid
+        if const_expr(k_grouped):
+            group_id_i32 = arith.index_cast(T.i32, bz)
+            group_m_start_i32 = _i32k(0)
+            group_m_size_i32 = arith.index_cast(T.i32, m_in)
+            row_start_i32 = arith.muli(arith.index_cast(T.i32, bx), _i32k(tile_m))
+            row_limit_i32 = arith.index_cast(T.i32, m_in)
+            # A group that contracts over nothing contributes nothing, and its
+            # output slab is left to the caller, as CK leaves it.
+            is_valid = arith.cmpi(arith.CmpIPredicate.slt, k_start_i32, k_end_i32)
+        else:
+            is_valid = _col.is_valid if const_expr(n_grouped) else _grp.is_valid
         if const_expr(n_grouped):
             # Blocks are enumerated across the packed groups, so this block's
             # first column comes from the partition rather than from its index.
@@ -440,9 +501,19 @@ def compile_grouped_gemm_blockscale_contiguous(
             # row tail and the epilogue's column mask.
             n_bound = fx.Index(_col.col_limit)
             b_group_off = fx.Index(0)
+            # scale_b is one flat [total_N] here, so the group is already in by_n.
+            sb_group_off = fx.Index(0)
+        elif const_expr(k_grouped):
+            # B is a single [N, total_K] the groups slice by column, so it has no
+            # per-group row base -- the slice is expressed as a K offset instead.
+            # scale_b is still [G, N], one set of column scales per group.
+            n_bound = None
+            b_group_off = fx.Index(0)
+            sb_group_off = None
         else:
             n_bound = None
             b_group_off = None
+            sb_group_off = None
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
@@ -460,6 +531,20 @@ def compile_grouped_gemm_blockscale_contiguous(
             else:
                 bx_m_out = bx_m
                 row_limit_out_i32 = row_limit_i32
+            # Where the groups divide K, A's [M, total_K] rows are shared by
+            # every group while scale_a is [G, M], each group having quantised
+            # its own slice. So A keeps the plain row and scale_a takes the
+            # group's slab; the output does too, via d_group_off below.
+            if const_expr(k_grouped):
+                bx_m_scale = bx_m + fx.Index(group_id_i32) * m_in
+                d_group_off = fx.Index(group_id_i32) * m_in * n_in
+                k_base_div4 = fx.Index(k_start_i32) // fx.Index(4)
+                k_bound = fx.Index(k_end_i32)
+            else:
+                bx_m_scale = bx_m
+                d_group_off = None
+                k_base_div4 = None
+                k_bound = None
 
             _t = compute_mfma_tiling(tile_m=tile_m, tile_n=tile_n)
             m_repeat = _t.m_repeat
@@ -499,6 +584,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 tile_k=tile_k,
                 k_in=k_in,
                 always=roll_k,
+                k_bound=k_bound,
             )
 
             (
@@ -523,6 +609,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 elem_bytes=elem_bytes,
                 k_in=k_in,
                 k_tail_mask=k_tail_mask,
+                k_base_div4=k_base_div4,
             )
 
             lds_load_packs_k64 = make_lds_loader(
@@ -577,6 +664,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                     n_padding=n_padding,
                     b_group_off=b_group_off,
                     n_bound=n_bound,
+                    k_base_div4=k_base_div4,
                 )
                 lds_load_b_packs_k64 = make_lds_b_loader(
                     lds_b=lds_b,
@@ -750,10 +838,22 @@ def compile_grouped_gemm_blockscale_contiguous(
                 _b_regs = prefetch_b_tile(0)
                 _n_acc = len(accs)
                 _n_a = len(_a_regs)
-                if const_expr(num_k_tiles > 1):
+                if const_expr(k_grouped):
+                    # ceil(K_g / tile_k), a runtime value. A bound of zero or
+                    # less simply runs no iterations.
+                    _kt_n = (
+                        fx.Index(arith.subi(k_end_i32, k_start_i32))
+                        + fx.Index(tile_k - 1)
+                    ) // fx.Index(tile_k)
+                    _main = _kt_n - fx.Index(1)
+                    _run_main = True
+                else:
+                    _main = num_k_tiles - 1
+                    _run_main = num_k_tiles > 1
+                if _run_main:
                     for _kt, _st in fx.range(
                         0,
-                        num_k_tiles - 1,
+                        _main,
                         1,
                         init=list(accs) + list(_a_regs) + list(_b_regs),
                     ):
@@ -775,7 +875,17 @@ def compile_grouped_gemm_blockscale_contiguous(
                     accs = [Vector(v) for v in _res[:_n_acc]]
                     _a_regs = [Vector(v) for v in _res[_n_acc : _n_acc + _n_a]]
                     _b_regs = [Vector(v) for v in _res[_n_acc + _n_a :]]
-                _last = num_k_tiles - 1
+                # The peeled tile. Clamped so an empty group still names a
+                # real tile; every one of its loads is masked off regardless.
+                if const_expr(k_grouped):
+                    _last = fx.Index(
+                        arith.maxsi(
+                            arith.index_cast(T.i32, _kt_n - fx.Index(1)),
+                            _i32k(0),
+                        )
+                    )
+                else:
+                    _last = num_k_tiles - 1
                 store_a_tile_to_lds(_a_regs, lds_base_pong)
                 store_b_tile_to_lds(_b_regs, lds_base_b)
                 _scales = prefetch_scales(_last)
@@ -796,12 +906,12 @@ def compile_grouped_gemm_blockscale_contiguous(
                     n_in=n_in,
                     by_n=by_n,
                     n_tile_base=n_tile_base,
-                    bx_m=bx_m,
+                    bx_m=bx_m_scale,
                     lane_mod_16=lane_mod_16,
                     lane_div_16=lane_div_16,
                     m_repeat=m_repeat,
                     num_acc_n=num_acc_n,
-                    group_n_off=b_group_off,
+                    group_n_off=sb_group_off,
                 )(accs)
 
             # ===== Epilogue: CShuffle vectorized stores =====
@@ -816,6 +926,7 @@ def compile_grouped_gemm_blockscale_contiguous(
                 c_n=c_n,
                 n_padding=n_padding,
                 n_bound=n_bound,
+                d_group_off=d_group_off,
             )
 
             # Mask the partial-tile tail: skip stores for global rows at or beyond
@@ -890,7 +1001,11 @@ def compile_grouped_gemm_blockscale_contiguous(
         else:
             gx = n_in // fx.Index(tile_n)
         gy = fx.Index(i32_num_m_tiles)  # M-tiles
-        gz = fx.Index(i32_num_groups) if const_expr(slab_layout) else fx.Index(1)
+        gz = (
+            fx.Index(i32_num_groups)
+            if const_expr(slab_layout or k_grouped)
+            else fx.Index(1)
+        )
 
         launcher = grouped_gemm_blockscale_contiguous_kernel(
             arg_d,
