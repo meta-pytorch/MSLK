@@ -10,7 +10,7 @@ from enum import auto, Enum
 
 import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
-from mslk.flydsl.common import is_flydsl_available, is_flydsl_version_at_least
+from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.quantize.shuffle import (
@@ -684,45 +684,6 @@ class FP8RowwisePreshuffle(FP8Rowwise):
     @property
     def supported_accelerators(self) -> set[Accelerator]:
         return {Accelerator.AMD_GFX942}
-
-    @property
-    def supported_gemm_types(self) -> set[GemmType]:
-        return {GemmType.REGULAR}
-
-    @property
-    def compute_dtype(self) -> ComputeDtype:
-        return ComputeDtype.FP8
-
-
-if is_flydsl_version_at_least():
-    from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
-
-
-@register_gemm_op
-class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
-    """
-    FP8 matmul with rowwise scaling and FlyDSL preshuffle kernel (gfx950).
-    """
-
-    def __init__(self):
-        self.fast_accum = True
-
-    def preprocess(self, x, w):
-        xq, wq, x_scale, w_scale = super().preprocess(x, w)
-        return xq, flydsl_preshuffle(wq), x_scale, w_scale
-
-    def compute(self, xq, wq, x_scale, w_scale):
-        return flydsl_preshuffle_gemm(xq, wq, x_scale, w_scale)
-
-    @property
-    def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX950}
-
-    @property
-    def supported(self) -> bool:
-        if not super().supported:
-            return False
-        return is_flydsl_version_at_least()
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
