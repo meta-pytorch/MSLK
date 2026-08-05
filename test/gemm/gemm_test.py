@@ -39,7 +39,6 @@ from mslk.testing.device import (
 from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
-    from mslk.flydsl.common import is_flydsl_available
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
     from mslk.quantize.mx_mixed_dtype_utils import (
         pack_fp6_e2m3,
