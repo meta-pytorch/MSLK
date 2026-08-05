@@ -164,7 +164,9 @@ def compile_grouped_gemm_blockscale_contiguous(
             IR, the compile time and the final code all then grow linearly with
             K. Rolling holds them constant, at the cost of carrying the
             accumulators and the prefetched tiles as loop state. Only the plain-B
-            K loop can be rolled today.
+            K loop can be rolled today. This is the kernel's mechanism and
+            defaults off; the host dispatch sets the policy and turns it on
+            wherever it applies.
 
     Returns:
         JIT launcher function.
