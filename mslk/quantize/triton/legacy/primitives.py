@@ -119,55 +119,6 @@ def _from_blocked(x: torch.Tensor, original_shape: Tuple[int, int]) -> torch.Ten
         return padded.contiguous()
 
 
-@triton.jit
-def _fp32_to_e8m0(
-    unscale,
-    mbits: tl.constexpr,
-    scale_round_mode: tl.constexpr,
-):
-    E8M0_EXPONENT_BIAS: tl.constexpr = 127  # type: ignore[Incompatible variable type]
-    sign = tl.where(unscale < 0, -1.0, 1.0)
-    abs_tensor = tl.abs(unscale)
-
-    # MBITS_F32 = 23
-    if scale_round_mode == "even":
-        val_to_add = (1 << (23 - mbits - 1)) - 1
-    elif scale_round_mode == "ceil":
-        val_to_add = (1 << 23) - 1
-    else:
-        val_to_add = 0
-
-    mask_exponent = ((1 << (8 + 1)) - 1) << 23
-    mask_mantissa = (1 << 23) - 1
-
-    fp32_bits = tl.extra.cuda.libdevice.float_as_int(abs_tensor)
-    fp32_bits_exp = (fp32_bits + val_to_add) & mask_exponent
-    exponent = (fp32_bits_exp >> 23) & 0xFF
-
-    if scale_round_mode == "nv_round":
-        mantissa = fp32_bits & mask_mantissa
-        is_denormal = (exponent == 0) & (mantissa != 0)
-        is_normal = ~is_denormal
-        condition1 = is_normal & (exponent < 254) & (mantissa > 0)
-        condition2 = is_denormal & (mantissa / (2**23) > 0.5)
-
-        exponent = tl.where(condition1 | condition2, exponent + 1, exponent)
-
-    exponent = exponent.to(tl.float32)
-    e8m0_values = sign * tl.exp2(exponent - E8M0_EXPONENT_BIAS)
-
-    unscale = e8m0_values
-    # In case unscale=0 (scale will be inf), or unscale=inf or nan, we set the scale to 1.0
-    unscale_invalid_mask = (
-        (e8m0_values == 0)
-        | (e8m0_values == float("inf"))
-        | (e8m0_values == float("nan"))
-    )
-    unscale = tl.where(unscale_invalid_mask, 1.0, unscale)
-
-    return unscale
-
-
 def unsigned_fp32_to_e8m0(
     tensor: torch.Tensor, mbits: tl.constexpr, scale_round_mode: tl.constexpr
 ) -> torch.Tensor:
@@ -222,73 +173,6 @@ def cal_global_scale_mx4_as_nvfp4(x: torch.Tensor):
     global_scale = 256.0 / global_amax_in_mx4_range
 
     return global_scale
-
-
-@triton.jit
-def nvfp4_scale_swizzle(offs_m):
-    """
-    Produces scale offsets swizzled according to the blackwell 128x4 scale layout.
-    Each 128x4 layout can be viewed as 32 4x4 layouts, each of which we'll refer to below as a sub_layout.
-
-    The returned offsets assume a 128x4 layout starting at 0. offs_m could be a subset of rows within a 128x4 layout.
-    """
-    # Offset of the 4x4 sub_layout within the 128x4 layout
-    sub_layout_idx = offs_m % 32
-    sub_layout_stride = 16
-    sub_layout_off = sub_layout_idx * sub_layout_stride
-    # Which row within the 4x4 sub_layout
-    sub_layout_row = offs_m // 32
-    # Offsets of the elements within 4x4 sub_layout
-    elems = tl.arange(0, 4)[None, :]
-    sub_layout_elem_offs = sub_layout_row * 4 + elems
-
-    scale_offs = sub_layout_off + sub_layout_elem_offs
-
-    return scale_offs
-
-
-@triton.jit
-def convert_fp32_to_fp4_packed(x_pairs):
-    """Convert FP32 pairs to packed FP4 format.
-
-    This function takes tensor where consecutive values along the last dimension
-    are packed together into single bytes.
-
-    Args:
-        x_pairs: [Tensor, Tensor] both w/ shapes [..., 1] where zipped last dimension contains
-                interleaved pairs of FP32 values to be packed together.
-
-    Returns:
-        Packed tensor with shape [...] (last dimension removed) where each
-        element is an int8 containing 2 FP4 values:
-        - First value of pair → low nibble (bits 0-3)
-        - Second value of pair → high nibble (bits 4-7)
-
-    Example:
-        Input:  [128, 32, 2] containing FP32 pairs
-        Output: [128, 32] containing packed FP4 bytes
-
-    """
-
-    x_fp4x2 = tl.inline_asm_elementwise(
-        asm="""
-        {
-        .reg .b8 byte0, byte1, byte2, byte3;
-        cvt.rn.satfinite.e2m1x2.f32 byte0, $5, $1;
-        cvt.rn.satfinite.e2m1x2.f32 byte1, $6, $2;
-        cvt.rn.satfinite.e2m1x2.f32 byte2, $7, $3;
-        cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $4;
-        mov.b32 $0, {byte0, byte1, byte2, byte3};
-        }
-        """,
-        constraints=("=r,r,r,r,r,r,r,r,r"),
-        args=x_pairs,
-        dtype=tl.uint8,
-        is_pure=True,
-        pack=4,
-    )
-
-    return x_fp4x2
 
 
 @triton.jit

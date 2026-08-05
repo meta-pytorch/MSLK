@@ -16,9 +16,9 @@ from typing import Optional, Union
 import torch
 import triton  # @manual=//triton:triton
 from mslk.quantize.triton.fp4_primitives import (
-    blocked_scale_offset,
     convert_fp32_to_fp4_packed,
     mx4_scale_normalize_encode,
+    mx4_scale_swizzle,
     RoundingMode,
 )
 from mslk.quantize.triton.quantize_kernels import _resolve_seed
@@ -69,11 +69,10 @@ def quantize_mx4_kernel(
     # ========================================================================
     if (not IS_ROCM) and M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
         offs_m = tl.arange(0, 128)[:, None]
-        logical_col = pid_n * NUM_GROUPS + tl.arange(0, NUM_GROUPS)[None, :]
-        num_scale_cols = N // GROUP_SIZE
-        scale_offs = blocked_scale_offset(
-            offs_m, logical_col, N_COL_BLOCKS, num_scale_cols
-        )
+        scale_pid_n = pid_n
+        if USE_INT64_INDEXING:
+            scale_pid_n = scale_pid_n.to(tl.int64)
+        scale_offs = mx4_scale_swizzle(offs_m, scale_pid_n, NUM_GROUPS)
         oob_mask = (offs_m >= M) & tl.full((NUM_GROUPS,), True, dtype=tl.int1)[None, :]
         zero_scales = tl.full([128, NUM_GROUPS], 0, dtype=tl.int8)
         tl.store(s_ptr + scale_offs, zero_scales, mask=oob_mask)
@@ -148,8 +147,18 @@ def quantize_mx4_kernel(
         scale_offs = logical_row * num_scale_cols + logical_col
         scale_store_mask = (logical_col < num_scale_cols) & (logical_row < M)
     else:
-        scale_offs = blocked_scale_offset(
-            logical_row, logical_col, N_COL_BLOCKS, num_scale_cols
+        ROW_TILES_PER_LAYOUT: tl.constexpr = 128 // M_PER_BLOCK
+        offs_m_in_layout = (
+            (pid_m % ROW_TILES_PER_LAYOUT) * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)
+        )[:, None]
+        row_block = pid_m // ROW_TILES_PER_LAYOUT
+        scale_pid_n = pid_n
+        if USE_INT64_INDEXING:
+            row_block = row_block.to(tl.int64)
+            scale_pid_n = scale_pid_n.to(tl.int64)
+        layout_off = row_block * N_COL_BLOCKS * 512
+        scale_offs = layout_off + mx4_scale_swizzle(
+            offs_m_in_layout, scale_pid_n, NUM_GROUPS
         )
         # Mask out scale columns beyond num_scale_cols (= N // GROUP_SIZE).
         # Without this mask, writes for col >= num_scale_cols collide with

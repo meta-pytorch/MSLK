@@ -4,12 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Self-contained, single-operator MX4 FP4 quantization Triton kernels.
+"""Self-contained, single-operator FP4 quantization Triton kernels.
 
 Each module owns exactly one ``@triton.jit`` kernel, specialized for one
-operator (MX4 non-stacked / stacked) with its ``SCALE_FORMAT`` / ``STACKED``
-behavior hardcoded, so each operator can be read, perf-tuned, and
-regression-tested in isolation. Genuinely-shared pieces (segment mapping,
+operator and scale format, so each operator can be read, perf-tuned, and
+regression-tested in isolation. Genuinely shared pieces (segment mapping,
 scale math, pack primitives) live in ``fp4_primitives``.
 """
 

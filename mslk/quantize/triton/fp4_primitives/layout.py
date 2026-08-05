@@ -9,8 +9,8 @@
 """
 Storage layout primitives for the Blackwell 128×4 FP4 scale arrangement.
 
-Provides the blocked-layout offset helper and the stacked-MoE segment map used
-by the MX4 quantize kernels.
+Provides blocked-layout offset helpers and the stacked-MoE segment map used by
+the FP4 quantize kernels.
 """
 
 import triton  # @manual
@@ -37,25 +37,46 @@ def blocked_scale_offset(logical_row, logical_col, n_col_blocks, num_cols):
     Returns:
         Flat offsets into the blocked layout buffer.
     """
-    # Pad the row stride to a multiple of 4 columns so the layout matches the canonical
-    # NVIDIA blocked-scale convention even when num_cols is not a multiple of 4.
-    flat_idx = logical_row * (n_col_blocks * 4) + logical_col
-
-    elems_per_row_block = 512 * n_col_blocks
-
-    first_dim = flat_idx // elems_per_row_block
-    second_dim = (flat_idx % elems_per_row_block) // (128 * n_col_blocks)
-    third_dim = (flat_idx % (128 * n_col_blocks)) // (4 * n_col_blocks)
-    fourth_dim = (flat_idx % (4 * n_col_blocks)) // 4
-    fifth_dim = flat_idx % 4
+    row_block = logical_row // 128
+    row_in_block = logical_row % 128
+    col_block = logical_col // 4
+    col_in_block = logical_col % 4
 
     return (
-        first_dim * elems_per_row_block
-        + fourth_dim * 512
-        + third_dim * 16
-        + second_dim * 4
-        + fifth_dim
+        row_block * (512 * n_col_blocks)
+        + col_block * 512
+        + (row_in_block % 32) * 16
+        + (row_in_block // 32) * 4
+        + col_in_block
     )
+
+
+@triton.jit
+def nvfp4_scale_swizzle(offs_m):
+    """Return offsets within one Blackwell 128x4 NVFP4 scale layout."""
+    sub_layout_off = (offs_m % 32) * 16
+    sub_layout_row = offs_m // 32
+    elems = tl.arange(0, 4)[None, :]
+    return sub_layout_off + sub_layout_row * 4 + elems
+
+
+@triton.jit
+def mx4_scale_swizzle(
+    offs_m,
+    pid_n,
+    NUM_COLS: tl.constexpr,
+):
+    """Return blocked offsets for one MX4 program's contiguous scale columns.
+
+    ``NUM_COLS`` must divide the four columns in a Blackwell scale tile. The
+    caller adds the base offset of the enclosing 128-row block; this helper
+    selects the 128x4 column tile and the program's columns within that tile.
+    """
+    PROGRAMS_PER_COL_BLOCK: tl.constexpr = 4 // NUM_COLS
+    col_block = pid_n // PROGRAMS_PER_COL_BLOCK
+    col_start = (pid_n % PROGRAMS_PER_COL_BLOCK) * NUM_COLS
+    elems = col_start + tl.arange(0, NUM_COLS)[None, :]
+    return col_block * 512 + (offs_m % 32) * 16 + (offs_m // 32) * 4 + elems
 
 
 @triton.jit

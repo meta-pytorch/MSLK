@@ -24,6 +24,8 @@ from mslk.quantize.triton.fp4_primitives.constants import (  # noqa: F401
 )
 from mslk.quantize.triton.fp4_primitives.layout import (  # noqa: F401
     blocked_scale_offset,
+    mx4_scale_swizzle,
+    nvfp4_scale_swizzle,
     stacked_segment_map,
 )
 from mslk.quantize.triton.fp4_primitives.packing import (  # noqa: F401
