@@ -27,7 +27,7 @@ SCALE_BLOCK = 128
 
 # Default tile when autotuning is disabled. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
-DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128}
+DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128, "waves_per_eu": 2}
 
 # Candidate tiles swept by autotune. tile_k is a multiple of the K-loop sub-block
 # size under either scheme. Rowwise scaling additionally allows tile_n below the
@@ -36,13 +36,22 @@ DEFAULT_TILE = {"tile_m": 128, "tile_n": 128, "tile_k": 128}
 _TILE_M = (64, 128, 256)
 _TILE_K = (128, 256)
 
+# Occupancy target, as a minimum waves-per-EU hint to the register allocator; 0
+# leaves the choice to the compiler. Preshuffled B is held in registers across a
+# whole pair of K tiles to cover HBM latency, which puts it right on the 256-VGPR
+# boundary between two waves per SIMD and one, so a shape can land either side of
+# it. Only these two are worth sweeping: three waves needs 170 registers and four
+# needs 128, which no configuration of this kernel comes close to.
+_WAVES_PER_EU = (0, 2)
+
 
 def _tiles(tile_ns):
     return tuple(
-        {"tile_m": tm, "tile_n": tn, "tile_k": tk}
+        {"tile_m": tm, "tile_n": tn, "tile_k": tk, "waves_per_eu": wpe}
         for tm in _TILE_M
         for tn in tile_ns
         for tk in _TILE_K
+        for wpe in _WAVES_PER_EU
     )
 
 
@@ -93,6 +102,7 @@ def launch(
     tile_m,
     tile_n,
     tile_k,
+    waves_per_eu=0,
 ):
     """Compile (cached) and launch the grouped GEMM for one tile config.
 
@@ -144,6 +154,8 @@ def launch(
         blockscale=blockscale,
         layout=layout,
         roll_k=roll_k,
+        # 0 means the compiler picks.
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         # Compile the tail-masked variant only when K stops mid-tile, so shapes
         # that divide keep the cheaper unmasked loads. This mirrors how CK picks
         # between its KPadding and Default specialisations on the host.

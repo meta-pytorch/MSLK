@@ -306,11 +306,12 @@ def compile_grouped_gemm_blockscale_contiguous(
     _scaling = "blockscale" if blockscale else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
+    _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     _npad = "_npad" if n_padding else ""
     module_name = (
         f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}"
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
