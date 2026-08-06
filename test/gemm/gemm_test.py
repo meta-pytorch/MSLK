@@ -717,6 +717,128 @@ class FP8Tests(unittest.TestCase):
         # Compare using loopover BF16 gemm
         self.bf16_loopover_validate(X_list, W_list, y)
 
+    @parameterized.expand(
+        [
+            # Group K that does not divide the K tile while the TOTAL does.
+            # Whether the total is tile-aligned says nothing about a group's
+            # slice, so a tail predicate keyed on the total is not emitted here
+            # and each group reads into the next one's data.
+            ([288] * 4,),  # total 1152
+            ([192, 320],),  # total 512
+            ([16, 512, 128, 368],),  # total 1024, mixed
+            ([0, 256, 256, 512],),  # total 1024, with an empty group
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_2d_2d_group_k_not_tile_aligned(
+        self, k_sizes: list[int]
+    ) -> None:
+        """Groups divide K at extents that do not land on a tile boundary.
+
+        The parameterised cases above keep every group's K a multiple of 16, the
+        vectorised load width, since neither implementation supports less.
+        """
+        M, N = 128, 256
+        G = len(k_sizes)
+        K_offsets = torch.cumsum(torch.tensor(k_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X_list, W_list = [], []
+        xq_list, wq_list, x_scale_list, w_scale_list = [], [], [], []
+        for k_size in k_sizes:
+            # A zero-width group still has to contribute a scale per row.
+            width = max(k_size, 1)
+            X = torch.randn((M, width), dtype=torch.bfloat16, device=self.device) * 0.1
+            W = torch.randn((N, width), dtype=torch.bfloat16, device=self.device) * 0.01
+            xq, x_scale = quantize_fp8_row(X)
+            wq, w_scale = quantize_fp8_row(W)
+            X_list.append(X[:, :k_size])
+            W_list.append(W[:, :k_size])
+            xq_list.append(xq[:, :k_size])
+            wq_list.append(wq[:, :k_size])
+            x_scale_list.append(x_scale)
+            w_scale_list.append(w_scale)
+
+        xq = torch.cat(xq_list, dim=1)
+        wq = torch.cat(wq_list, dim=1)
+        x_scale = torch.cat(x_scale_list, dim=0)
+        w_scale = torch.cat(w_scale_list, dim=0)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale, w_scale, K_offsets, out
+        )
+
+        # A group that contracts over nothing contributes nothing; the op leaves
+        # its slab alone, so only the rest is checked.
+        live = [g for g, k in enumerate(k_sizes) if k]
+        self.bf16_loopover_validate(
+            [X_list[g] for g in live],
+            [W_list[g] for g in live],
+            [y[g] for g in live],
+        )
+
+    @parameterized.expand(
+        [
+            ([264, 264],),  # a multiple of 8, not of any tile_n
+            ([8, 504, 128],),  # one group narrower than a single tile
+            ([1024, 264, 8],),
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_2d_group_n_not_tile_aligned(
+        self, n_sizes: list[int]
+    ) -> None:
+        """Groups divide N at extents that do not land on a tile boundary.
+
+        Every group's N stays a multiple of 8, the widest vectorised store,
+        which CK asserts on the device and this kernel needs for the same reason.
+        """
+        M, K = 128, 256
+        G = len(n_sizes)
+        total_n = sum(n_sizes)
+        N_offsets = torch.cumsum(torch.tensor(n_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((total_n, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((M, total_n), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale, N_offsets, out
+        )
+
+        self.bf16_loopover_validate(
+            list(X),
+            list(torch.split(W, n_sizes, dim=0)),
+            list(torch.split(y, n_sizes, dim=1)),
+        )
+
+    @parameterized.expand([(1,), (64,), (100,), (192,), (255,)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_3d_slab_not_tile_aligned(self, M: int) -> None:
+        """Batched, with a slab height that does not divide the M tile.
+
+        A full slab does not mean a tile fits inside it: the last tile overhangs
+        into the next group's rows, so the epilogue still has to mask by row.
+        """
+        G, N, K = 4, 256, 256
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale.view(G, -1), None, out
+        )
+
+        self.bf16_loopover_validate(list(X), list(W), list(y))
+
     def bf16_loopover_validate(
         self,
         x: Union[torch.Tensor, list[torch.Tensor]],
