@@ -737,6 +737,13 @@ class FP8Tests(unittest.TestCase):
 
         The parameterised cases above keep every group's K a multiple of 16, the
         vectorised load width, since neither implementation supports less.
+
+        Every other group holds constant, single-signed data. A read that runs
+        past a group's K end lands in the next group, and against constants the
+        extra terms accumulate coherently rather than cancelling, which puts the
+        error orders of magnitude above the comparison tolerance. Random
+        neighbours would leave it near the quantisation noise, where the
+        comparison cannot tell the two apart.
         """
         M, N = 128, 256
         G = len(k_sizes)
@@ -746,11 +753,25 @@ class FP8Tests(unittest.TestCase):
 
         X_list, W_list = [], []
         xq_list, wq_list, x_scale_list, w_scale_list = [], [], [], []
-        for k_size in k_sizes:
+        for g, k_size in enumerate(k_sizes):
             # A zero-width group still has to contribute a scale per row.
             width = max(k_size, 1)
-            X = torch.randn((M, width), dtype=torch.bfloat16, device=self.device) * 0.1
-            W = torch.randn((N, width), dtype=torch.bfloat16, device=self.device) * 0.01
+            if g % 2:
+                X = torch.full(
+                    (M, width), 0.1, dtype=torch.bfloat16, device=self.device
+                )
+                W = torch.full(
+                    (N, width), 0.01, dtype=torch.bfloat16, device=self.device
+                )
+            else:
+                X = (
+                    torch.randn((M, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.1
+                )
+                W = (
+                    torch.randn((N, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.01
+                )
             xq, x_scale = quantize_fp8_row(X)
             wq, w_scale = quantize_fp8_row(W)
             X_list.append(X[:, :k_size])
