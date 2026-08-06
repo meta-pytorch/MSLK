@@ -58,11 +58,11 @@ def _tiles(tile_ns):
 BLOCKSCALE_TILES = _tiles((128, 256))
 ROWWISE_TILES = _tiles((64, 128, 256))
 
-# A tile that overruns N or K is no longer invalid -- it compiles the tail-masked
-# variant -- but a tile that wastes part of its work on padding is not going to
-# win, so keep pruning on both axes. When nothing divides, which is exactly the
-# case that needs padding, prune_by_divisibility falls back to the full list and
-# the shape still gets tuned.
+# A tile that overruns N or K still compiles, as the tail-masked variant, but it
+# wastes part of its work on padding and is not going to win, so prune on both
+# axes. When nothing divides, which is the case that needs the padding,
+# prune_by_divisibility falls back to the full list and the shape still gets
+# tuned.
 _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # roll_k is deliberately absent: it is fixed policy rather than something that
 # varies per call, and a tuning space containing a fully unrolled candidate would

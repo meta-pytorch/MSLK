@@ -7,14 +7,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Shared building blocks for the grouped FP8 blockscale GEMM kernels.
+"""Shared building blocks for the grouped FP8 GEMM kernel.
 
-Used by the grouped_gemm_blockscale contiguous and masked kernels. Holds the
-parts of the two kernels that are byte-identical (parameter validation,
-compile-time scalar constants, helper closures) so they live in one place.
+Used by grouped_gemm_blockscale_contiguous.py: parameter validation,
+compile-time scalar constants, and the helper closures the kernel body is
+built from.
 
-scale_b is indexed as [num_groups, scale_k, scale_n] (per-group, per-K-block,
-per-N-block); scale_a is [scale_k, M] (transposed, per-token per-K-block).
+Block scaling indexes scale_b as [num_groups, scale_k, scale_n] (per-group,
+per-K-block, per-N-block) and scale_a as [scale_k, M] (transposed, per-token
+per-K-block). Rowwise scaling carries one scale per row of A and per column of
+B and applies them in the epilogue.
 """
 
 from collections import namedtuple
@@ -167,11 +169,11 @@ def validate_params(
             f"tile_n ({tile_n}) must be divisible by scale_block_n ({scale_block_n})"
         )
     if blockscale:
-        # Block scaling counts whole scale blocks along K and N, so a partial
-        # one at either end would be left out of that count and the scales
-        # misindexed from there on. Padding relaxes the tile bound, which used
-        # to imply this one, so state it in its own right. Rowwise scaling
-        # carries a scale per row and per column and is unaffected.
+        # A scale block is the unit one scale covers, so K and N have to span
+        # whole ones: a partial block at either end falls outside the count and
+        # misindexes the scales from there on. The tile bounds above do not
+        # imply this, since padding relaxes them. Rowwise scaling carries a
+        # scale per row and per column and is unaffected.
         if k % scale_block_k != 0:
             raise ValueError(
                 f"k ({k}) must be divisible by scale_block_k ({scale_block_k}) "
