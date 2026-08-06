@@ -45,8 +45,8 @@ if torch.version.hip is not None:
 
     if is_flydsl_available():
         # Registers mslk::f8f8bf16_groupwise_grouped and its _preshuffle
-        # sibling, and mslk::f8f8bf16_rowwise_grouped_stacked, whose ROCm slot
-        # gemm_ops.cpp leaves free for FlyDSL, and its _preshuffle sibling.
+        # sibling, and the rowwise grouped ops FlyDSL backs on ROCm:
+        # _stacked and its _preshuffle sibling, _dynamic and _mm.
         from .flydsl import (  # noqa: F401
             fp8_groupwise_grouped_gemm as _flydsl_groupwise_grouped,
             fp8_rowwise_grouped_gemm as _flydsl_rowwise_grouped,
