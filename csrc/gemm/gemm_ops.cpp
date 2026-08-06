@@ -90,6 +90,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
+  // Sibling of f8f8bf16_rowwise_grouped_mm taking weights already swizzled into
+  // the MFMA B layout. It serves the 2D-3D and 3D-3D operand ranks, the ones
+  // that leave each group a whole [N, K]; grouping along N or K cuts across the
+  // axes the swizzle interleaves, so those ranks raise.
+  m.def(
+      "f8f8bf16_rowwise_grouped_mm_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
   // BF16xINT4 rowwise GEMMs: schema only on ROCm; implementations are
   // registered by mslk.gemm.triton.int4_gemm via torch.library.impl at
   // Python import time.

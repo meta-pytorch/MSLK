@@ -19,9 +19,12 @@ takes as a compile-time ``layout``:
   group, of which the first ``zero_start_index_M[g]`` rows hold real tokens.
 * ``mslk::f8f8bf16_rowwise_grouped_mm`` -- the torch-native API, where the
   operand ranks pick the grouped axis.
-* ``..._preshuffle`` siblings of the first two consume weights already in the
-  MFMA B-preshuffle layout (see ``mslk.quantize.shuffle.preshuffle_b_mfma``).
-  Callers shuffle once at load time; the op does no shuffling.
+* ``..._preshuffle`` siblings of all three consume weights already in the MFMA
+  B-preshuffle layout (see ``mslk.quantize.shuffle.preshuffle_b_mfma``).
+  Callers shuffle once at load time; the op does no shuffling. The swizzle
+  interleaves N and K across the whole matrix, so it only applies where a group
+  owns an entire ``[N, K]``: the mm sibling therefore serves the 2D-3D and
+  3D-3D ranks and rejects the two that group along N or K.
 
 All of these are registered on ROCm, and gemm_ops.cpp leaves their slots free
 there, so nothing else implements them on this platform.
@@ -263,11 +266,16 @@ def matmul_f8f8bf16_rowwise_grouped_preshuffle(
     )
 
 
-def _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out):
+def _rowwise_grouped_mm_2d3d(
+    XQ, WQ, x_scale, w_scale, offsets, out, b_preshuffled=False
+):
     """Groups packed along M, addressed by cumulative offsets rather than sizes.
 
     Same operand layout as the stacked variant; only the group metadata differs,
     so the kernel decodes the offsets in its resolution loop.
+
+    The groups divide M, leaving each one a whole [N, K] of B to itself, so the
+    MFMA swizzle applies here exactly as it does to the stacked variant.
     """
     assert offsets is not None, "2D-3D grouped mm requires offsets for XQ"
     assert offsets.dtype == torch.int32, f"offsets must be int32, got {offsets.dtype}"
@@ -292,7 +300,7 @@ def _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out):
         x_scale,
         w_scale,
         offsets,
-        b_preshuffled=False,
+        b_preshuffled=b_preshuffled,
         blockscale=False,
         layout="offsets",
         out=out,
@@ -300,11 +308,16 @@ def _rowwise_grouped_mm_2d3d(XQ, WQ, x_scale, w_scale, offsets, out):
     return out
 
 
-def _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out):
+def _rowwise_grouped_mm_3d3d(
+    XQ, WQ, x_scale, w_scale, offsets, out, b_preshuffled=False
+):
     """Plain batched GEMM: fixed per-group slabs with every row carrying data.
 
     This is the padded layout with nothing to mask, so the kernel skips both the
     metadata load and the epilogue's row predicate.
+
+    Nothing is grouped along N or K, so B is a whole [N, K] per group and takes
+    the MFMA swizzle unchanged.
     """
     assert offsets is None, "3D-3D is a batched GEMM and takes no offsets"
     G, M, K = XQ.shape
@@ -331,7 +344,7 @@ def _rowwise_grouped_mm_3d3d(XQ, WQ, x_scale, w_scale, offsets, out):
         x_scale,
         w_scale,
         _unused_group_meta(XQ.device),
-        b_preshuffled=False,
+        b_preshuffled=b_preshuffled,
         blockscale=False,
         layout="batched",
         out=out.view(G * M, N),
@@ -462,6 +475,44 @@ def matmul_f8f8bf16_rowwise_grouped_mm(
     )
 
 
+def matmul_f8f8bf16_rowwise_grouped_mm_preshuffle(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    offsets: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Sibling of the grouped mm taking weights already MFMA-preshuffled.
+
+    Only the rank combinations that leave B whole are served: 2D-3D groups along
+    M and 3D-3D groups nothing, so each group owns an entire [N, K] and the
+    swizzle applies to it as it stands. Grouping along N or K cuts across the
+    axes the swizzle interleaves, so 3D-2D and 2D-2D have no preshuffled form
+    and are rejected rather than silently given the plain path.
+    """
+    ranks = (XQ.ndim, WQ.ndim)
+    if ranks == (2, 3):
+        return _rowwise_grouped_mm_2d3d(
+            XQ, WQ, x_scale, w_scale, offsets, out, b_preshuffled=True
+        )
+    if ranks == (3, 3):
+        return _rowwise_grouped_mm_3d3d(
+            XQ, WQ, x_scale, w_scale, offsets, out, b_preshuffled=True
+        )
+    if ranks in ((3, 2), (2, 2)):
+        axis = "N" if ranks == (3, 2) else "K"
+        raise ValueError(
+            f"{ranks[0]}D-{ranks[1]}D groups along {axis}, which the MFMA "
+            f"B-preshuffle layout interleaves across the whole matrix, so a "
+            f"group boundary falls inside the swizzle. Use "
+            f"matmul_f8f8bf16_rowwise_grouped_mm with plain weights instead"
+        )
+    raise ValueError(
+        f"XQ must be 2D or 3D and WQ 2D or 3D, got {XQ.ndim}D and {WQ.ndim}D"
+    )
+
+
 if (
     is_flydsl_available()
     and torch.version.hip is not None
@@ -500,4 +551,8 @@ if (
     _register(
         "mslk::f8f8bf16_rowwise_grouped_dynamic_preshuffle",
         matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle,
+    )
+    _register(
+        "mslk::f8f8bf16_rowwise_grouped_mm_preshuffle",
+        matmul_f8f8bf16_rowwise_grouped_mm_preshuffle,
     )

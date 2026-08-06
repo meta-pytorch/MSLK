@@ -860,6 +860,110 @@ class FP8Tests(unittest.TestCase):
 
         self.bf16_loopover_validate(list(X), list(W), list(y))
 
+    @parameterized.expand([("2d3d",), ("3d3d",)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle(self, ranks: str) -> None:
+        """The grouped mm ranks that leave each group a whole [N, K].
+
+        Weights arrive already in the MFMA B layout, which the caller applies
+        once at load time.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        if not hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_mm_preshuffle"):
+            self.skipTest("build predates the preshuffled grouped mm schema")
+
+        G, M, N, K = 4, 128, 256, 256
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        wq, w_scale = quantize_fp8_row(W)
+        op = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm_preshuffle
+
+        if ranks == "2d3d":
+            m_sizes = [64, 128, 32, 64]
+            offsets = torch.cumsum(torch.tensor(m_sizes, dtype=torch.int), dim=0).to(
+                device=self.device, dtype=torch.int32
+            )
+            total_m = sum(m_sizes)
+            X = (
+                torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device)
+                * 0.1
+            )
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((total_m, N), dtype=torch.bfloat16, device=self.device)
+            y = op(xq, preshuffle_b_mfma(wq), x_scale, w_scale, offsets, out)
+            X_list, W_list, y_list, row = [], [], [], 0
+            for g, m_g in enumerate(m_sizes):
+                X_list.append(X[row : row + m_g])
+                W_list.append(W[g])
+                y_list.append(y[row : row + m_g])
+                row += m_g
+        else:
+            X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+            y = op(
+                xq,
+                preshuffle_b_mfma(wq),
+                x_scale.view(G, -1),
+                w_scale.view(G, -1),
+                None,
+                out,
+            )
+            X_list, W_list, y_list = list(X), list(W), list(y)
+
+        self.bf16_loopover_validate(X_list, W_list, y_list)
+
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle_rejects_grouped_n_and_k(self) -> None:
+        """Grouping along N or K puts a group boundary inside the swizzle.
+
+        There is no preshuffled form of those, so they have to be refused rather
+        than quietly served from the plain path.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        from mslk.gemm.flydsl.fp8_rowwise_grouped_gemm import (
+            matmul_f8f8bf16_rowwise_grouped_mm_preshuffle as op,
+        )
+
+        G, M, N, K = 4, 128, 256, 256
+        X3 = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W2 = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq3, xs3 = quantize_fp8_row(X3)
+        wq2, ws2 = quantize_fp8_row(W2)
+        n_offsets = torch.cumsum(torch.full((G,), N // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "3D-2D groups along N"):
+            op(
+                xq3,
+                wq2,
+                xs3.view(G, -1),
+                ws2,
+                n_offsets,
+                torch.empty((M, N), dtype=torch.bfloat16, device=self.device),
+            )
+
+        X2 = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        xq2, xs2 = quantize_fp8_row(X2)
+        k_offsets = torch.cumsum(torch.full((G,), K // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "2D-2D groups along K"):
+            op(
+                xq2,
+                wq2,
+                xs2,
+                ws2,
+                k_offsets,
+                torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device),
+            )
+
     def bf16_loopover_validate(
         self,
         x: Union[torch.Tensor, list[torch.Tensor]],
