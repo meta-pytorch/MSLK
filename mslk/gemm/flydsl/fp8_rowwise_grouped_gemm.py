@@ -52,7 +52,7 @@ from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.flydsl import grouped_dispatch
 from mslk.utils.device import supports_float8_fnuz
 
-_PRESHUFFLE_OP_NAME = "mslk::f8f8bf16_rowwise_grouped_preshuffle"
+_STACKED_PRESHUFFLE_OP_NAME = "mslk::f8f8bf16_rowwise_grouped_stacked_preshuffle"
 
 
 def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
@@ -79,7 +79,7 @@ def _unused_group_meta(device: torch.device) -> torch.Tensor:
     return torch.zeros((1,), dtype=torch.int32, device=device)
 
 
-def _f8f8bf16_rowwise_grouped_preshuffle_meta(
+def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -130,7 +130,7 @@ def _dispatch_rowwise_grouped(
     )
 
 
-def matmul_f8f8bf16_rowwise_grouped(
+def matmul_f8f8bf16_rowwise_grouped_stacked(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -249,7 +249,7 @@ def matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle(
     )
 
 
-def matmul_f8f8bf16_rowwise_grouped_preshuffle(
+def matmul_f8f8bf16_rowwise_grouped_stacked_preshuffle(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -534,11 +534,14 @@ if (
             pass
 
     # _stacked already has a Meta implementation registered in mslk/gemm/_meta.py.
-    _register("mslk::f8f8bf16_rowwise_grouped_stacked", matmul_f8f8bf16_rowwise_grouped)
     _register(
-        _PRESHUFFLE_OP_NAME,
-        matmul_f8f8bf16_rowwise_grouped_preshuffle,
-        _f8f8bf16_rowwise_grouped_preshuffle_meta,
+        "mslk::f8f8bf16_rowwise_grouped_stacked",
+        matmul_f8f8bf16_rowwise_grouped_stacked,
+    )
+    _register(
+        _STACKED_PRESHUFFLE_OP_NAME,
+        matmul_f8f8bf16_rowwise_grouped_stacked_preshuffle,
+        _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta,
     )
     _register(
         "mslk::f8f8bf16_rowwise_grouped_dynamic",
