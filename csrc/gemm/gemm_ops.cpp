@@ -76,6 +76,11 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // Python import time.
   m.def(
       "f8f8bf16_rowwise_grouped_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
+  // Sibling of f8f8bf16_rowwise_grouped_dynamic taking weights already swizzled
+  // into the MFMA B layout; same schema otherwise, and implemented by the same
+  // FlyDSL module.
+  m.def(
+      "f8f8bf16_rowwise_grouped_dynamic_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor zero_start_index_M, bool zeroing_output_tensor=True) -> Tensor");
   m.def(
       "f8f8f16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(
@@ -141,12 +146,12 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);
   m.impl("f8f8bf16_rowwise_grouped", f8f8bf16_rowwise_grouped);
   m.impl("f8f8bf16_rowwise_grouped_cat", f8f8bf16_rowwise_grouped_cat);
-  // ROCm binds this from Python (fp8_rowwise_grouped_gemm.py), which needs the
-  // slot free; the same registration serves CUTLASS on CUDA.
+  // ROCm binds these from Python (fp8_rowwise_grouped_gemm.py), which needs the
+  // slots free; the same registrations serve CUTLASS on CUDA.
 #ifndef USE_ROCM
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
-#endif
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
+#endif
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
   m.impl("bf16bf16bf16_grouped_dynamic", bf16bf16bf16_grouped_dynamic);
@@ -156,7 +161,9 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
-  m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+  // f8f8bf16_rowwise_grouped_mm: bound from Python by
+  // fp8_rowwise_grouped_gemm.py, which serves every rank combination the
+  // schema accepts, so the slot is left free here.
   // i8i8bf16 / i8i8bf16_dynamic: dispatched to Python Triton kernels via
   // torch.library.impl registered in mslk/gemm/triton/int8_gemm.py.
   // IMPORTANT: int8_gemm.py must be imported before these ops are called;
@@ -204,7 +211,6 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);
   m.impl("f8f8bf16_rowwise_grouped", f8f8bf16_rowwise_grouped);
   m.impl("f8f8bf16_rowwise_grouped_cat", f8f8bf16_rowwise_grouped_cat);
-  m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
   m.impl("bf16bf16bf16_grouped_dynamic", bf16bf16bf16_grouped_dynamic);
@@ -214,11 +220,12 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
-  m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
-  // i8i8bf16 / i8i8bf16_dynamic and f8f8bf16_rowwise_grouped_stacked: Python
-  // dispatch; no CPU fallback needed.
+  // i8i8bf16 / i8i8bf16_dynamic and the rowwise grouped ops FlyDSL serves
+  // (_stacked, _dynamic, _mm and their preshuffle siblings): Python dispatch;
+  // no CPU fallback needed.
 #else
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
+  m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
   m.impl("f8f8bf16_groupwise_grouped", f8f8bf16_groupwise_grouped);
   m.impl("i8i8bf16", i8i8bf16);

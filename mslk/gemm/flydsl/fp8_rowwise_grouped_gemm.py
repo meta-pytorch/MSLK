@@ -23,8 +23,8 @@ takes as a compile-time ``layout``:
   MFMA B-preshuffle layout (see ``mslk.quantize.shuffle.preshuffle_b_mfma``).
   Callers shuffle once at load time; the op does no shuffling.
 
-All of these are registered on ROCm. The padded layout's preshuffle sibling has
-no schema declared for it, so it stays a plain function until one is added.
+All of these are registered on ROCm, and gemm_ops.cpp leaves their slots free
+there, so nothing else implements them on this platform.
 
 Rowwise scaling carries one scale per row of A and per column of B, both
 constant along K, so they factor out of the reduction and the kernel applies
@@ -468,16 +468,10 @@ if (
     and hasattr(torch.ops, "mslk")
 ):
     # FlyDSL supplies the ROCm implementation of these ops; their schemas are
-    # declared in csrc/gemm/gemm_ops.cpp, which also leaves the _stacked slot
-    # free on ROCm so this binding can take it. Skip an op whose schema is
-    # missing, as in a python-only build, and tolerate a repeat import
-    # rebinding it.
-    #
-    # _dynamic and _mm still carry a CK implementation on the CUDA key, so
-    # binding here overrides it and torch warns. Guarding those to non-ROCm in
-    # gemm_ops.cpp the way _stacked is would silence that, but it needs a
-    # rebuild to take effect; the override is what decides the dispatch either
-    # way.
+    # declared in csrc/gemm/gemm_ops.cpp, which leaves every one of these slots
+    # free on ROCm so these bindings can take them. Skip an op whose schema is
+    # missing, as in a python-only build or against a binary built before the
+    # schema was added, and tolerate a repeat import rebinding it.
     def _register(op_name, cuda_fn, meta_fn=None) -> None:
         if not hasattr(torch.ops.mslk, op_name.split("::")[1]):
             return
@@ -503,7 +497,7 @@ if (
     # point covering all four, so taking the slot for some of them would break
     # the rest.
     _register("mslk::f8f8bf16_rowwise_grouped_mm", matmul_f8f8bf16_rowwise_grouped_mm)
-
-    # matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle has no schema to bind
-    # to; adding one is a C++ change and so a rebuild. It stays reachable as a
-    # plain function until then.
+    _register(
+        "mslk::f8f8bf16_rowwise_grouped_dynamic_preshuffle",
+        matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle,
+    )
