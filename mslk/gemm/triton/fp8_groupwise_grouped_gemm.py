@@ -287,8 +287,18 @@ def matmul_f8f8bf16_groupwise_grouped(
 # The C++ schema is declared in gemm_ops.cpp (shared between CUDA and ROCm).
 # On ROCm the CUDA C++ implementation is absent; this module registers the
 # Triton kernel above as the dispatch target via torch.library.impl.
+#
+# FALLBACK ONLY: FlyDSL owns this op where it is available (see
+# mslk/gemm/flydsl/fp8_groupwise_grouped_gemm.py), so Triton registers it only
+# when FlyDSL is absent. Only one CUDA implementation can win, hence the explicit
+# gate rather than a dependence on import order.
+from mslk.flydsl.common import is_flydsl_available as _is_flydsl_available  # noqa: E402
 
-if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+if (
+    torch.version.hip is not None
+    and hasattr(torch.ops, "mslk")
+    and not _is_flydsl_available()
+):
     if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped"):
         try:
 

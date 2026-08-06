@@ -12,7 +12,7 @@ from typing import Tuple
 
 import torch
 import triton  # @manual
-from mslk.quantize.triton.legacy.primitives import (
+from mslk.quantize.triton.fp4_primitives import (
     convert_fp32_to_fp4_packed,
     nvfp4_scale_swizzle,
 )
@@ -129,7 +129,11 @@ def _nvfp4_quantize_stacked_kernel(
     scales = tl.where(scale_mask, scales, 0.0)
 
     # ---- Step 5: Write FP4 data (flat, no segment awareness) ----
-    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    x_fp4x2 = convert_fp32_to_fp4_packed(
+        x_blocks.reshape(M_PER_BLOCK, 32, 2).split(),
+        IS_GFX950=False,
+        IS_ROCM=False,
+    )
     fp4_offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
     fp4_offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
     fp4_mask = (fp4_offs_m < M) & (fp4_offs_n < N // 2)
@@ -221,7 +225,11 @@ def _nvfp4_quantize_stacked_token_scale_fused_row_kernel(
         total_scale = tl.div_rn(row_scale, scales_fp8.to(tl.float32)[:, None])
         x_blocks = x_blocks * total_scale
 
-        x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(BLOCK_K // 2, 2).split())
+        x_fp4x2 = convert_fp32_to_fp4_packed(
+            x_blocks.reshape(BLOCK_K // 2, 2).split(),
+            IS_GFX950=False,
+            IS_ROCM=False,
+        )
         fp4_offs_n = tl.arange(0, BLOCK_K // 2)
         fp4_mask = (row < M) & (fp4_offs_n < N // 2)
         tl.store(q_ptr + row * (N // 2) + fp4_offs_n, x_fp4x2, mask=fp4_mask)
@@ -269,7 +277,9 @@ def _nvfp4_quantize_stacked_token_scale_fused_row_kernel(
             x_blocks = x_blocks * total_scale
 
             x_fp4x2 = convert_fp32_to_fp4_packed(
-                x_blocks.reshape(CHUNK_SIZE // 2, 2).split()
+                x_blocks.reshape(CHUNK_SIZE // 2, 2).split(),
+                IS_GFX950=False,
+                IS_ROCM=False,
             )
             fp4_offs_n = k_start // 2 + fp4_offs_in_chunk
             fp4_mask = (row < M) & (fp4_offs_n < N // 2)

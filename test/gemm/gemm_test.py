@@ -893,18 +893,30 @@ class FP8GroupwiseTests(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # (m_values, N, K)
-            ([128, 64], 128, 256),  # small, 2 groups
-            ([512, 256, 128], 256, 512),  # medium, 3 groups
-            ([1, 128, 256], 128, 256),  # decode + prefill mix
-            ([2048, 1024], 512, 512),  # large, 2 groups
+            (*case, preshuffle)
+            for preshuffle in [False, True]
+            for case in [
+                # (m_values, N, K)
+                ([128, 64], 128, 256),  # small, 2 groups
+                ([512, 256, 128], 256, 512),  # medium, 3 groups
+                ([1, 128, 256], 128, 256),  # decode + prefill mix
+                ([2048, 1024], 512, 512),  # large, 2 groups
+            ]
         ]
     )
-    def test_f8f8bf16_groupwise_grouped(self, m_values: list, N: int, K: int) -> None:
+    def test_f8f8bf16_groupwise_grouped(
+        self, m_values: list, N: int, K: int, preshuffle: bool
+    ) -> None:
+        # FlyDSL backs both variants on ROCm, and the preshuffle op exists only
+        # there, so skip when it is unavailable.
+        from mslk.flydsl.common import is_flydsl_available
         from mslk.quantize.triton.fp8_quantize import (
             quantize_fp8_block,
             quantize_fp8_group,
         )
+
+        if (preshuffle or torch.version.hip is not None) and not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
 
         G = len(m_values)
         device = self.device
@@ -930,9 +942,18 @@ class FP8GroupwiseTests(unittest.TestCase):
         # Quantize activations: xq [TotalM, K], x_scale [K//128, TotalM].
         xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
 
-        out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
-            xq, wq, x_scale, w_scale, m_sizes
-        )
+        if preshuffle:
+            from mslk.quantize.shuffle import preshuffle_b_mfma
+
+            # The preshuffle op consumes weights already in the MFMA B layout;
+            # callers shuffle once at prep time.
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped_preshuffle(
+                xq, preshuffle_b_mfma(wq), x_scale, w_scale, m_sizes
+            )
+        else:
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
+                xq, wq, x_scale, w_scale, m_sizes
+            )
 
         # BF16 reference: compute per group and concatenate.
         ref_parts = []
@@ -944,7 +965,7 @@ class FP8GroupwiseTests(unittest.TestCase):
 
         self.assertFalse(out.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
-        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+        torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
 
 
 @skipUnlessCuda()

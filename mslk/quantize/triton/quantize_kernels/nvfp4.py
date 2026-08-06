@@ -6,39 +6,80 @@
 
 # pyre-unsafe
 
-from __future__ import annotations
-
-from typing import Tuple
+"""Dense NVFP4 quantization kernel and host wrapper."""
 
 import torch
-import triton  # @manual
-from mslk.quantize.triton.legacy.primitives import (
-    _fp32_to_e8m0,
+import triton  # @manual=//triton:triton
+from mslk.quantize.triton.fp4_primitives import (
     convert_fp32_to_fp4_packed,
     nvfp4_scale_swizzle,
 )
-from triton import language as tl  # @manual
+from triton import language as tl  # @manual=//triton:triton
 
 
-def triton_quantize_nvfp4(
+@triton.jit
+def _fp32_to_e8m0(
+    unscale,
+    mbits: tl.constexpr,
+    scale_round_mode: tl.constexpr,
+):
+    """Round FP32 scale values to power-of-two E8M0 values."""
+    E8M0_EXPONENT_BIAS: tl.constexpr = 127  # type: ignore[Incompatible variable type]
+    sign = tl.where(unscale < 0, -1.0, 1.0)
+    abs_tensor = tl.abs(unscale)
+
+    if scale_round_mode == "even":
+        val_to_add = (1 << (23 - mbits - 1)) - 1
+    elif scale_round_mode == "ceil":
+        val_to_add = (1 << 23) - 1
+    else:
+        val_to_add = 0
+
+    mask_exponent = ((1 << (8 + 1)) - 1) << 23
+    mask_mantissa = (1 << 23) - 1
+
+    fp32_bits = abs_tensor.to(tl.int32, bitcast=True)
+    fp32_bits_exp = (fp32_bits + val_to_add) & mask_exponent
+    exponent = (fp32_bits_exp >> 23) & 0xFF
+
+    if scale_round_mode == "nv_round":
+        mantissa = fp32_bits & mask_mantissa
+        is_denormal = (exponent == 0) & (mantissa != 0)
+        is_normal = ~is_denormal
+        condition1 = is_normal & (exponent < 254) & (mantissa > 0)
+        condition2 = is_denormal & (mantissa / (2**23) > 0.5)
+        exponent = tl.where(condition1 | condition2, exponent + 1, exponent)
+
+    e8m0_values = sign * tl.exp2(exponent.to(tl.float32) - E8M0_EXPONENT_BIAS)
+    invalid_mask = (
+        (e8m0_values == 0)
+        | (e8m0_values == float("inf"))
+        | (e8m0_values != e8m0_values)
+    )
+    return tl.where(invalid_mask, 1.0, e8m0_values)
+
+
+def quantize_nvfp4(
     x: torch.Tensor,
     global_scale: torch.Tensor | None,
     use_e8m0_scale: bool = False,
     use_precise_math: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a tensor to NVFP4 format.
 
     Args:
         x (torch.Tensor): Input tensor to be quantized.
-        global_scale (torch.Tensor | None): Per-tensor scale for two-level quantization.
+        global_scale (torch.Tensor | None): Per-tensor scale for two-level
+            quantization.
             If None, the global scale is not applied (treated as 1.0).
-        use_e8m0_scale (bool): Whether to use E8M0 for quantization. If True will mimic mx4's e8m0 scaling factor in nvfp4's fp8 local scale.
-        use_precise_math (bool): Whether to use precise math for quantization.
-            If disabled the kernel would multiply by the reciprocal instead of dividing when computing scales.
-            In practice this is **often** bitwise accurate as the scales are converted to FP8 right after.
+        use_e8m0_scale (bool): Whether to mimic MX4's E8M0 scaling factor in
+            NVFP4's FP8 local scale.
+        use_precise_math (bool): Whether to use division when computing scales.
+            If disabled, the kernel multiplies by the reciprocal instead. This
+            is often bitwise accurate because scales are immediately cast to FP8.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Quantized tensor and scales tensor in swizzled layout.
+        The quantized tensor and scales tensor in swizzled layout.
     """
     # reshape to 2d
     orig_leading_dims, orig_N = x.shape[:-2], x.shape[-1]
@@ -66,8 +107,7 @@ def triton_quantize_nvfp4(
     USE_MASK = M % M_PER_BLOCK != 0 or N % 64 != 0
 
     grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
-    # If M_PER_BLOCK is not 128 launch an extra set of blocks along M to handle zeroing scales.
-    # This is needed as otherwise the kernel would not visit those scales, and the spec requires padded scales to be zero.
+    # Launch an extra M block to zero scales in the 128-row padded tail.
     if M_PER_BLOCK != 128:
         grid = (grid[0], grid[1] + 1)
 
@@ -79,7 +119,7 @@ def triton_quantize_nvfp4(
     # Use int64 indexing when pointer offsets can exceed INT32_MAX
     use_int64_indexing = M * N > 2**31 - 1
 
-    triton_quantize_nvfp4_kernel[grid](
+    quantize_nvfp4_kernel[grid](
         x,
         global_scale,
         xq,
@@ -110,7 +150,7 @@ def triton_quantize_nvfp4(
 
 
 @triton.jit
-def triton_quantize_nvfp4_kernel(
+def quantize_nvfp4_kernel(
     x_ptr,
     global_scale_ptr,
     q_ptr,
@@ -131,6 +171,7 @@ def triton_quantize_nvfp4_kernel(
     FP4_E2M1_MAX = 6.0
     INV_FP4_E2M1_MAX = 1.0 / 6.0
 
+    NUM_GROUPS: tl.constexpr = 4  # type: ignore[Incompatible variable type]
     NUM_ELEM_PER_LAYOUT = 128 * 4
     NUM_N_BLOCKS = tl.cdiv(N, 64)
 
@@ -138,19 +179,20 @@ def triton_quantize_nvfp4_kernel(
     pid_n = tl.program_id(0)
 
     # Special blocks that zeros out tail M scales if M_PER_BLOCK != 128
-    # Technically this is a data race as we zero out scales another block has also zero'd out.
-    # Since we write the same value, it shouldn't be an issue.
+    # Multiple blocks may race to write the same zero value here.
     if M_PER_BLOCK != 128 and pid_m * M_PER_BLOCK >= M:
         # This is only used (and supported) when M < 128.
         tl.device_assert(pid_m == 1, "pid_m != 1 when M_PER_BLOCK != 128")
 
-        # Offset of the 128x4 layout
-        layout_off = pid_n * NUM_ELEM_PER_LAYOUT
         offs_m = tl.arange(0, 128)[:, None]
+        if USE_INT64_INDEXING:
+            layout_off = pid_n.to(tl.int64) * NUM_ELEM_PER_LAYOUT
+        else:
+            layout_off = pid_n * NUM_ELEM_PER_LAYOUT
         scale_offs = layout_off + nvfp4_scale_swizzle(offs_m)
 
-        oob_mask = (offs_m >= M) & tl.full((4,), True, dtype=tl.int1)[None, :]
-        zero_scales = tl.full([128, 4], 0, dtype=tl.float8e4nv)
+        oob_mask = (offs_m >= M) & tl.full((NUM_GROUPS,), True, dtype=tl.int1)[None, :]
+        zero_scales = tl.full([128, NUM_GROUPS], 0, dtype=tl.float8e4nv)
         tl.store(s_ptr + scale_offs, zero_scales, mask=oob_mask)
         return
 
@@ -174,7 +216,9 @@ def triton_quantize_nvfp4_kernel(
 
     load_offsets = offs_m * stride_xm + offs_n * stride_xn
     x = tl.load(x_ptr + load_offsets, mask=mask, other=other)  # [M_PER_BLOCK, 64]
-    x_blocks = x.to(tl.float32).reshape(M_PER_BLOCK, 4, 16)  # [M_PER_BLOCK, 4, 16]
+    x_blocks = x.to(tl.float32).reshape(
+        M_PER_BLOCK, NUM_GROUPS, 16
+    )  # [M_PER_BLOCK, 4, 16]
 
     # Block-wise max
     block_amax = tl.max(tl.abs(x_blocks), axis=2)  # [M_PER_BLOCK, 4]
@@ -205,7 +249,7 @@ def triton_quantize_nvfp4_kernel(
     x_blocks = x_blocks * total_scale  # [M_PER_BLOCK, 4, 16]
 
     if USE_MASK:
-        scale_offs_n = pid_n * 4 + tl.arange(0, 4)[None, :]
+        scale_offs_n = pid_n * NUM_GROUPS + tl.arange(0, NUM_GROUPS)[None, :]
         scale_mask = (offs_m < M) & (scale_offs_n < (N // 16))
 
         # Mask out scales to 0 if we are not aligned to M_PER_BLOCK x 64
@@ -216,10 +260,14 @@ def triton_quantize_nvfp4_kernel(
         )
 
     offs_m = (pid_m * M_PER_BLOCK % 128) + tl.arange(0, M_PER_BLOCK)[:, None]
-    # Offset of the 128x4 layout
-    layout_off = (
-        (pid_m * M_PER_BLOCK) // 128
-    ) * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT + pid_n * NUM_ELEM_PER_LAYOUT
+    row_block = (pid_m * M_PER_BLOCK) // 128
+    if USE_INT64_INDEXING:
+        row_block = row_block.to(tl.int64)
+        layout_off = row_block * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT
+        layout_off += pid_n.to(tl.int64) * NUM_ELEM_PER_LAYOUT
+    else:
+        layout_off = row_block * NUM_N_BLOCKS * NUM_ELEM_PER_LAYOUT
+        layout_off += pid_n * NUM_ELEM_PER_LAYOUT
     scale_offs = layout_off + nvfp4_scale_swizzle(offs_m)
     tl.store(
         s_ptr + scale_offs,
@@ -227,7 +275,11 @@ def triton_quantize_nvfp4_kernel(
     )
 
     # Convert to FP4
-    x_fp4x2 = convert_fp32_to_fp4_packed(x_blocks.reshape(M_PER_BLOCK, 32, 2).split())
+    x_fp4x2 = convert_fp32_to_fp4_packed(
+        x_blocks.reshape(M_PER_BLOCK, 32, 2).split(),
+        IS_GFX950=False,
+        IS_ROCM=False,
+    )
     offs_m = pid_m * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)[:, None]
     offs_n = pid_n * 32 + tl.arange(0, 32)[None, :]
     if USE_MASK:

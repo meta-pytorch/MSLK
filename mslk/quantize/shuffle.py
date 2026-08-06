@@ -205,3 +205,42 @@ def ck_preshuffle(src: torch.Tensor, NXdl: int = 16) -> torch.Tensor:
     # Reshape to original input shape.
     dst = dst.reshape(N, K)
     return dst
+
+
+def preshuffle_b_mfma(src: torch.Tensor) -> torch.Tensor:
+    """Swizzle FP8 weights into the layout MFMA A8 GEMM kernels load B from.
+
+    Rearranges the trailing ``(N, K)`` of ``src`` into
+    ``(N0, K0, KLane, NLane, KPack)`` order, which places each wave's 16x64 B
+    fragment contiguously so it can be read without a transpose. A leading group
+    dimension is preserved, so both a single weight ``[N, K]`` and per-group
+    weights ``[G, N, K]`` are accepted.
+
+    The tile dimensions are fixed at ``NLane=16``, ``KLane=4``, ``KPack=16``
+    because the consuming kernels build their B layout with those extents
+    hardcoded (see ``make_preshuffle_b_layout``); any other choice produces a
+    layout they cannot read.
+
+    Args:
+        src: FP8 weights, ``[N, K]`` or ``[G, N, K]``.
+
+    Returns:
+        The swizzled tensor, same shape and dtype as ``src``.
+    """
+    NLane, KLane, KPack = 16, 4, 16
+    N, K = src.shape[-2], src.shape[-1]
+    if N % NLane or K % (KLane * KPack):
+        raise ValueError(
+            f"preshuffle_b_mfma needs N % {NLane} == 0 and K % {KLane * KPack} == 0, "
+            f"got N={N} K={K}"
+        )
+    K0 = K // (KLane * KPack)
+    lead = src.shape[:-2]
+    src = src.reshape(*lead, N // NLane, NLane, K0, KLane, KPack)
+    ndim = src.ndim
+    # Permute only the trailing 5 dims: (N0, NLane, K0, KLane, KPack) ->
+    # (N0, K0, KLane, NLane, KPack), keeping any leading group dim in place.
+    lead_axes = tuple(range(ndim - 5))
+    n0, nlane, k0, klane, kpack = range(ndim - 5, ndim)
+    dst = src.permute(*lead_axes, n0, k0, klane, nlane, kpack).contiguous()
+    return dst.reshape(*lead, N, K)
