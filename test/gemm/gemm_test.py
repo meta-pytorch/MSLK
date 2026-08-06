@@ -1273,6 +1273,51 @@ class FP8GroupwiseTests(unittest.TestCase):
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
         torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
 
+    @parameterized.expand([(240,), (144,)])
+    @skipUnlessRocm()
+    def test_f8f8bf16_groupwise_grouped_rejects_partial_scale_block(
+        self, K: int
+    ) -> None:
+        """K covering a partial scale block has to be refused, not truncated.
+
+        Block scaling counts whole scale blocks along K; a partial one is left
+        out of that count and the scales are misindexed from there on, which
+        costs the tail of the contraction. The error that produces is small
+        enough to sit inside the tolerance this file compares with, so it has
+        to be refused at the boundary instead of checked for numerically.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+
+        N = 256
+        m_values = [128, 64]
+        G = len(m_values)
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=self.device)
+        total_m = sum(m_values)
+        x = torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        w_scale = torch.stack(ws_list, dim=0).contiguous()
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        with self.assertRaisesRegex(ValueError, "scale_block_k"):
+            torch.ops.mslk.f8f8bf16_groupwise_grouped(xq, wq, x_scale, w_scale, m_sizes)
+
 
 @skipUnlessCuda()
 @skipUnlessCudaCapability(9, 9)

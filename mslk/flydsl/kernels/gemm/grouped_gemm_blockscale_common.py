@@ -166,6 +166,22 @@ def validate_params(
         raise ValueError(
             f"tile_n ({tile_n}) must be divisible by scale_block_n ({scale_block_n})"
         )
+    if blockscale:
+        # Block scaling counts whole scale blocks along K and N, so a partial
+        # one at either end would be left out of that count and the scales
+        # misindexed from there on. Padding relaxes the tile bound, which used
+        # to imply this one, so state it in its own right. Rowwise scaling
+        # carries a scale per row and per column and is unaffected.
+        if k % scale_block_k != 0:
+            raise ValueError(
+                f"k ({k}) must be divisible by scale_block_k ({scale_block_k}) "
+                "under block scaling, which k_padding does not relax"
+            )
+        if n % scale_block_n != 0:
+            raise ValueError(
+                f"n ({n}) must be divisible by scale_block_n ({scale_block_n}) "
+                "under block scaling, which n_padding does not relax"
+            )
     if out_dtype not in ("bf16", "f16"):
         raise ValueError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
 
