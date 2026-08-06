@@ -7,35 +7,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Contiguous Grouped FP8 GEMM kernel with block scaling.
+"""Grouped FP8 GEMM kernel.
 
-Groups are concatenated along M with arbitrary (not tile-aligned) per-group row
-counts, and the output is compact [M_total, N]. Each output M-tile belongs to
-exactly one group, so a tile never spans a group boundary. The kernel resolves
-the owning group for its M-tile from m_sizes, and rows at or beyond that group's
-end are the partial-tile tail and are masked out of the store.
-
-The `layout` argument selects how the group geometry is encoded; groups may also
-occupy fixed per-group slabs rather than being packed. Only the resolution step
-differs, so the loaders, the K loop and the epilogue are shared by all of them.
+The `layout` argument selects both which axis the groups divide and how their
+geometry is encoded. Where the groups divide M they are concatenated with
+arbitrary, not tile-aligned, row counts and the output is compact
+[M_total, N]; each output M-tile then belongs to exactly one group, resolved
+from m_sizes, and rows at or beyond that group's end are the partial-tile tail
+and are masked out of the store. Groups may instead occupy fixed per-group
+slabs, or divide N or K. Only the resolution step differs between them, so the
+loaders, the K loop and the epilogue are shared.
 
 Scales are FP32 (software scaling) on all architectures.
 
 Tensors:
-  - A: [M_total, K] FP8 - concatenated rows from all groups
-  - scale_a: FP32 per-token, per-128K scales, laid out as per-group blocks (as
-    written by quantize_fp8_group with m_sizes): group g's block begins at
-    m_start * scale_k, and within it element (local_m, k_block) sits at
-    local_m + k_block * M_g. This is not a global [scale_k, M_total] transpose.
-  - B: [num_groups, N, K] FP8 - one weight matrix per group, preshuffled
-  - scale_b: [num_groups, scale_k, scale_n] FP32 - per-block scales
+  - A: [M_total, K] FP8 - the rows of every group, packed or in per-group slabs
+  - B: [num_groups, N, K] FP8 - one weight matrix per group, in the MFMA B
+    layout when b_preshuffled; a single [total_N, K] or [N, total_K] matrix
+    where the groups divide N or K
   - m_sizes: [num_groups] - the group geometry, whose encoding the `layout`
     argument selects: INT64 row counts, INT32 cumulative offsets, or unused
   - D: [M_total, N] BF16 - output
 
-Block scaling granularity:
-  - A: (1, 128) - per-token, per-128-K-elements
-  - B: (128, 128) - per-128-N, per-128-K block
+Rowwise scaling carries one FP32 scale per row of A and per column of B, both
+constant along K, and applies them in the epilogue.
+
+Block scaling carries FP32 scales at (1, 128) for A -- per-token, per-128-K --
+and (128, 128) for B, as:
+  - scale_a: laid out as per-group blocks (as written by quantize_fp8_group
+    with m_sizes): group g's block begins at m_start * scale_k, and within it
+    element (local_m, k_block) sits at local_m + k_block * M_g. This is not a
+    global [scale_k, M_total] transpose.
+  - scale_b: [num_groups, scale_k, scale_n]
 """
 
 import functools
@@ -57,7 +60,7 @@ from flydsl.expr import (
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
+from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
     init_accumulators,
@@ -93,7 +96,7 @@ LAYOUTS = ("sizes", "offsets", "padded", "batched", "n_offsets", "k_offsets")
 
 
 @functools.lru_cache(maxsize=128)
-def compile_grouped_gemm_blockscale_contiguous(
+def compile_fp8_grouped_gemm(
     *,
     n: int,
     k: int,
@@ -315,7 +318,7 @@ def compile_grouped_gemm_blockscale_contiguous(
     ).replace("-", "_")
 
     @flyc.kernel(name=module_name)
-    def grouped_gemm_blockscale_contiguous_kernel(
+    def fp8_grouped_gemm_kernel(
         arg_d: fx.Tensor,
         arg_a: fx.Tensor,
         arg_b: fx.Tensor,
@@ -967,7 +970,7 @@ def compile_grouped_gemm_blockscale_contiguous(
 
     # ===== JIT Launcher =====
     @flyc.jit
-    def launch_grouped_gemm_blockscale_contiguous(
+    def launch_fp8_grouped_gemm(
         arg_d: fx.Tensor,
         arg_a: fx.Tensor,
         arg_b: fx.Tensor,
@@ -1008,7 +1011,7 @@ def compile_grouped_gemm_blockscale_contiguous(
             else fx.Index(1)
         )
 
-        launcher = grouped_gemm_blockscale_contiguous_kernel(
+        launcher = fp8_grouped_gemm_kernel(
             arg_d,
             arg_a,
             arg_b,
@@ -1030,4 +1033,4 @@ def compile_grouped_gemm_blockscale_contiguous(
                         )
         launcher.launch(grid=(gx, gy, gz), block=(total_threads, 1, 1), stream=stream)
 
-    return launch_grouped_gemm_blockscale_contiguous
+    return launch_fp8_grouped_gemm

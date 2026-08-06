@@ -9,9 +9,8 @@
 
 """Shared building blocks for the grouped FP8 GEMM kernel.
 
-Used by grouped_gemm_blockscale_contiguous.py: parameter validation,
-compile-time scalar constants, and the helper closures the kernel body is
-built from.
+Used by fp8_grouped_gemm.py: parameter validation, compile-time scalar
+constants, and the helper closures the kernel body is built from.
 
 Block scaling indexes scale_b as [num_groups, scale_k, scale_n] (per-group,
 per-K-block, per-N-block) and scale_a as [scale_k, M] (transposed, per-token

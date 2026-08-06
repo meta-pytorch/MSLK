@@ -114,9 +114,7 @@ def launch(
     counts on one tuned config. ``n``/``k`` are likewise passed for the key and
     for tile pruning, and are read back off the operands here.
     """
-    from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
-        compile_grouped_gemm_blockscale_contiguous,
-    )
+    from mslk.flydsl.kernels.gemm.fp8_grouped_gemm import compile_fp8_grouped_gemm
 
     total_M, K = XQ.shape
     G, N = _group_and_n(WQ, m_sizes, layout)
@@ -140,7 +138,7 @@ def launch(
         # self-skips surplus tiles, so this needs no device sync and holds under
         # graph capture.
         num_m_tiles = total_M // tile_m + G
-    launcher = compile_grouped_gemm_blockscale_contiguous(
+    launcher = compile_fp8_grouped_gemm(
         n=N,
         k=K,
         num_groups=G,
