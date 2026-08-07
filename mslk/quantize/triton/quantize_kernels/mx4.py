@@ -278,6 +278,12 @@ def quantize_mx4(
     if M_PER_BLOCK != 128 and not rocm:
         grid = (grid[0], grid[1] + 1)
     use_int64 = M * N > 2**31 - 1
+    launch_options: dict[str, int | str] = {
+        "num_stages": 3 if M >= 256 else 1,
+        "num_warps": 4,
+    }
+    if not rocm and not use_int64:
+        launch_options["ptx_options"] = "--minnctapersm=1"
 
     quantize_mx4_kernel[grid](  # pyre-ignore[28]
         x_2d,  # [M, N] input (2D-flattened)
@@ -310,10 +316,7 @@ def quantize_mx4(
         IS_ROCM=rocm,
         # pyre-ignore[6]
         IS_GFX950=gfx950,
-        # pyre-ignore[28]
-        num_stages=3 if M >= 256 else 1,
-        # pyre-ignore[28]
-        num_warps=4,
+        **launch_options,  # pyre-ignore[28]
     )
 
     xq = xq.view(*orig_leading_dims, -1, N // 2)
