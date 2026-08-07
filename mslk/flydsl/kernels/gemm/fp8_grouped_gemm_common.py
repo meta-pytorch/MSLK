@@ -415,6 +415,10 @@ def resolve_group_rows(
     when the grid cannot place a tile outside its group, so the caller's guard
     disappears at trace time rather than becoming a branch on a constant.
     """
+    # Where the groups divide K there is no row geometry to resolve, and the
+    # metadata is int32 K offsets rather than the int64 row counts decoded
+    # below, so the caller resolves that layout itself.
+    assert layout != "k_offsets", "k_offsets resolves its own geometry"
     reads_group_meta = layout not in ("batched", "n_offsets")
     slab_layout = layout in ("padded", "batched", "n_offsets")
 

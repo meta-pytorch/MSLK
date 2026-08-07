@@ -27,7 +27,8 @@ Tensors:
     where the groups divide N or K
   - m_sizes: [num_groups] - the group geometry, whose encoding the `layout`
     argument selects: INT64 row counts, INT32 cumulative offsets, or unused
-  - D: [M_total, N] BF16 - output
+  - D: [M_total, N] BF16 - output, which is the flattened [G * M, N] where the
+    groups divide K and each produces a whole output of its own
 
 Rowwise scaling carries one FP32 scale per row of A and per column of B, both
 constant along K, and applies them in the epilogue.

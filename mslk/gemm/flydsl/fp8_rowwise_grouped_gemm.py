@@ -91,6 +91,32 @@ def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
     return XQ.new_empty((total_M, N), dtype=torch.bfloat16)
 
 
+def _f8f8bf16_rowwise_grouped_dynamic_meta(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    zero_start_index_M: torch.Tensor,
+    zeroing_output_tensor: bool = True,
+) -> torch.Tensor:
+    G, expected_m, _ = XQ.shape
+    N = WQ.shape[1]
+    return XQ.new_empty((G, expected_m, N), dtype=torch.bfloat16)
+
+
+def _f8f8bf16_rowwise_grouped_mm_meta(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    offsets: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    # The op writes the caller's buffer in place and returns it, so the result
+    # is that buffer whichever rank combination the operands select.
+    return out
+
+
 def _dispatch_rowwise_grouped(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -186,7 +212,8 @@ def _dispatch_rowwise_grouped_dynamic(
 
     # Rows past a group's valid count are never written, so they carry whatever the
     # buffer already held. Zero them up front when the caller asks for it, matching
-    # the CK implementation's separate zeroing pass.
+    # the CK implementation's separate zeroing pass. A shape that reduces over
+    # nothing is zeroed either way, since zero is then the whole answer.
     alloc = torch.zeros if zeroing_output_tensor else torch.empty
     out = alloc((G, expected_m, N), dtype=torch.bfloat16, device=XQ.device)
 
@@ -414,6 +441,8 @@ def _rowwise_grouped_mm_2d2d(XQ, WQ, x_scale, w_scale, offsets, out):
 
     A group whose K slice is empty contributes nothing, and its slab of ``out``
     is left as the caller passed it -- the same as CK, which skips such groups.
+    Where every group is empty the whole contraction has length zero, which sums
+    to zero, and ``out`` is zeroed rather than left alone.
     """
     assert offsets is not None, "2D-2D grouped mm requires offsets for K"
     assert offsets.dtype == torch.int32, f"offsets must be int32, got {offsets.dtype}"
@@ -549,16 +578,23 @@ if (
     _register(
         "mslk::f8f8bf16_rowwise_grouped_dynamic",
         matmul_f8f8bf16_rowwise_grouped_dynamic,
+        _f8f8bf16_rowwise_grouped_dynamic_meta,
     )
     # Every rank combination is served, which this op needs: it is one entry
     # point covering all four, so taking the slot for some of them would break
     # the rest.
-    _register("mslk::f8f8bf16_rowwise_grouped_mm", matmul_f8f8bf16_rowwise_grouped_mm)
+    _register(
+        "mslk::f8f8bf16_rowwise_grouped_mm",
+        matmul_f8f8bf16_rowwise_grouped_mm,
+        _f8f8bf16_rowwise_grouped_mm_meta,
+    )
     _register(
         "mslk::f8f8bf16_rowwise_grouped_dynamic_preshuffle",
         matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle,
+        _f8f8bf16_rowwise_grouped_dynamic_meta,
     )
     _register(
         "mslk::f8f8bf16_rowwise_grouped_mm_preshuffle",
         matmul_f8f8bf16_rowwise_grouped_mm_preshuffle,
+        _f8f8bf16_rowwise_grouped_mm_meta,
     )
