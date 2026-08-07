@@ -94,6 +94,9 @@ from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 # Supported encodings of the group geometry; see the ``layout`` argument below.
 LAYOUTS = ("sizes", "offsets", "padded", "batched", "n_offsets", "k_offsets")
 
+# Lanes the CShuffle epilogue lays across N, matching mfma_epilog's default.
+CSHUFFLE_NLANE = 32
+
 
 @functools.lru_cache(maxsize=128)
 def compile_fp8_grouped_gemm(
@@ -127,6 +130,15 @@ def compile_fp8_grouped_gemm(
         scale_block_k: K-dimension scale block size (default 128)
         scale_block_n: N-dimension scale block size (default 128)
         out_dtype: Output data type ("bf16" or "f16")
+        waves_per_eu: Minimum waves per EU to ask the register allocator for,
+            or None to leave the choice to the compiler. Raising it caps the
+            register budget, which trades spills against occupancy.
+        k_padding: Emit the per-load K-range predicate so K need only reach a
+            16-element load boundary rather than a whole tile. Forced on where
+            the groups divide K, whose per-group end is a runtime value.
+        n_padding: Emit the per-store column predicate so N need only reach an
+            8-column store boundary rather than a whole tile. Forced on where
+            the groups divide N, for the same reason.
         b_preshuffled: When True (default) B is expected pre-swizzled into the
             MFMA layout and loaded HBM->registers (no B LDS). When False, B is
             plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
@@ -200,20 +212,19 @@ def compile_fp8_grouped_gemm(
                 "a scale block cannot straddle a group's K slice, and the "
                 "preshuffled layout swizzles K across the whole matrix"
             )
-        # A group's K length is only known on the device, so the trip count
-        # cannot be a compile-time constant and the loop cannot be unrolled.
+        # A group's K length is only known on the device. The trip count is
+        # therefore not a compile-time constant, so the loop cannot be
+        # unrolled, and every tile is bounded by that runtime end rather than
+        # by a compile-time last tile.
         roll_k = True
-    if n_grouped and (blockscale or b_preshuffled):
-        raise ValueError(
-            "layout 'n_offsets' supports only rowwise scaling with plain B: "
-            "ragged N would need per-group scale blocks, and the preshuffled "
-            "layout swizzles N across the whole matrix"
-        )
-    if k_grouped:
-        # Every tile is bounded by the group's K end, which is a runtime value,
-        # so the predicate cannot be confined to a compile-time last tile.
         k_padding = True
     if n_grouped:
+        if blockscale or b_preshuffled:
+            raise ValueError(
+                "layout 'n_offsets' supports only rowwise scaling with plain B: "
+                "ragged N would need per-group scale blocks, and the preshuffled "
+                "layout swizzles N across the whole matrix"
+            )
         # A group's column end is a runtime value, so unlike a compile-time N
         # remainder the tail mask cannot be elided; N only has to reach a store
         # boundary, which validate_params checks below.
@@ -305,7 +316,7 @@ def compile_fp8_grouped_gemm(
         )
 
     # Module name for caching
-    _variant = "contiguous_pingpong" if b_preshuffled else "plain"
+    _variant = "pingpong" if b_preshuffled else "plain"
     _scaling = "blockscale" if blockscale else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
@@ -468,25 +479,10 @@ def compile_fp8_grouped_gemm(
         def _i32k(v):  # raw i32 constant
             return arith.constant(int(v), type=T.i32)
 
-        _grp = resolve_group_rows(
-            arg_m_sizes=arg_m_sizes,
-            num_groups_in=num_groups_in,
-            m_in=m_in,
-            m_tile_idx=bx,
-            slab_idx=bz,
-            tile_m=tile_m,
-            num_groups=num_groups,
-            layout=layout,
-            group_id=_col_group_id,
-        )
-        group_id_i32 = _grp.group_id
-        row_start_i32 = _grp.row_start
-        row_limit_i32 = _grp.row_limit
-        group_m_start_i32 = _grp.group_m_start
-        group_m_size_i32 = _grp.group_m_size
-        # Rows are always whole slabs when the groups divide N, so validity is
-        # entirely a question of whether this N-block belongs to a group.
         if const_expr(k_grouped):
+            # Every group spans the whole output, so there is no row geometry
+            # to resolve: the group rides the z axis and the M-tile indexes the
+            # output directly.
             group_id_i32 = arith.index_cast(T.i32, bz)
             group_m_start_i32 = _i32k(0)
             group_m_size_i32 = arith.index_cast(T.i32, m_in)
@@ -496,6 +492,24 @@ def compile_fp8_grouped_gemm(
             # output slab is left to the caller, as CK leaves it.
             is_valid = arith.cmpi(arith.CmpIPredicate.slt, k_start_i32, k_end_i32)
         else:
+            _grp = resolve_group_rows(
+                arg_m_sizes=arg_m_sizes,
+                num_groups_in=num_groups_in,
+                m_in=m_in,
+                m_tile_idx=bx,
+                slab_idx=bz,
+                tile_m=tile_m,
+                num_groups=num_groups,
+                layout=layout,
+                group_id=_col_group_id,
+            )
+            group_id_i32 = _grp.group_id
+            row_start_i32 = _grp.row_start
+            row_limit_i32 = _grp.row_limit
+            group_m_start_i32 = _grp.group_m_start
+            group_m_size_i32 = _grp.group_m_size
+            # Rows are always whole slabs when the groups divide N, so validity
+            # is entirely a question of whether this N-block belongs to a group.
             is_valid = _col.is_valid if const_expr(n_grouped) else _grp.is_valid
         if const_expr(n_grouped):
             # Blocks are enumerated across the packed groups, so this block's
@@ -920,7 +934,10 @@ def compile_fp8_grouped_gemm(
 
             # ===== Epilogue: CShuffle vectorized stores =====
             c_n = n_in
-            e_vec = 4 if (tile_n % (32 * 4)) == 0 else 2
+            # The CShuffle epilogue lays CSHUFFLE_NLANE lanes across N, each
+            # storing e_vec elements, and requires tile_n to divide by their
+            # product. Take the wider store where it does.
+            e_vec = 4 if (tile_n % (CSHUFFLE_NLANE * 4)) == 0 else 2
 
             write_row_to_lds, store_pair = make_epilogue_writers(
                 accs=accs,
