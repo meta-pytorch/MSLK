@@ -139,7 +139,6 @@ def tunable(
                     "from the tuned path; pass returns= naming its output buffer"
                 ) from None
 
-        call.launch_untuned = launch_fn
         return call
 
     return decorate

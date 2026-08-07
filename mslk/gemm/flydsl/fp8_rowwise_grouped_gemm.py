@@ -292,6 +292,7 @@ def _rowwise_grouped_mm_2d3d(
     assert tuple(out.shape) == (total_M, N), (
         f"out must be [total_M, N] = {(total_M, N)}, got {tuple(out.shape)}"
     )
+    assert out.is_contiguous(), "out must be contiguous"
     _assert_fp8_operands(XQ, WQ)
 
     grouped_dispatch.dispatch(
