@@ -498,17 +498,6 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
         from mslk.flydsl.common import is_flydsl_available as _is_flydsl_batched
 
         if _is_flydsl_batched():
-            _batched_preshuffle_cache: dict = {}
-
-            def _get_batched_preshuffled(WQ: Tensor) -> Tensor:
-                key = WQ.data_ptr()
-                cached = _batched_preshuffle_cache.get(key)
-                if cached is not None and cached.shape == WQ.shape:
-                    return cached
-                B = WQ.shape[0]
-                shuf = torch.stack([flydsl_preshuffle(WQ[i]) for i in range(B)])
-                _batched_preshuffle_cache[key] = shuf
-                return shuf
 
             @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
             def _f8f8bf16_rowwise_batched_flydsl(
@@ -520,10 +509,13 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                 use_fast_accum: bool = True,
                 output: Optional[Tensor] = None,
             ) -> Tensor:
-                WQ_shuf = _get_batched_preshuffled(WQ)
+                if bias is not None:
+                    raise NotImplementedError(
+                        "FlyDSL batched preshuffle GEMM does not support bias"
+                    )
                 return flydsl_preshuffle_batched_gemm(
                     XQ,
-                    WQ_shuf,
+                    WQ,
                     x_scale,
                     w_scale,
                     out=output,

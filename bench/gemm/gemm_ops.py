@@ -12,6 +12,13 @@ import torch
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
+
+if is_flydsl_available():
+    from mslk.gemm.flydsl.preshuffle_gemm import (
+        flydsl_preshuffle,
+        flydsl_preshuffle_batched_gemm,
+        flydsl_preshuffle_gemm,
+    )
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.quantize.shuffle import (
     ck_preshuffle,
@@ -702,20 +709,13 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
 
     def __init__(self):
         self.fast_accum = True
-        self._flydsl_gemm = None
-        if self.supported:
-            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_gemm
-
-            self._flydsl_gemm = flydsl_preshuffle_gemm
 
     def preprocess(self, x, w):
         xq, wq, x_scale, w_scale = super().preprocess(x, w)
-        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
-
         return xq, flydsl_preshuffle(wq), x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
-        return self._flydsl_gemm(xq, wq, x_scale, w_scale)
+        return flydsl_preshuffle_gemm(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
@@ -1275,22 +1275,13 @@ class FP8RowwiseBatchedPreshuffleFlyDSL(FP8RowwiseBatched):
     FP8 batched matmul with rowwise scaling and FlyDSL preshuffle kernel (gfx950).
     """
 
-    def __init__(self):
-        self._flydsl_batched_gemm = None
-        if self.supported:
-            from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle_batched_gemm
-
-            self._flydsl_batched_gemm = flydsl_preshuffle_batched_gemm
-
     def quantize(self, x, w):
         xq, wq, x_scale, w_scale = super().quantize(x, w)
-        from mslk.gemm.flydsl.preshuffle_gemm import flydsl_preshuffle
-
         wq_shuf = torch.stack([flydsl_preshuffle(wq[i]) for i in range(wq.shape[0])])
         return xq, wq_shuf, x_scale, w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
-        return self._flydsl_batched_gemm(xq, wq, x_scale, w_scale)
+        return flydsl_preshuffle_batched_gemm(xq, wq, x_scale, w_scale)
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
