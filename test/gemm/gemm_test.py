@@ -39,6 +39,11 @@ from mslk.testing.device import (
 from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
+    from mslk.gemm.flydsl.preshuffle_gemm import (
+        flydsl_preshuffle,
+        flydsl_preshuffle_batched_gemm,
+        flydsl_preshuffle_gemm,
+    )
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
     from mslk.quantize.mx_mixed_dtype_utils import (
         pack_fp6_e2m3,
@@ -2936,7 +2941,7 @@ class MX8MX4Tests(unittest.TestCase):
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
         # Quantize A to MX8 with blocked scale layout
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -3092,7 +3097,7 @@ class MX8MX6Tests(unittest.TestCase):
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
         # MX8 activation with blocked scale layout.
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -3133,7 +3138,7 @@ class MX8MX6Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale_raw, aq = to_mxfp8(A)
         a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
             torch.uint8
         )
@@ -3386,10 +3391,6 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
-        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
-
-        cls.flydsl_preshuffle = staticmethod(flydsl_preshuffle)
-        cls.flydsl_preshuffle_gemm = staticmethod(flydsl_preshuffle_gemm)
 
     @parameterized.expand(
         [
@@ -3406,11 +3407,52 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = self.flydsl_preshuffle(wq)
+        wq_shuffled = flydsl_preshuffle(wq)
 
-        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
 
         ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            # small M (decode)
+            (16, 1, 1280, 8192),
+            (4, 1, 8192, 1024),
+            # medium M
+            (4, 32, 1280, 8192),
+            (8, 64, 8192, 1024),
+            (2, 128, 7424, 8192),
+            # large M (prefill)
+            (2, 1024, 1280, 8192),
+            (2, 4096, 8192, 1024),
+            # B=1 (degenerate batch)
+            (1, 64, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, B: int, M: int, N: int, K: int) -> None:
+        x = torch.randn(B, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(B, N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = torch.stack([flydsl_preshuffle(wq[i]) for i in range(B)])
+
+        out = flydsl_preshuffle_batched_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
 
