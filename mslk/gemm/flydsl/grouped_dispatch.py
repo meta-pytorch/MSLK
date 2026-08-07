@@ -173,7 +173,7 @@ def launch(
         WQ.contiguous().view(torch.int8),
         x_scale.contiguous(),
         w_scale.contiguous(),
-        m_sizes,
+        m_sizes.contiguous(),
         total_M,
         N,
         K,

@@ -39,9 +39,11 @@ from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
 # kernel can end on.
 K_LOAD_ELEMS = 16
 
-# Widest vectorised epilogue store, in output columns. With n_padding the tail N
-# block is suppressed a whole store at a time, so this is the finest N
-# granularity the kernel can end on.
+# Finest N granularity the kernel can end on. With n_padding the tail N block is
+# suppressed a whole store at a time, and the widest store covers four output
+# columns (eight bytes), so four would do. Eight is kept because it is also the
+# bound CK enforces, and holding the two to one rule keeps a shape that runs on
+# one running on the other.
 N_STORE_ELEMS = 8
 
 
@@ -1671,10 +1673,17 @@ def make_epilogue_writers(
         col_mask = None
         if n_padding:
             # Columns past the bound belong to the next output row, or to the
-            # next group where the groups share one; drop the whole store.
+            # next group where the groups share one. A store covers e_vec of
+            # them at once, so it is the last column it would write that has to
+            # stay inside the bound: predicating on the first would let a store
+            # that begins inside the group finish outside it, over the columns
+            # the next group owns and also writes.
             col_mask = arith.cmpi(
-                arith.CmpIPredicate.ult,
-                arith.index_cast(T.i32, col_g0),
+                arith.CmpIPredicate.ule,
+                arith.addi(
+                    arith.index_cast(T.i32, col_g0),
+                    arith.constant(int(e_vec), type=T.i32),
+                ),
                 arith.index_cast(T.i32, c_n if n_bound is None else n_bound),
             )
         if e_vec == 4:

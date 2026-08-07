@@ -360,11 +360,13 @@ def _rowwise_grouped_mm_3d2d(XQ, WQ, x_scale, w_scale, offsets, out):
     results are packed side by side into [M, total_N] instead of end to end, so
     the weights arrive as one [total_N, K] matrix whose rows the offsets divide.
 
-    Every group's column count must be a multiple of 8, the width of the
-    vectorised epilogue store, so that no store straddles a group boundary. The
-    offsets live on the device, so like CK this cannot be checked on the host;
-    unlike CK, which asserts on the device, a violation here silently leaves the
-    straddling columns unwritten.
+    Every group's column count must be a multiple of 8, matching the bound CK
+    asserts, so that no store straddles a group boundary; the epilogue's widest
+    store covers four columns, so four is what the kernel itself needs. The
+    offsets live on the device, so like CK this cannot be checked on the host.
+    Unlike CK, which asserts on the device, a violation here leaves the
+    straddling columns unwritten rather than aborting: the store that would
+    cross the boundary is dropped, so the next group's columns are left to it.
     """
     assert offsets is not None, "3D-2D grouped mm requires offsets for WQ"
     assert offsets.dtype == torch.int32, f"offsets must be int32, got {offsets.dtype}"
