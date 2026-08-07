@@ -212,6 +212,10 @@ def dispatch(
     Callers validate their own operand contract first; this only handles the
     parts every variant shares. ``XQ``/``out`` are the flattened 2D views in the
     slab layouts, so the shape handling below is common to all of them.
+
+    An allocated output is [total_M, N], which is its shape only where the
+    groups divide M or own a slab of it. Where they divide N or K it has a
+    different shape, so those layouts pass ``out`` rather than rely on this.
     """
     total_M, K = XQ.shape
     G, N = _group_and_n(WQ, M_sizes, layout)
@@ -219,7 +223,10 @@ def dispatch(
     if out is None:
         out = torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
     if total_M == 0 or N == 0 or K == 0 or G == 0:
-        return out
+        # The kernel does not launch, so nothing else writes the output. A
+        # contraction over nothing sums to zero, and where the output holds no
+        # elements at all this is a no-op.
+        return out.zero_()
 
     # Tune on the shape of one group rather than of the concatenation, so that
     # the key describes the work a block actually does. Only the grouped axis
