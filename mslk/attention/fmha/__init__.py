@@ -12,8 +12,6 @@ import torch
 from . import (
     attn_bias,
     ck,
-    ck_decoder,
-    ck_splitk,
     cute_blackwell,
     cute_hopper,
     cutlass,
@@ -21,6 +19,8 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    flydsl_decoder,
+    flydsl_splitk,
     triton_splitk,
 )
 from .attn_bias import (
@@ -56,8 +56,12 @@ MemoryEfficientAttentionCutlassFwdFlashBwOp = (cutlass.FwOp, flash.BwOp)
 MemoryEfficientAttentionFlashAttentionOp = (flash.FwOp, flash.BwOp)
 MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp)
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
-MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
-MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
+MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
+MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
+# Backward-compat aliases: these decode ops now run FlyDSL, not CK (the CK operator
+# path was removed).  Kept so existing callers of the old names keep working.
+MemoryEfficientAttentionCkDecoderOp = MemoryEfficientAttentionFlyDSLDecoderOp
+MemoryEfficientAttentionSplitKCkOp = MemoryEfficientAttentionSplitKFlyDSLOp
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
     cute_blackwell.BwOp,
@@ -981,6 +985,8 @@ __all__ = [
     "MemoryEfficientAttentionFlashMtiaAttentionOp",
     "memory_efficient_attention",
     "MemoryEfficientAttentionCkOp",
+    "MemoryEfficientAttentionFlyDSLDecoderOp",
+    "MemoryEfficientAttentionSplitKFlyDSLOp",
     "MemoryEfficientAttentionCkDecoderOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
