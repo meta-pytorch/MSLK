@@ -231,10 +231,17 @@ def dispatch(
     # Tune on the shape of one group rather than of the concatenation, so that
     # the key describes the work a block actually does. Only the grouped axis
     # needs normalising; the others are already per-group.
-    if layout == "n_offsets":
-        m_key, n_key = total_M // G, N // G
+    #
+    # M is grouped wherever a group owns a slab of it, which the slab layouts
+    # and the N-grouped one all do: a block then sees one slab, not the stack.
+    # Packed along M it is not, since the groups differ in height and there is
+    # no single per-group M to key on.
+    if layout in ("padded", "batched", "n_offsets"):
+        m_key = total_M // G
     else:
-        m_key, n_key = total_M, N
+        m_key = total_M
+    # The groups divide N, so one group owns a fraction of the columns.
+    n_key = N // G if layout == "n_offsets" else N
     # The groups divide K, so one group contracts over a fraction of it.
     k_key = K // G if layout == "k_offsets" else K
 
