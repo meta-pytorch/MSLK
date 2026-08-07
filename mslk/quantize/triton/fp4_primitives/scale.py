@@ -190,8 +190,8 @@ def mx4_scale_normalize_encode(
       1. zero-guards amax with ``BF16_MIN_NORMAL``;
       2. computes the shared exponent via ``_compute_exp`` (per-group stochastic
          rand bits when ``STOCHASTIC``), subtracts ``EBITS``, clamps to [-127, 125];
-      3. builds the fp32 scale via an **fp64** ``exp2`` intermediate and divides
-         ``x_blocks`` by it;
+      3. builds the exact fp32 power-of-two scale from its IEEE 754 bits and
+         divides ``x_blocks`` by it;
       4. optionally adds per-element mantissa-LSB noise for stochastic rounding of
          the FP32→FP4 cast (decorrelated stream via ``seed ^ 0x5A5A5A5A``);
       5. encodes the exponent as biased E8M0 int8.
@@ -220,8 +220,10 @@ def mx4_scale_normalize_encode(
     group_exp = group_exp - EBITS
     group_exp = tl.clamp(group_exp, -127, 125)
 
-    # Use float64 intermediate for exp2 precision
-    scale_float = tl.exp2(group_exp.to(tl.float64)).to(tl.float32)
+    normal_scale_bits = (group_exp.to(tl.int32) + E8M0_EXPONENT_BIAS) << 23
+    # 2^-127 is subnormal in fp32; a zero biased exponent would encode +0.
+    scale_bits = tl.where(group_exp == -127, 1 << 22, normal_scale_bits)
+    scale_float = scale_bits.to(tl.float32, bitcast=True)
 
     # Normalize input by dividing by scale
     x_blocks = x_blocks / scale_float[:, :, None]

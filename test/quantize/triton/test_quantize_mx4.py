@@ -83,6 +83,57 @@ class QuantizeMX4Test(unittest.TestCase):
 
     @parameterized.expand(
         [
+            ("bf16", torch.bfloat16),
+            ("fp16", torch.float16),
+        ]
+    )
+    def test_extreme_finite_values_match_torch_ref(self, _name, dtype):
+        finfo = torch.finfo(dtype)
+        min_subnormal = torch.tensor([1], dtype=torch.uint16).view(dtype).item()
+        low = torch.tensor(
+            [0.0, -0.0, min_subnormal, -min_subnormal, finfo.tiny, -finfo.tiny],
+            dtype=dtype,
+            device="cuda",
+        ).repeat(6)[:32]
+        high = torch.tensor(
+            [min_subnormal, -min_subnormal, 1.0, -1.0, finfo.max, -finfo.max],
+            dtype=dtype,
+            device="cuda",
+        ).repeat(6)[:32]
+        x = torch.stack((low, high))
+
+        xq, scales = quantize_mx4(x, rounding_mode=RoundingMode.ceil)
+        ref_xq, ref_scales = torch_quantize_mx4_ref(x, group_size=32)
+        self.assertTrue(torch.equal(xq, ref_xq))
+        if is_rocm():
+            actual_scales = scales.view(torch.uint8).reshape(2, -1)
+        else:
+            actual_scales = _unblock_mx4_scales(scales.view(torch.int8), 2, 1).view(
+                torch.uint8
+            )
+        self.assertTrue(torch.equal(actual_scales, ref_scales.view(torch.uint8)))
+
+    @parameterized.expand(
+        [
+            ("nearest", RoundingMode.nearest),
+            ("floor", RoundingMode.floor),
+            ("even", RoundingMode.even),
+            ("stochastic", RoundingMode.stochastic),
+            ("ceil", RoundingMode.ceil),
+        ]
+    )
+    def test_inf_scale_saturates_for_every_rounding_mode(self, _name, mode):
+        x = torch.zeros(1, 32, dtype=torch.bfloat16, device="cuda")
+        x[0, 0] = float("inf")
+        _, scales = quantize_mx4(x, rounding_mode=mode, seed=0x12345678)
+        if is_rocm():
+            scale = scales.view(torch.uint8).reshape(1, -1)
+        else:
+            scale = _unblock_mx4_scales(scales.view(torch.int8), 1, 1).view(torch.uint8)
+        self.assertEqual(252, scale[0, 0].item())
+
+    @parameterized.expand(
+        [
             # (name, group_max, expected_biased_exponent):
             # byte = ceil(log2(group_max)) - EBITS(2) + 127, stored as int8.
             ("pow2_4", 4.0, 127),
