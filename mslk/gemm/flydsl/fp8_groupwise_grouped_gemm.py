@@ -29,94 +29,12 @@ Tensor contract:
   Output  : [TotalM, N]             BF16
 """
 
-import os
-
 import torch
 from mslk.flydsl.common import is_flydsl_available
-from mslk.flydsl.jit import run_compiled
+from mslk.gemm.flydsl import grouped_dispatch
 from mslk.utils.device import supports_float8_fnuz
 
 _OP_NAME = "mslk::f8f8bf16_groupwise_grouped_preshuffle"
-
-# Only the scale-block granularity is fixed; tile_m/tile_n/tile_k are chosen per
-# call -- either by FlyDSL autotune (MSLK_AUTOTUNE_ENABLE set) or a fixed default.
-_SCALE_BLOCK = 128
-
-# Default tile when autotuning is disabled. Valid for any supported shape
-# (tile_n=tile_k=128 divide every supported N/K, incl. small N=128). This is the
-# CI / no-benchmark path -- matches the CUTLASS heuristic fallback tile.
-_DEFAULT_TILE = (128, 128, 128)
-
-# Candidate tile space swept by autotune. tile_n must be a multiple of
-# scale_block_n=128 so a tile never straddles a weight scale block, and tile_k is
-# pinned to the same granularity. Configs that do not divide a given shape are
-# pruned before benchmarking, and ones that overflow LDS are rejected at compile.
-_AUTOTUNE_TILES = (
-    (64, 128, 128),
-    (128, 128, 128),
-    (256, 128, 128),
-    (64, 256, 128),
-    (128, 256, 128),
-    (256, 256, 128),
-)
-
-
-def _next_pow2(x: int) -> int:
-    """Smallest power of two >= x (x>=1). Buckets TotalM for the autotune key so
-    nearby token counts share one tuned config -- matching the CUDA-graph capture
-    buckets a server pre-captures, and bounding the pre-warm set."""
-    if x <= 1:
-        return 1
-    return 1 << (int(x) - 1).bit_length()
-
-
-def _launch_kernel(
-    XQ, WQ, x_scale, w_scale, m_sizes, output, *, tile_m, tile_n, tile_k, b_preshuffled
-):
-    """Compile (cached) and launch the grouped GEMM for one tile config. Shared
-    by the autotune target and the fixed-config path. Writes into `output`."""
-    from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_contiguous import (
-        compile_grouped_gemm_blockscale_contiguous,
-    )
-
-    TotalM, K = XQ.shape
-    G, N, _ = WQ.shape
-    # Grid M-extent: host-known upper bound (each group wastes at most one partial
-    # tile). The kernel resolves group ownership from M_sizes and self-skips
-    # surplus tiles.
-    num_m_tiles = TotalM // tile_m + G
-    launcher = compile_grouped_gemm_blockscale_contiguous(
-        n=N,
-        k=K,
-        num_groups=G,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        scale_block_k=_SCALE_BLOCK,
-        scale_block_n=_SCALE_BLOCK,
-        out_dtype="bf16",
-        b_preshuffled=b_preshuffled,
-    )
-    # Operands keep their natural shape: argument marshalling packs each memref
-    # extent as int32, which a flattened view overflows at 2**31 elements. The
-    # kernel addresses them as flat byte buffers regardless. FP8 is viewed as
-    # int8 for the handoff.
-    run_compiled(
-        launcher,
-        output,
-        XQ.contiguous().view(torch.int8),
-        WQ.contiguous().view(torch.int8),
-        x_scale.contiguous(),
-        w_scale.contiguous(),
-        m_sizes,
-        TotalM,
-        N,
-        K,
-        G,
-        num_m_tiles,
-        torch.cuda.current_stream(),
-    )
-    return output
 
 
 def _f8f8bf16_groupwise_grouped_preshuffle_meta(
@@ -131,85 +49,6 @@ def _f8f8bf16_groupwise_grouped_preshuffle_meta(
     return XQ.new_empty((TotalM, N), dtype=torch.bfloat16)
 
 
-def _autotune_target(
-    XQ,
-    WQ,
-    x_scale,
-    w_scale,
-    m_sizes,
-    output,
-    m_bucket,
-    n,
-    k,
-    b_preshuffled,
-    *,
-    tile_m,
-    tile_n,
-    tile_k,
-):
-    """FlyDSL @autotune benchmarks this per candidate tile. Keyed on
-    (m_bucket, n, k, b_preshuffled): m_bucket=nextPow2(TotalM) buckets token
-    counts; n/k separate the problem shapes (gate/up vs down-proj want different
-    tiles); b_preshuffled distinguishes the two kernels (different B-load path,
-    can't share a tuned config). Key args are otherwise passed straight through.
-    tile_* arrive as Config kwargs."""
-    return _launch_kernel(
-        XQ,
-        WQ,
-        x_scale,
-        w_scale,
-        m_sizes,
-        output,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        b_preshuffled=b_preshuffled,
-    )
-
-
-def _prune_tiles(configs, named_args, **kwargs):
-    """Drop tile configs invalid for this shape (tile_n must divide N, tile_k
-    must divide K) before benchmarking.
-
-    FlyDSL's Autotuner calls this as ``(configs, sig_args)``; ``**kwargs`` keeps
-    it compatible with the Triton-style ``(configs, named_args, **meta)`` form.
-    """
-    WQ = named_args.get("WQ")
-    XQ = named_args.get("XQ")
-    if WQ is None or XQ is None:
-        return configs
-    N = WQ.shape[1]
-    K = XQ.shape[1]
-    kept = [
-        c
-        for c in configs
-        if N % c.kwargs["tile_n"] == 0 and K % c.kwargs["tile_k"] == 0
-    ]
-    return kept or configs
-
-
-# Single autotuner for both B-layout variants, built lazily (flydsl.autotune only
-# imports when FlyDSL is present). b_preshuffled is a KEY arg (not a Config kwarg)
-# so the two kernels get separate tuned entries in one shared disk cache.
-_AUTOTUNER = None
-
-
-def _get_autotuner():
-    global _AUTOTUNER
-    if _AUTOTUNER is None:
-        from flydsl.autotune import autotune, Config
-
-        configs = [
-            Config(tile_m=tm, tile_n=tn, tile_k=tk) for (tm, tn, tk) in _AUTOTUNE_TILES
-        ]
-        _AUTOTUNER = autotune(
-            configs=configs,
-            key=["m_bucket", "n", "k", "b_preshuffled"],
-            prune_configs_by=_prune_tiles,
-        )(_autotune_target)
-    return _AUTOTUNER
-
-
 def _dispatch_grouped_gemm(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -221,12 +60,6 @@ def _dispatch_grouped_gemm(
 ) -> torch.Tensor:
     """Shared dispatch for both grouped ops. WQ is already in the layout the
     variant expects (MFMA-preshuffled if b_preshuffled else plain [G,N,K]).
-
-    Tile selection follows the CUTLASS precedent: when MSLK_AUTOTUNE_ENABLE is
-    set, FlyDSL autotune benchmarks the candidate tiles on a cache-miss and
-    persists the winner (keyed on nextPow2(TotalM) and b_preshuffled); otherwise
-    a fixed default tile is used with no benchmarking (the CI / graph-capture-safe
-    path).
     """
     assert XQ.ndim == 2, f"XQ must be [TotalM, K], got {XQ.shape}"
     assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
@@ -245,41 +78,14 @@ def _dispatch_grouped_gemm(
     assert WQ.dtype == expected_fp8, f"WQ must be {expected_fp8}, got {WQ.dtype}"
     assert M_sizes.dtype == torch.int64, f"M_sizes must be int64, got {M_sizes.dtype}"
 
-    output = torch.empty((TotalM, N), dtype=torch.bfloat16, device=XQ.device)
-    if TotalM == 0 or N == 0 or K == 0 or G == 0:
-        return output
-
-    if os.environ.get("MSLK_AUTOTUNE_ENABLE"):
-        # FlyDSL's Autotuner discards the tuned function's return value, so read
-        # the result from the output buffer the kernel wrote into.
-        _get_autotuner()(
-            XQ,
-            WQ,
-            x_scale,
-            w_scale,
-            M_sizes,
-            output,
-            _next_pow2(TotalM),
-            N,
-            K,
-            b_preshuffled,
-        )
-        return output
-
-    tile_m, tile_n, tile_k = _DEFAULT_TILE
-    assert N % tile_n == 0, f"N={N} must be a multiple of tile_n={tile_n}"
-    assert K % tile_k == 0, f"K={K} must be a multiple of tile_k={tile_k}"
-    return _launch_kernel(
+    return grouped_dispatch.dispatch(
         XQ,
         WQ,
         x_scale,
         w_scale,
         M_sizes,
-        output,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
         b_preshuffled=b_preshuffled,
+        blockscale=True,
     )
 
 

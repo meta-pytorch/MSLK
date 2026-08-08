@@ -727,6 +727,253 @@ class FP8Tests(unittest.TestCase):
         # Compare using loopover BF16 gemm
         self.bf16_loopover_validate(X_list, W_list, y)
 
+    @parameterized.expand(
+        [
+            # Group K that does not divide the K tile while the TOTAL does.
+            # Whether the total is tile-aligned says nothing about a group's
+            # slice, so a tail predicate keyed on the total is not emitted here
+            # and each group reads into the next one's data.
+            ([288] * 4,),  # total 1152
+            ([192, 320],),  # total 512
+            ([16, 512, 128, 368],),  # total 1024, mixed
+            ([0, 256, 256, 512],),  # total 1024, with an empty group
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_2d_2d_group_k_not_tile_aligned(
+        self, k_sizes: list[int]
+    ) -> None:
+        """Groups divide K at extents that do not land on a tile boundary.
+
+        The parameterised cases above keep every group's K a multiple of 16, the
+        vectorised load width, since neither implementation supports less.
+
+        Every other group holds constant, single-signed data. A read that runs
+        past a group's K end lands in the next group, and against constants the
+        extra terms accumulate coherently rather than cancelling, which puts the
+        error orders of magnitude above the comparison tolerance. Random
+        neighbours would leave it near the quantisation noise, where the
+        comparison cannot tell the two apart.
+        """
+        M, N = 128, 256
+        G = len(k_sizes)
+        K_offsets = torch.cumsum(torch.tensor(k_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X_list, W_list = [], []
+        xq_list, wq_list, x_scale_list, w_scale_list = [], [], [], []
+        for g, k_size in enumerate(k_sizes):
+            # A zero-width group still has to contribute a scale per row.
+            width = max(k_size, 1)
+            if g % 2:
+                X = torch.full(
+                    (M, width), 0.1, dtype=torch.bfloat16, device=self.device
+                )
+                W = torch.full(
+                    (N, width), 0.01, dtype=torch.bfloat16, device=self.device
+                )
+            else:
+                X = (
+                    torch.randn((M, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.1
+                )
+                W = (
+                    torch.randn((N, width), dtype=torch.bfloat16, device=self.device)
+                    * 0.01
+                )
+            xq, x_scale = quantize_fp8_row(X)
+            wq, w_scale = quantize_fp8_row(W)
+            X_list.append(X[:, :k_size])
+            W_list.append(W[:, :k_size])
+            xq_list.append(xq[:, :k_size])
+            wq_list.append(wq[:, :k_size])
+            x_scale_list.append(x_scale)
+            w_scale_list.append(w_scale)
+
+        xq = torch.cat(xq_list, dim=1)
+        wq = torch.cat(wq_list, dim=1)
+        x_scale = torch.cat(x_scale_list, dim=0)
+        w_scale = torch.cat(w_scale_list, dim=0)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale, w_scale, K_offsets, out
+        )
+
+        # A group that contracts over nothing contributes nothing; the op leaves
+        # its slab alone, so only the rest is checked.
+        live = [g for g, k in enumerate(k_sizes) if k]
+        self.bf16_loopover_validate(
+            [X_list[g] for g in live],
+            [W_list[g] for g in live],
+            [y[g] for g in live],
+        )
+
+    @parameterized.expand(
+        [
+            ([264, 264],),  # a multiple of 8, not of any tile_n
+            ([8, 504, 128],),  # one group narrower than a single tile
+            ([1024, 264, 8],),
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_2d_group_n_not_tile_aligned(
+        self, n_sizes: list[int]
+    ) -> None:
+        """Groups divide N at extents that do not land on a tile boundary.
+
+        Every group's N stays a multiple of 8, the widest vectorised store,
+        which CK asserts on the device and this kernel needs for the same reason.
+        """
+        M, K = 128, 256
+        G = len(n_sizes)
+        total_n = sum(n_sizes)
+        N_offsets = torch.cumsum(torch.tensor(n_sizes, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((total_n, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((M, total_n), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale, N_offsets, out
+        )
+
+        self.bf16_loopover_validate(
+            list(X),
+            list(torch.split(W, n_sizes, dim=0)),
+            list(torch.split(y, n_sizes, dim=1)),
+        )
+
+    @parameterized.expand([(1,), (64,), (100,), (192,), (255,)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_3d_3d_slab_not_tile_aligned(self, M: int) -> None:
+        """Batched, with a slab height that does not divide the M tile.
+
+        A full slab does not mean a tile fits inside it: the last tile overhangs
+        into the next group's rows, so the epilogue still has to mask by row.
+        """
+        G, N, K = 4, 256, 256
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+        out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale.view(G, -1), w_scale.view(G, -1), None, out
+        )
+
+        self.bf16_loopover_validate(list(X), list(W), list(y))
+
+    @parameterized.expand([("2d3d",), ("3d3d",)])
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle(self, ranks: str) -> None:
+        """The grouped mm ranks that leave each group a whole [N, K].
+
+        Weights arrive already in the MFMA B layout, which the caller applies
+        once at load time.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        if not hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_mm_preshuffle"):
+            self.skipTest("build predates the preshuffled grouped mm schema")
+
+        G, M, N, K = 4, 128, 256, 256
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        wq, w_scale = quantize_fp8_row(W)
+        op = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm_preshuffle
+
+        if ranks == "2d3d":
+            m_sizes = [64, 128, 32, 64]
+            offsets = torch.cumsum(torch.tensor(m_sizes, dtype=torch.int), dim=0).to(
+                device=self.device, dtype=torch.int32
+            )
+            total_m = sum(m_sizes)
+            X = (
+                torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device)
+                * 0.1
+            )
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((total_m, N), dtype=torch.bfloat16, device=self.device)
+            y = op(xq, preshuffle_b_mfma(wq), x_scale, w_scale, offsets, out)
+            X_list, W_list, y_list, row = [], [], [], 0
+            for g, m_g in enumerate(m_sizes):
+                X_list.append(X[row : row + m_g])
+                W_list.append(W[g])
+                y_list.append(y[row : row + m_g])
+                row += m_g
+        else:
+            X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            xq, x_scale = quantize_fp8_row(X)
+            out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+            y = op(
+                xq,
+                preshuffle_b_mfma(wq),
+                x_scale.view(G, -1),
+                w_scale.view(G, -1),
+                None,
+                out,
+            )
+            X_list, W_list, y_list = list(X), list(W), list(y)
+
+        self.bf16_loopover_validate(X_list, W_list, y_list)
+
+    @skipUnlessRocm()
+    def test_grouped_gemm_mm_preshuffle_rejects_grouped_n_and_k(self) -> None:
+        """Grouping along N or K puts a group boundary inside the swizzle.
+
+        There is no preshuffled form of those, so they have to be refused rather
+        than quietly served from the plain path.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+        from mslk.gemm.flydsl.fp8_rowwise_grouped_gemm import (
+            matmul_f8f8bf16_rowwise_grouped_mm_preshuffle as op,
+        )
+
+        G, M, N, K = 4, 128, 256, 256
+        X3 = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W2 = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        xq3, xs3 = quantize_fp8_row(X3)
+        wq2, ws2 = quantize_fp8_row(W2)
+        n_offsets = torch.cumsum(torch.full((G,), N // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "3D-2D groups along N"):
+            op(
+                xq3,
+                wq2,
+                xs3.view(G, -1),
+                ws2,
+                n_offsets,
+                torch.empty((M, N), dtype=torch.bfloat16, device=self.device),
+            )
+
+        X2 = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        xq2, xs2 = quantize_fp8_row(X2)
+        k_offsets = torch.cumsum(torch.full((G,), K // G, dtype=torch.int), dim=0).to(
+            device=self.device, dtype=torch.int32
+        )
+        with self.assertRaisesRegex(ValueError, "2D-2D groups along K"):
+            op(
+                xq2,
+                wq2,
+                xs2,
+                ws2,
+                k_offsets,
+                torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device),
+            )
+
     def bf16_loopover_validate(
         self,
         x: Union[torch.Tensor, list[torch.Tensor]],
@@ -860,6 +1107,65 @@ class FP8Tests(unittest.TestCase):
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
+    @parameterized.expand(
+        [
+            (1, 512, 512, 512, True),  # small MNK (also small G)
+            (16, 256, 1024, 2048, True),  # medium MNK
+            (64, 128, 6144, 3584, True),  # large MNK
+            (16, 512, 512, 512, True),  # medium G
+            (64, 512, 512, 512, True),  # large G
+            (4, 256, 1024, 512, False),  # padding left uninitialised
+        ]
+    )
+    @skipUnlessRocm()
+    def test_grouped_gemm_dynamic(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+        zeroing_output_tensor: bool,
+    ) -> None:
+        """Padded per-group layout: [G, M, K] with a runtime valid row count.
+
+        Unlike the stacked variant the groups do not share one packed buffer;
+        each gets a fixed slab of M rows of which only the first
+        zero_start_index_M[g] hold real tokens. The rest is padding, so the
+        reference only covers the valid rows, and the padded output rows are
+        checked separately.
+        """
+        # Cover empty, partially filled and completely filled groups.
+        valid_m = torch.randint(0, M + 1, (G,), dtype=torch.int64)
+        valid_m[0] = 0
+        valid_m[-1] = M
+        valid_m_gpu = valid_m.to(device=self.device)
+
+        X = torch.randn((G, M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(X)
+        wq, w_scale = quantize_fp8_row(W)
+
+        y = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic(
+            xq, wq, x_scale, w_scale, valid_m_gpu, zeroing_output_tensor
+        )
+        self.assertEqual(tuple(y.shape), (G, M, N))
+
+        # Only the valid rows of each group are defined by the op, so compare
+        # those and leave the padding to the check below.
+        x_group = [X[g, : valid_m[g]] for g in range(G)]
+        w_group = [W[g] for g in range(G)]
+        y_group = [y[g, : valid_m[g]] for g in range(G)]
+        self.bf16_loopover_validate(x_group, w_group, y_group)
+
+        if zeroing_output_tensor:
+            for g in range(G):
+                padding = y[g, valid_m[g] :]
+                self.assertTrue(
+                    (padding == 0).all().item(),
+                    f"group {g} padding rows must be zeroed",
+                )
+
 
 @skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9, 10)
@@ -976,6 +1282,51 @@ class FP8GroupwiseTests(unittest.TestCase):
         self.assertFalse(out.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
         torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
+
+    @parameterized.expand([(240,), (144,)])
+    @skipUnlessRocm()
+    def test_f8f8bf16_groupwise_grouped_rejects_partial_scale_block(
+        self, K: int
+    ) -> None:
+        """K covering a partial scale block has to be refused, not truncated.
+
+        Block scaling counts whole scale blocks along K; a partial one is left
+        out of that count and the scales are misindexed from there on, which
+        costs the tail of the contraction. The error that produces is small
+        enough to sit inside the tolerance this file compares with, so it has
+        to be refused at the boundary instead of checked for numerically.
+        """
+        from mslk.flydsl.common import is_flydsl_available
+        from mslk.quantize.triton.fp8_quantize import (
+            quantize_fp8_block,
+            quantize_fp8_group,
+        )
+
+        if not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
+
+        N = 256
+        m_values = [128, 64]
+        G = len(m_values)
+        m_sizes = torch.tensor(m_values, dtype=torch.int64, device=self.device)
+        total_m = sum(m_values)
+        x = torch.randn((total_m, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        ws = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        wq_list, ws_list = zip(
+            *[
+                quantize_fp8_block(w, block_m=128, block_k=128, k_major=False)
+                for w in ws
+            ]
+        )
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        w_scale = torch.stack(ws_list, dim=0).contiguous()
+        xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
+
+        with self.assertRaisesRegex(ValueError, "scale_block_k"):
+            torch.ops.mslk.f8f8bf16_groupwise_grouped(xq, wq, x_scale, w_scale, m_sizes)
 
 
 @skipUnlessCuda()

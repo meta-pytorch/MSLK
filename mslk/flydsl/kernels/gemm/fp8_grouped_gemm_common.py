@@ -7,14 +7,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Shared building blocks for the grouped FP8 blockscale GEMM kernels.
+"""Shared building blocks for the grouped FP8 GEMM kernel.
 
-Used by the grouped_gemm_blockscale contiguous and masked kernels. Holds the
-parts of the two kernels that are byte-identical (parameter validation,
-compile-time scalar constants, helper closures) so they live in one place.
+Used by fp8_grouped_gemm.py: parameter validation, compile-time scalar
+constants, and the helper closures the kernel body is built from.
 
-scale_b is indexed as [num_groups, scale_k, scale_n] (per-group, per-K-block,
-per-N-block); scale_a is [scale_k, M] (transposed, per-token per-K-block).
+Block scaling indexes scale_b as [num_groups, scale_k, scale_n] (per-group,
+per-K-block, per-N-block) and scale_a as [scale_k, M] (transposed, per-token
+per-K-block). Rowwise scaling carries one scale per row of A and per column of
+B and applies them in the epilogue.
 """
 
 from collections import namedtuple
@@ -32,6 +33,63 @@ from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     swizzle_xor16,
     tile_chunk_coord_i32,
 )
+
+# FP8 elements covered by one 16-byte vectorised load. With k_padding the tail K
+# tile is masked a whole load at a time, so this is the finest K granularity the
+# kernel can end on.
+K_LOAD_ELEMS = 16
+
+# Finest N granularity the kernel can end on. With n_padding the tail N block is
+# suppressed a whole store at a time, and the widest store covers four output
+# columns (eight bytes), so four would do. Eight is kept because it is also the
+# bound CK enforces, and holding the two to one rule keeps a shape that runs on
+# one running on the other.
+N_STORE_ELEMS = 8
+
+
+def make_k_tail_mask(
+    *, k_padding, num_k_tiles, k, tile_k, k_in, always=False, k_bound=None
+):
+    """Build the per-load K-range predicate used by the A and B tile loaders.
+
+    Returns ``mask(k_tile_idx_py, base_k_div4, col_local_i32)`` yielding None
+    wherever no masking is needed, so every tile but the last emits exactly the
+    code it did before.
+
+    ``k_bound`` replaces K as the bound the predicate compares against, which is
+    what the layouts that let the groups divide K need: a load belongs to the
+    group only while it stays inside that group's slice.
+
+    ``always`` drops that last-tile test and emits the predicate on every tile.
+    A rolled K loop traces its body once, so which iteration is the last is no
+    longer a Python-level fact; the predicate is correct on every tile either
+    way, since it compares against K rather than against the tile index.
+
+    A masked ``buffer_load`` reads out of the buffer's range and so returns zero,
+    which is what a K tail needs: the excess lanes contribute nothing to the sum.
+    A plain out-of-range offset would not do, since reading past K within a row
+    lands on the next row's data rather than outside the buffer.
+    """
+    # A supplied bound is a per-group K end, so whether the whole K is tile
+    # aligned says nothing about whether a group's slice is: the tail can land
+    # anywhere inside it, and the predicate is always needed.
+    tail = k_padding and (k_bound is not None or k % tile_k != 0)
+    _bound = k_in if k_bound is None else k_bound
+
+    def mask(k_tile_idx_py, base_k_div4, col_local_i32):
+        if not tail or not (always or k_tile_idx_py == num_k_tiles - 1):
+            return None
+        # Loads are 16-byte aligned and K is a multiple of that width, so a chunk
+        # is either wholly inside K or wholly outside it.
+        chunk_start_div4 = base_k_div4 + col_local_i32
+        return arith.cmpi(
+            arith.CmpIPredicate.ult,
+            arith.index_cast(T.i32, chunk_start_div4),
+            arith.index_cast(T.i32, _bound // fx.Index(4)),
+        )
+
+    return mask
+
 
 CompileConstants = namedtuple(
     "CompileConstants",
@@ -57,21 +115,76 @@ CompileConstants = namedtuple(
 )
 
 
-def validate_params(*, n, k, tile_n, tile_k, scale_block_k, scale_block_n, out_dtype):
+def validate_params(
+    *,
+    n,
+    k,
+    tile_n,
+    tile_k,
+    scale_block_k,
+    scale_block_n,
+    out_dtype,
+    blockscale=False,
+    k_padding=False,
+    n_padding=False,
+):
     """Validate the divisibility constraints and out_dtype choice shared by
-    both grouped GEMM blockscale kernels."""
-    if k % tile_k != 0:
+    the grouped GEMM kernels.
+
+    scale_block_k splits a K tile into the sub-blocks the MFMA schedule steps
+    through, so tile_k must cover a whole number of them under either scaling
+    scheme -- a tile_k below scale_block_k yields zero sub-blocks and a compute
+    loop that never runs.
+
+    scale_block_n only matters to block scaling, where a tile must not straddle
+    a scale block. Rowwise scaling carries one scale per row of A and per column
+    of B and applies it in the epilogue, so tile_n is free of that alignment and
+    may be smaller than scale_block_n.
+    """
+    if k_padding:
+        # The tail K tile is masked off per 16-byte load, so K only has to land on
+        # a load boundary rather than a whole tile.
+        if k % K_LOAD_ELEMS != 0:
+            raise ValueError(
+                f"k ({k}) must be divisible by {K_LOAD_ELEMS} (the vectorised "
+                "load width) even with k_padding"
+            )
+    elif k % tile_k != 0:
         raise ValueError(f"k ({k}) must be divisible by tile_k ({tile_k})")
-    if n % tile_n != 0:
+    if n_padding:
+        # The tail N block is masked per store, whose widest form covers
+        # N_STORE_ELEMS columns, so N only has to land on that boundary.
+        if n % N_STORE_ELEMS != 0:
+            raise ValueError(
+                f"n ({n}) must be divisible by {N_STORE_ELEMS} (the widest "
+                "vectorised store) even with n_padding"
+            )
+    elif n % tile_n != 0:
         raise ValueError(f"n ({n}) must be divisible by tile_n ({tile_n})")
     if tile_k % scale_block_k != 0:
         raise ValueError(
             f"tile_k ({tile_k}) must be divisible by scale_block_k ({scale_block_k})"
         )
-    if tile_n % scale_block_n != 0:
+    if blockscale and tile_n % scale_block_n != 0:
         raise ValueError(
             f"tile_n ({tile_n}) must be divisible by scale_block_n ({scale_block_n})"
         )
+    if blockscale:
+        # A scale block is the unit one scale covers, so K and N have to span
+        # whole ones: a partial block at either end falls outside the count and
+        # misindexes the scales from there on. The tile bounds above do not
+        # imply this, since padding relaxes them. Rowwise scaling carries a
+        # scale per row and per column and is unaffected.
+        if k % scale_block_k != 0:
+            raise ValueError(
+                f"k ({k}) must be divisible by scale_block_k ({scale_block_k}) "
+                "under block scaling, which k_padding does not relax"
+            )
+        if n % scale_block_n != 0:
+            raise ValueError(
+                f"n ({n}) must be divisible by scale_block_n ({scale_block_n}) "
+                "under block scaling, which n_padding does not relax"
+            )
     if out_dtype not in ("bf16", "f16"):
         raise ValueError(f"out_dtype must be 'bf16' or 'f16', got {out_dtype!r}")
 
@@ -168,7 +281,7 @@ def out_mlir_for(out_dtype):
 
 
 def compute_compile_constants(
-    *, n, k, tile_m, tile_n, tile_k, scale_block_k, scale_block_n
+    *, n, k, tile_m, tile_n, tile_k, scale_block_k, scale_block_n, k_padding=False
 ):
     """Compute the compile-time scalar constants shared by both kernels.
 
@@ -176,7 +289,9 @@ def compute_compile_constants(
     """
     total_threads = 256
     elem_bytes = 1  # FP8
-    num_k_tiles = k // tile_k
+    # With k_padding the last tile is only partly covered by K; it still runs, with
+    # its out-of-range loads masked to zero, which contribute nothing to the sum.
+    num_k_tiles = -(-k // tile_k) if k_padding else k // tile_k
     scale_k = k // scale_block_k
     scale_n = n // scale_block_n
     sb_per_tile = tile_k // scale_block_k  # scale blocks per K-tile
@@ -268,6 +383,240 @@ def setup_lds_allocation_plain(
     return lds_alloc_offset, lds_tile_elems, lds_b_offset_elems
 
 
+GroupResolution = namedtuple(
+    "GroupResolution",
+    ["group_id", "row_start", "row_limit", "group_m_start", "group_m_size", "is_valid"],
+)
+
+
+def resolve_group_rows(
+    *,
+    arg_m_sizes,
+    num_groups_in,
+    m_in,
+    m_tile_idx,
+    slab_idx,
+    tile_m,
+    num_groups,
+    layout,
+    group_id=None,
+):
+    """Work out which group owns this M-tile and where its rows begin and end.
+
+    This is the only part of the kernel that the group layout changes;
+    everything downstream consumes the returned coordinates unchanged. See the
+    ``layout`` argument of the kernel factory for what each encoding means.
+
+    ``m_tile_idx`` is the M-tile block id, and ``slab_idx`` the group block id
+    that only the slab layouts use. ``group_id`` supplies the group when it has
+    already been resolved elsewhere, as the N-grouped layout does: its rows form
+    a full per-group slab exactly as the batched layout's do, but the group
+    follows from the column partition rather than from a grid axis. ``is_valid`` comes back as a Python ``True``
+    when the grid cannot place a tile outside its group, so the caller's guard
+    disappears at trace time rather than becoming a branch on a constant.
+    """
+    # Where the groups divide K there is no row geometry to resolve, and the
+    # metadata is int32 K offsets rather than the int64 row counts decoded
+    # below, so the caller resolves that layout itself.
+    assert layout != "k_offsets", "k_offsets resolves its own geometry"
+    reads_group_meta = layout not in ("batched", "n_offsets")
+    slab_layout = layout in ("padded", "batched", "n_offsets")
+
+    # Group metadata is INT32 when it holds cumulative offsets and INT64 when it
+    # holds row counts. "batched" carries none, so no resource is built for it
+    # and arg_m_sizes goes unread.
+    if reads_group_meta:
+        meta_bytes = 4 if layout == "offsets" else 8
+        ms_rsrc = buffer_ops.create_buffer_resource(
+            arg_m_sizes,
+            max_size=False,
+            num_records_bytes=num_groups_in * fx.Index(meta_bytes),
+        )
+
+    def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+        return arith.constant(int(v), type=T.i32)
+
+    bx_i32 = arith.index_cast(T.i32, m_tile_idx)
+    tile_m_c = _i32(tile_m)
+    tile_m_bump = _i32(tile_m - 1)
+
+    if slab_layout:
+        # Every group owns a fixed slab of expected_m rows, so the group is a
+        # grid axis and needs no resolution.
+        group_id_i32 = (
+            group_id if group_id is not None else arith.index_cast(T.i32, slab_idx)
+        )
+        expected_m_i32 = arith.divui(arith.index_cast(T.i32, m_in), _i32(num_groups))
+        group_m_start_i32 = arith.muli(group_id_i32, expected_m_i32)
+        group_m_size_i32 = expected_m_i32
+        row_start_i32 = arith.addi(group_m_start_i32, arith.muli(bx_i32, tile_m_c))
+        if reads_group_meta:
+            # m_sizes holds the count of rows in each slab that carry real
+            # data; the rest is padding the epilogue must not write.
+            valid_m = buffer_ops.buffer_load(
+                ms_rsrc, slab_idx * 2, vec_width=1, dtype=T.i32
+            )
+            # A group can hold fewer valid rows than the grid has tiles for
+            # it, so skip whole tiles that start past them.
+            is_valid = arith.cmpi(
+                arith.CmpIPredicate.slt, arith.muli(bx_i32, tile_m_c), valid_m
+            )
+        else:
+            # The slab is full, so every row of it carries data and the grid
+            # is exactly ceil(slab / tile_m) tiles: no tile starts past the
+            # slab, and the guard is dropped rather than emitted always-true.
+            # The rows of the tile past the slab still carry nothing, though:
+            # tile_m need not divide it, and the overrun lands on the next
+            # group, so the epilogue still masks by row.
+            valid_m = expected_m_i32
+            is_valid = True
+        row_limit_i32 = arith.addi(group_m_start_i32, valid_m)
+    else:
+        # Packed layout: groups are concatenated along M, so resolve which one
+        # owns this flat M-tile id from m_sizes. Doing it here rather than
+        # from a host-built dispatch map keeps the launch free of helper
+        # kernels, which matters under CUDA-graph capture where each one is
+        # replayed per call. num_groups is a compile-time constant, so the loop
+        # unrolls to a few scalar ops. acc_m/acc_t are the running m_start and
+        # tile_start prefixes; tiles beyond the real tile count (the grid extent
+        # is an upper bound) match no group and stay marked -1.
+        acc_m = _i32(0)  # cumulative rows before group g (m_starts[g])
+        acc_t = _i32(0)  # cumulative tiles before group g (tile_starts[g])
+        group_id_i32 = _i32(-1)
+        row_start_i32 = _i32(0)
+        row_limit_i32 = _i32(0)
+        group_m_start_i32 = _i32(0)  # first global row of the owning group
+        group_m_size_i32 = _i32(0)  # row count of the owning group
+        for _g in range_constexpr(num_groups):
+            if layout == "offsets":
+                # Cumulative int32 row ends. acc_m is already the running
+                # prefix, so a group's own row count is the step between them;
+                # decoding here costs a subtract and saves the caller a whole
+                # kernel launch to difference the offsets host-side.
+                m_g = arith.subi(
+                    buffer_ops.buffer_load(ms_rsrc, _g, vec_width=1, dtype=T.i32),
+                    acc_m,
+                )
+            else:
+                # m_sizes is int64; read the low dword of element _g (index
+                # _g*2 in dwords). Row counts fit in int32, so the high dword
+                # is always zero and no host-side narrowing kernel is needed.
+                m_g = buffer_ops.buffer_load(ms_rsrc, _g * 2, vec_width=1, dtype=T.i32)
+            tiles_g = arith.divui(arith.addi(m_g, tile_m_bump), tile_m_c)
+            acc_t_next = arith.addi(acc_t, tiles_g)
+            in_grp = arith.andi(
+                arith.cmpi(arith.CmpIPredicate.sge, bx_i32, acc_t),
+                arith.cmpi(arith.CmpIPredicate.slt, bx_i32, acc_t_next),
+            )
+            rs = arith.addi(acc_m, arith.muli(arith.subi(bx_i32, acc_t), tile_m_c))
+            rl = arith.addi(acc_m, m_g)
+            group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
+            row_start_i32 = arith.select(in_grp, rs, row_start_i32)
+            row_limit_i32 = arith.select(in_grp, rl, row_limit_i32)
+            group_m_start_i32 = arith.select(in_grp, acc_m, group_m_start_i32)
+            group_m_size_i32 = arith.select(in_grp, m_g, group_m_size_i32)
+            acc_m = arith.addi(acc_m, m_g)
+            acc_t = acc_t_next
+
+        is_valid = arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0))
+
+    return GroupResolution(
+        group_id=group_id_i32,
+        row_start=row_start_i32,
+        row_limit=row_limit_i32,
+        group_m_start=group_m_start_i32,
+        group_m_size=group_m_size_i32,
+        is_valid=is_valid,
+    )
+
+
+GroupKSlice = namedtuple("GroupKSlice", ["k_start", "k_end"])
+
+
+def resolve_group_k(*, arg_offsets, num_groups_in, slab_idx):
+    """Read the K slice this group contracts over.
+
+    Where the groups divide K every group produces a full output, so the group
+    is a grid axis and nothing has to be resolved from the tile index -- only
+    the ends of its slice, which are two adjacent cumulative offsets. Group 0
+    starts at zero, so its lower end is not read.
+    """
+    off_rsrc = buffer_ops.create_buffer_resource(
+        arg_offsets, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+    )
+    g_i32 = arith.index_cast(T.i32, slab_idx)
+    zero = arith.constant(0, type=T.i32)
+    is_first = arith.cmpi(arith.CmpIPredicate.eq, g_i32, zero)
+    prev = buffer_ops.buffer_load(
+        off_rsrc,
+        arith.subi(g_i32, arith.constant(1, type=T.i32)),
+        vec_width=1,
+        dtype=T.i32,
+    )
+    k_start = arith.select(is_first, zero, prev)
+    k_end = buffer_ops.buffer_load(off_rsrc, g_i32, vec_width=1, dtype=T.i32)
+    return GroupKSlice(k_start=k_start, k_end=k_end)
+
+
+GroupColResolution = namedtuple(
+    "GroupColResolution", ["group_id", "col_base", "col_limit", "is_valid"]
+)
+
+
+def resolve_group_cols(*, arg_offsets, num_groups_in, n_block_idx, tile_n, num_groups):
+    """Work out which group owns this N-block and where its columns end.
+
+    The mirror of ``resolve_group_rows`` for weights concatenated along N, where
+    the groups partition the output's columns instead of its rows, so the group
+    follows from the N-block index. ``arg_offsets`` is [num_groups] INT32
+    cumulative column ends -- the same encoding the "offsets" layout reads on
+    the M axis.
+
+    Returns the owning group, the global first column of this block, and the
+    group's exclusive column end, which is the bound the N tail masks against.
+    Blocks past the last group match none and come back invalid, the same way
+    surplus M-tiles do in the packed layouts.
+    """
+    off_rsrc = buffer_ops.create_buffer_resource(
+        arg_offsets, max_size=False, num_records_bytes=num_groups_in * fx.Index(4)
+    )
+
+    def _i32(v):  # raw i32 constant (arith.* requires unwrapped MLIR values)
+        return arith.constant(int(v), type=T.i32)
+
+    by_i32 = arith.index_cast(T.i32, n_block_idx)
+    tile_n_c = _i32(tile_n)
+    tile_n_bump = _i32(tile_n - 1)
+
+    acc_n = _i32(0)  # cumulative columns before group g
+    acc_b = _i32(0)  # cumulative N-blocks before group g
+    group_id_i32 = _i32(-1)
+    col_base_i32 = _i32(0)
+    col_limit_i32 = _i32(0)
+    for _g in range_constexpr(num_groups):
+        end_g = buffer_ops.buffer_load(off_rsrc, _g, vec_width=1, dtype=T.i32)
+        n_g = arith.subi(end_g, acc_n)
+        blocks_g = arith.divui(arith.addi(n_g, tile_n_bump), tile_n_c)
+        acc_b_next = arith.addi(acc_b, blocks_g)
+        in_grp = arith.andi(
+            arith.cmpi(arith.CmpIPredicate.sge, by_i32, acc_b),
+            arith.cmpi(arith.CmpIPredicate.slt, by_i32, acc_b_next),
+        )
+        cb = arith.addi(acc_n, arith.muli(arith.subi(by_i32, acc_b), tile_n_c))
+        group_id_i32 = arith.select(in_grp, _i32(_g), group_id_i32)
+        col_base_i32 = arith.select(in_grp, cb, col_base_i32)
+        col_limit_i32 = arith.select(in_grp, end_g, col_limit_i32)
+        acc_n = end_g
+        acc_b = acc_b_next
+
+    return GroupColResolution(
+        group_id=group_id_i32,
+        col_base=col_base_i32,
+        col_limit=col_limit_i32,
+        is_valid=arith.cmpi(arith.CmpIPredicate.sge, group_id_i32, _i32(0)),
+    )
+
+
 def make_a_tile_loaders(
     *,
     a_rsrc,
@@ -286,6 +635,8 @@ def make_a_tile_loaders(
     k_in,
     m_in=None,
     group_idx=None,
+    k_tail_mask=None,
+    k_base_div4=None,
 ):
     """Build the prefetch + LDS-store closures for the A tile.
 
@@ -295,8 +646,12 @@ def make_a_tile_loaders(
     (masked path), `group_idx * m_in * (k_in/4)` is added as the leading
     term inside `prefetch_a_tile`, exactly matching the original masked
     code so the resulting MLIR (and ISA) is byte-identical. `k_blocks16`
-    is returned for reuse by the downstream LDS-load helper.
+    is returned for reuse by the downstream LDS-load helper. `k_base_div4`
+    shifts every load to the start of this group's K slice, for the layouts
+    where the groups divide K rather than an output axis; the row stride stays
+    the full K, since the slice is a column block of a wider matrix.
     """
+    _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_a_tile_div4 = fx.make_layout(
         (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
     )
@@ -327,6 +682,8 @@ def make_a_tile_loaders(
     def prefetch_a_tile(k_tile_idx_py):
         """Load A tile from global memory into VGPRs."""
         base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        if k_base_div4 is not None:
+            base_k_div4 = k_base_div4 + base_k_div4
         parts = []
         for i in range_constexpr(num_a_loads):
             row_global = bx_m + a_row_local[i]
@@ -339,7 +696,13 @@ def make_a_tile_loaders(
                     + base_k_div4
                     + a_col_local_i32[i]
                 )
-            a_vec = buffer_ops.buffer_load(a_rsrc, idx_i32, vec_width=4, dtype=T.i32)
+            a_vec = buffer_ops.buffer_load(
+                a_rsrc,
+                idx_i32,
+                vec_width=4,
+                dtype=T.i32,
+                mask=_k_tail_mask(k_tile_idx_py, base_k_div4, a_col_local_i32[i]),
+            )
             parts.append(Vector(a_vec).bitcast(fx.Int32))
         return parts
 
@@ -388,6 +751,11 @@ def make_b_tile_loaders(
     elem_bytes,
     n_in,
     k_in,
+    k_tail_mask=None,
+    n_padding=False,
+    b_group_off=None,
+    n_bound=None,
+    k_base_div4=None,
 ):
     """Build the prefetch + LDS-store closures for a PLAIN (non-preshuffled)
     B tile [tile_n, tile_k].
@@ -395,11 +763,16 @@ def make_b_tile_loaders(
     Mirror of `make_a_tile_loaders` with N in place of M. B is `[G, N, K]`
     row-major, so the per-tile global base adds the group offset
     `group_idx * n_in * (k_in/4)` (always present — B is always grouped) plus
-    the N-tile base `by_n` (the block's N-block start). Coalesced 16-byte
+    the N-tile base `by_n` (the block's N-block start). `b_group_off` replaces
+    that leading offset where B is one flat [total_N, K] matrix and the group is
+    already folded into `by_n`, and `n_bound` replaces the row bound the tail
+    masks against, which is then the group's column end rather than N.
+    Coalesced 16-byte
     (dwordx4) loads via `tile_chunk_coord_i32`; LDS store uses the same XOR16
     swizzle as A. Returns `(prefetch_b_tile, store_b_tile_to_lds, b_row_local,
     b_col_local_i32, k_blocks16_b)`.
     """
+    _k_tail_mask = k_tail_mask or (lambda *_: None)
     layout_b_tile_div4 = fx.make_layout(
         (tile_n, tile_k_dwords), stride=(tile_k_dwords, 1)
     )
@@ -407,7 +780,10 @@ def make_b_tile_loaders(
     tx_i32_base = tx * c_chunk_b
     _k_div4_factor = k_in // fx.Index(4)
     # B is [G, N, K]: leading offset selects this tile's group and N-block base.
-    b_tile_offset_div4 = group_idx * n_in * _k_div4_factor
+    b_tile_offset_div4 = (
+        b_group_off if b_group_off is not None else group_idx * n_in * _k_div4_factor
+    )
+    _n_bound = n_in if n_bound is None else n_bound
     k_blocks16_b = arith.index(tile_k_bytes // 16)
     c4_bytes = fx.Index(4)
 
@@ -428,6 +804,8 @@ def make_b_tile_loaders(
     def prefetch_b_tile(k_tile_idx_py):
         """Load plain B tile from global memory into VGPRs (coalesced dwordx4)."""
         base_k_div4 = fx.Index(k_tile_idx_py * tile_k_dwords)
+        if k_base_div4 is not None:
+            base_k_div4 = k_base_div4 + base_k_div4
         parts = []
         for i in range_constexpr(num_b_loads):
             row_global = by_n + b_row_local[i]  # global N row
@@ -437,7 +815,22 @@ def make_b_tile_loaders(
                 + base_k_div4
                 + b_col_local_i32[i]
             )
-            b_vec = buffer_ops.buffer_load(b_rsrc, idx_i32, vec_width=4, dtype=T.i32)
+            kmask = _k_tail_mask(k_tile_idx_py, base_k_div4, b_col_local_i32[i])
+            if n_padding:
+                # Rows past N hold the next group's weights, so read zero instead.
+                nmask = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, row_global),
+                    arith.index_cast(T.i32, _n_bound),
+                )
+                kmask = nmask if kmask is None else arith.andi(kmask, nmask)
+            b_vec = buffer_ops.buffer_load(
+                b_rsrc,
+                idx_i32,
+                vec_width=4,
+                dtype=T.i32,
+                mask=kmask,
+            )
             parts.append(Vector(b_vec).bitcast(fx.Int32))
         return parts
 
@@ -744,6 +1137,7 @@ def make_compute_tile(
     sa_group_off=None,
     group_m_start=None,
     group_m_size=None,
+    blockscale=False,
 ):
     """Build the per-K-tile compute closure.
 
@@ -756,6 +1150,14 @@ def make_compute_tile(
     `sa_group_off` is None for the contig path (no addition emitted)
     and `group_idx * c_scale_k * m_in` for the masked path; only the
     gfx942 SW path uses it.
+
+    Where the scales are applied follows from how they vary. Block scaling has a
+    distinct scale per (scale_block_k x scale_block_n) block, so each block's
+    partial sum needs its own factor and the scaling happens here, per block,
+    inside the K loop. Rowwise scaling has one scale per row of A and one per
+    column of B, both constant along K, so they factor out of the reduction and
+    the K loop accumulates unscaled, leaving a single scaling in the epilogue
+    (see `make_rowwise_scaler`).
     """
 
     def compute_tile(
@@ -768,7 +1170,7 @@ def make_compute_tile(
 
             s_a_vecs = []
             s_b_vals = []
-            if not _use_hw_scale:
+            if blockscale and not _use_hw_scale:
                 if group_m_start is not None:
                     # quantize_fp8_group(m_sizes=...) stores scale_a as per-group
                     # blocks: group g starts at M_start*scale_k and holds element
@@ -854,24 +1256,29 @@ def make_compute_tile(
                         )
             elif _is_gfx950:
                 # gfx950: use the wide 16x16x128 MFMA with a neutral E8M0 scale
-                # (0x7F7F7F7F = no-op hardware scaling), accumulate a whole
-                # scale-block into block_accs, then apply the FP32 scales in
-                # software once per scale-block. This avoids both the 4x-narrower
-                # 16x16x32 MFMA and the per-K-step VALU scale cost of the path
-                # below.
-                combined_scales = []
-                for mi in range_constexpr(m_repeat):
-                    mi_combined = []
-                    for ni in range_constexpr(num_acc_n):
-                        s_b_bc = Vector.filled(
-                            (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                        )
-                        mi_combined.append(
-                            ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
-                        )
-                    combined_scales.append(mi_combined)
-
-                block_accs = [acc_init] * (num_acc_n * m_repeat)
+                # (0x7F7F7F7F = no-op hardware scaling), which avoids the
+                # 4x-narrower 16x16x32 MFMA of the path below.
+                #
+                # Block scaling accumulates a whole scale block into block_accs
+                # and folds it into current_accs with the FP32 scales once per
+                # block, keeping the VALU scale cost off the per-K-step path.
+                # Rowwise scaling has nothing to fold in per block, so the MFMAs
+                # accumulate straight into current_accs.
+                if blockscale:
+                    combined_scales = []
+                    for mi in range_constexpr(m_repeat):
+                        mi_combined = []
+                        for ni in range_constexpr(num_acc_n):
+                            s_b_bc = Vector.filled(
+                                (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                            )
+                            mi_combined.append(
+                                ArithValue(s_a_vecs[mi]) * ArithValue(s_b_bc)
+                            )
+                        combined_scales.append(mi_combined)
+                    mfma_accs = [acc_init] * (num_acc_n * m_repeat)
+                else:
+                    mfma_accs = current_accs
                 ku0 = sb * ku_per_sb
                 ku1 = ku0 + 1
                 b0_packs0, b0_packs1 = b_tile_in[ku0]
@@ -893,12 +1300,12 @@ def make_compute_tile(
                             b0_packs0[ni], b0_packs1[ni], b1_packs0[ni], b1_packs1[ni]
                         )
                         acc_idx = mi * num_acc_n + ni
-                        block_accs[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_accs[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                             mfma_res_ty,
                             [
                                 a128,
                                 b128,
-                                block_accs[acc_idx],
+                                mfma_accs[acc_idx],
                                 0,
                                 0,
                                 0,
@@ -908,14 +1315,15 @@ def make_compute_tile(
                             ],
                         )
 
-                for mi in range_constexpr(m_repeat):
-                    for ni in range_constexpr(num_acc_n):
-                        acc_idx = mi * num_acc_n + ni
-                        current_accs[acc_idx] = math_dialect.fma(
-                            block_accs[acc_idx],
-                            combined_scales[mi][ni],
-                            current_accs[acc_idx],
-                        )
+                if blockscale:
+                    for mi in range_constexpr(m_repeat):
+                        for ni in range_constexpr(num_acc_n):
+                            acc_idx = mi * num_acc_n + ni
+                            current_accs[acc_idx] = math_dialect.fma(
+                                mfma_accs[acc_idx],
+                                combined_scales[mi][ni],
+                                current_accs[acc_idx],
+                            )
             else:
                 for ku_local in range_constexpr(ku_per_sb):
                     ku = sb * ku_per_sb + ku_local
@@ -941,27 +1349,111 @@ def make_compute_tile(
 
                         for ni in range_constexpr(num_acc_n):
                             acc_idx = mi * num_acc_n + ni
-
                             mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
-                            mfma_mid = mfma_fn(
-                                T.f32x4, [a0, b_packs0[ni], acc_init, 0, 0, 0]
-                            )
-                            mfma_result = mfma_fn(
-                                T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
-                            )
 
-                            s_a_v4 = s_a_vecs[mi]
-                            s_b_bc = Vector.filled(
-                                (4,), fx.Float32(s_b_vals[ni]), fx.Float32
-                            )
-                            scaled = ArithValue(mfma_result) * ArithValue(s_a_v4)
-                            current_accs[acc_idx] = math_dialect.fma(
-                                scaled, s_b_bc, current_accs[acc_idx]
-                            )
+                            if blockscale:
+                                # This block's partial sum starts from zero so it
+                                # can be scaled on its own before joining the
+                                # running accumulator.
+                                mfma_mid = mfma_fn(
+                                    T.f32x4, [a0, b_packs0[ni], acc_init, 0, 0, 0]
+                                )
+                                mfma_result = mfma_fn(
+                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                )
+
+                                s_a_v4 = s_a_vecs[mi]
+                                s_b_bc = Vector.filled(
+                                    (4,), fx.Float32(s_b_vals[ni]), fx.Float32
+                                )
+                                scaled = ArithValue(mfma_result) * ArithValue(s_a_v4)
+                                current_accs[acc_idx] = math_dialect.fma(
+                                    scaled, s_b_bc, current_accs[acc_idx]
+                                )
+                            else:
+                                # Nothing to scale per block, so chain the MFMAs
+                                # straight onto the running accumulator.
+                                mfma_mid = mfma_fn(
+                                    T.f32x4,
+                                    [a0, b_packs0[ni], current_accs[acc_idx], 0, 0, 0],
+                                )
+                                current_accs[acc_idx] = mfma_fn(
+                                    T.f32x4, [a1, b_packs1[ni], mfma_mid, 0, 0, 0]
+                                )
 
         return current_accs
 
     return compute_tile
+
+
+def make_rowwise_scaler(
+    *,
+    sa_rsrc,
+    sb_rsrc,
+    group_idx,
+    n_in,
+    by_n,
+    n_tile_base,
+    bx_m,
+    lane_mod_16,
+    lane_div_16,
+    m_repeat,
+    num_acc_n,
+    group_n_off=None,
+):
+    """Build the closure that applies rowwise scales to the finished accumulators.
+
+    Rowwise scaling multiplies each output element by ``scale_a[row]`` and
+    ``scale_b[group, col]``, both constant along K, so this runs once after the
+    K loop rather than inside it.
+
+    The MFMA 16x16 C fragment holds four f32 per lane that share a column and
+    differ by row, which is exactly how the two scales vary: scale_b contributes
+    one value broadcast across the fragment, and scale_a contributes a vector of
+    the fragment's four rows. Unlike the block-scale lookup, the column here
+    includes ``lane_mod_16``, so scale_b is not wave-uniform and must not be
+    routed through readfirstlane.
+
+    Returns ``apply_rowwise_scales(accs)``.
+    """
+
+    def apply_rowwise_scales(accs):
+        scaled = list(accs)
+
+        # scale_a is [total_M]: one value per global row.
+        row_off_base = lane_div_16 * fx.Index(4)
+        s_a_vecs = []
+        for mi in range_constexpr(m_repeat):
+            s_a_row = []
+            for ii in range_constexpr(4):
+                row_global = bx_m + (mi * 16) + row_off_base + fx.Index(ii)
+                s_a_row.append(
+                    buffer_ops.buffer_load(
+                        sa_rsrc, row_global, vec_width=1, dtype=T.f32
+                    )
+                )
+            s_a_vecs.append(Vector.from_elements(s_a_row, fx.Float32))
+
+        # scale_b is [num_groups, n]: element (g, col) at g*n + col. Where it is
+        # instead one flat [total_N] vector the group is already folded into
+        # by_n, and the caller passes a zero base.
+        _group_n_off = group_idx * n_in if group_n_off is None else group_n_off
+        s_b_bcs = []
+        for ni in range_constexpr(num_acc_n):
+            col_global = _group_n_off + by_n + n_tile_base + (ni * 16) + lane_mod_16
+            s_b_val = buffer_ops.buffer_load(
+                sb_rsrc, col_global, vec_width=1, dtype=T.f32
+            )
+            s_b_bcs.append(Vector.filled((4,), fx.Float32(s_b_val), fx.Float32))
+
+        for mi in range_constexpr(m_repeat):
+            for ni in range_constexpr(num_acc_n):
+                acc_idx = mi * num_acc_n + ni
+                v = ArithValue(scaled[acc_idx]) * ArithValue(s_a_vecs[mi])
+                scaled[acc_idx] = v * ArithValue(s_b_bcs[ni])
+        return scaled
+
+    return apply_rowwise_scales
 
 
 def make_kloop_plain(
@@ -1017,7 +1509,7 @@ def make_kloop_plain(
     return run_kloop
 
 
-def make_pingpong_kloop(
+def make_pingpong_stages(
     *,
     num_k_tiles,
     tile_k,
@@ -1033,90 +1525,101 @@ def make_pingpong_kloop(
     row_a_lds_base,
     col_offset_base_bytes,
 ):
-    """Build the ping-pong K-loop driver.
+    """Build the prologue and the per-pair body of the ping-pong K loop.
 
-    Returns `run_kloop(accs)` which advances `accs` through all
-    K-tiles using the prologue + alternating ping/pong stages.
-    Loop body is byte-identical between contig and masked, so this
-    factory has no offset parameters.
+    Returns ``(prologue, pair)``. ``prologue()`` fills the pong buffer and
+    returns the state the first pair consumes; ``pair(accs, k_pair, state)``
+    advances two K tiles and returns the state the next pair consumes.
+
+    Splitting the body out lets the loop itself be written either way. The
+    unrolled form walks it with a compile-time index; the rolled form can only
+    be written in the kernel's own source, since the loop construct is
+    AST-rewritten, and calls the same body from there. ``steady`` says the pair
+    is known to have both of its tiles and a successor to prefetch, which is
+    what a rolled body needs: with a runtime index the tail tests are not
+    Python-level facts.
     """
 
-    def run_kloop(accs):
-        # Prologue: prefetch first A tile into VGPRs, store to LDS, load B + scales
+    def prologue():
+        # Prefetch first A tile into VGPRs, store to LDS, load B + scales
         a_regs0 = prefetch_a_tile(0)
         store_a_tile_to_lds(a_regs0, lds_base_pong)
         b_tile_pong = load_b_tile(fx.Index(0))
         scales_pong_pf = prefetch_scales(0)
         gpu.barrier()
-
         # Prefetch first A pack from pong (hides LDS latency behind upcoming VMEM)
         a0_prefetch_pong = lds_load_packs_k64(
             row_a_lds_base, col_offset_base_bytes, lds_base_pong
         )
+        return (b_tile_pong, scales_pong_pf, a0_prefetch_pong)
 
-        for k_pair in range_constexpr(0, num_k_tiles, 2):
-            # Prefetch the next scales before the B-tile VMEM so the scale-load
-            # latency hides behind it; then the A+B registers.
-            if k_pair + 1 < num_k_tiles:
-                scales_ping_pf = prefetch_scales(k_pair + 1)
-                a_regs_ping = prefetch_a_tile(k_pair + 1)
-                b_tile_ping = load_b_tile(fx.Index((k_pair + 1) * tile_k))
+    def pair(accs, k_pair, state, *, steady=False):
+        b_tile_pong, scales_pong_pf, a0_prefetch_pong = state
+        has_odd = True if steady else (k_pair + 1 < num_k_tiles)
+        has_next = True if steady else (k_pair + 2 < num_k_tiles)
 
-            # Compute current tile from pong LDS
+        # Prefetch the next scales before the B-tile VMEM so the scale-load
+        # latency hides behind it; then the A+B registers.
+        if has_odd:
+            scales_ping_pf = prefetch_scales(k_pair + 1)
+            a_regs_ping = prefetch_a_tile(k_pair + 1)
+            b_tile_ping = load_b_tile(fx.Index((k_pair + 1) * tile_k))
+
+        # Compute current tile from pong LDS
+        accs = compute_tile(
+            accs,
+            k_pair,
+            lds_base_pong,
+            b_tile_pong,
+            scales_pong_pf,
+            a0_prefetch=a0_prefetch_pong,
+        )
+        a0_prefetch_pong = None
+
+        # Store next A to LDS (ds_write after compute, overlaps with trailing MFMAs)
+        if has_odd:
+            store_a_tile_to_lds(a_regs_ping, lds_base_ping)
+            hot_loop_scheduler()
+        gpu.barrier()
+
+        if has_odd:
+            # Prefetch first A pack from ping
+            a0_prefetch_ping = lds_load_packs_k64(
+                row_a_lds_base, col_offset_base_bytes, lds_base_ping
+            )
+
+            # Prefetch next scales + A+B
+            if has_next:
+                scales_pong_pf = prefetch_scales(k_pair + 2)
+                a_regs_pong = prefetch_a_tile(k_pair + 2)
+                b_tile_pong = load_b_tile(fx.Index((k_pair + 2) * tile_k))
+
+            # Compute current tile from ping LDS
             accs = compute_tile(
                 accs,
-                k_pair,
-                lds_base_pong,
-                b_tile_pong,
-                scales_pong_pf,
-                a0_prefetch=a0_prefetch_pong,
+                k_pair + 1,
+                lds_base_ping,
+                b_tile_ping,
+                scales_ping_pf,
+                a0_prefetch=a0_prefetch_ping,
             )
-            a0_prefetch_pong = None
+            a0_prefetch_ping = None
 
-            # Store next A to LDS (ds_write after compute, overlaps with trailing MFMAs)
-            if k_pair + 1 < num_k_tiles:
-                store_a_tile_to_lds(a_regs_ping, lds_base_ping)
+            # Store next A to LDS
+            if has_next:
+                store_a_tile_to_lds(a_regs_pong, lds_base_pong)
                 hot_loop_scheduler()
             gpu.barrier()
 
-            if k_pair + 1 < num_k_tiles:
-                # Prefetch first A pack from ping
-                a0_prefetch_ping = lds_load_packs_k64(
-                    row_a_lds_base, col_offset_base_bytes, lds_base_ping
+            # Prefetch first A pack from pong for next iteration
+            if has_next:
+                a0_prefetch_pong = lds_load_packs_k64(
+                    row_a_lds_base, col_offset_base_bytes, lds_base_pong
                 )
 
-                # Prefetch next scales + A+B
-                if k_pair + 2 < num_k_tiles:
-                    scales_pong_pf = prefetch_scales(k_pair + 2)
-                    a_regs_pong = prefetch_a_tile(k_pair + 2)
-                    b_tile_pong = load_b_tile(fx.Index((k_pair + 2) * tile_k))
+        return accs, (b_tile_pong, scales_pong_pf, a0_prefetch_pong)
 
-                # Compute current tile from ping LDS
-                accs = compute_tile(
-                    accs,
-                    k_pair + 1,
-                    lds_base_ping,
-                    b_tile_ping,
-                    scales_ping_pf,
-                    a0_prefetch=a0_prefetch_ping,
-                )
-                a0_prefetch_ping = None
-
-                # Store next A to LDS
-                if k_pair + 2 < num_k_tiles:
-                    store_a_tile_to_lds(a_regs_pong, lds_base_pong)
-                    hot_loop_scheduler()
-                gpu.barrier()
-
-                # Prefetch first A pack from pong for next iteration
-                if k_pair + 2 < num_k_tiles:
-                    a0_prefetch_pong = lds_load_packs_k64(
-                        row_a_lds_base, col_offset_base_bytes, lds_base_pong
-                    )
-
-        return accs
-
-    return run_kloop
+    return prologue, pair
 
 
 def make_epilogue_writers(
@@ -1127,6 +1630,8 @@ def make_epilogue_writers(
     e_vec,
     c_n,
     d_group_off=None,
+    n_padding=False,
+    n_bound=None,
 ):
     """Build the CShuffle-epilogue writer closures.
 
@@ -1135,6 +1640,11 @@ def make_epilogue_writers(
     addition emitted) and `group_idx * m_in * n_in` for the masked
     path. Using a Python `is None` guard keeps the contig MLIR
     identical to the pre-extraction code.
+
+    `c_n` is the output's leading dimension, and normally also bounds the column
+    mask, since a group's columns run to the end of its row. Where groups sit
+    side by side along N the row spans all of them, so `n_bound` gives the
+    owning group's column end instead.
     """
 
     def write_row_to_lds(
@@ -1164,13 +1674,33 @@ def make_epilogue_writers(
         else:
             idx_out = d_group_off + row * c_n + col_g0
         byte_off = idx_out * 2
+        col_mask = None
+        if n_padding:
+            # Columns past the bound belong to the next output row, or to the
+            # next group where the groups share one. A store covers e_vec of
+            # them at once, so it is the last column it would write that has to
+            # stay inside the bound: predicating on the first would let a store
+            # that begins inside the group finish outside it, over the columns
+            # the next group owns and also writes.
+            col_mask = arith.cmpi(
+                arith.CmpIPredicate.ule,
+                arith.addi(
+                    arith.index_cast(T.i32, col_g0),
+                    arith.constant(int(e_vec), type=T.i32),
+                ),
+                arith.index_cast(T.i32, c_n if n_bound is None else n_bound),
+            )
         if e_vec == 4:
             frag_i32x2 = Vector(frag).bitcast(fx.Int32)
-            buffer_ops.buffer_store(frag_i32x2, d_rsrc, byte_off, offset_is_bytes=True)
+            buffer_ops.buffer_store(
+                frag_i32x2, d_rsrc, byte_off, mask=col_mask, offset_is_bytes=True
+            )
         else:
             frag_i32x1 = Vector(frag).bitcast(fx.Int32)
             frag_i32 = frag_i32x1[0]
-            buffer_ops.buffer_store(frag_i32, d_rsrc, byte_off, offset_is_bytes=True)
+            buffer_ops.buffer_store(
+                frag_i32, d_rsrc, byte_off, mask=col_mask, offset_is_bytes=True
+            )
 
     return write_row_to_lds, store_pair
 
