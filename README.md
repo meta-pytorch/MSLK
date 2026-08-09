@@ -64,10 +64,10 @@ Then build for your target variant (**CUDA/ROCm**) using one of the sections bel
 ### **CUDA Build**
 ```bash
 # Creates a conda environment and installs dependencies.
-# The conda env will look something like: build-py3.14-torchnightly-cuda12.9.1
+# The conda env will look something like: build-py3.14-torchnightly-cuda13.0.2
 ./ci/integration/mslk_oss_build.bash
 # After the initial setup, activate the env and iterate faster:
-conda activate build-py3.14-torchnightly-cuda12.9.1
+conda activate build-py3.14-torchnightly-cuda13.0.2
 python setup.py install
 ```
 
