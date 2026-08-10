@@ -123,6 +123,7 @@ def silu_mul_quant(
         valid_token_count,
         T,
         D,  # pyre-ignore
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_T,
         TL_FP8_DTYPE=tl_dtype,  # pyre-ignore
         MAX_FP8=max_fp8,  # pyre-ignore
@@ -193,6 +194,7 @@ def _mslk_silu_mul(
         if token_index >= valid_token_count:
             return
 
+    # pyrefly: ignore [bad-argument-type]
     for _ in tl.range(0, BLOCK_D_OUTER // BLOCK_D_INNER, num_stages=3):
         x0 = tl.load(
             x0_ptr + token_index * stride_0 + feature_offset,
@@ -254,6 +256,7 @@ def _mslk_silu_mul_quant(
     else:
         ub = float("inf")
 
+    # pyrefly: ignore [bad-argument-type]
     for token_index in tl.range(start_idx, end_idx, 1, num_stages=2):
         x0 = tl.load(
             x0_ptr + token_index * stride_0 + offsets,
