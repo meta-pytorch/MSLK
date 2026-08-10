@@ -3413,6 +3413,34 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
         ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
 
+    def test_empty_input(self) -> None:
+        M, N, K = 0, 256, 256
+        x = torch.empty(M, K, dtype=torch.bfloat16, device=self.device)
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = self.flydsl_preshuffle(wq)
+
+        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref)
+
+    def test_multidimensional_input(self) -> None:
+        M, N, K = 32, 256, 256
+        x = torch.randn(3, M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = self.flydsl_preshuffle(wq)
+
+        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

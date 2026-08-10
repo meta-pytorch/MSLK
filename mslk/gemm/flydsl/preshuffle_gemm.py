@@ -14,6 +14,7 @@ Public API:
 """
 
 from dataclasses import dataclass
+from math import prod
 from typing import Optional
 
 import torch
@@ -145,28 +146,37 @@ def flydsl_preshuffle_gemm(
     """Run FlyDSL preshuffle FP8 rowwise GEMM.
 
     Args:
-        XQ: FP8 activation tensor (M, K).
+        XQ: FP8 activation tensor (..., M, K).
         WQ: FP8 weight tensor (N, K), pre-shuffled via ``flydsl_preshuffle``.
-        x_scale: Per-token activation scale (M, 1) or (M,), float32.
+        x_scale: Per-token activation scale (..., M, 1) or (..., M), float32.
         w_scale: Per-channel weight scale (N, 1) or (N,), float32.
-        out: Optional pre-allocated output tensor (M, N).
+        out: Optional pre-allocated output tensor (..., M, N).
         tile_m/tile_n/tile_k: Tile dimensions. If None, auto-selected.
         dtype: Output dtype (bfloat16 or float16).
 
     Returns:
-        Output tensor (M, N) in ``dtype``.
+        Output tensor (..., M, N) in ``dtype``.
     """
     require_flydsl()
+
+    m = prod(XQ.shape[:-1])
+    k = XQ.shape[-1]
+    n = WQ.shape[0]
+    output_shape = (*XQ.shape[:-1], n)
+
+    if out is None:
+        out = torch.empty(output_shape, dtype=dtype, device=XQ.device)
+    elif out.shape != output_shape:
+        raise ValueError(f"Expected output shape {output_shape}, got {out.shape}")
+
+    if m == 0 or n == 0:
+        return out
+    if k == 0:
+        return out.zero_()
 
     compile_fn = _get_compile_fn()
     if compile_fn is None:
         raise RuntimeError("FlyDSL preshuffle kernel compiler not available")
-
-    m, k = XQ.shape[0], XQ.shape[-1]
-    n = WQ.shape[0]
-
-    if out is None:
-        out = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     if tile_m is None or tile_n is None or tile_k is None:
         cfg = select_default_config(m, n, k)
