@@ -53,28 +53,36 @@ _TL_CAT_HAS_DIM = "dim" in inspect.signature(tl.cat).parameters
 _MAX_SPLIT_K = 8  # largest SPLIT_K value in the config sweep
 
 
+def _num_warps_for_tile(bm: int, bn: int) -> List[int]:
+    tile = bm * bn
+    if tile <= 2048:
+        return [4]
+    elif tile >= 16384:
+        return [8]
+    else:
+        return [4, 8]
+
+
 def _get_configs() -> List[Config]:
     configs = []
     for bm in [32, 64, 128, 256]:
         for bn in [32, 64, 128, 256]:
             for bk in [32, 64, 128]:
-                for nw in [4, 8]:
-                    for ns in [1, 2]:
-                        for gsm in [4, 8]:
-                            for sk in [1, 2, 4, 8]:
-                                configs.append(
-                                    Config(
-                                        {
-                                            "BLOCK_M": bm,
-                                            "BLOCK_N": bn,
-                                            "BLOCK_K": bk,
-                                            "GROUP_SIZE_M": gsm,
-                                            "SPLIT_K": sk,
-                                        },
-                                        num_warps=nw,
-                                        num_stages=ns,
-                                    )
-                                )
+                for sk in [1, 2, 4, 8]:
+                    for nw in _num_warps_for_tile(bm, bn):
+                        configs.append(
+                            Config(
+                                {
+                                    "BLOCK_M": bm,
+                                    "BLOCK_N": bn,
+                                    "BLOCK_K": bk,
+                                    "GROUP_SIZE_M": 8,
+                                    "SPLIT_K": sk,
+                                },
+                                num_warps=nw,
+                                num_stages=2,
+                            )
+                        )
     return configs
 
 
@@ -89,28 +97,13 @@ def _prune_configs(configs, named_args, **kwargs):
         bn = c.kwargs["BLOCK_N"]
         bk = c.kwargs["BLOCK_K"]
         sk = c.kwargs.get("SPLIT_K", 1)
-        nw = c.num_warps
-        ns = c.num_stages
-        # 2*BLOCK_K must divide group_size (dequant alignment)
         if group_size % (2 * bk) != 0:
             continue
-        # K2 must be cleanly divisible by BLOCK_K * SPLIT_K
         if K2 % (bk * sk) != 0:
             continue
-        # SPLIT_K > 1 only helps small M (otherwise adds atomic overhead for no gain)
         if sk > 1 and M >= 512:
             continue
-        # Skip tiles much larger than the problem dimension
         if bm > max(M, 32) or bn > max(N, 32):
-            continue
-        # Small tiles don't need 8 warps; large tiles don't benefit from 4
-        tile_elems = bm * bn
-        if tile_elems <= 2048 and nw == 8:
-            continue
-        if tile_elems >= 16384 and nw == 4:
-            continue
-        # Large tiles with many stages cause register spills
-        if tile_elems >= 16384 and ns >= 3:
             continue
         pruned.append(c)
     return pruned
