@@ -187,10 +187,8 @@ def construct_fp8_attention_inputs(
     k = torch.randn(1, B * Mkv, Hkv, 1, K, dtype=dtype, device=device)
     v = torch.randn(1, B * Mkv, Hkv, 1, K, dtype=dtype, device=device)
 
-    # Use the same fp8 format the decode kernels dequantize with, per the canonical
-    # picker.  Hardcoding fnuz for all HIP mis-quantizes gfx950 (which uses OCP e4m3fn):
-    # the kernel would then read the packed bytes as a different format -> NaN.  This
-    # mirrors the arch-aware format selection in the Triton kernel.
+    # Match the fp8 format the decode kernels dequantize with (gfx950 uses e4m3fn,
+    # not fnuz); a mismatch reads the packed bytes as the wrong format -> NaN.
     pt_fp8_dtype = get_fp8_constants()[0]
 
     qfn = quantize_fp8_symmetric if use_symmetric else quantize_fp8_asymmetric
@@ -430,10 +428,8 @@ def add_q_fp8_to_inputs(
         InputsFp8 object with quantized query tensor
     """
     inp.quantize_qk_to_fp8 = True
-    # Use the same fp8 format the decode kernels dequantize with, per the canonical
-    # picker.  Hardcoding fnuz for all HIP mis-quantizes gfx950 (which uses OCP e4m3fn):
-    # the kernel would then read the packed bytes as a different format -> NaN.  This
-    # mirrors the arch-aware format selection in the Triton kernel.
+    # Match the fp8 format the decode kernels dequantize with (gfx950 uses e4m3fn,
+    # not fnuz); a mismatch reads the packed bytes as the wrong format -> NaN.
     pt_fp8_dtype = get_fp8_constants()[0]
     # Get original query tensor
     q = inp.query

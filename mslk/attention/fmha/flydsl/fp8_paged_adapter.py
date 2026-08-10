@@ -8,12 +8,8 @@
 
 """On-the-fly adapter: dense f16/bf16 KV -> native-fp8 paged decode.
 
-Bridges the dense padded KV cache (`[B, padding, G, Hkv, D]`) the CK decoder ops
-pass to the fp8 kernel's native-fp8 paged cache by quantizing + paging per call.
-Quant/repack cost is paid every call (no persistent fp8 cache); benchmarks should
-account for it separately.
-
-Only decode (`q_seqlen == 1`), head_dim % 16 == 0, gfx950.
+Quantizes + pages the dense padded KV cache into the fp8 kernel's layout per call
+(no persistent fp8 cache). Only decode (q_seqlen == 1), head_dim % 16 == 0, gfx950.
 """
 
 from __future__ import annotations
@@ -57,33 +53,30 @@ def dense_kv_to_fp8_paged(
     assert padding % block_size == 0, (
         f"padding {padding} must be a multiple of block_size {block_size}"
     )
-    # GQA: fold (B, G) into the batch/sequence axis (one "sequence" per KV head,
-    # B*G folded sequences); the query path folds the same way so group g's query
-    # heads pair with KV group g.
+    # GQA: fold (B, G) into the batch/seq axis (one sequence per KV head); query folds
+    # the same way so group g's query heads pair with KV group g.
     from .pa_decode_fp8 import KV_COMPUTE_BLOCK
 
     BG = B * G
     dev = key.device
 
-    # GOTCHA: the kernel reads KV_COMPUTE_BLOCK // block_size block-table entries per
-    # partition; a context shorter than one partition would read block_tables/cache out
-    # of bounds -> GPU fault. Pad each seq's block count up to one full partition (extra
-    # tokens masked by context_lengths, never used) to keep every read in bounds.
+    # GOTCHA: kernel reads KV_COMPUTE_BLOCK // block_size block-table entries per
+    # partition; a shorter context would read out of bounds -> GPU fault. Pad each
+    # seq's block count up to one full partition (extras masked by context_lengths).
     min_blocks_per_seq = KV_COMPUTE_BLOCK // block_size
     blocks_per_seq = max(padding // block_size, min_blocks_per_seq)
     padded = blocks_per_seq * block_size
     num_blocks = BG * blocks_per_seq
 
-    # [B, padding, G, Hkv, D] -> [B*G, padding, Hkv, D] (group folded into batch/seq).
+    # [B, padding, G, Hkv, D] -> [B*G, padding, Hkv, D].
     kbg = key.permute(0, 2, 1, 3, 4).reshape(BG, padding, Hkv, D)
     vbg = value.permute(0, 2, 1, 3, 4).reshape(BG, padding, Hkv, D)
     if padded != padding:
-        # GOTCHA: pad with ONES not zeros. An all-zero token quantizes to a ~0 scale and
-        # the kernel can hit inf/NaN dequantizing it BEFORE context_lengths masks it out.
+        # GOTCHA: pad with ONES not zeros. Zeros quantize to a ~0 scale and can
+        # dequant to inf/NaN before context_lengths masks them out.
         pad_k = kbg.new_ones(BG, padded - padding, Hkv, D)
         kbg = torch.cat([kbg, pad_k], dim=1)
         vbg = torch.cat([vbg, pad_k], dim=1)
-    # (B*G, padded) -> (num_blocks, block_size).
     k = kbg.reshape(num_blocks, block_size, Hkv, D).permute(0, 2, 1, 3).contiguous()
     v = vbg.reshape(num_blocks, block_size, Hkv, D).permute(0, 2, 1, 3).contiguous()
 
@@ -129,9 +122,7 @@ def fp8_paged_decode_from_dense(
     block_size: int = 16,
 ) -> torch.Tensor:
     """Run fp8 paged decode against a dense f16/bf16 KV cache (quantized per call).
-
-    Returns output shaped like the dense query heads: ``[B, q_seqlen, G, Hq, D]``.
-    """
+    Returns output shaped [B, q_seqlen, G, Hq, D]."""
     from .pa_decode_fp8 import pa_decode_ps_launch
 
     B, q_seqlen, G, Hq, D = query.shape
@@ -144,12 +135,10 @@ def fp8_paged_decode_from_dense(
         dense_kv_to_fp8_paged(key, value, block_size=block_size)
     )
 
-    # GQA: fold (B, G) into the sequence axis (matching dense_kv_to_fp8_paged's B*G
-    # paging); context_lengths must be replicated across the G groups per batch element.
+    # GQA: replicate context_lengths across G groups (matches B*G paging).
     if seq_positions is None:
         context_lengths = torch.full((BG,), padding, dtype=torch.int32, device=dev)
     else:
-        # seq_positions [B] -> [B, G] -> [B*G]
         context_lengths = (
             seq_positions.to(torch.int32)
             .view(B, 1)
@@ -158,8 +147,7 @@ def fp8_paged_decode_from_dense(
             .contiguous()
         )
 
-    # Kernel query layout [num_seqs=B*G, Hq, D]: fold group into the sequence axis to
-    # pair with KV group g.
+    # Kernel query layout [num_seqs=B*G, Hq, D].
     q_flat = query.reshape(BG, Hq, D).contiguous()
     out = torch.zeros(BG, Hq, D, dtype=query.dtype, device=dev)
 

@@ -58,8 +58,7 @@ MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
-# Backward-compat aliases: these decode ops now run FlyDSL, not CK (the CK operator
-# path was removed).  Kept so existing callers of the old names keep working.
+# Backward-compat aliases: the old CK decode op names now map to FlyDSL.
 MemoryEfficientAttentionCkDecoderOp = MemoryEfficientAttentionFlyDSLDecoderOp
 MemoryEfficientAttentionSplitKCkOp = MemoryEfficientAttentionSplitKFlyDSLOp
 MemoryEfficientAttentionCuteFlashAttentionOp = (

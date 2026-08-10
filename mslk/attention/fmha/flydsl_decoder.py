@@ -32,32 +32,20 @@ def _flydsl_decode_forward(
     seq = normalize_seq_positions(seq_positions, B, KV_MAX, q5.device)
 
     if use_fp8_kv:
-        # Per-call opt-in (inp.quantize_kv_to_fp8): quantize dense f16/bf16 KV to
-        # native fp8 and run the paged fp8 decode.  Lossy + per-call quant cost;
-        # gfx950 only (MQA + GQA; the adapter pads short contexts).
+        # Opt-in fp8-KV: quantize dense KV to fp8 per call (lossy, gfx950 only).
         from .flydsl.pa_decode_fp8_dispatch import is_fp8_paged_decode_available
 
         if is_fp8_paged_decode_available():
             from .flydsl.fp8_paged_adapter import fp8_paged_decode_from_dense
 
             return fp8_paged_decode_from_dense(q5, k5, v5, seq, scale)
-    # split_k=0 -> the kernel's auto split-K heuristic (auto_split_k_hp), which fills
-    # the GPU with enough KV partitions to hide memory latency.  The previous split_k=1
-    # forced a single partition (no parallelism), leaving the single-step decoder ~1.3x
-    # slower than CK; auto split-K brings it in line with the split-K decode op.  The
-    # kernel combines the partitions internally and returns a single output tensor.
+    # split_k=0 -> kernel's auto split-K heuristic (fills the GPU to hide memory latency).
     return pa_decode_launch(q5, k5, v5, seq, scale, split_k=0)
 
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """FlyDSL dense decode op (gfx942/gfx950).
-
-    FlyDSL is the sole backend: the CK operator path has been removed.  Requires
-    FlyDSL (raises via require_flydsl on an unsupported arch).  Supports f16 / bf16
-    / f32 KV in a dense padded layout with GQA/MQA.  Keeps the xformers op name and
-    API so existing callers are unchanged.
-    """
+    """FlyDSL dense decode op (gfx942/gfx950). f16/bf16/f32 KV, dense padded layout, GQA/MQA."""
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
@@ -170,10 +158,6 @@ class FwOp(AttentionFwOpBase):
                 torch.tensor(key.shape[-1], dtype=torch.float32)
             ).item()
 
-        # FlyDSL is the sole decode backend (the CK operator path was removed): it
-        # covers f16/bf16 KV across gfx942 + gfx950 and outperforms the old CK
-        # kernel (which used no matrix cores) on every measured shape.  The op name
-        # and API are unchanged, so callers are unaffected.
         require_flydsl()
         out = _flydsl_decode_forward(
             query=query,

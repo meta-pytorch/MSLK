@@ -7,28 +7,20 @@
 """Paged-attention decode benchmark: FlyDSL vs Triton.
 
 Backends (``--backends``): flydsl, triton (dense f16/bf16); flydsl_fp8 (native
-e4m3fn per-token symmetric), triton_fp8 (int32-packed asymmetric scale/shift). The
-two fp8 schemes aren't bit-compatible but decode the same KV (quantized once, outside
-the timed region), so latencies are comparable.
+e4m3fn per-token symmetric), triton_fp8 (int32-packed asymmetric). KV is quantized
+once outside the timed region, so the two fp8 schemes' latencies are comparable.
 
-Two timing modes:
-  * eager (``--no-cuda-graph``, default): shared ``mslk.bench.common.utils.do_bench``.
-  * graph (``--cuda-graph``): HIP graph capture + replay (removes launch overhead).
-
-gfx950 gotchas (see the runners / _bench_ms_graph for detail):
-  * fp8 runners cache the ``flyc.compile`` CompiledFunction so timing is kernel-only
-    and scales with KV (calling the public dispatcher directly pays ~0.38ms/call of
-    JIT dispatch that hides the ~0.02ms kernel — flat, meaningless numbers).
-  * flydsl_fp8 IS graph-capturable (its kernels thread the capture stream); dense
-    flydsl is NOT (launches on default stream → empty graph, caught by EmptyGraphError
-    → reported skip); triton/triton_fp8 skipped in graph mode (HSA_INVALID_PACKET).
-  * triton/*fp8/flydsl_fp8 are timed in a subprocess per shape (allocator scratch
-    faults / cross-kernel symbol clashes would otherwise crash the sweep).
+Timing modes: graph (``--cuda-graph``, default, HIP capture + replay) and eager
+(``--no-cuda-graph``, via do_bench). All backends capture + replay cleanly.
+_bench_ms_graph carries a safety backstop that rejects an empty capture (a kernel
+launched off the capture stream replays as a bogus sub-µs time); see the runners
+for fp8 CompiledFunction caching. Only flydsl_fp8 runs in a per-shape subprocess
+(its compiled artifact shares GPU-module symbols with the dense FlyDSL path).
 
 Usage:
     python bench/attn/decoder_bench.py
     python bench/attn/decoder_bench.py --shapes decode_llm --dtype bf16
-    python bench/attn/decoder_bench.py --backends flydsl_fp8,triton_fp8 --cuda-graph
+    python bench/attn/decoder_bench.py --backends flydsl,triton --no-cuda-graph
 """
 
 from __future__ import annotations
@@ -48,52 +40,22 @@ from mslk.bench.common.utils import BenchOptions, do_bench
 
 
 def _bench_ms_eager(fn: Callable, rep_ms: int = 200) -> float:
-    """Eager GPU time via the shared do_bench (consistent with gemm/conv/quantize benches).
-
-    do_bench's cuda_graph/rotating_buffer are NOT used: cuda_graph unrolls thousands of
-    fn() into one capture (segfaults the fp8 kernel, no empty-graph guard) so graph
-    timing stays local; rotating_buffer needs tensors passed as args but our runners
-    close over them (zero-arg thunk).
-    """
+    """Eager GPU time via the shared do_bench (cuda_graph/rotating_buffer disabled:
+    graph timing stays local, and our runners are zero-arg thunks)."""
     return do_bench(fn, (), BenchOptions(cuda_graph=False, rep_ms=rep_ms))
 
 
-def _bench_ms_eager_events(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
-    """Fixed-rep raw-event eager timing — internal probe only, used as the
-    non-empty-graph baseline in _bench_ms_graph (do_bench self-tunes its rep count)."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
-    start_ev.record()
-    for _ in range(rep):
-        fn()
-    end_ev.record()
-    end_ev.synchronize()
-    return start_ev.elapsed_time(end_ev) / rep  # ms
-
-
 class EmptyGraphError(RuntimeError):
-    """CUDA-graph capture recorded no work — fn launched off the capture stream (e.g.
-    FlyDSL's default-stream launch). Replay is a no-op, so surface it instead of a
-    bogus sub-microsecond time."""
+    """CUDA-graph capture recorded no work — fn launched off the capture stream.
+    Replay is a no-op, so surface it instead of a bogus sub-microsecond time."""
 
 
 def _bench_ms_graph(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
     """GPU kernel time via CUDA-graph capture + replay (removes per-launch dispatch).
 
     Requires fn to launch onto the current (capture) stream and reuse the same buffers.
-    Default-stream launches capture empty -> raised as EmptyGraphError. Kept local (not
-    do_bench_cudagraph, which segfaults the fp8 kernel and lacks an empty-graph guard).
+    Default-stream launches capture empty -> raised as EmptyGraphError.
     """
-    # Eager baseline (small, cheap) — used only to sanity-check that the graph is
-    # non-empty.  A real graph replays in ~the eager kernel time; an empty graph
-    # replays in a fraction of it.  Uses a plain event loop (not do_bench) so this
-    # stays a lightweight internal probe.
-    eager_ref = _bench_ms_eager_events(fn, warmup=warmup, rep=min(rep, 50))
-
     # Warm up on a side stream first so lazy allocations / autotune happen before
     # capture (capture forbids new allocations and synchronizations).
     side = torch.cuda.Stream()
@@ -124,24 +86,23 @@ def _bench_ms_graph(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
 
     ms = start_ev.elapsed_time(end_ev) / rep
 
-    # Empty-graph guard: a genuine capture replays in at least a good fraction of
-    # the eager kernel time.  ≤15% means nothing was recorded (off-capture-stream
-    # launch) — the sub-µs "time" is noise, not a real speedup.
-    if ms < 0.15 * eager_ref:
+    # Empty-graph guard: a graph that recorded nothing (off-capture-stream launch)
+    # replays as a sub-µs no-op. Use an absolute floor, NOT a fraction of eager —
+    # eager here is dominated by per-call CPU dispatch (e.g. Triton's autotune-config
+    # lookup, ~100us) that replay removes, so a real kernel legitimately replays at a
+    # small fraction of eager. Real decode kernels replay in >=~10us; empty is ~0.1us.
+    _EMPTY_GRAPH_FLOOR_MS = 2e-3  # 2us
+    if ms < _EMPTY_GRAPH_FLOOR_MS:
         raise EmptyGraphError(
-            f"graph replay {ms * 1e3:.1f}us << eager {eager_ref * 1e3:.1f}us — "
-            "kernel launched off the capture stream (nothing captured)"
+            f"graph replay {ms * 1e3:.1f}us < {_EMPTY_GRAPH_FLOOR_MS * 1e3:.0f}us "
+            "floor — kernel launched off the capture stream (nothing captured)"
         )
     return ms
 
 
 def _bench_ms(fn: Callable, rep_ms: int = 200, use_cuda_graph: bool = False) -> float:
     """Dispatch to graph (local capture) or eager (shared do_bench) timing.
-
-    ``rep_ms`` is the target duration passed through to both timers.  The graph
-    path converts it to a fixed replay count (~10 reps/ms, capped) since it times a
-    single captured launch; the eager path hands ``rep_ms`` straight to do_bench.
-    """
+    The graph path converts rep_ms to a fixed replay count (~10 reps/ms, capped)."""
     if use_cuda_graph:
         rep = min(500, max(10, rep_ms * 10))
         return _bench_ms_graph(fn, warmup=25, rep=rep)
@@ -284,14 +245,7 @@ def _run_triton(
     q, k, v, seq, scale, disable_autotune: bool = False
 ) -> Optional[Callable]:
     """Build a callable that runs the Triton split-K kernel for one shape.
-
-    On ROCm/gfx950, Triton's intermediate buffers (o_splitk, lse_splitk) can be
-    freed by PyTorch's caching allocator before the GPU kernel finishes when
-    shapes change within one process, causing a GPU memory fault.  The main loop
-    therefore times Triton in a subprocess per shape (see ``_bench_triton_subproc``);
-    this in-process runner is only safe for a single shape.
-    ``disable_autotune=True`` uses FwOp_S1 (split_k=1) to skip autotuning.
-    """
+    disable_autotune=True uses FwOp_S1 (split_k=1) to skip autotuning."""
     try:
         from mslk.attention.fmha.attn_bias import (
             BlockDiagonalCausalWithOffsetPaddedKeysMask,
@@ -312,9 +266,18 @@ def _run_triton(
             kv_seqlen=[int(s) for s in kv_seqlen_list],
             kv_padding=KV,
         )
-        k_flat = k.reshape(1, B * KV, 1, Hkv, D).contiguous()
-        v_flat = v.reshape(1, B * KV, 1, Hkv, D).contiguous()
-        q_flat = q.reshape(1, B, 1, Hq, D).contiguous()
+        # Canonical BMGHK: kv-head groups on G, query heads per group on H, with K/V
+        # EXPANDED to Hq//Hkv per group. triton_splitk.FwOp doesn't broadcast KV heads
+        # itself (the dispatcher rejects unexpanded KV), so a stride-0 KV head would
+        # feed the kernel mis-strided memory -> NaN/garbage.
+        Hpg = Hq // Hkv
+        q_flat = q.reshape(1, B, Hkv, Hpg, D).contiguous()
+        k_flat = (
+            k.reshape(1, B * KV, Hkv, 1, D).expand(1, B * KV, Hkv, Hpg, D).contiguous()
+        )
+        v_flat = (
+            v.reshape(1, B * KV, Hkv, 1, D).expand(1, B * KV, Hkv, Hpg, D).contiguous()
+        )
         attn_bias.k_seqinfo.to(k.device)
         attn_bias.q_seqinfo.to(q.device)
 
@@ -347,11 +310,7 @@ def _make_attn_bias(B: int, KV: int, seq):
 
 def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
     """FlyDSL native-fp8 paged decode over a pre-quantized fp8 KV cache (gfx950).
-
-    KV is quantized + paged ONCE outside the timed region (like _run_triton_fp8, and
-    like a real fp8-resident cache) so the timed callable is kernel-only. The per-call
-    quantize path (Inputs.quantize_kv_to_fp8) would fold quant cost into every call.
-    """
+    KV is quantized + paged ONCE outside the timed region so timing is kernel-only."""
     try:
         import flydsl.compiler as flyc
         from mslk.attention.fmha.flydsl.fp8_paged_adapter import dense_kv_to_fp8_paged
@@ -409,11 +368,8 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         )
         out_5d = out.reshape(BG, 1, num_kv_heads, query_group_size, D)
 
-        # Build the compute + reduce kernels once (lru_cached), then cache their
-        # FlyDSL CompiledFunction so the timed region skips the per-call JIT dispatch
-        # path (arg-binding + Protocol isinstance cache-key rebuild) that otherwise
-        # dominates — ~0.38ms/call of pure Python, hiding the real ~0.02ms GPU time.
-        # This mirrors what mslk.flydsl.jit.run_compiled does for the dense path.
+        # Cache the compiled CompiledFunctions so the timed region skips per-call JIT
+        # dispatch, whose Python overhead would otherwise dominate the GPU kernel time.
         compute = compile_pa_decode_ps(
             block_size=block_size,
             max_context_partition_num=mcpn,
@@ -431,10 +387,8 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
             max_parts=mcpn,
             output_dtype_str=_get_output_dtype_str(out),
         )
-        # Everything except the trailing stream slot is fixed per shape.  The stream
-        # is appended at CALL time (not baked in here): CUDA-graph capture runs on a
-        # side stream, and both kernels must launch onto THAT stream to be recorded —
-        # a build-time snapshot of the default stream would make capture see nothing.
+        # Args are fixed per shape except the stream, appended at CALL time so graph
+        # capture (side stream) records the launches onto the capture stream.
         compute_head = (
             exp_sums,
             max_logits,
@@ -484,16 +438,13 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
             BG,
             num_kv_heads,
         )
-        # Compile once against a representative stream (the default stream is fine;
-        # the CompiledFunction is keyed on arg TYPES, not the stream pointer value).
+        # CompiledFunction is keyed on arg TYPES, not the stream pointer, so any stream works.
         s0 = torch.cuda.current_stream()
         cf_compute = flyc.compile(compute["launch"], *compute_head, s0)
         cf_reduce = flyc.compile(reduce["launch"], *reduce_head, s0)
 
         def _call():
-            s = (
-                torch.cuda.current_stream()
-            )  # live stream — the capture stream during graph capture
+            s = torch.cuda.current_stream()  # capture stream during graph capture
             cf_compute(*compute_head, s)
             cf_reduce(*reduce_head, s)
 
@@ -506,13 +457,7 @@ def _run_flydsl_fp8(q, k, v, seq, scale) -> Optional[Callable]:
 
 def _quant_pack_triton_fp8(x: torch.Tensor):
     """Quantize dense KV to Triton's int32-packed asymmetric fp8 format.
-
-    Returns ``(packed_int32, scale_shift_int32)`` where the last-dim fp8 bytes are
-    reinterpreted as int32 and the per-token (scale, shift) pair is packed as two
-    f16 values into one int32 — the layout ``triton_splitk.InputsFp8`` expects.
-    Mirrors the reference harness; uses the arch-correct fp8 dtype from
-    ``get_fp8_constants`` (e4m3fn on gfx950).
-    """
+    Returns (packed_int32, scale_shift_int32) as triton_splitk.InputsFp8 expects."""
     from mslk.utils.triton.fp8_utils import get_fp8_constants
 
     fp8_dtype = get_fp8_constants()[0]
@@ -540,8 +485,7 @@ def _run_triton_fp8(q, k, v, seq, scale) -> Optional[Callable]:
     """Triton split-K decode over int32-packed asymmetric fp8 KV (``InputsFp8``).
 
     KV is pre-quantized once (outside the timed region) into Triton's packed
-    format; the timed callable only runs the kernel.  Like the dense Triton path
-    this is timed in a subprocess per shape (allocator scratch-freeing fault).
+    format; the timed callable only runs the kernel.
     """
     try:
         from mslk.attention.fmha.common import InputsFp8
@@ -552,9 +496,16 @@ def _run_triton_fp8(q, k, v, seq, scale) -> Optional[Callable]:
         B, _, G, Hq, D = q.shape
         _, KV, _, Hkv, _ = k.shape
         attn_bias = _make_attn_bias(B, KV, seq)
-        q_flat = q.reshape(1, B, 1, Hq, D).contiguous()
-        k_flat = k.reshape(1, B * KV, 1, Hkv, D).contiguous()
-        v_flat = v.reshape(1, B * KV, 1, Hkv, D).contiguous()
+        # Canonical BMGHK with K/V EXPANDED to Hq//Hkv per group; triton_splitk needs
+        # explicit KV-head expansion (see _run_triton). Quant packs the expanded heads.
+        Hpg = Hq // Hkv
+        q_flat = q.reshape(1, B, Hkv, Hpg, D).contiguous()
+        k_flat = (
+            k.reshape(1, B * KV, Hkv, 1, D).expand(1, B * KV, Hkv, Hpg, D).contiguous()
+        )
+        v_flat = (
+            v.reshape(1, B * KV, Hkv, 1, D).expand(1, B * KV, Hkv, Hpg, D).contiguous()
+        )
         ki, ks = _quant_pack_triton_fp8(k_flat)
         vi, vs = _quant_pack_triton_fp8(v_flat)
         inp = InputsFp8(
@@ -580,9 +531,9 @@ def _run_triton_fp8(q, k, v, seq, scale) -> Optional[Callable]:
 # Subprocess isolation (Triton eager multi-shape)
 # --------------------------------------------------------------------------- #
 
-# In-process runners keyed by backend name.  Only backends listed here can be
-# timed via the subprocess worker (Triton needs it; FlyDSL does not but is
-# included so the worker is backend-agnostic).
+# Runners keyed by backend name, used by both the in-process path and the
+# subprocess worker (only flydsl_fp8 needs the subprocess; the rest are listed so
+# the worker is backend-agnostic).
 _RUNNERS: Dict[str, Callable] = {
     "flydsl": _run_flydsl,
     "triton": _run_triton,
@@ -603,14 +554,10 @@ def _bench_subproc(
     disable_autotune: bool,
     use_graph: bool = False,
 ) -> Tuple[float, str]:
-    """Time one backend+shape in a fresh subprocess; return ``(ms, status)``.
+    """Time one backend+shape in a fresh subprocess; return (ms, status).
 
-    A crashing child (GPU fault, non-zero exit) is reported as ``("err")`` /
-    ``("skip")`` without taking down the parent sweep — that isolation is the
-    whole point (Triton's allocator frees scratch across shapes → GPU fault; the
-    FlyDSL fp8 artifact collides with the dense path's GPU-module symbols).  With
-    ``use_graph`` the child times via CUDA-graph capture (and reports ``skip`` if
-    the graph comes back empty).
+    A crashing child is reported as err/skip without taking down the parent sweep
+    (isolation is the point — see the backend notes in main()).
     """
     import json
     import subprocess
@@ -647,11 +594,7 @@ def _bench_subproc(
 
 
 def _worker_main(payload: str) -> None:
-    """Subprocess entry: time ONE backend on ONE shape, print ``RESULT <json>``.
-
-    Runs in its own process so a Triton GPU fault (freed o_splitk/lse_splitk
-    scratch across shapes) cannot corrupt the parent's CUDA context.
-    """
+    """Subprocess entry: time ONE backend on ONE shape, print ``RESULT <json>``."""
     import json
 
     spec = json.loads(payload)
@@ -777,11 +720,11 @@ def _result_row(
 )
 @click.option(
     "--cuda-graph/--no-cuda-graph",
-    default=False,
+    default=True,
     show_default=True,
-    help="Time via real CUDA-graph replay (removes launch overhead). "
-    "Triton is skipped in this mode (un-graphable on gfx950); use "
-    "--both-graph-modes to get graphed FlyDSL + eager Triton together.",
+    help="Time via real CUDA-graph replay (removes launch overhead; default). "
+    "All backends are captured; use --no-cuda-graph for eager timing, or "
+    "--both-graph-modes to write both to CSV.",
 )
 @click.option(
     "--both-graph-modes",
@@ -865,20 +808,13 @@ def invoke_main(
         "triton_fp8": _run_triton_fp8,
     }
 
-    # Backends that cannot be timed under CUDA-graph capture: the Triton paths raise
-    # HSA_STATUS_ERROR_INVALID_PACKET_FORMAT during HIP graph capture on gfx950, so
-    # they are skipped in graph mode.  (flydsl_fp8 IS graph-capturable — the fp8
-    # kernels thread the capture stream through both compute + reduce launches.)
-    _NO_GRAPH_BACKENDS = {"triton", "triton_fp8"}
-    # Backends timed in a subprocess per shape (BOTH modes).  Independent reasons:
-    #   * triton / triton_fp8 — o_splitk/lse_splitk scratch is freed by the caching
-    #     allocator across shape changes within one process, faulting the GPU; some
-    #     fp8 GQA shapes also fault the kernel outright.  (Eager only — graph-skipped.)
-    #   * flydsl_fp8 — its compiled artifact shares GPU-module global symbols with
-    #     the dense FlyDSL path; running both in one process collides and faults.
-    #     Each is clean alone, so a fresh process per shape sidesteps the clash — in
-    #     graph mode too (the child captures + replays, reporting real kernel time).
-    _SUBPROC_BACKENDS = {"triton", "triton_fp8", "flydsl_fp8"}
+    # No backend needs graph-skipping: Triton and FlyDSL both capture + replay
+    # cleanly. Kept as a hook for any future un-capturable backend.
+    _NO_GRAPH_BACKENDS: set = set()
+    # flydsl_fp8 is timed in a subprocess per shape: its compiled artifact shares
+    # GPU-module global symbols with the dense FlyDSL path, so running both in one
+    # process collides and faults. Triton runs in-process — no isolation needed.
+    _SUBPROC_BACKENDS = {"flydsl_fp8"}
 
     all_csv_rows: List[dict] = []
 
@@ -894,9 +830,7 @@ def invoke_main(
         print(f"  Timing: {timing_note}.")
         if use_graph and any(b in _NO_GRAPH_BACKENDS for b in run_backends):
             skipped = [b for b in run_backends if b in _NO_GRAPH_BACKENDS]
-            print(
-                f"  Note: {', '.join(skipped)} skipped in graph mode (un-graphable on gfx950)."
-            )
+            print(f"  Note: {', '.join(skipped)} skipped in graph mode.")
         print(f"{'=' * 80}")
         print(_header(run_backends))
         print("-" * len(_header(run_backends)))
@@ -912,17 +846,14 @@ def invoke_main(
                     row_results[backend] = None
                     continue
 
-                # Graph mode: skip un-graphable backends entirely.
+                # Graph mode: skip any backend flagged un-capturable (currently none).
                 if use_graph and backend in _NO_GRAPH_BACKENDS:
                     row_results[backend] = Result(
                         B, Hq, Hkv, kv_seqlen, D, dtype, backend, 0.0, 0.0, "skip"
                     )
                     continue
 
-                # Subprocess-isolated backends: route out of process so a GPU fault on
-                # one shape can't kill the sweep.  The child honors use_graph, so
-                # flydsl_fp8 is captured+replayed there (Triton only reaches this path
-                # in eager mode — it is graph-skipped above).
+                # Subprocess-isolated backends: route out of process (child honors use_graph).
                 if backend in _SUBPROC_BACKENDS:
                     ms, status = _bench_subproc(
                         backend,
@@ -961,8 +892,7 @@ def invoke_main(
                         B, Hq, Hkv, kv_seqlen, D, dtype, backend, ms, bw, "ok"
                     )
                 except EmptyGraphError:
-                    # Backend launches off the capture stream — can't be graphed on
-                    # this stack.  Report as skip (not a bogus fast number).
+                    # Launches off the capture stream — report as skip, not a bogus fast number.
                     row_results[backend] = Result(
                         B, Hq, Hkv, kv_seqlen, D, dtype, backend, 0.0, 0.0, "skip"
                     )

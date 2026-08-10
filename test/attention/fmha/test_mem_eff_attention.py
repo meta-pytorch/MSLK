@@ -1129,13 +1129,10 @@ def test_flydsl_fp8_decoder(
     bsz: int,
     d: int,
 ) -> None:
-    """Correctness of the FlyDSL native-fp8 paged decode.
+    """Correctness of the FlyDSL native-fp8 paged decode (Inputs.quantize_kv_to_fp8).
 
-    Exercises the ``Inputs.quantize_kv_to_fp8`` per-call opt-in: the dense f16/bf16
-    KV is quantized to native fp8 (e4m3fn) on the fly and run through the paged fp8
-    kernel.  Covers MQA (kv_heads=1) and GQA (kv_heads>1, canonical BMGHK where the KV
-    groups live in the G axis).  Compared to the full-precision reference within fp8
-    quantization tolerance.  Short contexts (< 256) fall back to the dense path.
+    Covers MQA (kv_heads=1) and GQA (kv_heads>1); short contexts (<256) fall back to
+    the dense path. Compared to the full-precision reference within fp8 tolerance.
     """
     from mslk.attention.fmha.flydsl.pa_decode_fp8_dispatch import (
         is_fp8_paged_decode_available,
@@ -1152,9 +1149,8 @@ def test_flydsl_fp8_decoder(
     torch.manual_seed(1)
     dev = "cuda"
 
-    # Canonical BMGHK: G = kv_heads groups, H = n_heads query heads per group.  K/V
-    # are folded to one head per group ([..., kv_heads, 1, D]) then broadcast to H
-    # (stride-0), matching how GQA/MQA decode inputs are built elsewhere.
+    # Canonical BMGHK: G = kv_heads groups, H = n_heads query heads per group. K/V are
+    # folded to one head per group then broadcast to H (stride-0).
     k_folded = (1, bsz * padding, kv_heads, 1, d)
     k_shape = (1, bsz * padding, kv_heads, n_heads, d)
     q_shape = (1, bsz, kv_heads, n_heads, d)
@@ -1175,9 +1171,7 @@ def test_flydsl_fp8_decoder(
     out, _ = op.apply(inp, needs_gradient=False)
     ref_output = ref_attention_for_test(q, k, v, attn_bias)
 
-    # op.apply returns [B, 1, G, Hq, D] (batch in dim 0); the reference follows the
-    # xformers convention [1, B, G, Hq, D] (batch folded into dim 1).  Reshape to
-    # match before comparing.
+    # op.apply returns [B, 1, G, Hq, D]; the reference uses [1, B, G, Hq, D].
     out = out.reshape(ref_output.shape)
 
     # fp8 (e4m3fn) has ~2 mantissa bits -> loose tolerance vs the full-precision ref.
@@ -2082,11 +2076,8 @@ def test_triton_splitk_rowwise_fp8(
         inp_ref, op=fmha.triton_splitk.FwOp
     )
 
-    # fp8 (e4m3) has ~2 mantissa bits, so a handful of elements land on a different
-    # quantization-grid point than the reference and miss a very tight tolerance.
-    # Bounds are set to absorb that single-element rounding noise (they were
-    # originally tuned for the fnuz grid; gfx950's OCP e4m3fn snaps a few values
-    # differently, as does the Hkv==2 path — see the pre-existing 1e-2 bump).
+    # fp8 (~2 mantissa bits): loosened to absorb single-element grid rounding noise
+    # (gfx950 OCP e4m3fn snaps a few values differently than the fnuz grid).
     atol = 5e-3
     rtol = 5e-3
     if Hkv == 2 and torch.version.hip is not None:
@@ -2107,8 +2098,8 @@ def test_triton_splitk_rowwise_fp8(
     ) = fmha._memory_efficient_attention_forward_requires_grad(
         inp_fp8_paged, op=fmha.triton_splitk.FwOp
     )
-    # Non-paged vs paged fp8: a couple of elements land on a different e4m3 grid
-    # point between the two layouts; widen from the fnuz-era 2e-3/1e-4 to absorb it.
+    # Non-paged vs paged fp8: a few elements snap to a different e4m3 grid point
+    # between the two layouts, so use a tolerance that absorbs single-element rounding.
     torch.testing.assert_close(
         attn_output_fp8, attn_output_fp8_paged, atol=5e-3, rtol=5e-3
     )

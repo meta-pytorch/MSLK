@@ -23,7 +23,6 @@ def canonicalize_qkv_5d(
     V: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return (Q, K, V) in [B, *, G, H, D] 5D form (4D BMHK promoted with G=1)."""
-    # Promote 4D -> 5D (insert G=1 dimension)
     if Q.ndim == 4:
         Q = Q.unsqueeze(2)
     if K.ndim == 4:
@@ -35,8 +34,7 @@ def canonicalize_qkv_5d(
         f"Expected 5D tensors after promotion; got Q={Q.shape}, K={K.shape}"
     )
 
-    # Multiquery (stride-0 H) is handled by the kernel via stride_kh=0 in the buffer
-    # descriptor; we pass strides from .stride() directly, so nothing to do here.
+    # Multiquery (stride-0 H) is handled by the kernel from .stride() directly.
     return Q, K, V
 
 

@@ -6,17 +6,15 @@
 
 # pyre-strict
 
-"""FlyDSL paged-attention decode (generic) — per-warp Q-head ownership with TLOOP.
+"""FlyDSL paged-attention decode (generic) — arch-generic fallback.
 
-Arch-generic fallback. Uses mfma_f32_16x16x32 (K=32). Each warp owns one Q head
-(NUM_WARPS=4 heads/CTA), so softmax is intra-warp only — no pv_lds/ms_lds merge.
-TLOOP: each warp covers all TILE_N=64 tokens per step via 4 sub-tiles of 16.
+Each warp owns one Q head (NUM_WARPS=4 heads/CTA), so softmax is intra-warp only.
+Uses mfma_f32_16x16x32 (K=32); TLOOP covers TILE_N=64 tokens/step via 4 sub-tiles of 16.
 
 MFMA layout (mfma_f32_16x16x32_f16, wave64), lane l:
-  A: vec<8,f16>/lane → A[row=l%16, k=(l//16)*8 : +8]
-  B: vec<8,f16>/lane → B[col=l%16, k=(l//16)*8 : +8]
-  C: vec<4,f32>/lane → C[(l//16)*4+elem, l%16]
-Per warp: tok_qk = lane%16 (N-col/token), k_grp = lane//16 (0..3, D chunk).
+  A/B: vec<8,f16>/lane → [row/col=l%16, k=(l//16)*8 : +8]
+  C:   vec<4,f32>/lane → C[(l//16)*4+elem, l%16]
+Per warp: tok_qk = lane%16 (token), k_grp = lane//16 (0..3, D chunk).
 """
 
 from __future__ import annotations
@@ -518,6 +516,7 @@ def _make_generic_jit_launcher(
         scale: fx.Float32,
         split_total: fx.Int32,
         grid_x: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
     ) -> None:
         from flydsl._mlir import ir as _ir  # pyre-ignore[21]
         from flydsl.compiler.kernel_function import (  # pyre-ignore[21]
@@ -549,7 +548,7 @@ def _make_generic_jit_launcher(
             num_hkv,
             scale,
             split_total,
-        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1))
+        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return _launcher
 
@@ -593,6 +592,9 @@ def pa_decode_generic_launch(
     sq = Q.stride()
     sk2 = K.stride()
     dev = Q.device
+    # Thread the live stream into .launch so the kernel is captured under CUDA graphs
+    # (a default-stream launch would capture empty).
+    stream = torch.cuda.current_stream()
 
     if split_k == 1:
         dummy = torch.empty(0, dtype=torch.float32, device=dev)
@@ -621,6 +623,7 @@ def pa_decode_generic_launch(
             softmax_scale,
             split_k,
             grid_x,
+            stream,
         )
     else:
         po = torch.empty((B, G, split_k, H_q, D), dtype=torch.float32, device=dev)
@@ -651,8 +654,9 @@ def pa_decode_generic_launch(
             softmax_scale,
             split_k,
             grid_x,
+            stream,
         )
         out_view = out.squeeze(1)
-        pa_decode_reduce(po, pm, ps, out_view)
+        pa_decode_reduce(po, pm, ps, out_view, stream=stream)
 
     return out

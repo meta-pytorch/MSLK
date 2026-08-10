@@ -8,17 +8,14 @@
 
 """Public dispatcher for the FlyDSL native-fp8 paged-attention decode.
 
-Native-fp8 paged KV with a symmetric per-token scale (vLLM/Gluon layout) — a
-different scheme from the Triton `InputsFp8` int32-packed + asymmetric scale/shift
-path, so this is a separate guarded entry point (not folded into flydsl_splitk.FwOp).
+Native-fp8 paged KV with a symmetric per-token scale (vLLM/Gluon layout); distinct
+from the Triton int32-packed asymmetric-scale path, hence a separate guarded entry.
 
 Expected inputs (same CUDA device):
   * query       : [num_seqs, num_query_heads, head_size] bf16/f16.
   * key_cache   : [num_blocks, num_kv_heads, head_size // 16, block_size, 16] fp8.
-  * value_cache : shuffle_value_cache_layout 5-D transposed
-                  [num_blocks, num_kv_heads, block_size // 16, head_size, 16] fp8.
-  * key_scale/value_scale : per-token f32 in [num_blocks, num_kv_heads, block_size, 1]
-                  layout (raw pertoken_quant output; strides (nkv*bs, bs, 1, 1)).
+  * value_cache : [num_blocks, num_kv_heads, block_size // 16, head_size, 16] fp8 (transposed).
+  * key_scale/value_scale : per-token f32 [num_blocks, num_kv_heads, block_size, 1].
   * block_tables    : [num_seqs, max_blocks_per_seq] int32.
   * context_lengths : [num_seqs] int32.
 
@@ -49,12 +46,9 @@ def csr_to_block_tables(
     kv_page_indices: torch.Tensor,  # [total_pages] int32 — flat physical page ids
     kv_indptr: torch.Tensor,  # [num_seqs + 1] int32 — prefix sum of pages/seq
 ) -> torch.Tensor:
-    """Convert ragged CSR paging into a dense padded `block_tables`.
-
-    CSR (reference/vLLM/flashinfer format): sequence `b` owns pages
-    `kv_page_indices[kv_indptr[b] : kv_indptr[b + 1]]`. The kernel takes a 2-D
-    `block_tables[num_seqs, max_blocks_per_seq]` instead; this shim bridges the two.
-    Rows right-padded with 0 (inert: the walk is bounded by context_lengths).
+    """Convert ragged CSR paging (kv_page_indices/kv_indptr) into a dense padded
+    block_tables[num_seqs, max_blocks_per_seq]. Rows right-padded with 0 (inert:
+    the walk is bounded by context_lengths).
     """
     if kv_indptr.dtype != torch.int32:
         kv_indptr = kv_indptr.to(torch.int32)
@@ -67,7 +61,6 @@ def csr_to_block_tables(
     max_blocks = int(counts.max().item()) if num_seqs > 0 else 0
     max_blocks = max(max_blocks, 1)
     block_tables = torch.zeros((num_seqs, max_blocks), dtype=torch.int32, device=dev)
-    # num_seqs is small (batch), so a Python loop avoids a ragged gather.
     for b in range(num_seqs):
         lo = int(indptr[b].item())
         hi = int(indptr[b + 1].item())
@@ -95,9 +88,8 @@ def paged_attention_decode_fp8_csr(
     temporary_output: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> str:
-    """CSR-paging entry: like `paged_attention_decode_fp8` but takes ragged
-    `kv_page_indices` / `kv_indptr` (reference/vLLM format); converts then dispatches.
-    """
+    """CSR-paging entry: converts ragged kv_page_indices/kv_indptr then dispatches to
+    paged_attention_decode_fp8."""
     block_tables = csr_to_block_tables(kv_page_indices, kv_indptr)
     return paged_attention_decode_fp8(
         output,
@@ -134,11 +126,8 @@ def paged_attention_decode_fp8(
     temporary_output: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> str:
-    """Run the FlyDSL native-fp8 paged-attention decode (writes into `output`).
-
-    Guarded wrapper around `pa_decode_fp8.pa_decode_ps_launch`; raises when FlyDSL /
-    the arch is unavailable. Returns the launcher's launch-path tag string.
-    """
+    """Run the FlyDSL native-fp8 paged decode (writes into `output`). Guarded wrapper
+    around pa_decode_fp8.pa_decode_ps_launch; raises when FlyDSL/arch unavailable."""
     require_flydsl()
     if not is_fp8_paged_decode_available():
         raise RuntimeError(

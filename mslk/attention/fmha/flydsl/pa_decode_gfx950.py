@@ -11,19 +11,16 @@
 Packs up to 16 query heads sharing a KV head onto the MFMA M-dim. One CTA = one
 warp = one KV head's whole GQA group.
   QK: A=Q[head=M(16), k=head_dim], B=K[tok=N(16), k=head_dim] -> C[head, tok].
-  Softmax: a head's TILE_N scores spread across lane%16 -> per-head max/sum reduce
-      over low 4 lane bits via dpp_xor(1,2,4,8).
+  Softmax: per-head max/sum reduce over low 4 lane bits via dpp_xor(1,2,4,8).
   PV: A=P[head=M, tok=K(32)], B=V[tok=K, d=N(16)] -> C[head, d].
+MFMA reg<->matrix layout: 16x16x32 lane l reg e -> C[m=(l//16)*4+e, n=l%16].
 
-MFMA reg<->matrix layout (empirical): 16x16x32 lane l reg e -> C[m=(l//16)*4+e, n=l%16].
+V staged into LDS in [dpass][tok][16] transpose layout via wide vec8 loads, read
+back with ds_read_tr16_b64. V HBM loads issued EARLY so latency overlaps QK+softmax
+(intra-tile software pipeline).
 
-V-load (key perf win): V staged into LDS in [dpass][tok][16] transpose layout via
-wide vec8 loads, read back with ds_read_tr16_b64 (128-bit HW transpose). V HBM loads
-issued EARLY (into regs) so latency overlaps QK+softmax; LDS stores + one barrier
-happen just before PV (intra-tile software pipeline).
-
-gfx950 only. GQA ratio must be in [1,16]; falls back to pa_decode_generic otherwise.
-Split-K via pa_decode_reduce.
+gfx950 only; GQA ratio in [1,16] (else falls back to pa_decode_generic). Split-K
+via pa_decode_reduce.
 """
 
 from __future__ import annotations
@@ -98,9 +95,7 @@ def compile_pa_decode_gfx950(
         else rocdl.mfma_f32_16x16x32_f16
     )
 
-    # LDS: P[MFMA_M, TILE_N] f32 (redistributed between QK and PV layouts) +
-    # DOUBLE-BUFFERED V: two transpose-layout tiles ([dpass][tok][16]) so the next
-    # tile's V staging overlaps current compute. PV reads via ds_read_tr16_b64.
+    # LDS: P[MFMA_M, TILE_N] f32 + double-buffered V ([dpass][tok][16] transpose tiles).
     _NUM_DMA_V = (TILE_N * _HEAD // 8) // WARP_SIZE  # 16B (8 f16) chunks / 64 lanes
     _P_LDS = MFMA_M * TILE_N  # f32, P redistribution
     _V_LDS = TILE_N * _HEAD  # f16, one V tile (transpose layout)
@@ -397,10 +392,8 @@ def compile_pa_decode_gfx950(
 
             _v4h = T.vec(4, _FX_KV.ir_type)
             for dpass in range_constexpr(_DN):
-                # B-frag V via ds_read_tr16_b64 (128-bit HW transpose): group G=grp
-                # owns toks G*8..G*8+7; two tr16 reads give lane l reg e ->
-                # V[tok=G*8+{0..3}/{4..7}, d=dpass*16+tok_lane] from [dpass][tok][16]
-                # LDS layout (replaces 8 scalar reads with 2 wide reads).
+                # B-frag V via two ds_read_tr16_b64 (128-bit HW transpose): group grp
+                # owns toks grp*8..+7 -> V[tok, d=dpass*16+tok_lane] (2 wide reads vs 8).
                 _GB = fx.Int32(dpass * (TILE_N * 16)) + (grp * fx.Int32(8)) * fx.Int32(
                     16
                 )
@@ -528,6 +521,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
         scale,
         split_total,
         grid_x,
+        stream: fx.Stream = fx.Stream(None),
     ):
         from flydsl._mlir import ir as _ir
         from flydsl.compiler.kernel_function import CompilationContext
@@ -558,7 +552,7 @@ def _make_gfx950_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split_k):
             ratio,
             scale,
             split_total,
-        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1))
+        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return _launcher
 
@@ -606,6 +600,9 @@ def pa_decode_gfx950_launch(
     sk2 = K.stride()
     dev = Q.device
     n_cta_base = B * G * H_kv
+    # Thread the live stream into .launch so the kernel is captured under CUDA graphs
+    # (a default-stream launch would capture empty).
+    stream = torch.cuda.current_stream()
     if split_k == 1:
         dummy = torch.empty(0, dtype=torch.float32, device=dev)
         launcher = _make_gfx950_jit_launcher(D, kv_str, out_str, 1)
@@ -633,6 +630,7 @@ def pa_decode_gfx950_launch(
             softmax_scale,
             split_k,
             n_cta_base,
+            stream,
         )
     else:
         po = torch.empty((B, G, split_k, H_q, D), dtype=torch.float32, device=dev)
@@ -663,6 +661,7 @@ def pa_decode_gfx950_launch(
             softmax_scale,
             split_k,
             n_cta_base * split_k,
+            stream,
         )
-        pa_decode_reduce(po, pm, ps, out.squeeze(1))
+        pa_decode_reduce(po, pm, ps, out.squeeze(1), stream=stream)
     return out

@@ -144,10 +144,8 @@ def _compile_reduce(
             norm_w = arith.mulf(w_f32, inv_sum)
             norm_w32 = arith.bitcast(T.i32, norm_w)
 
-            # Lane owns a CONTIGUOUS _CHUNKS-wide slice (lane*_CHUNKS..) not a strided
-            # one, so one vec_width=_CHUNKS load replaces _CHUNKS scalar loads per
-            # partition (the mp-scaling scalar-load cost). Coalescing preserved: 64
-            # lanes cover a contiguous 64*_CHUNKS block per partition.
+            # Lane owns a contiguous _CHUNKS-wide slice, so one vec load replaces
+            # _CHUNKS scalar loads per partition (coalescing preserved).
             base_hd = lane * fx.Int32(_CHUNKS)
             accs = [c_zero] * _CHUNKS
             for p in range_constexpr(_MAX_PARTS):
@@ -282,6 +280,7 @@ def _make_reduce_jit_launcher(
         grid_b: Int32,
         grid_g: Int32,
         grid_hq: Int32,
+        stream: fx.Stream = fx.Stream(None),
     ) -> None:
         from flydsl._mlir import ir as _ir  # pyre-ignore[21]
         from flydsl.compiler.kernel_function import (  # pyre-ignore[21]
@@ -309,7 +308,7 @@ def _make_reduce_jit_launcher(
             s_o_b,
             s_o_g,
             s_o_hq,
-        ).launch(grid=(grid_b, grid_g, grid_hq), block=(WARP_SIZE, 1, 1))
+        ).launch(grid=(grid_b, grid_g, grid_hq), block=(WARP_SIZE, 1, 1), stream=stream)
 
     return _launcher
 
@@ -322,8 +321,13 @@ def pa_decode_reduce(
     partial_max: torch.Tensor,  # [B, G, max_parts, H_q]     f32
     partial_sum: torch.Tensor,  # [B, G, max_parts, H_q]     f32
     output: torch.Tensor,  # [B, G, H_q, D]             target dtype
+    stream: object = None,
 ) -> None:
-    """Combine split-K partitions into the final output (in-place)."""
+    """Combine split-K partitions into the final output (in-place).
+
+    Pass the caller's stream so the reduce is captured on the same stream as the
+    compute kernel under CUDA graphs; defaults to the current stream.
+    """
     from mslk.flydsl.jit import run_compiled  # pyre-ignore[21]
 
     B, G, max_parts, H_q, D = partial_out.shape
@@ -332,6 +336,9 @@ def pa_decode_reduce(
     ]
     arch = get_rocm_arch()
     launcher = _make_reduce_jit_launcher(D, max_parts, dtype_str, arch)
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
 
     po, pm, o = partial_out, partial_max, output
     run_compiled(
@@ -353,6 +360,7 @@ def pa_decode_reduce(
         B,
         G,
         H_q,
+        stream,
     )
 
 

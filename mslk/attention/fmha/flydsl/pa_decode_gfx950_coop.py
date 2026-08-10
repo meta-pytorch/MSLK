@@ -8,24 +8,19 @@
 
 """FlyDSL decode (gfx950 cooperative-DMA) — ds_read_tr16_b64 HW transpose.
 
-Uses ds_read_tr16_b64 (gfx950+ HW LDS transpose) for PV to cut V LDS reads 8x
-(2 reads per (dc, pks) step = 16/lane/tile vs 128 scalar reads).
+Per-head coop-DMA fallback for GQA ratios that can't head-pack. Uses ds_read_tr16_b64
+(gfx950+ HW LDS transpose) for PV to cut V LDS reads 8x.
 
-MFMA: mfma_f32_32x32x16_f16 with A=V_T (from ds_read_tr16_b64), B=P.
-  A[m=d_sub, k=tok] = V[tok, d=dc*32+d_sub] (HW transposed)
-  B[n=d_sub2, k=tok] = P[tok] (broadcast to all n rows)
-  C[m=d_sub, n=*] = PV[d=dc*32+d_sub] (all n cols equal for broadcast P)
+PV MFMA mfma_f32_32x32x16_f16, A=V_T (from ds_read_tr16_b64), B=P (broadcast):
+  A[m=d_sub, k=tok] = V[tok, d=dc*32+d_sub]; C[m=d_sub, n=*] = PV[d=dc*32+d_sub].
 
-Lane decomposition (matching flash_attn_generic.py):
-  lane_div_32 = lane//32     -> tok half (lo/hi within pks step)
-  tr_k_group  = (lane%16)//4 -> 0..3: K-row (tok) offset within 4-row group
-  tr_col_sub  = lane%4       -> 0..3: 4-column (d) sub-group
-  tr_col_half = (lane%32)//16-> 0/1: first/second 16-d half of DC chunk
+Lane decomposition for ds_read_tr16_b64:
+  lane_div_32 = lane//32     -> tok half within pks step
+  tr_k_group  = (lane%16)//4 -> K-row (tok) offset within 4-row group
+  tr_col_sub  = lane%4       -> 4-column (d) sub-group
+  tr_col_half = (lane%32)//16-> first/second 16-d half of DC chunk
 
-V LDS: linear row-major (no swizzle — required by ds_read_tr16_b64). K/P LDS: as v3.
-Output: C[e] at lane l -> d = dc*32 + ld32*4 + (e//4)*8 + (e%4).
-
-gfx950 only (ds_read_tr16_b64 requires CDNA4).
+V LDS is linear row-major (required by ds_read_tr16_b64). gfx950 only.
 """
 
 from __future__ import annotations
@@ -102,8 +97,7 @@ def compile_pa_decode_gfx950_coop(
     _SPLIT = _SK > 1
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _FX_OUT = _FX_DTYPE[output_dtype_str]
-    # MFMA intrinsics are dtype-specific: pick f16/bf16 to match KV operand dtype
-    # (mismatched operand dtype fails MLIR verification).
+    # MFMA intrinsic must match KV operand dtype (mismatch fails MLIR verification).
     _mfma_qk = (
         rocdl.mfma_f32_16x16x32_bf16
         if kv_dtype_str == "bf16"
@@ -417,14 +411,11 @@ def compile_pa_decode_gfx950_coop(
 
             gpu.barrier()
 
-            # ── PV: mfma_f32_32x32x16_f16 with A=V_T (ds_read_tr16_b64), B=P ──
-            # ds_read_tr16_b64 lane addressing (matching flash_attn_generic.py):
-            #   d_col  = dc*32 + tr_col_half*16 + tr_col_sub*4  (f16 idx, d-dim)
-            #   k_row  = pks*16 + ld32*4 + tr_k_group           (f16 idx, tok-dim)
-            #   lds_lo = v_lds_base + k_row*_V_STRIDE + d_col
-            # v_lo=tr16(lds_lo) -> k=0..3; v_hi=tr16(lds_lo+8*_V_STRIDE) -> k=4..7;
-            # A-frag = shuffle(v_lo, v_hi) -> v8f16. P B-frag mirrors tr16 tok order:
-            # k=0..3 -> toks pks*16+ld32*4+j, k=4..7 -> +j+4 (gap at 4..7).
+            # ── PV: mfma_f32_32x32x16_f16, A=V_T (ds_read_tr16_b64), B=P ──
+            # ds_read_tr16_b64 addressing:
+            #   d_col = dc*32 + tr_col_half*16 + tr_col_sub*4  (f16, d-dim)
+            #   k_row = pks*16 + ld32*4 + tr_k_group           (f16, tok-dim)
+            # v_lo=tr16(lds_lo) -> k=0..3; v_hi=tr16(+8 toks) -> k=4..7.
 
             v4f16_type = T.vec(4, _FX_KV.ir_type)
 
@@ -481,8 +472,7 @@ def compile_pa_decode_gfx950_coop(
                     # Combine into v8f16 A-frag: [lo[0..3], hi[0..3]]
                     v_frag = vector.shuffle(v_lo_v4, v_hi_v4, [0, 1, 2, 3, 4, 5, 6, 7])
 
-                    # P B-frag must match V A-frag tok order: j=0..3 -> tok
-                    # pks*16+ld32*4+j, j=4..7 -> +j+4 (V hi-read covers toks +{8..11}).
+                    # P B-frag must match V A-frag tok order (hi-read covers toks +8..11).
                     p_frag = zero_v8h
                     for j in range_constexpr(8):
                         tok_j = (
@@ -537,8 +527,7 @@ def compile_pa_decode_gfx950_coop(
             )
             _po_base = _pm_base * fx.Int32(_HEAD)
 
-        # Output layout (empirical): C[e] at lane l -> d = dc*32 + ld32*4 + (e//4)*8 + (e%4).
-        # ld32=0/1 partition the 32 d per DC chunk; all written once per lane.
+        # Output: C[e] at lane l -> d = dc*32 + ld32*4 + (e//4)*8 + (e%4).
         if hq_abs < num_hq:
             inv_raw = arith.unwrap(inv_sum)
             for dc in range_constexpr(_D_CHUNKS):
@@ -600,6 +589,7 @@ def _make_gfx950_coop_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split
         scale,
         split_total,
         grid_x,
+        stream: fx.Stream = fx.Stream(None),
     ):
         from flydsl._mlir import ir as _ir
         from flydsl.compiler.kernel_function import CompilationContext
@@ -629,7 +619,7 @@ def _make_gfx950_coop_jit_launcher(head_size, kv_dtype_str, out_dtype_str, split
             num_hkv,
             scale,
             split_total,
-        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1))
+        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return _launcher
 
@@ -645,10 +635,8 @@ def pa_decode_gfx950_coop_launch(
 
     B, _, G, H_q, D = Q.shape
     _, KV_MAX, _, H_kv, _ = K.shape
-    # Requires (a) gfx950 (ds_read_tr16_b64 + raw_ptr_buffer_load_lds) and (b)
-    # cooperative-DMA coherence: all NUM_WARPS warps share one K/V LDS tile, so
-    # must map to the same KV head — valid only when GQA ratio H_q/H_kv is a
-    # multiple of NUM_WARPS. Else fall back to pa_decode_generic (per-warp heads).
+    # Requires gfx950 and coop-DMA coherence: all NUM_WARPS warps share one K/V LDS
+    # tile, so GQA ratio must be a multiple of NUM_WARPS. Else fall back to generic.
     _coop_ok = (
         H_q % H_kv == 0 and (H_q // H_kv) % NUM_WARPS == 0 and H_q % NUM_WARPS == 0
     )
@@ -677,6 +665,9 @@ def pa_decode_gfx950_coop_launch(
     sq = Q.stride()
     sk2 = K.stride()
     dev = Q.device
+    # Thread the live stream into .launch so the kernel is captured under CUDA graphs
+    # (a default-stream launch would capture empty).
+    stream = torch.cuda.current_stream()
     if split_k == 1:
         dummy = torch.empty(0, dtype=torch.float32, device=dev)
         launcher = _make_gfx950_coop_jit_launcher(D, kv_str, out_str, 1)
@@ -703,6 +694,7 @@ def pa_decode_gfx950_coop_launch(
             softmax_scale,
             split_k,
             B * G * hq_blocks,
+            stream,
         )
     else:
         po = torch.empty((B, G, split_k, H_q, D), dtype=torch.float32, device=dev)
@@ -732,6 +724,7 @@ def pa_decode_gfx950_coop_launch(
             softmax_scale,
             split_k,
             B * G * hq_blocks * split_k,
+            stream,
         )
-        pa_decode_reduce(po, pm, ps, out.squeeze(1))
+        pa_decode_reduce(po, pm, ps, out.squeeze(1), stream=stream)
     return out

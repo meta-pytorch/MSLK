@@ -40,7 +40,6 @@ def _flydsl_splitk_forward(
             from .flydsl.fp8_paged_adapter import fp8_paged_decode_from_dense
 
             return fp8_paged_decode_from_dense(q5, k5, v5, seq, scale)
-        # else fall through to dense (off-gfx950 / fp8 unavailable).
 
     return pa_decode_launch(q5, k5, v5, seq, scale, split_k=split_k)
 
@@ -74,8 +73,6 @@ class FwOp(AttentionFwOpBase):
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
         reasons = super().shape_not_supported_reasons(Mq, Mkv, K, Kv)
-        # if K not in {16, 32, 64, 128}:
-        #     reasons.append(f"Embed dim {K} not supported")
         return reasons
 
     @classmethod
@@ -85,7 +82,6 @@ class FwOp(AttentionFwOpBase):
         if d.key.dtype != torch.int32:
             check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
             check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
-        # FlyDSL is the sole backend now; it must be importable + support this arch.
         if not is_flydsl_available():
             reasons.append("FlyDSL is not available for this GPU architecture")
 
@@ -178,7 +174,6 @@ class FwOp(AttentionFwOpBase):
             ).item()
 
         require_flydsl()
-        # fp8-KV opt-in: per-call via inp.quantize_kv_to_fp8 (lossy, gfx950 only).
         use_fp8_kv = getattr(inp, "quantize_kv_to_fp8", False)
         out = _flydsl_splitk_forward(
             query=query,

@@ -8,14 +8,13 @@
 
 """FlyDSL native-FP8 symmetric-scale paged-attention decode (persistent scheduling).
 
-MSLK port of the upstream FlyDSL ``pa_decode_fp8`` reference, only the
-persistent-scheduling small-block compute path (``compile_pa_decode_ps`` +
-``pa_decode_ps_kernel``); sliding-window and aiter/metadata paths not ported.
+Ports only the persistent-scheduling small-block compute path (compile_pa_decode_ps
++ pa_decode_ps_kernel) from the upstream FlyDSL reference.
 
 Grid = (batch, kv_heads, max_context_partition_num); each CTA walks 256-token
-sub-partitions with online-softmax loop-carried state.  K/V physical pages come
-from a per-sequence ``block_tables`` (page sizes 16/64).  Query is bf16/f16 with
-kernel-internal symmetric FP8 query-scale.  pip ``flydsl`` only.
+sub-partitions with online-softmax loop-carried state. K/V pages come from a
+per-sequence block_tables (page sizes 16/64). Query bf16/f16 with kernel-internal
+symmetric FP8 query-scale.
 """
 
 from __future__ import annotations
@@ -378,10 +377,8 @@ def _prefetch_q_chunks(
     q_elems_per_lane: int = Q_ELEMS_PER_LANE,
     q_chunks_per_lane: int = Q_CHUNKS_PER_LANE,
 ):
-    # bf16/f16 + in-kernel query_scale.  Each lane owns `q_elems_per_lane`
-    # (= max(8, head_dim // MFMA_N)) contiguous Q elems, loaded as
-    # `q_chunks_per_lane` × vec_width=4 loads.  16 lanes must together cover the
-    # full head-dim (8/2 at head_dim<=128, 16/4 at head_dim=256).
+    # Each lane owns q_elems_per_lane (= max(8, head_dim//MFMA_N)) contiguous Q elems
+    # via q_chunks_per_lane vec4 loads; 16 lanes cover the full head-dim.
     q_load_lane = lane16id
     if const_expr(q_lanes_per_head < MFMA_N):
         q_load_lane = arith.select(
@@ -417,14 +414,10 @@ def _finish_q_fragments(
     q_elems_per_lane: int = Q_ELEMS_PER_LANE,
 ):
     # LDS Q layout (per-qhead contiguous): Q[head=h][hd=d] at byte offset
-    # h * HEAD_SIZE + d (FP8).  Aliased with later P writes via logits_lds_*.
-    # Writer: thread (warp W, rowid R', lane L') owns qhead = W*4 + R' =
-    #   local_qhead_idx, head_dim [L'*8 .. L'*8+7]; writes 1 i64 at
-    #   local_qhead_idx * HEAD_SIZE + lane16id * 8.
-    # Reader (mfma_f32_16x16x32_fp8_fp8, B=Q^T, N=qhead, K=head_dim): thread
-    #   (rowid R, lane L), k_step = qkhe*2 + qkr, consumes
-    #   Q[head=L][hd=(qkhe*4 + R)*16 + qkr*8 + 0..7], byte offset
-    #   L * HEAD_SIZE + qkhe*64 + R*16 + qkr*8.
+    # h*HEAD_SIZE + d (FP8), aliased with later P writes via logits_lds_*.
+    # Writer: qhead=local_qhead_idx writes 1 i64 at qhead*HEAD_SIZE + lane16id*8.
+    # Reader (mfma_f32_16x16x32_fp8_fp8, B=Q^T): thread (rowid R, lane L),
+    #   k_step=qkhe*2+qkr, byte offset L*HEAD_SIZE + qkhe*64 + R*16 + qkr*8.
     c_head_size = fx.Int32(head_size)
     lds_q_base = local_qhead_idx * c_head_size + lane16id * fx.Int32(q_elems_per_lane)
     abs_mask = fx.Vector.filled(4, 0x7FFFFFFF, fx.Int32)
@@ -462,8 +455,7 @@ def _finish_q_fragments(
             softmax_lds_f32, [fx.Index(local_qhead_idx)]
         )
 
-    # One packed i32 word per vec4 chunk; words are head-dim-contiguous, stored
-    # as a single vec<q_chunks, i32> at the per-lane byte base.
+    # One packed i32 word per vec4 chunk, stored as a single vec at the per-lane base.
     v01 = fx.Vector.from_elements(q_words, dtype=fx.Int32)
     lds_q_i32 = lds_q_base >> fx.Int32(2)
     if const_expr(q_lanes_per_head < MFMA_N):
@@ -479,8 +471,7 @@ def _finish_q_fragments(
     )[0].ir_value()
     for qkhe in range_constexpr(qkhe_loop):
         for qkr in range_constexpr(2):
-            # See layout comment above. Byte offset:
-            #   lane16id * HEAD_SIZE + qkhe*64 + rowid*16 + qkr*8
+            # Byte offset: lane16id*HEAD_SIZE + qkhe*64 + rowid*16 + qkr*8 (see above).
             lds_rd_byte = (
                 lane16id * c_head_size
                 + fx.Int32(qkhe << 6)
@@ -989,9 +980,8 @@ def _make_pa_phase_helpers(
         fm_contract = arith.FastMathFlags.contract
         v_correction_vec = vector.broadcast(T.f32x4, v_correction)
 
-        # Batch-load all P_i64 from LDS upfront: p_i64 depends only on (vt, j),
-        # not vhe, so hoist the VTLOOP*2 ds_read_b64 ops out of the vhe loop to
-        # let the compiler pipeline them (lgkmcnt drains before the MFMA chain).
+        # Hoist all P_i64 LDS loads out of the vhe loop (p_i64 depends only on
+        # (vt, j)) so the compiler can pipeline them before the MFMA chain.
         p_i64_all = []
         for vt in range_constexpr(VTLOOP):
             for j in range_constexpr(2):
@@ -1108,9 +1098,7 @@ def get_recommended_splits(
     context_partition_size: int = KV_COMPUTE_BLOCK,
     query_length: int = 1,
 ) -> int:
-    """Recommend ``max_context_partition_num``; mirrors aiter's Gluon
-    ``get_recommended_splits`` so callers need no aiter dependency.
-    """
+    """Recommend max_context_partition_num; mirrors aiter's get_recommended_splits."""
     if sliding_window > 0:
         window_token_count = sliding_window + query_length
         return _cdiv(window_token_count - 1, context_partition_size) + 1
@@ -1279,8 +1267,7 @@ def compile_pa_decode_ps(
     _HEAD = head_dim
     _QKHELOOP = head_dim // QKHE_PER_FETCH
     _VHELOOP = head_dim // MFMA_N // NUM_WARPS
-    # Each of 16 MFMA lanes supplies head_dim//MFMA_N Q elems so the lanes cover
-    # the full head-dim; clamp to 8 so head_dim<=128 keeps the fixed 8/2 path.
+    # Clamp to 8 so head_dim<=128 keeps the fixed 8/2 path.
     _Q_ELEMS_PER_LANE = max(Q_ELEMS_PER_LANE, head_dim // MFMA_N)
     _Q_CHUNKS_PER_LANE = _Q_ELEMS_PER_LANE // 4
     _Q_LANES_PER_HEAD = head_dim // _Q_ELEMS_PER_LANE
@@ -1302,8 +1289,7 @@ def compile_pa_decode_ps(
     LDS_VMAX_BYTES = NUM_WARPS * MFMA_N * 4 if const_expr(per_token_kv) else 0
     LDS_SOFTMAX_TOTAL = LDS_SOFTMAX_BYTES + LDS_VMAX_BYTES
     LDS_SCALE_TOTAL = LDS_SCALE_BYTES if const_expr(per_token_kv) else 0
-    # Unique global symbol per compile to avoid clashes when multiple compiled
-    # artifacts share one GPU context.
+    # Unique global symbol per compile to avoid clashes in a shared GPU context.
     _smem_sym_name = (
         f"pa_ps_smallblk_smem_bs{block_size}_ql{query_length}"
         f"_qgs{query_group_size}_tv{int(trans_v)}_qd{query_input_dtype}"
@@ -1347,8 +1333,7 @@ def compile_pa_decode_ps(
         stride_to_group: Int32,
         stride_bt_seq: Int32,
         # Per-token K/V scale strides (per_token_kv only), scale layout
-        # [num_blocks, num_kv_heads, block_size]: stride_ks_block =
-        # num_kv_heads*block_size, stride_ks_head = block_size.  0 for per-tensor.
+        # [num_blocks, num_kv_heads, block_size]; both 0 for per-tensor.
         stride_ks_block: Int32,
         stride_ks_head: Int32,
     ):
@@ -1537,9 +1522,8 @@ def compile_pa_decode_ps(
         def _unwrap(v):
             return v.ir_value() if hasattr(v, "ir_value") else v
 
-        # Loop state: `_mtp_groups` accumulators (rmax, rsum, outs...) plus the
-        # current sub-partition's K and V tiles.  Both K and V are loop-carried
-        # (ping-pong) so the body uses them while prefetching the NEXT iter.
+        # Loop state: _mtp_groups accumulators (rmax, rsum, outs...) + the current
+        # sub-partition's K/V tiles (loop-carried ping-pong for prefetch).
         state_width = 2 + _VHELOOP
 
         def _pack_states(states, k_flat, v_flat):
@@ -1593,9 +1577,8 @@ def compile_pa_decode_ps(
         bt_rsrc_v4 = _ptr8_to_v4i32(bt_rsrc)
 
         def _s_buffer_load(soffset_bytes_i32, vec_width: int):
-            """Scalar buffer load (s_buffer_load_dword[x4]), returns an SGPR.
-            REQUIRES `soffset_bytes_i32` wave-uniform.  Saves the vmcnt(0) drain
-            + readfirstlane of the VMEM path, freeing VMEM slots for V/K."""
+            """Scalar buffer load (s_buffer_load_dword[x4]) -> SGPR. REQUIRES
+            soffset_bytes_i32 wave-uniform. Saves the vmcnt(0) drain + readfirstlane."""
             from flydsl._mlir import ir as _ir
             from flydsl._mlir.dialects import llvm as _llvm
             from flydsl.expr.rocdl import _to_ir as _rocdl_to_ir
@@ -1623,9 +1606,8 @@ def compile_pa_decode_ps(
             )
 
         def _pa_small_block_stage_phys_blocks(partition_block_base):
-            # bt offset is wave-uniform, so s_buffer_load lands the result in
-            # SGPRs directly — eliminates the vmcnt(0) drain (was 25% of kernel
-            # stalls) and the downstream readfirstlane.
+            # bt offset is wave-uniform -> s_buffer_load into SGPRs, avoiding the
+            # vmcnt(0) drain and the downstream readfirstlane of the VMEM path.
             if const_expr(block_size == 64):
                 bt_elem_off = batch_idx * stride_bt_seq + partition_block_base + warp_id
                 phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=1)
@@ -1641,9 +1623,7 @@ def compile_pa_decode_ps(
         def _pa_small_block_store_phys_blocks_to_lds(phys_block_vec):
             if (lane16id | rowid) == fx.Int32(0):
                 if const_expr(block_size == 64):
-                    # block_size=64: scalar i32; wrap in a 1-elem Vector for the
-                    # LDS .store API.  Each warp writes 1 i32 to
-                    # bt_lds_i32[warp_id]; readers pull the 4-elem vec at 0.
+                    # Each warp writes 1 i32 to bt_lds_i32[warp_id]; readers pull vec4 at 0.
                     fx.Vector.from_elements([phys_block_vec], dtype=fx.Int32).store(
                         bt_lds_i32,
                         [fx.Index(warp_id)],
@@ -1671,11 +1651,9 @@ def compile_pa_decode_ps(
                     v_phys_blocks.append(phys_block)
             return v_phys_blocks
 
-        # Pre-load the FIRST (reverse-order = last partition) sub-partition's
-        # block-table entries before Q setup so the dependent K prefetch avoids
-        # the table latency.  Empty-slot guard: CTAs with the loop running 0
-        # iters still issue prologue reads via `last_partition_idx`; clamp to 0
-        # so reads stay in-bounds (results unused).
+        # Pre-load the FIRST (reverse-order = last) sub-partition's block-table
+        # entries before Q setup so the dependent K prefetch avoids table latency.
+        # Empty-slot guard: clamp to 0 so 0-iter CTAs' prologue reads stay in-bounds.
         _safe_init_partition = arith.select(
             local_partition_start < num_total_partitions,
             last_partition_idx,
@@ -1684,9 +1662,7 @@ def compile_pa_decode_ps(
         first_block_base = _safe_init_partition * fx.Int32(_blocks_per_partition)
         first_phys_blocks = _pa_small_block_stage_phys_blocks(first_block_base)
 
-        # Pre-load Q for every MTP group ONCE before the KV loop; q_frags/qi/qhi/
-        # qscale stay in registers across the loop (Q load paid once per CTA).
-
+        # Pre-load Q for every MTP group ONCE before the KV loop (stays in registers).
         q_frags_per_mtp = []
         qi_per_mtp = []
         qhi_per_mtp = []
@@ -1728,9 +1704,8 @@ def compile_pa_decode_ps(
 
         _pa_small_block_store_phys_blocks_to_lds(first_phys_blocks)
 
-        # Per-token K/V scale staging (per_token_kv only).  Each thread stages
-        # its LDS slot t (partition-local token) from that token's page (indices
-        # in bt_lds_i32), scale layout [num_blocks, num_kv_heads, block_size].
+        # Per-token K/V scale staging (per_token_kv only): each thread stages its
+        # LDS slot t from that token's page. Scale layout [num_blocks, kv_heads, block_size].
         def _stage_small_block_kv_scales():
             t = warp_id * fx.Int32(WARP_SIZE) + rowid * fx.Int32(MFMA_N) + lane16id
             part_page = _udiv_const(t, _block_size)
@@ -1767,9 +1742,8 @@ def compile_pa_decode_ps(
                 )
             return k_scale_vecs, v_scale_vecs
 
-        # Pre-load the FIRST sub-partition's K so the loop body can issue the
-        # next K prefetch in parallel with the current QK MFMA.  Empty slots
-        # compute k_flat0 but never use it (bounded loads return block 0).
+        # Pre-load the FIRST sub-partition's K so the body can prefetch the next
+        # K in parallel with the current QK MFMA.
         k_flat0 = _pa_small_block_load_k_flat(
             k_global_ptr,
             kv_h,
@@ -1782,9 +1756,8 @@ def compile_pa_decode_ps(
             qkhe_loop=_QKHELOOP,
         )
         gpu.barrier()
-        # Prologue V load (ping-pong with K): issue iter 0's V here so the body
-        # can issue iter N+1's V at the end of iter N, hidden behind the next
-        # QK MFMA.  Reads LDS-staged first_phys_blocks (barrier ensures vis).
+        # Prologue V load (ping-pong with K): issue iter 0's V here so the body can
+        # prefetch iter N+1's V behind the next QK MFMA. (barrier ensures LDS vis).
         _v_phys_blocks0 = _pa_small_block_load_v_phys_blocks_from_lds()
         _v_results0 = _pa_small_block_load_v_trans(
             v_global_ptr,
@@ -1811,9 +1784,8 @@ def compile_pa_decode_ps(
             init=_pack_states(init_states, k_flat0, v_flat0),
         ):
             cur_states, k_flat, v_flat = _unpack_states(state)
-            # Reverse iteration: remap the forward scf.for index so sub_part_i32
-            # walks from last_partition_idx down to local_partition_start
-            # (sink-prone partition 0 processed last).
+            # Reverse iteration: walk from last_partition_idx down to
+            # local_partition_start (sink-prone partition 0 processed last).
             _sub_raw_i32 = arith.index_cast(T.i32, sub_part_ib)
             sub_part_i32 = last_partition_idx - (_sub_raw_i32 - local_partition_start)
             sub_token_start = sub_part_i32 * c_cps
@@ -1823,17 +1795,15 @@ def compile_pa_decode_ps(
             k_ops = _unflatten_k(k_flat, qkhe_loop=_QKHELOOP)
             v_results = _unflatten_v_results(v_flat, vhe_loop=_VHELOOP)
 
-            # Per-token K/V scale staging (per_token_kv only): stage scales to
-            # LDS once per partition (bt_lds_i32 holds this partition's pages)
-            # and read cached f32x4 vecs, reused across all MTP groups.
+            # Per-token K/V scale staging (per_token_kv only): stage to LDS once
+            # per partition, read cached f32x4 vecs reused across all MTP groups.
             if const_expr(per_token_kv):
                 _stage_small_block_kv_scales()
                 gpu.barrier()
                 k_scale_vecs, v_scale_vecs = _load_small_block_scale_vecs()
 
-            # NEXT sub-partition's K base (reverse: next == sub_part_i32 - 1),
-            # clamped to local_partition_start so the final iter's prefetch
-            # stays in the block_table window (result yielded but unused).
+            # NEXT sub-partition's K base (reverse: sub_part_i32 - 1), clamped to
+            # local_partition_start so the final iter's prefetch stays in-window.
             next_part_i32 = sub_part_i32 - fx.Int32(1)
             next_safe_part = arith.select(
                 next_part_i32 >= local_partition_start,
@@ -1910,9 +1880,8 @@ def compile_pa_decode_ps(
                 outs = _pv_mfma(v_results, outs, v_correction)
                 new_states.append(tuple([rmax, rsum] + outs))
 
-            # Cross-iter V prefetch (ping-pong): issue NEXT iter's V AFTER PV
-            # MFMA (current V vgprs now free).  V phys_blocks from LDS-staged
-            # next_phys_blocks; latency hidden behind next QK MFMA + softmax.
+            # Cross-iter V prefetch (ping-pong): issue NEXT iter's V AFTER PV MFMA
+            # (current V vgprs now free); latency hidden behind next QK MFMA + softmax.
             _v_phys_blocks_next = _pa_small_block_load_v_phys_blocks_from_lds()
             _v_next_results = _pa_small_block_load_v_trans(
                 v_global_ptr,
@@ -2049,9 +2018,8 @@ def compile_pa_decode_ps_reduce(
     _HD = head_dim
     _EQGS = eqgs
     _MP = max_parts
-    # Each thread owns a contiguous _VEC-wide head-dim slice for ONE group g, so
-    # per-partition stats and weights are computed once per thread (not per d).
-    # _VEC divides _HD; temporary_output d-axis is contiguous → coalesced load.
+    # Each thread owns a contiguous _VEC-wide head-dim slice for ONE group g
+    # (stats/weights computed once per thread); _VEC divides _HD -> coalesced load.
     _VEC = 4 if (head_dim % 4 == 0) else (2 if (head_dim % 2 == 0) else 1)
     _DV = _HD // _VEC  # vector-slots per group along head-dim
     _N = _EQGS * _DV  # total (g, d-slot) work items per (batch, kv_head)
@@ -2147,11 +2115,8 @@ def compile_pa_decode_ps_reduce(
             safe = arith.select(arith.unwrap(gsum) > c_zero, arith.unwrap(gsum), c_one)
             inv = arith.unwrap(_rcp_f32(fx.Float32(safe)))
 
-            # Accumulate the weighted _VEC-wide head-dim slice (one coalesced
-            # vec load per partition).  WARNING: temporary_output is ALWAYS bf16
-            # (compute kernel writes bf16 partials regardless of `output` dtype),
-            # so the load dtype MUST be bf16 — using _OUT_FX would misread the
-            # bytes for an f16 output.
+            # WARNING: temporary_output is ALWAYS bf16 (compute kernel writes bf16
+            # partials regardless of `output` dtype), so the load dtype MUST be bf16.
             accs = [c_zero] * _VEC
             for p in range_constexpr(_MP):
                 to_off = (
@@ -2386,13 +2351,11 @@ def pa_decode_ps_launch(
         s,
     )
 
-    # Combine the NORMALIZED partials + max/sum into `output` via a dedicated
-    # reduce matching this normalized-partial convention (pa_decode_reduce
-    # expects un-normalized numerators, so it can't be reused).
+    # Dedicated reduce for NORMALIZED partials (pa_decode_reduce expects
+    # un-normalized numerators, so it can't be reused).
     out_dtype_str = _get_output_dtype_str(output)
-    # The reduce needs a contiguous (eqgs, head_size) block per (batch, kv_head),
-    # which holds only for query_length == 1; query_length > 1 interleaves dim 1
-    # around num_kv_heads and needs a different mapping.
+    # Reduce needs a contiguous (eqgs, head_size) block per (batch, kv_head),
+    # which holds only for query_length == 1.
     if query_length != 1:
         raise NotImplementedError(
             "pa_decode_ps_launch reduce: query_length > 1 not supported yet "
@@ -2429,17 +2392,13 @@ def pa_decode_ps_launch(
 
 # ── AOT interface ─────────────────────────────────────────────────────────────
 #
-# Native-fp8 paged decode is gfx950-only.  softmax_scale is baked into the compiled
-# kernel (unlike the dense path, which takes it as a runtime arg), so AOT precompiles
-# with the default scale 1/sqrt(head_dim) — the value the adapter/dispatch use when
-# inp.scale is None.  Callers passing a non-default scale JIT-compile on first use.
-# The compute kernel and its reduce are compiled per config.
+# gfx950-only. softmax_scale is baked into the kernel, so AOT precompiles with the
+# default 1/sqrt(head_dim); non-default scales JIT-compile on first use.
 
 AOT_ARCHS: List[str] = ["gfx950"]
 
-# Baked compile-time params.  block_size=16, per_token_kv/trans_v match the adapter
-# (dense_kv_to_fp8_paged); query_group_size covers MQA (1) + GQA ratios; max_parts
-# is get_recommended_splits' output range (max(4, min(n, 8)) -> {4, 8}).
+# Baked params match the adapter (dense_kv_to_fp8_paged): block_size=16, per_token_kv,
+# trans_v; qgs covers MQA(1)+GQA; max_parts is get_recommended_splits' range {4, 8}.
 _FP8_HEAD_SIZES = (128, 256)
 _FP8_QGS = (1, 2, 4, 8, 16)
 _FP8_MAX_PARTS = (4, 8)
