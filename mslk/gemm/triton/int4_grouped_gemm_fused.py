@@ -65,9 +65,10 @@ def _get_grouped_configs() -> List[Config]:
 
 
 def _prune_grouped_configs(configs, named_args, **kwargs):
-    group_size = named_args["group_size"]
-    N = named_args["N"]
-    K2 = named_args["K2"]
+    all_args = {**named_args, **kwargs}
+    group_size = all_args["group_size"]
+    N = all_args["N"]
+    K2 = all_args["K2"]
     pruned = []
     for c in configs:
         bn = c.kwargs["BLOCK_N"]
