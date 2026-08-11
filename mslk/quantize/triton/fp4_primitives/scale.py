@@ -45,7 +45,7 @@ def _floor_log2(x):
         x: FP32 input tensor. Must be positive (undefined for x <= 0).
 
     Returns:
-        floor(log2(x)) as float32 tensor.
+        floor(log2(x)) as int32 tensor.
     """
     FP32_EXP_MASK: tl.constexpr = 0x7F800000  # type: ignore[Incompatible variable type]
     FP32_EXP_OFFSET: tl.constexpr = 23  # type: ignore[Incompatible variable type]
@@ -53,7 +53,7 @@ def _floor_log2(x):
 
     x = x.to(tl.int32, bitcast=True) & FP32_EXP_MASK
     x = x >> FP32_EXP_OFFSET
-    return (x - FP32_EXP_BIAS).to(tl.float32)
+    return x - FP32_EXP_BIAS
 
 
 @triton.jit
@@ -83,7 +83,7 @@ def _round_log2_via_bits(x, val_to_add: tl.constexpr):
             mode (see above).
 
     Returns:
-        Rounded ``log2(x)`` as a float32 tensor.
+        Rounded ``log2(x)`` as an int32 tensor.
     """
     FP32_EXP_MASK: tl.constexpr = 0x7F800000  # type: ignore[Incompatible variable type]
     FP32_EXP_OFFSET: tl.constexpr = 23  # type: ignore[Incompatible variable type]
@@ -91,7 +91,7 @@ def _round_log2_via_bits(x, val_to_add: tl.constexpr):
 
     bits = x.to(tl.int32, bitcast=True) + val_to_add
     bits = (bits & FP32_EXP_MASK) >> FP32_EXP_OFFSET
-    return (bits - FP32_EXP_BIAS).to(tl.float32)
+    return bits - FP32_EXP_BIAS
 
 
 @triton.jit
@@ -120,7 +120,7 @@ def _compute_exp(
         MBITS: Number of mantissa bits in the target MX4 format (compile-time constant).
 
     Returns:
-        Shared exponent for each group as float32 tensor.
+        Shared exponent for each group as int32 tensor.
     """
     MBITS_FP32: tl.constexpr = 23  # type: ignore[Incompatible variable type]
     M_ROUND: tl.constexpr = (1 << (MBITS_FP32 - MBITS - 1)) - 1  # type: ignore
@@ -132,7 +132,7 @@ def _compute_exp(
         # transition is at x = 2^k * sqrt(2), which does not correspond
         # to a clean bit-trick threshold, so we keep the legacy
         # ``floor(log2(x) + 0.5)`` formulation here.
-        return tl.floor(tl.log2(group_max) + 0.5)
+        return tl.floor(tl.log2(group_max) + 0.5).to(tl.int32)
     if rounding_mode == 1:
         return _floor_log2(group_max)
     elif rounding_mode == 2:
@@ -159,8 +159,8 @@ def encode_mx4_exponent(group_exp):
     the inverse of decoding: ``original_exp = stored_value - 127``.
 
     Args:
-        group_exp: Integer-valued shared exponent (float32 tensor), typically
-            in the range [-127, 125] after clamping.
+        group_exp: Shared exponent (int32 tensor), typically in the range
+            [-127, 125] after clamping.
 
     Returns:
         Biased exponent as int8 tensor, with values in [0, 252].
@@ -187,11 +187,12 @@ def mx4_scale_normalize_encode(
     """Shared MX4 scale + normalize + (optional stochastic) + E8M0 encode.
 
     Given the fp32 tile ``x_blocks`` and its per-group ``block_amax``, this:
-      1. zero-guards amax with ``BF16_MIN_NORMAL``;
+      1. zero-guards amax with ``BF16_MIN_NORMAL`` when required by the selected
+         rounding mode;
       2. computes the shared exponent via ``_compute_exp`` (per-group stochastic
          rand bits when ``STOCHASTIC``), subtracts ``EBITS``, clamps to [-127, 125];
-      3. builds the fp32 scale via an **fp64** ``exp2`` intermediate and divides
-         ``x_blocks`` by it;
+      3. builds the exact reciprocal fp32 power-of-two scale from its IEEE 754
+         bits and multiplies ``x_blocks`` by it;
       4. optionally adds per-element mantissa-LSB noise for stochastic rounding of
          the FP32→FP4 cast (decorrelated stream via ``seed ^ 0x5A5A5A5A``);
       5. encodes the exponent as biased E8M0 int8.
@@ -202,7 +203,12 @@ def mx4_scale_normalize_encode(
     Returns ``(x_blocks, encoded_scales)`` where ``x_blocks`` is the normalized
     (and stochastically perturbed) tile and ``encoded_scales`` is int8 E8M0.
     """
-    safe_amax = tl.where(block_amax == 0, BF16_MIN_NORMAL, block_amax)
+    if ROUNDING_MODE != 0:
+        # Bit-based modes map zero below the supported exponent range, and the
+        # clamp below produces the same -127 exponent as BF16_MIN_NORMAL.
+        safe_amax = block_amax
+    else:
+        safe_amax = tl.where(block_amax == 0, BF16_MIN_NORMAL, block_amax)
 
     # Stochastic rounding (OCP MX v1.0): per-group rand bits feed the
     # ``rounding_mode == 3`` branch of ``_compute_exp``. When
@@ -218,13 +224,13 @@ def mx4_scale_normalize_encode(
     else:
         group_exp = _compute_exp(safe_amax, ROUNDING_MODE, 0, MBITS)
     group_exp = group_exp - EBITS
-    group_exp = tl.clamp(group_exp, -127, 125)
+    group_exp = tl.maximum(tl.minimum(group_exp, 125), -127)
 
-    # Use float64 intermediate for exp2 precision
-    scale_float = tl.exp2(group_exp.to(tl.float64)).to(tl.float32)
-
-    # Normalize input by dividing by scale
-    x_blocks = x_blocks / scale_float[:, :, None]
+    # The reciprocal exponent is in [-125, 127], so it is always a normal
+    # FP32 value, including when the original scale is the subnormal 2^-127.
+    inv_scale_bits = (-group_exp + E8M0_EXPONENT_BIAS) << 23
+    inv_scale_float = inv_scale_bits.to(tl.float32, bitcast=True)
+    x_blocks = x_blocks * inv_scale_float[:, :, None]
 
     # Per-element stochastic rounding on the FP32→FP4 cast. Add uniform noise in
     # the discarded mantissa bits before the ``cvt.rn.satfinite.e2m1x2.f32`` PTX

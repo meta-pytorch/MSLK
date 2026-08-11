@@ -39,6 +39,7 @@ def quantize_mx4_stacked_kernel(
     stride_xm,  # row stride of x_ptr (elements to skip per row)
     stride_xn,  # col stride of x_ptr (usually 1 for contiguous)
     N,  # number of columns in the input matrix
+    padded_total_M,  # CUDA-graph-safe upper bound on padded rows
     seed,  # int64 seed for tl.randint (Philox-3); only consulted when STOCHASTIC=True
     NUM_SEGMENTS: tl.constexpr,  # number of expert segments
     PREFIX_NUM: tl.constexpr,  # next_power_of_2(NUM_SEGMENTS) for tl.cumsum
@@ -54,6 +55,7 @@ def quantize_mx4_stacked_kernel(
     STOCHASTIC: tl.constexpr,  # True → enable software stochastic rounding
     IS_ROCM: tl.constexpr,  # True → plain [M, K//32] scale layout (AMD GEMM contract)
     IS_GFX950: tl.constexpr,  # True → gfx950 native FP4 packing instruction
+    ZERO_SLACK: tl.constexpr,  # True → initialize trailing over-allocation in-kernel
 ):
     """Stacked MX4 quantization kernel processing [M_PER_BLOCK, 64] tiles.
 
@@ -62,9 +64,8 @@ def quantize_mx4_stacked_kernel(
     segment + logical row via ``stacked_segment_map``, and per-group E8M0 scales
     are stored at the row's padded offset so each segment is 128-row aligned in
     the scale buffer. Padding rows within ``[0, padded_total)`` get
-    ``is_valid_row=False`` → zero scales, written in-kernel; the over-allocated
-    slack rows ``[padded_total, padded_total_M)`` are zeroed by the host
-    ``torch.zeros`` allocation.
+    ``is_valid_row=False`` → zero scales, written in-kernel. For aligned scale
+    layouts, fully slack tiles initialize the trailing over-allocation.
 
     Grid: (cdiv(N, 64), cdiv(padded_total_M, M_PER_BLOCK)).
     """
@@ -88,8 +89,21 @@ def quantize_mx4_stacked_kernel(
     ) = stacked_segment_map(
         m_sizes_ptr, pid_m, M_PER_BLOCK, NUM_SEGMENTS, PREFIX_NUM, BSEARCH_ITERS
     )
-    # Skip fully-slack tiles (beyond the last segment's padded rows).
+    # Handle fully-slack tiles beyond the last segment's padded rows.
     if pid_m * M_PER_BLOCK >= padded_total:
+        if ZERO_SLACK:
+            slack_rows = (
+                pid_m.to(tl.int64) * M_PER_BLOCK
+                + tl.arange(0, M_PER_BLOCK).to(tl.int64)[:, None]
+            )
+            slack_cols = (
+                pid_n.to(tl.int64) * NUM_GROUPS
+                + tl.arange(0, NUM_GROUPS).to(tl.int64)[None, :]
+            )
+            padded_cols: tl.constexpr = N_COL_BLOCKS * 4
+            slack_offs = slack_rows * padded_cols + slack_cols
+            slack_mask = (slack_rows < padded_total_M) & (slack_cols < padded_cols)
+            tl.store(s_ptr + slack_offs, 0, mask=slack_mask)
         return
 
     # Compute tile offsets and load [M_PER_BLOCK, 64] tile. Rows are indexed by
@@ -282,13 +296,9 @@ def quantize_mx4_stacked(
         # rows are masked out by the kernel). No per-segment 128-row pad.
         scales = torch.zeros(M, scale_K, dtype=torch.int8, device=x.device)
     else:
-        # Zero-init the scale buffer. The kernel writes scales only for rows in
-        # ``[0, padded_total)`` where ``padded_total = sum(round_up(m_i, 128))``;
-        # the CUDA-graph-safe buffer is over-allocated to the upper bound
-        # ``padded_total_M = M + num_segments * 127`` (to avoid a GPU→CPU sync),
-        # so the slack rows ``[padded_total, padded_total_M)`` are never touched
-        # by the kernel and must be zeroed here.
-        scales = torch.zeros(
+        # Aligned layouts are fully overwritten by data, padding, and slack CTAs.
+        scale_factory = torch.empty if scale_K % 4 == 0 else torch.zeros
+        scales = scale_factory(
             padded_total_M, padded_cols, dtype=torch.int8, device=x.device
         )
 
@@ -304,11 +314,12 @@ def quantize_mx4_stacked(
     quantize_mx4_stacked_kernel[grid](  # pyre-ignore[28]
         x_2d,  # [M, N] input (2D-flattened)
         xq,  # [M, N//2] output packed FP4
-        scales,  # [padded_total_M_ub, padded_cols] output scales (pre-zeroed)
+        scales,  # [padded_total_M_ub, padded_cols] output scales
         m_sizes,  # [num_segments] int64 rows per segment
         x_2d.stride(0),  # stride_xm
         x_2d.stride(1),  # stride_xn
         N,  # number of columns
+        padded_total_M,  # padded-row allocation upper bound
         seed_int,  # int64 seed for tl.randint (unused when STOCHASTIC=False)
         # pyre-ignore[6]
         NUM_SEGMENTS=num_segments,
@@ -338,6 +349,8 @@ def quantize_mx4_stacked(
         IS_ROCM=rocm,
         # pyre-ignore[6]
         IS_GFX950=gfx950,
+        # pyre-ignore[6]
+        ZERO_SLACK=not rocm and scale_K % 4 == 0,
         # pyre-ignore[28]
         num_stages=3 if M >= 256 else 1,
         # pyre-ignore[28]
