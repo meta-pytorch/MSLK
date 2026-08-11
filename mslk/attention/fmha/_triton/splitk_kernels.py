@@ -534,7 +534,9 @@ def _fwd_kernel_splitK(  # noqa: C901
                 PACKED_D_PER_GROUP,
                 FP8_QUANTIZED,
                 Q.dtype.element_ty,
+                # pyrefly: ignore [bad-argument-type]
                 v_dtype,
+                # pyrefly: ignore [bad-argument-type]
                 i,
                 IS_HIP,
                 QUANTIZE_PV_TO_FP8,
@@ -544,16 +546,16 @@ def _fwd_kernel_splitK(  # noqa: C901
 
             # Unpack results based on quantization configuration
             if QUANTIZE_PV_TO_FP8 and QUANTIZE_QK_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], v_scale, k_scale = result  # noqa: F821
             elif QUANTIZE_PV_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], v_scale = result  # noqa: F821
             elif QUANTIZE_QK_TO_FP8:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i], k_scale = result  # noqa: F821
             else:
-                # pyrefly: ignore [unbound-name]
+                # pyrefly: ignore [bad-unpacking, unbound-name]
                 k[i], v[i] = result  # noqa: F821
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -958,6 +960,7 @@ def _process_fp8_quantization(
             k_t = dequantize(
                 tl.trans(k),
                 tl.trans(k_scale),
+                # pyrefly: ignore [bad-argument-type]
                 tl.trans(k_shift) if not USE_FP32_SCALES else None,
                 PACKED_PER_VAL,
                 IS_HIP,

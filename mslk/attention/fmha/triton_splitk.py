@@ -1104,6 +1104,7 @@ def merge_attentions(
         lse_out,
         # pyrefly: ignore [bad-argument-type]
         split_k=split_k,
+        # pyrefly: ignore [bad-argument-type]
         splitK_pow2=splitK_pow2,
         # pyrefly: ignore [bad-argument-type]
         **_strides(attn_split, "osk_z", "osk_g", "osk_h", "osk_s", "osk_m", "osk_k"),
@@ -1115,6 +1116,7 @@ def merge_attentions(
         **_strides(lse_out, "lse_z", "lse_g", "lse_h", "lse_m"),
         # pyrefly: ignore [bad-argument-type]
         head_dim=head_dim,
+        # pyrefly: ignore [bad-argument-type]
         head_dim_pow_2=triton.next_power_of_2(head_dim),
         # pyrefly: ignore [bad-argument-type]
         G=G,
