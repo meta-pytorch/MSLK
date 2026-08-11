@@ -36,6 +36,7 @@ if torch.version.hip is not None:
     # module, which overrides the default (non-existent) CUDA impl so that
     # torch.ops.mslk.* dispatches to the Triton kernel on AMD.
     from .triton import (  # noqa: F401
+        f8i4bf16_rowwise_gemm as _f8i4bf16_rowwise_gemm,
         fp8_groupwise_gemm,
         fp8_groupwise_grouped_gemm,
         grouped_gemm as _grouped_gemm,

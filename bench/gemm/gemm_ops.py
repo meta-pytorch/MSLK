@@ -9,6 +9,16 @@ import functools
 from enum import auto, Enum
 
 import torch
+
+import mslk.gemm  # noqa: F401 — ensure mslk namespace exists
+
+_STUB_SCHEMAS = [
+    ("f8i4bf16_rowwise", "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor"),
+]
+for _name, _schema in _STUB_SCHEMAS:
+    if not hasattr(torch.ops, "mslk") or not hasattr(torch.ops.mslk, _name):
+        torch.library.define(f"mslk::{_name}", _schema)
+
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.flydsl.common import is_flydsl_version_at_least
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
@@ -1922,6 +1932,23 @@ class TritonBF16Int4GroupedShuffled(CutlassFP8Int4Rowwise):
     @property
     def weight_bytes_per_element(self) -> float:
         return 0.5
+
+
+@register_gemm_op
+class TritonFP8Int4Rowwise(CutlassFP8Int4Rowwise):
+    """ROCm Triton FP8xINT4 rowwise GEMM."""
+
+    def compute(self, xq, wq, x_scale, w_scale, w_zp):
+        from mslk.gemm.triton.f8i4bf16_rowwise_gemm import matmul_f8i4bf16_rowwise
+
+        return matmul_f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
+
+    def quantize_and_compute(self, xq, wq, x_scale, w_scale, w_zp):
+        return self.compute(xq, wq, x_scale, w_scale, w_zp)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
 
 
 @register_gemm_op
