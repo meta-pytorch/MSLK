@@ -44,6 +44,7 @@ def quantize_mx4_kernel(
     EBITS: tl.constexpr,  # exponent bits in target FP4 format (2 for E2M1)
     MBITS: tl.constexpr,  # mantissa bits in target FP4 format (1 for E2M1)
     N_COL_BLOCKS: tl.constexpr,  # ceil(num_scale_cols / 4) — blocked layout offset
+    HAS_PADDING_PROGRAM: tl.constexpr,  # True when the N grid includes a padding CTA
     STOCHASTIC: tl.constexpr,  # True → enable software stochastic rounding
     IS_ROCM: tl.constexpr,  # True → plain [M, K//32] scale layout (AMD GEMM contract)
     IS_GFX950: tl.constexpr,  # True → gfx950 native FP4 packing instruction
@@ -54,8 +55,10 @@ def quantize_mx4_kernel(
     bytes and per-group E8M0 (power-of-two biased int8) scales in the Blackwell
     blocked layout. MX4 has no global scale.
 
-    Grid: (cdiv(N, 64), cdiv(M, M_PER_BLOCK) [+1 for tail zeroing when
-    M_PER_BLOCK != 128]).
+    On NVIDIA, the N grid covers complete four-column scale layouts. On ROCm,
+    it covers the input's 64-element tiles. The M grid is
+    cdiv(M, M_PER_BLOCK), plus one for NVIDIA tail zeroing when
+    M_PER_BLOCK != 128.
     """
     TILE_N: tl.constexpr = 64  # type: ignore[Incompatible variable type]
     NUM_GROUPS: tl.constexpr = TILE_N // GROUP_SIZE
@@ -76,6 +79,26 @@ def quantize_mx4_kernel(
         oob_mask = (offs_m >= M) & tl.full((NUM_GROUPS,), True, dtype=tl.int1)[None, :]
         zero_scales = tl.full([128, NUM_GROUPS], 0, dtype=tl.int8)
         tl.store(s_ptr + scale_offs, zero_scales, mask=oob_mask)
+        return
+
+    # A padded MX4-32 scale layout can require one more N program than the
+    # input. That program owns only scale padding and must not load input data.
+    if HAS_PADDING_PROGRAM and pid_n * TILE_N >= N:
+        ROW_TILES_PER_LAYOUT: tl.constexpr = 128 // M_PER_BLOCK
+        offs_m_in_layout = (
+            (pid_m % ROW_TILES_PER_LAYOUT) * M_PER_BLOCK + tl.arange(0, M_PER_BLOCK)
+        )[:, None]
+        row_block = pid_m // ROW_TILES_PER_LAYOUT
+        scale_pid_n = pid_n
+        if USE_INT64_INDEXING:
+            row_block = row_block.to(tl.int64)
+            scale_pid_n = scale_pid_n.to(tl.int64)
+        layout_off = row_block * N_COL_BLOCKS * 512
+        scale_offs = layout_off + mx4_scale_swizzle(
+            offs_m_in_layout, scale_pid_n, NUM_GROUPS
+        )
+        zero_scales = tl.full([M_PER_BLOCK, NUM_GROUPS], 0, dtype=tl.int8)
+        tl.store(s_ptr + scale_offs, zero_scales)
         return
 
     # Compute tile offsets and load [M_PER_BLOCK, 64] tile.
@@ -160,11 +183,7 @@ def quantize_mx4_kernel(
         scale_offs = layout_off + mx4_scale_swizzle(
             offs_m_in_layout, scale_pid_n, NUM_GROUPS
         )
-        # Mask out scale columns beyond num_scale_cols (= N // GROUP_SIZE).
-        # Without this mask, writes for col >= num_scale_cols collide with
-        # valid scales of subsequent rows in the swizzled layout. Rows are
-        # already on-tile by construction in the non-stacked path.
-        scale_store_mask = logical_col < num_scale_cols
+        scale_store_mask = None
     tl.store(
         s_ptr + scale_offs,
         encoded_scales,
@@ -264,20 +283,34 @@ def quantize_mx4(
     else:
         padded_rows = triton.cdiv(M, 128) * 128
         padded_cols = n_col_blocks * 4
-        # Zero-init so OOB positions (where the kernel does not write) are zero.
-        scales = torch.zeros(
+        scales = torch.empty(
             padded_rows, padded_cols, dtype=torch.int8, device=x.device
         )
 
     # M_PER_BLOCK: rows per program. Capped at 128 (scale layout alignment).
     M_PER_BLOCK = min(triton.next_power_of_2(M), 128)
     USE_MASK = M % M_PER_BLOCK != 0 or N % 64 != 0
-    grid = (triton.cdiv(N, 64), triton.cdiv(M, M_PER_BLOCK))
+    data_grid_n = triton.cdiv(N, 64)
+    if rocm:
+        grid_n = data_grid_n
+    else:
+        groups_per_program = 64 // group_size
+        programs_per_scale_layout = 4 // groups_per_program
+        grid_n = n_col_blocks * programs_per_scale_layout
+    grid = (grid_n, triton.cdiv(M, M_PER_BLOCK))
     # Extra row of blocks to zero out tail scales when M_PER_BLOCK < 128
     # (NVIDIA padded layout only; ROCm has no padded tail).
     if M_PER_BLOCK != 128 and not rocm:
         grid = (grid[0], grid[1] + 1)
     use_int64 = M * N > 2**31 - 1
+    launch_options: dict[str, int | str] = {
+        "num_stages": 3 if M >= 256 else 1,
+        "num_warps": 4,
+    }
+    if not rocm and not use_int64:
+        launch_options["ptx_options"] = "--minnctapersm=1"
+        if not stochastic:
+            launch_options["maxnreg"] = 80
 
     quantize_mx4_kernel[grid](  # pyre-ignore[28]
         x_2d,  # [M, N] input (2D-flattened)
@@ -305,15 +338,14 @@ def quantize_mx4(
         # pyre-ignore[6]
         N_COL_BLOCKS=n_col_blocks,
         # pyre-ignore[6]
+        HAS_PADDING_PROGRAM=not rocm and grid_n > data_grid_n,
+        # pyre-ignore[6]
         STOCHASTIC=stochastic,
         # pyre-ignore[6]
         IS_ROCM=rocm,
         # pyre-ignore[6]
         IS_GFX950=gfx950,
-        # pyre-ignore[28]
-        num_stages=3 if M >= 256 else 1,
-        # pyre-ignore[28]
-        num_warps=4,
+        **launch_options,  # pyre-ignore[28]
     )
 
     xq = xq.view(*orig_leading_dims, -1, N // 2)

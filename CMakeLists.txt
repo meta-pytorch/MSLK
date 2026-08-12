@@ -136,6 +136,28 @@ set(mslk_include_directories
   ${THIRDPARTY}/composable_kernel/library/include
   ${NCCL_INCLUDE_DIRS})
 
+# The vendored composable_kernel submodule ships `ck/config.h.in` but not the
+# generated `ck/config.h` that `ck/ck.hpp` includes.  ROCm installations provide
+# the generated header under ${ROCM_PATH}/include, but toolchains coming from
+# the `rocm-sdk-devel` wheel (e.g. the ROCm 7.14 manylinux builder image) don't.
+#
+# Only the presence of the header matters here: MSLK passes none of CK's
+# `-DCK_USE_*` build flags, and the `CK_USE_{OCP,FNUZ}_FP8` values written by
+# `configure_file()` are the literal token `ON`, which `#if` evaluates to 0.
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  find_file(CK_CONFIG_H ck/config.h PATHS ${ROCM_PATH}/include NO_DEFAULT_PATH)
+
+  if(NOT CK_CONFIG_H)
+    message(STATUS "generating ck/config.h")
+    set(CK_ENABLE_ALL_DTYPES "ON")
+    configure_file(
+      ${THIRDPARTY}/composable_kernel/include/ck/config.h.in
+      ${CMAKE_BINARY_DIR}/ck_config/ck/config.h
+      @ONLY)
+    list(APPEND mslk_include_directories ${CMAKE_BINARY_DIR}/ck_config)
+  endif()
+endif()
+
 
 ################################################################################
 # HIP Code Generation

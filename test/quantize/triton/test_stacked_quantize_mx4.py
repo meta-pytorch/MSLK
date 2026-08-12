@@ -154,6 +154,18 @@ class StackedQuantizeMX4Test(unittest.TestCase):
             f"FP4 data mismatch for m_sizes={m_sizes_list}, N={N}, gs={group_size}",
         )
 
+        if not is_rocm():
+            padded_rows = sum(
+                math.ceil(m_i / 128) * 128 for m_i in m_sizes_list if m_i > 0
+            )
+            slack_start = padded_rows * padded_cols
+            slack = b_scales[slack_start:]
+            expected_slack_bytes = (
+                sum(m_sizes_list) + len(m_sizes_list) * 127 - padded_rows
+            ) * padded_cols
+            self.assertEqual(expected_slack_bytes, slack.numel())
+            self.assertTrue(torch.equal(slack, torch.zeros_like(slack)))
+
     # NaN/Inf saturation: a special value in one segment must not corrupt the
     # per-segment output (each segment still matches independent quantize_mx4).
 

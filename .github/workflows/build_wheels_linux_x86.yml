@@ -57,12 +57,16 @@ jobs:
       # Nova Coordinate Filters:
       # cuda/12.6: No longer supported in MSLK
       # rocm/3.13t: causes segfaults at runtime
+      # rocm/{3.14t,3.15,3.15t}: FlyDSL, which is a mandatory dependency for the
+      #   ROCm variant (see ci/flydsl_version.txt), publishes no wheels for the
+      #   free-threaded builds or for 3.x >= 3.15.  Drop the coordinates again
+      #   as the wheels become available.
       # python/3.14: torch.compile support is missing, see https://github.com/pytorch/pytorch/issues/156856
       run: |
         set -ex
         pwd
         ls
-        MATRIX_BLOB="$( python .github/scripts/filter_nova_matrix.py --filter 'desired_cuda:cu126' --filter 'gpu_arch_type:rocm;python_version:3.13t' )"
+        MATRIX_BLOB="$( python .github/scripts/filter_nova_matrix.py --filter 'desired_cuda:cu126' --filter 'gpu_arch_type:rocm;python_version:3.13t,3.14t,3.15,3.15t' )"
         echo "${MATRIX_BLOB}"
         echo "matrix=${MATRIX_BLOB}" >> "${GITHUB_OUTPUT}"
 
