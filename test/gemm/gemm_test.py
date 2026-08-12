@@ -3421,9 +3421,9 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = self.flydsl_preshuffle(wq)
+        wq_shuffled = flydsl_preshuffle(wq)
 
-        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
 
         ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(out, ref)
@@ -3435,9 +3435,9 @@ class FlyDSLPreshuffleGemmTest(unittest.TestCase):
 
         xq, x_scale = quantize_fp8_row(x)
         wq, w_scale = quantize_fp8_row(w)
-        wq_shuffled = self.flydsl_preshuffle(wq)
+        wq_shuffled = flydsl_preshuffle(wq)
 
-        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+        out = flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
 
         ref = (x @ w.T).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
