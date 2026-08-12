@@ -33,9 +33,12 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator
 
+from ._common import tensor_cache_sig as _fmha_tensor_cache_sig
 from .flash_attn_utils import (
     _make_flash_attn_generic_traits,
     _waitcnt_vm_n,
+    DualwaveSplitKCombineContext,
+    DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
     GenericGemmHelper,
     GenericKvGmemToLdsLoader,
@@ -70,6 +73,12 @@ def build_flash_attn_func_module_primary(
     kv_cache_layout="linear",
     skip_kv_pad_mask=None,
     return_lse=False,
+    window_left=-1,
+    has_bias=False,
+    causal_top_left=False,
+    has_dropout=False,
+    gappy_kv=False,
+    num_kv_splits=1,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -89,6 +98,11 @@ def build_flash_attn_func_module_primary(
         raise ValueError(
             "generic flash_attn_func supports f16/bf16 only; fp8 is routed by flash_attn_interface"
         )
+
+    # D=256 is VGPR-bound (occupancy caps at 1 wave/EU); waves_per_eu=1 lets the
+    # compiler use registers instead of spilling. Occupancy hint only.
+    if head_dim >= 256:
+        waves_per_eu = 1
 
     if block_m is None and num_heads >= 32:
         _launcher_m128 = build_flash_attn_func_module_primary(
@@ -113,6 +127,11 @@ def build_flash_attn_func_module_primary(
             kv_cache_layout=kv_cache_layout,
             skip_kv_pad_mask=skip_kv_pad_mask,
             return_lse=return_lse,
+            window_left=window_left,
+            has_bias=has_bias,
+            causal_top_left=causal_top_left,
+            has_dropout=has_dropout,
+            gappy_kv=gappy_kv,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -136,6 +155,11 @@ def build_flash_attn_func_module_primary(
             kv_cache_layout=kv_cache_layout,
             skip_kv_pad_mask=skip_kv_pad_mask,
             return_lse=return_lse,
+            window_left=window_left,
+            has_bias=has_bias,
+            causal_top_left=causal_top_left,
+            has_dropout=has_dropout,
+            gappy_kv=gappy_kv,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -228,6 +252,12 @@ def build_flash_attn_func_module_primary(
         sm_scale=sm_scale,
         skip_kv_pad_mask=skip_kv_pad_mask,
         return_lse=return_lse,
+        window_left=window_left,
+        has_bias=has_bias,
+        causal_top_left=causal_top_left,
+        has_dropout=has_dropout,
+        gappy_kv=gappy_kv,
+        num_kv_splits=num_kv_splits,
     )
     _flash_attn_generic_cache_tag = traits.cache_tag
 
@@ -271,12 +301,23 @@ def build_flash_attn_func_module_primary(
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
+        Workspace: fx.Tensor,
+        batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
+        KvSeqStart: fx.Tensor,
         BlockTable: fx.Tensor,
         block_table_stride: fx.Int32,
+        Bias: fx.Tensor,
+        bias_stride_b: fx.Int32,
+        bias_stride_h: fx.Int32,
+        bias_stride_q: fx.Int32,
+        Dropout: fx.Tensor,
+        dropout_stride_b: fx.Int32,
+        dropout_stride_h: fx.Int32,
+        dropout_stride_q: fx.Int32,
     ):
         # Make shape/mode traits visible to the JIT cache key.
         _ = _flash_attn_generic_cache_tag
@@ -295,7 +336,8 @@ def build_flash_attn_func_module_primary(
         ctx.init_lds_view()
         ctx.init_thread_mapping()
         ctx.init_block_mapping()
-        ctx.init_sequence_lengths(CuSeqQ, CuSeqKv)
+        ctx.init_sequence_lengths(CuSeqQ, CuSeqKv, KvSeqStart)
+        ctx.init_workspace(Workspace, batch_size)
         ctx.init_load_mapping()
 
         # Dense/varlen fold batch into raw K/V pointers; paged adds page_id per tile.
@@ -309,6 +351,12 @@ def build_flash_attn_func_module_primary(
 
         # Per-batch Q/O descriptors, then K/V DMA resources when DMA is enabled.
         ctx.init_descriptors(Q, O)
+        if const_expr(traits.HAS_BIAS):
+            ctx.init_bias(Bias, bias_stride_b, bias_stride_h, bias_stride_q)
+        if const_expr(traits.HAS_DROPOUT):
+            ctx.init_dropout(
+                Dropout, dropout_stride_b, dropout_stride_h, dropout_stride_q
+            )
         if const_expr(traits.ENABLE_DMA):
             kv_gmem_to_lds.init_dma()
 
@@ -319,6 +367,7 @@ def build_flash_attn_func_module_primary(
         ctx.init_constants(sm_scale)
         ctx.init_kv_bounds()
         kv_upper = ctx.kv_upper
+        kv_lower = ctx.kv_lower
 
         # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf)]
         _use_dma_dbuf = traits.ENABLE_DMA and not traits.ENABLE_PREFETCH_3BUF
@@ -333,16 +382,16 @@ def build_flash_attn_func_module_primary(
             init_args.append(ctx.c_zero_v16f32)
         if const_expr(_use_dma_dbuf):
             init_args.append(fx.Index(0))
-            kv_gmem_to_lds.coop_dma_k(fx.Index(0), buf_id=0)
+            kv_gmem_to_lds.coop_dma_k(kv_lower, buf_id=0)
             rocdl.s_waitcnt(0)
         if const_expr(_pipe_k):
-            _k0_vecs = kv_gmem_to_lds.coop_load_k_global(fx.Index(0))
+            _k0_vecs = kv_gmem_to_lds.coop_load_k_global(kv_lower)
             for _kb in range_constexpr(traits.NUM_BATCHES_KV):
                 init_args.append(_k0_vecs[_kb])
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(
-            0, kv_upper, traits.BLOCK_N_OUT, init=init_args
+            kv_lower, kv_upper, traits.BLOCK_N_OUT, init=init_args
         ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
@@ -493,6 +542,11 @@ def build_flash_attn_func_module_primary(
 
                 # ==== Online softmax over 64 KV positions ====
                 s_raw_lo, s_raw_hi = softmax_helper.split_scores(s_acc_lo, s_acc_hi)
+                # Additive bias, before masking so masked positions stay -inf.
+                if const_expr(traits.HAS_BIAS):
+                    s_raw_lo, s_raw_hi = softmax_helper.add_bias(
+                        s_raw_lo, s_raw_hi, kv_start
+                    )
                 s_raw_lo, s_raw_hi = softmax_helper.apply_kv_mask(
                     s_raw_lo, s_raw_hi, kv_start
                 )
@@ -500,6 +554,7 @@ def build_flash_attn_func_module_primary(
                     traits.ENABLE_GFX942_KV_GPFETCH
                     and traits.DTYPE_STR == "bf16"
                     and not traits.USE_K16
+                    and not traits.HAS_DROPOUT
                 ):
                     m_new_raw, corr, neg_scaled_max = (
                         softmax_helper.online_softmax_stats(
@@ -513,6 +568,11 @@ def build_flash_attn_func_module_primary(
                             m_running, l_running, s_raw_lo, s_raw_hi
                         )
                     )
+                    # Dropout after online_softmax so l_new/LSE excludes it.
+                    if const_expr(traits.HAS_DROPOUT):
+                        p_vals_lo, p_vals_hi = softmax_helper.apply_dropout(
+                            p_vals_lo, p_vals_hi, kv_start
+                        )
                     o_accs, corr_vec = softmax_helper.rescale_o_accs(o_accs, corr)
 
                 if const_expr(
@@ -564,6 +624,7 @@ def build_flash_attn_func_module_primary(
                     traits.ENABLE_GFX942_KV_GPFETCH
                     and traits.DTYPE_STR == "bf16"
                     and not traits.USE_K16
+                    and not traits.HAS_DROPOUT
                 ):
                     o_accs, l_new = softmax_helper.gemm2_gpfetch_fused(
                         gemm_helper,
@@ -598,8 +659,67 @@ def build_flash_attn_func_module_primary(
                     _yield_args.append(_next_k_vecs[_kb])
             loop_results = yield _yield_args
 
-        # ---- Normalize and store O (128-bit buffer_store_dwordx4) ----
-        store_helper.finalize_o(loop_results)
+        # ---- Store O ----
+        if const_expr(traits.SPLITK):
+            # Split-K writes an unnormalized-then-reweighted partial to the workspace;
+            # the combine kernel merges splits into the final O + LSE.
+            store_helper.store_splitk_partial(loop_results, ctx.q_row)
+        else:
+            # Normalize and store O (128-bit buffer_store_dwordx4).
+            store_helper.finalize_o(loop_results)
+
+    # Split-K combine: merge per-split partials into final O + LSE. The generic O
+    # register/pack layout matches the dualwave path, so the shared combine kernel
+    # reads the workspace verbatim (one wave row covers four O columns per lane).
+    COMBINE_BLOCK = 256
+    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
+    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+
+    @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
+    def flash_attn_generic_combine_kernel(
+        O: fx.Tensor,  # noqa: E741
+        Workspace: fx.Tensor,
+        LSE: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        stride_q_n: fx.Int32,
+    ):
+        c_ctx = DualwaveSplitKCombineContext(
+            traits, O, Workspace, batch_size, seq_len, stride_q_n, LSE=LSE
+        )
+        c_ctx.init_types_and_constants()
+        c_ctx.init_runtime_indices()
+        c_ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
+        # ceil-div grid can spawn rows past the last valid (batch, head, seq) row when
+        # seq_len is not a multiple of COMBINE_ROWS_PER_BLOCK; those overflow threads
+        # decode batch_idx >= batch_size. Clamp their row into range so workspace/O
+        # descriptors stay in-bounds, then drop their stores below (the real owner of
+        # the clamped row writes the correct value).
+        total_rows = (
+            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
+        )
+        c_ctx.row_in_bounds = c_ctx.row < total_rows
+        c_ctx.row = (c_ctx.row_in_bounds).select(c_ctx.row, fx.Index(0))
+        heads_per_batch = c_ctx.seq_len_v * traits.NUM_HEADS_Q
+        c_ctx.batch_idx = c_ctx.row // heads_per_batch
+        _rem = c_ctx.row % heads_per_batch
+        c_ctx.q_head_idx = _rem // c_ctx.seq_len_v
+        c_ctx.seq_idx = _rem % c_ctx.seq_len_v
+        c_ctx.init_workspace()
+        c_ctx.init_descriptors()
+
+        combine = DualwaveSplitKCombineHelper(c_ctx)
+        m_s, l_s = combine.load_ml_rows()
+        m_max = combine.reduce_m_max(m_s)
+        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        o_pack = combine.pack_output(acc, den)
+
+        def _store_in_bounds():
+            combine.store_output(o_pack)
+            if const_expr(traits.RETURN_LSE):
+                combine.store_lse(m_max, den)
+
+        scf_if_dispatch(c_ctx.row_in_bounds, _store_in_bounds)
 
     @flyc.jit
     def launch_flash_attn_generic(
@@ -608,13 +728,24 @@ def build_flash_attn_func_module_primary(
         V: fx.Tensor,
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
+        Workspace: fx.Tensor,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
+        KvSeqStart: fx.Tensor,
         BlockTable: fx.Tensor,
         block_table_stride: fx.Int32,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
+        stride_q_n: fx.Int32,
+        Bias: fx.Tensor,
+        bias_stride_b: fx.Int32,
+        bias_stride_h: fx.Int32,
+        bias_stride_q: fx.Int32,
+        Dropout: fx.Tensor,
+        dropout_stride_b: fx.Int32,
+        dropout_stride_h: fx.Int32,
+        dropout_stride_q: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -626,6 +757,10 @@ def build_flash_attn_func_module_primary(
         sl_idx = fx.Index(seq_len)
         num_q_tiles = (sl_idx + traits.BLOCK_M - 1) // traits.BLOCK_M
         grid_x = bs_idx * num_q_tiles * traits.NUM_HEADS_Q
+        if const_expr(traits.SPLITK):
+            grid_y = traits.NUM_KV_SPLITS
+        else:
+            grid_y = 1
 
         passthrough_entries = (
             [
@@ -642,12 +777,23 @@ def build_flash_attn_func_module_primary(
             V,
             O,
             LSE,
+            Workspace,
+            batch_size,
             seq_len,
             seq_len_kv,
             CuSeqQ,
             CuSeqKv,
+            KvSeqStart,
             BlockTable,
             block_table_stride,
+            Bias,
+            bias_stride_b,
+            bias_stride_h,
+            bias_stride_q,
+            Dropout,
+            dropout_stride_b,
+            dropout_stride_h,
+            dropout_stride_q,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": (
@@ -658,10 +804,25 @@ def build_flash_attn_func_module_primary(
                 "passthrough": passthrough_entries,
             },
         ).launch(
-            grid=(grid_x, 1, 1),
+            grid=(grid_x, grid_y, 1),
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
+        if const_expr(traits.SPLITK):
+            # ceil-div: seq_len need not be a multiple of COMBINE_ROWS_PER_BLOCK
+            # (generic supports arbitrary seq_len). Overflow rows in the last block
+            # are dropped by the in-bounds guard inside the combine kernel.
+            combine_rows = bs_idx * traits.NUM_HEADS_Q * sl_idx
+            combine_blocks = (
+                combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK - 1)
+            ) // fx.Index(COMBINE_ROWS_PER_BLOCK)
+            flash_attn_generic_combine_kernel(
+                O, Workspace, LSE, batch_size, seq_len, stride_q_n
+            ).launch(
+                grid=(combine_blocks, 1, 1),
+                block=(COMBINE_BLOCK, 1, 1),
+                stream=stream,
+            )
 
     # Best MI355X FMHA numbers were measured with ROCm/llvm-project `felix/tune_fmha`;
     # other LLVM revisions usually leave a few percent of peak throughput on the table.
@@ -681,6 +842,10 @@ def build_flash_attn_func_module_primary(
         "llvm_options": _llvm_opts,
     }
 
+    # Cache compiled kernels keyed on flydsl's per-tensor cache signatures, so the
+    # warm path reuses the CompiledFunction instead of rebuilding the JIT key.
+    _cf_cache = {}
+
     def _launch(
         Q,
         K,
@@ -690,46 +855,139 @@ def build_flash_attn_func_module_primary(
         seq_len,
         *,
         lse=None,
+        workspace=None,
+        stride_q_n=None,
         cu_seqlens_q=None,
         cu_seqlens_kv=None,
+        kv_seqstart=None,
         block_table=None,
         block_table_stride=0,
         seq_len_kv=None,
+        bias=None,
+        bias_stride_b=0,
+        bias_stride_h=0,
+        bias_stride_q=0,
+        dropout=None,
+        dropout_stride_b=0,
+        dropout_stride_h=0,
+        dropout_stride_q=0,
         stream=None,
     ):
         if traits.RETURN_LSE and lse is None:
             raise ValueError("return_lse=True requires an lse output tensor")
-        # Dense/non-paged pass the output tensor as a placeholder for the unused
-        # cu_seqlens / block_table / LSE slots; the kernel only reads/writes them
-        # under const_expr(VARLEN) / const_expr(PAGED) / const_expr(RETURN_LSE).
+        if traits.HAS_BIAS and bias is None:
+            raise ValueError("has_bias=True requires a bias tensor")
+        if traits.HAS_DROPOUT and dropout is None:
+            raise ValueError("has_dropout=True requires a dropout mask tensor")
+        if traits.GAPPY_KV and kv_seqstart is None:
+            raise ValueError("gappy_kv=True requires a kv_seqstart tensor")
+        if traits.SPLITK and workspace is None:
+            raise ValueError("num_kv_splits > 1 requires a fp32 workspace tensor")
+        # Pass Out as a placeholder for unused optional tensors; the kernel only
+        # reads each under its const_expr trait.
         lse_t = lse if lse is not None else Out
+        ws_t = workspace if workspace is not None else Out
         cq = cu_seqlens_q if cu_seqlens_q is not None else Out
         ck = cu_seqlens_kv if cu_seqlens_kv is not None else Out
+        kvs = kv_seqstart if kv_seqstart is not None else Out
         bt = block_table if block_table is not None else Out
+        bias_t = bias if bias is not None else Out
+        drop_t = dropout if dropout is not None else Out
         skv = seq_len if seq_len_kv is None else seq_len_kv
-        with CompilationContext.compile_hints(_fmha_compile_hints):
-            return launch_flash_attn_generic(
+        sqn = traits.STRIDE_TOKEN_Q if stride_q_n is None else stride_q_n
+        stream_arg = fx.Stream(stream)
+
+        tensor_args = (Q, K, V, Out, lse_t, ws_t, cq, ck, kvs, bt, bias_t, drop_t)
+        _sig_by_id = {}
+        key = []
+        for t in tensor_args:
+            s = _sig_by_id.get(id(t))
+            if s is None:
+                s = _fmha_tensor_cache_sig(t)
+                _sig_by_id[id(t)] = s
+            key.append(s)
+        cf = _cf_cache.get(tuple(key))
+        if cf is not None:
+            return cf(
                 Q,
                 K,
                 V,
                 Out,
                 lse_t,
+                ws_t,
                 cq,
                 ck,
+                kvs,
                 bt,
                 block_table_stride,
                 batch_size,
                 seq_len,
                 skv,
-                fx.Stream(stream),
+                sqn,
+                bias_t,
+                bias_stride_b,
+                bias_stride_h,
+                bias_stride_q,
+                drop_t,
+                dropout_stride_b,
+                dropout_stride_h,
+                dropout_stride_q,
+                stream_arg,
             )
 
+        with CompilationContext.compile_hints(_fmha_compile_hints):
+            cf = flyc.compile(
+                launch_flash_attn_generic,
+                Q,
+                K,
+                V,
+                Out,
+                lse_t,
+                ws_t,
+                cq,
+                ck,
+                kvs,
+                bt,
+                block_table_stride,
+                batch_size,
+                seq_len,
+                skv,
+                sqn,
+                bias_t,
+                bias_stride_b,
+                bias_stride_h,
+                bias_stride_q,
+                drop_t,
+                dropout_stride_b,
+                dropout_stride_h,
+                dropout_stride_q,
+                stream_arg,
+            )
+        _cf_cache[tuple(key)] = cf
+        return cf
+
     def _compile(
-        Q, K, V, Out, batch_size, seq_len, seq_len_kv=None, lse=None, stream=None
+        Q,
+        K,
+        V,
+        Out,
+        batch_size,
+        seq_len,
+        seq_len_kv=None,
+        lse=None,
+        bias=None,
+        dropout=None,
+        stream=None,
     ):
         if traits.RETURN_LSE and lse is None:
             raise ValueError("return_lse=True requires an lse output tensor")
+        if traits.HAS_BIAS and bias is None:
+            raise ValueError("has_bias=True requires a bias tensor")
+        if traits.HAS_DROPOUT and dropout is None:
+            raise ValueError("has_dropout=True requires a dropout mask tensor")
         lse_t = lse if lse is not None else Out
+        bias_t = bias if bias is not None else Out
+        drop_t = dropout if dropout is not None else Out
         skv = seq_len if seq_len_kv is None else seq_len_kv
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return flyc.compile(
@@ -742,17 +1000,35 @@ def build_flash_attn_func_module_primary(
                 Out,
                 Out,
                 Out,
+                Out,
+                Out,
                 0,
                 batch_size,
                 seq_len,
                 skv,
+                traits.STRIDE_TOKEN_Q,
+                bias_t,
+                0,
+                0,
+                0,
+                drop_t,
+                0,
+                0,
+                0,
                 fx.Stream(stream),
             )
 
     _launch.compile = _compile
 
     def _wrap_pad_mask_dispatch(_inner):
-        if skip_kv_pad_mask is not None or varlen or paged or causal:
+        if (
+            skip_kv_pad_mask is not None
+            or varlen
+            or paged
+            or causal
+            or has_bias
+            or has_dropout
+        ):
             return _inner
 
         _launch_skip = build_flash_attn_func_module_primary(
@@ -777,6 +1053,11 @@ def build_flash_attn_func_module_primary(
             kv_cache_layout=kv_cache_layout,
             skip_kv_pad_mask=True,
             return_lse=return_lse,
+            window_left=window_left,
+            has_bias=has_bias,
+            causal_top_left=causal_top_left,
+            has_dropout=has_dropout,
+            gappy_kv=gappy_kv,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -800,6 +1081,11 @@ def build_flash_attn_func_module_primary(
             kv_cache_layout=kv_cache_layout,
             skip_kv_pad_mask=False,
             return_lse=return_lse,
+            window_left=window_left,
+            has_bias=has_bias,
+            causal_top_left=causal_top_left,
+            has_dropout=has_dropout,
+            gappy_kv=gappy_kv,
         )
 
         def _pad_dispatch(*args, **kwargs):

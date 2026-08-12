@@ -25,7 +25,7 @@ from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from ._common import dtype_to_elem_type
+from ._common import dtype_to_elem_type, tensor_cache_sig as _fmha_tensor_cache_sig
 from .flash_attn_utils import (
     _anchor_v_o,
     _anchor_v_p,
@@ -887,6 +887,10 @@ def build_flash_attn_dualwave_swp_module(
         },
     }
 
+    # Cache compiled kernels by flydsl's per-tensor cache signatures; see
+    # build_flash_attn_func_module_primary in flash_attn_generic.py.
+    _cf_cache = {}
+
     def _launch(
         Q,
         K,
@@ -940,27 +944,30 @@ def build_flash_attn_dualwave_swp_module(
             block_table = O
         if block_table_stride is None:
             block_table_stride = 0
-        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
-            if stream is None:
-                return launch_flash_attn_dualwave_swp(
-                    Q,
-                    K,
-                    V,
-                    O,
-                    debug_counts,
-                    lse_t,
-                    cu_seqlens_q,
-                    cu_seqlens_kv,
-                    block_table,
-                    batch_size,
-                    seq_len,
-                    seq_len_kv,
-                    stride_q_n,
-                    stride_kv_n,
-                    head_dim_runtime,
-                    block_table_stride,
-                )
-            return launch_flash_attn_dualwave_swp(
+        stream_arg = fx.Stream(stream)
+
+        tensor_args = (
+            Q,
+            K,
+            V,
+            O,
+            debug_counts,
+            lse_t,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            block_table,
+        )
+        _sig_by_id = {}
+        key = []
+        for t in tensor_args:
+            s = _sig_by_id.get(id(t))
+            if s is None:
+                s = _fmha_tensor_cache_sig(t)
+                _sig_by_id[id(t)] = s
+            key.append(s)
+        cf = _cf_cache.get(tuple(key))
+        if cf is not None:
+            return cf(
                 Q,
                 K,
                 V,
@@ -977,8 +984,32 @@ def build_flash_attn_dualwave_swp_module(
                 stride_kv_n,
                 head_dim_runtime,
                 block_table_stride,
-                stream=stream,
+                stream_arg,
             )
+
+        with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
+            cf = flyc.compile(
+                launch_flash_attn_dualwave_swp,
+                Q,
+                K,
+                V,
+                O,
+                debug_counts,
+                lse_t,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                block_table,
+                batch_size,
+                seq_len,
+                seq_len_kv,
+                stride_q_n,
+                stride_kv_n,
+                head_dim_runtime,
+                block_table_stride,
+                stream_arg,
+            )
+        _cf_cache[tuple(key)] = cf
+        return cf
 
     def _compile(
         Q,

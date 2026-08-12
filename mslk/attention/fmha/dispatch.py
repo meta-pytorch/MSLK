@@ -14,7 +14,16 @@ from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import torch
 
-from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, triton_splitk
+from . import (
+    attn_bias,
+    ck,
+    cutlass,
+    flash,
+    flash3,
+    flash_mtia,
+    flydsl_forward,
+    triton_splitk,
+)
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
@@ -132,6 +141,9 @@ def _dispatch_fw_priority_list(
         priority_list_ops = deque(
             [
                 ck.FwOp,
+                # After CK so it does not displace the default, but available for
+                # inputs CK declines or when explicitly selected.
+                flydsl_forward.FwOp,
             ]
         )
     # pyrefly: ignore [bad-argument-type]

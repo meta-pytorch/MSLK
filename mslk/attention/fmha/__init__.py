@@ -22,6 +22,7 @@ from . import (
     flash3,
     flash_mtia,
     flydsl,
+    flydsl_forward,
     triton_splitk,
 )
 from .attn_bias import (
@@ -59,6 +60,8 @@ MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
+# FlyDSL forward op. Backward falls back to the CK backward (no FlyDSL bw yet).
+MemoryEfficientAttentionFlyDSLOp = (flydsl_forward.FwOp, ck.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
     cute_blackwell.BwOp,
@@ -961,6 +964,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash_mtia.FwOp,
     flash3.FwOp,
     triton_splitk.FwOp,
+    flydsl_forward.FwOp,
 ]
 
 ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
@@ -985,6 +989,7 @@ __all__ = [
     "memory_efficient_attention",
     "MemoryEfficientAttentionCkOp",
     "MemoryEfficientAttentionCkDecoderOp",
+    "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
     "attn_bias",
