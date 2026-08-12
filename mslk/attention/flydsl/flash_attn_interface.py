@@ -1193,7 +1193,10 @@ def flydsl_flash_attn_func(
                     and not _has_bias
                     and not _has_dropout
                     and not cross
-                    and (debug_lazy or (can_dualwave and _dense_routes_to_dualwave(B, Sq)))
+                    and (
+                        debug_lazy
+                        or (can_dualwave and _dense_routes_to_dualwave(B, Sq))
+                    )
                 ):
                     exe = _build_dense_dualwave(
                         num_heads=H,

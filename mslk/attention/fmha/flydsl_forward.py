@@ -228,9 +228,7 @@ class FwOp(AttentionFwOpBase):
         # the leading rows are fully masked (undefined softmax).
         elif isinstance(d.attn_bias, LowerTriangularFromBottomRightMask):
             if d.query.shape[1] > d.key.shape[1]:
-                reasons.append(
-                    "LowerTriangularFromBottomRightMask requires Mq <= Mkv"
-                )
+                reasons.append("LowerTriangularFromBottomRightMask requires Mq <= Mkv")
         # Other dense masks are self-attention only (varlen/paged/gappy handle
         # cross-length via their own paths).
         elif not isinstance(
@@ -377,9 +375,7 @@ class FwOp(AttentionFwOpBase):
             kw["dropout_mask"] = (rand_uniform <= keep).to(inp.query.dtype) * (
                 1.0 / (1.0 - inp.p)
             )
-            rng_state = torch.tensor(
-                [seed, offset], dtype=torch.int64, device="cpu"
-            )
+            rng_state = torch.tensor([seed, offset], dtype=torch.int64, device="cpu")
 
         # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
         # restore input shape (slice/reshape are no-ops when a path didn't pad).
@@ -496,9 +492,7 @@ class FwOp(AttentionFwOpBase):
             kstart = bias.k_seqinfo.seqstart[:B_kv].to(torch.int32)
             kend = bias.k_seqinfo.seqlen.to(torch.int32)
             kseqlen = (kend - kstart).to(q.device)
-            kcum = torch.nn.functional.pad(
-                kseqlen.cumsum(0, dtype=torch.int32), (1, 0)
-            )
+            kcum = torch.nn.functional.pad(kseqlen.cumsum(0, dtype=torch.int32), (1, 0))
             kw["cu_seqlens_q"] = bias.q_seqinfo.seqstart.to(q.device)
             kw["cu_seqlens_kv"] = kcum
             kw["max_seqlen_q"] = int(bias.q_seqinfo.max_seqlen)

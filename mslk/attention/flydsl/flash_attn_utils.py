@@ -2460,9 +2460,9 @@ class GenericFlashAttnContext:
                 self.kv_upper - base_lower, fx.Index(0)
             )
             num_tiles = (span + step - fx.Index(1)) // step
-            chunk = (
-                num_tiles + fx.Index(traits.NUM_KV_SPLITS - 1)
-            ) // fx.Index(traits.NUM_KV_SPLITS)
+            chunk = (num_tiles + fx.Index(traits.NUM_KV_SPLITS - 1)) // fx.Index(
+                traits.NUM_KV_SPLITS
+            )
             t0 = self.split_idx * chunk
             t1 = t0 + chunk
             lo = base_lower + t0 * step
@@ -2683,9 +2683,7 @@ class GenericKvGmemToLdsLoader:
         # can be non-page-aligned, so a tile spans up to two physical pages -- return
         # both (loaded once per tile) and select per row in _paged_row_idx.
         if const_expr(self.ctx.traits.GAPPY_KV):
-            return self.page_ids.gappy_tile_pages(
-                self.ctx.kv_seq_start + tile_start
-            )
+            return self.page_ids.gappy_tile_pages(self.ctx.kv_seq_start + tile_start)
         return self.page_ids.page_id(tile_start)
 
     def _paged_row_idx(self, pid, tile_start, row_total):
@@ -3458,9 +3456,7 @@ class GenericSoftmaxHelper:
             top_left = const_expr(traits.CAUSAL_TOP_LEFT)
             seq_len_kv_i32 = fx.Int32(ctx.seqlen_kv_b) if top_left else None
             if top_left:
-                tile_needs_mask = tile_needs_mask | (
-                    max_kv_col_i32 >= seq_len_kv_i32
-                )
+                tile_needs_mask = tile_needs_mask | (max_kv_col_i32 >= seq_len_kv_i32)
             # Sliding-window: a tile needs masking when its lowest kv column falls
             # outside the left edge for the highest q row in the block; the
             # per-element select below applies the exact per-row bound.
@@ -3469,9 +3465,7 @@ class GenericSoftmaxHelper:
                 window_left_i32 = fx.Int32(traits.WINDOW_LEFT)
                 q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
                 window_lo_edge_i32 = q_end_i32 - window_left_i32
-                tile_needs_mask = tile_needs_mask | (
-                    kv_start_i32 < window_lo_edge_i32
-                )
+                tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
             col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
             c_neg_inf = ctx.c_neg_inf
 
