@@ -1040,6 +1040,28 @@ def test_decoder_ck(
     dtype: str,
 ) -> None:
     _test_decoder(
+        fmha.ck_decoder.FwOp,
+        kv_heads=kv_heads,
+        n_heads=n_heads,  # qheads per kv head
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
+@pytest.mark.parametrize("padding", [32, 4096])
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+def test_decoder_flydsl(
+    n_heads: int,
+    kv_heads: Optional[int],
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    _test_decoder(
         fmha.flydsl_decoder.FwOp,
         kv_heads=kv_heads,
         n_heads=n_heads,  # qheads per kv head
@@ -1076,12 +1098,7 @@ def test_cutlass_blackwell_decoder(
 
 @rocm_only
 @pytest.mark.parametrize(
-    "op",
-    [
-        fmha.flydsl_splitk.FwOp_S1,
-        fmha.flydsl_splitk.FwOp_S2,
-        fmha.flydsl_splitk.FwOp_S4,
-    ],
+    "op", [fmha.ck_splitk.FwOp_S1, fmha.ck_splitk.FwOp_S2, fmha.ck_splitk.FwOp_S4]
 )
 @pytest.mark.parametrize("dtype", ["f32"])
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
@@ -1112,16 +1129,44 @@ def test_ck_splitk_decoder(
 @rocm_only
 @pytest.mark.parametrize(
     "op",
-    [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp, fmha.flydsl_splitk.FwOp_S2],
-    ids=lambda o: o.NAME,
+    [
+        fmha.flydsl_splitk.FwOp_S1,
+        fmha.flydsl_splitk.FwOp_S2,
+        fmha.flydsl_splitk.FwOp_S4,
+    ],
 )
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("n_heads", [16])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1), (32, 1), (4096, 8)])
+def test_flydsl_splitk_decoder(
+    op,
+    kv_heads: Optional[int],
+    n_heads: int,
+    padding: int,
+    bsz: int,
+    dtype: str,
+    d: int,
+) -> None:
+    _test_decoder(
+        op,
+        kv_heads=kv_heads,
+        n_heads=n_heads,
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+        d=d,
+    )
+
+
+@rocm_only
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("n_heads", [1, 16])
 @pytest.mark.parametrize("kv_heads", [1, 2], ids=lambda x: f"kvh{x}")
 @pytest.mark.parametrize("padding, bsz", [(512, 2), (2048, 4), (32, 8)])
 @pytest.mark.parametrize("d", [128, 256])
 def test_flydsl_fp8_decoder(
-    op,
     dtype: str,
     n_heads: int,
     kv_heads: int,
