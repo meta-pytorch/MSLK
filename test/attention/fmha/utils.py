@@ -25,6 +25,7 @@ from mslk.attention.fmha.attn_bias_utils import (
     ref_attention_bmhk,
 )
 from mslk.attention.fmha.triton_splitk import InputsFp8
+from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 IN_RE_WORKER: bool = os.environ.get("INSIDE_RE_WORKER") is not None
 
@@ -186,9 +187,9 @@ def construct_fp8_attention_inputs(
     k = torch.randn(1, B * Mkv, Hkv, 1, K, dtype=dtype, device=device)
     v = torch.randn(1, B * Mkv, Hkv, 1, K, dtype=dtype, device=device)
 
-    pt_fp8_dtype = (
-        torch.float8_e4m3fnuz if torch.version.hip is not None else torch.float8_e4m3fn
-    )
+    # Match the fp8 format the decode kernels dequantize with (gfx950 uses e4m3fn,
+    # not fnuz); a mismatch reads the packed bytes as the wrong format -> NaN.
+    pt_fp8_dtype = get_fp8_constants()[0]
 
     qfn = quantize_fp8_symmetric if use_symmetric else quantize_fp8_asymmetric
 
@@ -427,9 +428,9 @@ def add_q_fp8_to_inputs(
         InputsFp8 object with quantized query tensor
     """
     inp.quantize_qk_to_fp8 = True
-    pt_fp8_dtype = (
-        torch.float8_e4m3fnuz if torch.version.hip is not None else torch.float8_e4m3fn
-    )
+    # Match the fp8 format the decode kernels dequantize with (gfx950 uses e4m3fn,
+    # not fnuz); a mismatch reads the packed bytes as the wrong format -> NaN.
+    pt_fp8_dtype = get_fp8_constants()[0]
     # Get original query tensor
     q = inp.query
 
