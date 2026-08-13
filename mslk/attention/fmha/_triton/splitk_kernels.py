@@ -782,12 +782,18 @@ def autotune_kernel(kernel: Callable):
         if block_n >= block_m
     ]
 
-    # HIP graph capture is unreliable on gfx950 for this kernel (HSA_INVALID_PACKET
-    # / GPU faults); use_cuda_graph=False uses standard do_bench timing.
+    # HIP graph capture faulted (HSA_INVALID_PACKET / GPU faults) during autotuning of
+    # this kernel on gfx950 with ROCm < 7.14; fixed in ROCm 7.14. Disable graph-based
+    # autotuning only on that affected stack; gfx942, CUDA, and gfx950 on ROCm >= 7.14
+    # keep it.
+    from mslk.utils.device import is_gfx950, rocm_version_at_least
+
+    graph_autotune_broken = is_gfx950() and not rocm_version_at_least(7, 14)
+
     kernel = triton.autotune(
         configs=TRITON_CONFIGS,
         key=AUTOTUNER_KEY,
-        use_cuda_graph=False if torch.version.hip else True,
+        use_cuda_graph=not graph_autotune_broken,
         prune_configs_by={
             "early_config_prune": early_config_prune,
         },
