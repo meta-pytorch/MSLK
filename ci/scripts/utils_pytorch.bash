@@ -26,13 +26,22 @@ __verify_pytorch_gpu_integration () {
   # shellcheck disable=SC2086,SC2155
   local torch_version_hip=$(conda run ${env_prefix} python -c "import torch; print(torch.version.hip)")
   # shellcheck disable=SC2086,SC2155
-  local torch_device_compatibility=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_capability())")
-  # shellcheck disable=SC2086,SC2155
-  local torch_device_name=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_name(torch.cuda.current_device()))")
-  # shellcheck disable=SC2086,SC2155
   local torch_device_count=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.device_count())")
-  # shellcheck disable=SC2086,SC2155
-  local torch_device_properties=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_properties(0))")
+
+  local torch_device_compatibility="unavailable"
+  local torch_device_name="unavailable"
+  local torch_device_properties="unavailable"
+  if [[ "${torch_cuda_available}" == "True" ]]; then
+    # shellcheck disable=SC2086,SC2155
+    torch_device_compatibility=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_capability())")
+    # shellcheck disable=SC2086,SC2155
+    torch_device_name=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_name(torch.cuda.current_device()))")
+    # shellcheck disable=SC2086,SC2155
+    torch_device_properties=$(conda run ${env_prefix} python -c "import torch; print(torch.cuda.get_device_properties(0))")
+  elif [[ "${ENFORCE_CUDA_DEVICE:-0}" == "1" ]]; then
+    echo "[CHECK] PyTorch cannot access a required GPU."
+    return 1
+  fi
 
   echo ""
   echo "################################################################################"

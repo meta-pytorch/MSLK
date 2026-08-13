@@ -119,12 +119,15 @@ __conda_install_gcc () {
   local cc_path=$(conda run ${env_prefix} printenv CC)
   # shellcheck disable=SC2155,SC2086
   local cxx_path=$(conda run ${env_prefix} printenv CXX)
+  # shellcheck disable=SC2155,SC2086
+  local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
 
-  # Set the symlinks, override if needed
-  print_exec ln -sf "${cc_path}" "$(dirname "$cc_path")/cc"
-  print_exec ln -sf "${cc_path}" "$(dirname "$cc_path")/gcc"
-  print_exec ln -sf "${cxx_path}" "$(dirname "$cxx_path")/c++"
-  print_exec ln -sf "${cxx_path}" "$(dirname "$cxx_path")/g++"
+  # Keep compiler aliases inside the Conda environment even when CC/CXX resolve
+  # to a read-only system path on a build host.
+  print_exec ln -sf "${cc_path}" "${conda_prefix}/bin/cc"
+  print_exec ln -sf "${cc_path}" "${conda_prefix}/bin/gcc"
+  print_exec ln -sf "${cxx_path}" "${conda_prefix}/bin/c++"
+  print_exec ln -sf "${cxx_path}" "${conda_prefix}/bin/g++"
 
   if [ "$SET_GLIBCXX_PRELOAD" == "1" ]; then
     # Set libstdc++ preload options
@@ -163,12 +166,13 @@ __remove_gcc_activation_scripts () {
   # Clang.
   #   https://stackoverflow.com/questions/64289376/how-to-circumvent-anaconda-gcc-compiler
   #
-  # shellcheck disable=SC2155,SC2086
   echo "[INSTALL] Removing GCC package activation scripts ..."
-  local conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
-  print_exec ls -la ${conda_prefix}/etc/conda/activate.d
-  print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gcc_linux-${COMPILER_ARCHNAME}.sh
-  print_exec rm -rf ${conda_prefix}/etc/conda/activate.d/activate-gxx_linux-${COMPILER_ARCHNAME}.sh
+  local conda_prefix
+  # shellcheck disable=SC2086
+  conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX)
+  print_exec ls -la "${conda_prefix}/etc/conda/activate.d"
+  print_exec rm -rf "${conda_prefix}/etc/conda/activate.d/activate-gcc_linux-${COMPILER_ARCHNAME}.sh"
+  print_exec rm -rf "${conda_prefix}/etc/conda/activate.d/activate-gxx_linux-${COMPILER_ARCHNAME}.sh"
 }
 
 __conda_install_clang () {
@@ -431,7 +435,7 @@ print_library_infos () {
     print_exec "nm -gDCu ${library} > ${usymbols_file}"
     # shellcheck disable=SC2086
     echo "[CHECK] Listing out undefined symbols ($(wc -l ${usymbols_file} | awk '{print $1}') total):"
-    cat "${usymbols_file}" | sort
+    sort "${usymbols_file}"
 
     echo "[CHECK] Listing out external shared libraries linked:"
     print_exec ldd "${library}"
