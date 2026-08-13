@@ -220,14 +220,14 @@ def flydsl_preshuffle_gemm(
     )
 
     import flydsl.expr as fx  # pyre-ignore[21]
-    from mslk.gemm.flydsl._kernels.tensor_shim import _run_compiled, ptr_arg
+    from mslk.flydsl.jit import ptr_arg, run_compiled
 
     def _as_i8(t: Tensor) -> Tensor:
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = out.contiguous()
     _dummy_bias = torch.empty(0, dtype=out.dtype, device=out.device)
-    _run_compiled(
+    run_compiled(
         exe,
         ptr_arg(out_contig.view(-1)),
         ptr_arg(_as_i8(XQ.contiguous()).view(-1)),
