@@ -546,6 +546,25 @@ class TestNVFP4QuantizeStacked:
         expected = torch.clamp(row_amax, min=1.0e-8) / (FP8_E4M3_MAX * FP4_E2M1_MAX)
         torch.testing.assert_close(token_scale_inv, expected, atol=1e-12, rtol=1e-6)
 
+    def test_token_scale_all_zero_block_packs_to_zero(self) -> None:
+        """An all-zero 16-element block must not quantize to a zero e4m3 scale.
+
+        The per-block scale is floored by a clamp before the ``.to(float8e4nv)``
+        cast; a floor below the smallest positive e4m3 subnormal (``2**-9``)
+        rounds to zero, so ``total_scale = row_scale / 0 -> inf`` and
+        ``0 * inf -> NaN`` saturates the block's packed FP4 nibbles to 0x7
+        (+6.0) instead of zero.
+        """
+        K = 64
+        m_sizes = torch.tensor([1], dtype=torch.int64, device=self.device)
+        x = torch.ones(1, K, dtype=torch.bfloat16, device=self.device)
+        x[0, 16:32] = 0.0  # row amax stays 1.0, block 1 amax becomes 0
+
+        xq, _, _ = nvfp4_quantize_stacked_with_token_scale(m_sizes, x)
+
+        block1 = xq.view(torch.uint8)[0, 8:16]
+        assert torch.all(block1 == 0), f"zero block corrupted: {block1.tolist()}"
+
     @pytest.mark.parametrize("num_experts,m_sizes_list,K", TOKEN_SCALE_MOE_SHAPES)
     def test_token_scale_matches_per_row_reference(
         self,

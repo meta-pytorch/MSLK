@@ -166,7 +166,8 @@ def quantize_nvfp4_kernel(
     USE_GLOBAL_SCALE: tl.constexpr,
     USE_INT64_INDEXING: tl.constexpr,
 ):
-    E4M3_EPS = 1.5258789e-05
+    # Smallest positive fp8 e4m3 subnormal. A smaller floor rounds to zero.
+    E4M3_EPS = 0.001953125
     FP8_E4M3_MAX = 448.0
     FP4_E2M1_MAX = 6.0
     INV_FP4_E2M1_MAX = 1.0 / 6.0

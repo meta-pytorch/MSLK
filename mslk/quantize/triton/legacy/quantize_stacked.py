@@ -57,7 +57,8 @@ def _nvfp4_quantize_stacked_kernel(
         M_PER_BLOCK: Rows per block (constexpr, power of 2, <= 128, autotuned).
     """
     tl.static_assert(M_PER_BLOCK <= 128)
-    E4M3_EPS: tl.constexpr = 1.5258789e-05  # type: ignore[Incompatible variable type]
+    # Smallest positive fp8 e4m3 subnormal. A smaller floor rounds to zero.
+    E4M3_EPS: tl.constexpr = 0.001953125  # type: ignore[Incompatible variable type]
     FP8_E4M3_MAX = 448.0  # type: ignore[Incompatible variable type]
     FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
 
@@ -177,7 +178,8 @@ def _nvfp4_quantize_stacked_token_scale_fused_row_kernel(
     CHUNK_SIZE: tl.constexpr,
     CHUNK_SCALE_BLOCKS: tl.constexpr,
 ):
-    E4M3_EPS: tl.constexpr = 1.5258789e-05  # type: ignore[Incompatible variable type]
+    # Smallest positive fp8 e4m3 subnormal. A smaller floor rounds to zero.
+    E4M3_EPS: tl.constexpr = 0.001953125  # type: ignore[Incompatible variable type]
     FP8_E4M3_MAX = 448.0  # type: ignore[Incompatible variable type]
     FP4_E2M1_MAX: tl.constexpr = 6  # type: ignore[Incompatible variable type]
     MIN_NORMAL: tl.constexpr = 1.0e-8  # type: ignore[Incompatible variable type]
