@@ -99,8 +99,12 @@ class DecodeOpBase(metaclass=abc.ABCMeta):
         Hpg = Hq // Hkv
         shape = (1, B * kv_seqlen, Hkv, Hpg, D)
         q = torch.randn(1, B, Hkv, Hpg, D, dtype=dtype, device=dev)
-        k = torch.randn(1, B * kv_seqlen, Hkv, 1, D, dtype=dtype, device=dev).expand(shape)
-        v = torch.randn(1, B * kv_seqlen, Hkv, 1, D, dtype=dtype, device=dev).expand(shape)
+        k = torch.randn(1, B * kv_seqlen, Hkv, 1, D, dtype=dtype, device=dev).expand(
+            shape
+        )
+        v = torch.randn(1, B * kv_seqlen, Hkv, 1, D, dtype=dtype, device=dev).expand(
+            shape
+        )
         attn_bias = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
             q_seqlen=[1] * B,
             kv_seqlen=[kv_seqlen] * B,
@@ -231,7 +235,10 @@ class FlyDSLFp8(DecodeOpBase):
             B, num_kv_heads, mcpn, eqgs, device=dev, dtype=torch.float32
         )
         max_logits = torch.full(
-            (B, num_kv_heads, mcpn, eqgs), float("-inf"), device=dev, dtype=torch.float32
+            (B, num_kv_heads, mcpn, eqgs),
+            float("-inf"),
+            device=dev,
+            dtype=torch.float32,
         )
         tmp_out = torch.zeros(
             B, num_kv_heads, mcpn, eqgs, D, device=dev, dtype=torch.bfloat16

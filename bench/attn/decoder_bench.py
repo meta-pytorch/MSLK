@@ -36,7 +36,9 @@ ShapeList = list[tuple[int, int, int, int, int]]
 shape_registry: dict[str, Callable[[], ShapeList]] = {}
 
 
-def register_shapes(name: str) -> Callable[[Callable[[], ShapeList]], Callable[[], ShapeList]]:
+def register_shapes(
+    name: str,
+) -> Callable[[Callable[[], ShapeList]], Callable[[], ShapeList]]:
     def decorator(fn: Callable[[], ShapeList]) -> Callable[[], ShapeList]:
         shape_registry[name] = fn
         return fn
@@ -64,7 +66,10 @@ def _shapes_decode_llm() -> ShapeList:
 @register_shapes("sweep_kv")
 def _shapes_sweep_kv() -> ShapeList:
     """Sweep KV sequence length."""
-    return [(1, 32, 8, kv_len, 128) for kv_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]]
+    return [
+        (1, 32, 8, kv_len, 128)
+        for kv_len in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    ]
 
 
 @register_shapes("sweep_batch")
@@ -178,9 +183,7 @@ def benchmark(
 
 def collect_ops(kernels: Optional[list[str]], dtype: str) -> list[DecodeOpBase]:
     ops = [
-        op
-        for op in get_decode_ops()
-        if op.supported and dtype in op.supported_dtypes
+        op for op in get_decode_ops() if op.supported and dtype in op.supported_dtypes
     ]
     if kernels is None:
         return ops
