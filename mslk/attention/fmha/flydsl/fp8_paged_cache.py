@@ -6,10 +6,11 @@
 
 # pyre-strict
 
-"""On-the-fly adapter: dense f16/bf16 KV -> native-fp8 paged decode.
+"""Build a native-fp8 paged KV cache (with precomputed scales) from dense KV.
 
-Quantizes + pages the dense padded KV cache into the fp8 kernel's layout per call
-(no persistent fp8 cache). Only decode (q_seqlen == 1), head_dim % 16 == 0, gfx950.
+Quantizes + pages a dense padded f16/bf16 KV cache into the fp8 decode kernel's
+layout. Intended to construct a persistent fp8 cache once (e.g. for tests and
+benchmarks); it is NOT called per decode step. head_dim % 16 == 0, gfx950.
 """
 
 from __future__ import annotations
@@ -110,58 +111,3 @@ def dense_kv_to_fp8_paged(
         .contiguous()
     )
     return key_cache, value_cache, key_scale, value_scale, block_tables
-
-
-def fp8_paged_decode_from_dense(
-    query: torch.Tensor,  # [B, q_seqlen, G, Hq, D] f16/bf16
-    key: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
-    value: torch.Tensor,  # [B, padding, G, Hkv, D] f16/bf16
-    seq_positions: torch.Tensor,  # [B] int32 context lengths (or None)
-    scale: float,
-    *,
-    block_size: int = 16,
-) -> torch.Tensor:
-    """Run fp8 paged decode against a dense f16/bf16 KV cache (quantized per call).
-    Returns output shaped [B, q_seqlen, G, Hq, D]."""
-    from .pa_decode_fp8 import pa_decode_ps_launch
-
-    B, q_seqlen, G, Hq, D = query.shape
-    assert q_seqlen == 1, f"fp8 paged decode supports q_seqlen=1, got {q_seqlen}"
-    _, padding, _, Hkv, _ = key.shape
-    dev = query.device
-    BG = B * G
-
-    key_cache, value_cache, key_scale, value_scale, block_tables = (
-        dense_kv_to_fp8_paged(key, value, block_size=block_size)
-    )
-
-    # GQA: replicate context_lengths across G groups (matches B*G paging).
-    if seq_positions is None:
-        context_lengths = torch.full((BG,), padding, dtype=torch.int32, device=dev)
-    else:
-        context_lengths = (
-            seq_positions.to(torch.int32)
-            .view(B, 1)
-            .expand(B, G)
-            .reshape(BG)
-            .contiguous()
-        )
-
-    # Kernel query layout [num_seqs=B*G, Hq, D].
-    q_flat = query.reshape(BG, Hq, D).contiguous()
-    out = torch.zeros(BG, Hq, D, dtype=query.dtype, device=dev)
-
-    pa_decode_ps_launch(
-        out,
-        q_flat,
-        key_cache,
-        value_cache,
-        context_lengths,
-        scale,
-        key_scale=key_scale,
-        value_scale=value_scale,
-        block_tables=block_tables,
-        max_context_partition_num=0,
-    )
-    # [B*G, Hq, D] -> [B, q_seqlen, G, Hq, D]
-    return out.view(B, q_seqlen, G, Hq, D)

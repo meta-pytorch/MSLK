@@ -2397,8 +2397,8 @@ def pa_decode_ps_launch(
 
 AOT_ARCHS: List[str] = ["gfx950"]
 
-# Baked params match the adapter (dense_kv_to_fp8_paged): block_size=16, per_token_kv,
-# trans_v; qgs covers MQA(1)+GQA; max_parts is get_recommended_splits' range {4, 8}.
+# Baked params match the cache builder (dense_kv_to_fp8_paged): block_size=16,
+# per_token_kv, trans_v; qgs covers MQA(1)+GQA; max_parts is get_recommended_splits' {4, 8}.
 _FP8_HEAD_SIZES = (128, 256)
 _FP8_QGS = (1, 2, 4, 8, 16)
 _FP8_MAX_PARTS = (4, 8)

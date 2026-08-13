@@ -1174,11 +1174,15 @@ def test_flydsl_fp8_decoder(
     bsz: int,
     d: int,
 ) -> None:
-    """Correctness of the FlyDSL native-fp8 paged decode (Inputs.quantize_kv_to_fp8).
+    """Correctness of the FlyDSL native-fp8 paged decode kernel.
 
-    Covers MQA (kv_heads=1) and GQA (kv_heads>1); short contexts (<256) fall back to
-    the dense path. Compared to the full-precision reference within fp8 tolerance.
+    Builds a persistent fp8 paged KV cache with precomputed per-token scales via
+    ``dense_kv_to_fp8_paged``, then runs ``pa_decode_ps_launch`` directly against it —
+    the real fp8-cache usage, not per-call quantization. Covers MQA (kv_heads=1) and
+    GQA (kv_heads>1), compared to a full-precision reference within fp8 tolerance.
     """
+    from mslk.attention.fmha.flydsl.fp8_paged_cache import dense_kv_to_fp8_paged
+    from mslk.attention.fmha.flydsl.pa_decode_fp8 import pa_decode_ps_launch
     from mslk.attention.fmha.flydsl.pa_decode_fp8_dispatch import (
         is_fp8_paged_decode_available,
     )
@@ -1193,30 +1197,48 @@ def test_flydsl_fp8_decoder(
     dtype_ = {"f16": torch.float16, "bf16": torch.bfloat16}[dtype]
     torch.manual_seed(1)
     dev = "cuda"
+    B, G, Hq, D = bsz, kv_heads, n_heads, d
 
-    # Canonical BMGHK: G = kv_heads groups, H = n_heads query heads per group. K/V are
-    # folded to one head per group then broadcast to H (stride-0).
-    k_folded = (1, bsz * padding, kv_heads, 1, d)
-    k_shape = (1, bsz * padding, kv_heads, n_heads, d)
-    q_shape = (1, bsz, kv_heads, n_heads, d)
-    k = torch.randn(k_folded, dtype=dtype_, device=dev).expand(k_shape)
-    v = torch.randn(k_folded, dtype=dtype_, device=dev).expand(k_shape)
-    q = torch.randn(q_shape, dtype=dtype_, device=dev)
-    k_seqlen = torch.randint(1, padding + 1, (bsz,)).tolist()
+    # Packed BMGHK for the reference/bias: one KV head per group broadcast to Hq.
+    k_folded = (1, B * padding, G, 1, D)
+    k_shape = (1, B * padding, G, Hq, D)
+    kf = torch.randn(k_folded, dtype=dtype_, device=dev)
+    vf = torch.randn(k_folded, dtype=dtype_, device=dev)
+    k = kf.expand(k_shape)
+    v = vf.expand(k_shape)
+    q = torch.randn((1, B, G, Hq, D), dtype=dtype_, device=dev)
+    seq = torch.randint(1, padding + 1, (B,), dtype=torch.int32, device=dev)
+
+    # Build the fp8 paged cache ONCE (precomputed scales), then run the kernel over it.
+    # Per-batch dense KV [B, padding, G, 1, D] is what the cache builder expects.
+    k_dense = kf[0].unflatten(0, (B, padding))
+    v_dense = vf[0].unflatten(0, (B, padding))
+    key_cache, value_cache, key_scale, value_scale, block_tables = (
+        dense_kv_to_fp8_paged(k_dense, v_dense, block_size=16)
+    )
+    BG = B * G
+    context_lengths = seq.view(B, 1).expand(B, G).reshape(BG).contiguous()
+    q_flat = q.reshape(BG, Hq, D).contiguous()
+    out = torch.zeros(BG, Hq, D, dtype=q.dtype, device=dev)
+    pa_decode_ps_launch(
+        out,
+        q_flat,
+        key_cache,
+        value_cache,
+        context_lengths,
+        float(D**-0.5),
+        key_scale=key_scale,
+        value_scale=value_scale,
+        block_tables=block_tables,
+        max_context_partition_num=0,
+    )
 
     attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-        q_seqlen=[1] * bsz,
-        kv_seqlen=k_seqlen,
+        q_seqlen=[1] * B,
+        kv_seqlen=seq.tolist(),
         kv_padding=padding,
     )
-    inp = fmha.Inputs(q, k, v, attn_bias=attn_bias, quantize_kv_to_fp8=True)
-    if skip_reasons := op.not_supported_reasons(inp):
-        pytest.skip("; ".join(skip_reasons))
-
-    out, _ = op.apply(inp, needs_gradient=False)
     ref_output = ref_attention_for_test(q, k, v, attn_bias)
-
-    # op.apply returns [B, 1, G, Hq, D]; the reference uses [1, B, G, Hq, D].
     out = out.reshape(ref_output.shape)
 
     # fp8 (e4m3fn) has ~2 mantissa bits -> loose tolerance vs the full-precision ref.

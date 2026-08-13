@@ -12,7 +12,16 @@ from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
+from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .utils.op_common import get_operator, register_operator
+
+# FlyDSL is a mandatory ROCm-only backend but absent on CUDA/CPU builds; guard the
+# kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
+# in apply() raises a clear error before pa_decode_launch is ever called.
+try:
+    from .flydsl.pa_decode_dense import pa_decode_launch
+except ImportError:
+    pa_decode_launch = None
 
 
 def _flydsl_splitk_forward(
@@ -22,24 +31,11 @@ def _flydsl_splitk_forward(
     seq_positions: Optional[torch.Tensor],
     scale: float,
     split_k: int,
-    use_fp8_kv: bool = False,
 ) -> torch.Tensor:
-    from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
-    from .flydsl.pa_decode_dense import pa_decode_launch
-
     q5, k5, v5 = canonicalize_qkv_5d(query, key, value)
     B = q5.shape[0]
     KV_MAX = k5.shape[1]
     seq = normalize_seq_positions(seq_positions, B, KV_MAX, q5.device)
-
-    if use_fp8_kv:
-        # Opt-in fp8-KV: quantize dense KV to native fp8 per call (lossy, gfx950 only).
-        from .flydsl.pa_decode_fp8_dispatch import is_fp8_paged_decode_available
-
-        if is_fp8_paged_decode_available():
-            from .flydsl.fp8_paged_adapter import fp8_paged_decode_from_dense
-
-            return fp8_paged_decode_from_dense(q5, k5, v5, seq, scale)
 
     return pa_decode_launch(q5, k5, v5, seq, scale, split_k=split_k)
 
@@ -174,7 +170,6 @@ class FwOp(AttentionFwOpBase):
             ).item()
 
         require_flydsl()
-        use_fp8_kv = getattr(inp, "quantize_kv_to_fp8", False)
         out = _flydsl_splitk_forward(
             query=query,
             key=key,
@@ -182,7 +177,6 @@ class FwOp(AttentionFwOpBase):
             seq_positions=seq_positions_gpu,
             scale=qk_scale,
             split_k=split_k,
-            use_fp8_kv=use_fp8_kv,
         )
 
         return out, None

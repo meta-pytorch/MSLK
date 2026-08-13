@@ -206,9 +206,6 @@ class Inputs:
     quantize_qk_to_fp8: bool = False
     use_fp32_scales: bool = False
     num_splits: int = 0
-    # Opt-in for FlyDSL native-fp8 paged decode: quantize dense KV to fp8 (e4m3fn)
-    # per call and run the fp8 kernel. gfx950 + G=1 only, else falls back to dense.
-    quantize_kv_to_fp8: bool = False
 
     @property
     def device(self) -> torch.device:
