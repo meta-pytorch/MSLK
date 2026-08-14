@@ -25,8 +25,11 @@ from .utils import assert_allclose, ref_attention_for_test, rocm_only
 
 def _drop_mask(batch_size, q_len, kv_len, p, device):
     # Op-independent: always CK's philox (what the op itself calls internally).
-    pattern = torch.empty((batch_size, 1, q_len, kv_len), device=device)
-    rand_uniform = torch.ops.xformers._ck_rand_uniform(p, pattern)
+    dev = torch.device(device)
+    dev_index = dev.index if dev.index is not None else 0
+    rand_uniform = torch.ops.xformers._ck_rand_uniform(
+        p, batch_size, 1, q_len, kv_len, dev_index
+    )
     mask = (rand_uniform <= int((1.0 - p) * 255.0)).to(torch.float32)
     return mask.reshape(batch_size, q_len, kv_len)
 

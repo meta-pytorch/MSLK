@@ -596,6 +596,21 @@ def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
 
+def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
+    """Bounded uint8 (0/1 dropout keep-mask) load from a buffer resource, to f32.
+
+    Same bounded-resource semantics as _bf16_buffer_load_f32 (an OOB tail row
+    reads 0 in hardware). The keep bit converts 0/1 -> 0.0/1.0; the 1/(1-p)
+    inverted-dropout scale is a constant factor applied to the attention output
+    by the caller (it factors out of the per-(q,k) sum), not here.
+    """
+    c0 = buffer_ops._create_i32_constant(0)
+    raw = rocdl.raw_ptr_buffer_load(
+        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+    )
+    return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
+
+
 def _pointer_store(value: ir.Value, ptr: ir.Value):
     return llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
@@ -2406,7 +2421,7 @@ class GenericFlashAttnContext:
 
     def init_dropout(self, Dropout, drop_stride_b, drop_stride_h, drop_stride_q):
         # Same bounded-plane-resource scheme as init_bias.
-        eb = 2  # bytes per element; the generic path is f16/bf16 only
+        eb = 1  # bytes per element; the dropout keep-mask is uint8 (0/1)
         self.drop_stride_q = fx.Int32(drop_stride_q)
         plane_off_bytes = (
             fx.Index(self.batch_idx) * fx.Index(drop_stride_b)
@@ -3433,8 +3448,9 @@ class GenericSoftmaxHelper:
         return s_raw_lo, s_raw_hi
 
     def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
-        # Multiply the 32 post-softmax probabilities by M[q_row, kv_col] (0 or
-        # 1/(1-p)). Same fragment gather as add_bias, applied after online_softmax.
+        # Multiply the 32 post-softmax probabilities by the uint8 keep bit
+        # M[q_row, kv_col] (0 or 1). Same fragment gather as add_bias, applied
+        # after online_softmax. The 1/(1-p) scale is applied to the output.
         ctx = self.ctx
         traits = ctx.traits
         kv_start_i32 = fx.Int32(kv_start)
@@ -3443,13 +3459,15 @@ class GenericSoftmaxHelper:
         # lanes are already zero post-softmax, so no index clamp is needed.
         row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
         k_sub_i32 = fx.Int32(traits.K_SUB_N)
-        eb = fx.Int32(2)  # bytes per element (generic path is f16/bf16 only)
+        eb = fx.Int32(1)  # bytes per element (uint8 keep-mask)
         for r in range_constexpr(16):
             kv_col = col_base_i32 + fx.Int32(moff[r])
             off_lo = (row_base_i32 + kv_col) * eb
             off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-            m_lo = _bf16_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
-            m_hi = _bf16_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
+            # keep bit is 0/1; the 1/(1-p) scale is applied to the output by the
+            # caller (constant factor, so it factors out of the per-(q,k) sum).
+            m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
+            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
             p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
             p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
         return p_vals_lo, p_vals_hi

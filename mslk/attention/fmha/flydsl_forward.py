@@ -399,26 +399,26 @@ class FwOp(AttentionFwOpBase):
 
         kw["return_lse"] = needs_gradient
 
-        # Dropout (dense only): reuse CK's philox mask so output matches ck.FwOp and
-        # ck.BwOp can reproduce it from rng_state.
-        rng_state: Optional[torch.Tensor] = None
+        # Dropout (dense only): Python-only mask via native torch RNG. This is
+        # CUDA-graph-safe and advances per replay, and drops the CK philox
+        # dependency. NOTE: backward mask regeneration is not implemented yet --
+        # training (needs_gradient) with dropout is rejected below until a
+        # flydsl dropout backward that reproduces this mask lands.
         if inp.p != 0.0:
             B = inp.query.shape[0]
             Sq = inp.query.shape[1]
             H = inp.query.shape[2]
             Skv = inp.key.shape[1]
-            gen = torch.cuda.default_generators[inp.query.device.index]
-            seed = int(gen.initial_seed())
-            offset = int(gen.get_offset())
-            # _ck_rand_uniform advances the generator like CK's fused forward and
-            # returns a [B, H, Sq, Skv] uint8 randval; keep <=> rand <= (1-p)*255.
-            pattern = torch.empty((B, H, Sq, Skv), device=inp.query.device)
-            rand_uniform = torch.ops.xformers._ck_rand_uniform(inp.p, pattern)
-            keep = int((1.0 - inp.p) * 255.0)
-            kw["dropout_mask"] = (rand_uniform <= keep).to(inp.query.dtype) * (
-                1.0 / (1.0 - inp.p)
+            keep = (
+                torch.rand(
+                    B, H, Sq, Skv, device=inp.query.device, dtype=torch.float32
+                )
+                >= inp.p
             )
-            rng_state = torch.tensor([seed, offset], dtype=torch.int64, device="cpu")
+            # uint8 keep-mask (0/1), half the memory of a bf16/f16 mask. The
+            # 1/(1-p) inverted-dropout scale is applied to the output in _run
+            # (a constant factor, so it factors out of the per-(q,k) sum).
+            kw["dropout_mask"] = keep.to(torch.uint8)
 
         # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
         # restore input shape (slice/reshape are no-ops when a path didn't pad).
@@ -427,7 +427,11 @@ class FwOp(AttentionFwOpBase):
                 q, k, v = _pad_hd(q), _pad_hd(k), _pad_hd(v)
             result = flydsl_flash_attn_func(q, k, v, **kw)
             out, lse = result if needs_gradient else (result, None)
-            return out[..., :D_native].reshape(inp.query.shape), lse
+            out = out[..., :D_native].reshape(inp.query.shape)
+            if inp.p != 0.0:
+                # Inverted-dropout output scale (the uint8 mask carries no scale).
+                out = out * (1.0 / (1.0 - inp.p))
+            return out, lse
 
         def _set_varlen_kw(cu_q, cu_kv, max_q, max_kv, cross):
             kw["cu_seqlens_q"] = cu_q
@@ -581,12 +585,15 @@ class FwOp(AttentionFwOpBase):
         ctx: Optional[Context] = None
         if needs_gradient:
             if inp.p != 0.0:
-                # ck.BwOp regenerates the dropout mask from rng_state.
-                from . import ck
-
-                ctx = Context(lse=lse, out=out, op_bw=ck.BwOp)
-                ctx.rng_state = rng_state
-            else:
-                # No FlyDSL backward yet.
-                ctx = Context(lse=lse, out=out, op_bw=None)
+                # TODO: implement a flydsl dropout backward that regenerates the
+                # Python (torch RNG) mask. Until then the mask cannot be
+                # reproduced in the backward (ck.BwOp only knows CK philox), so
+                # reject training + dropout rather than return wrong gradients.
+                raise NotImplementedError(
+                    "flydsl dropout backward is not implemented yet for the "
+                    "Python-generated mask; dropout is currently forward/"
+                    "inference-only (needs_gradient=False)."
+                )
+            # No FlyDSL backward yet.
+            ctx = Context(lse=lse, out=out, op_bw=None)
         return out, ctx

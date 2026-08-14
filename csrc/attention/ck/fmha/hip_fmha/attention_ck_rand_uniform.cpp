@@ -25,23 +25,26 @@
 namespace {
 
 /**
- * generate a tensor with random uniform values. only used for testing, not much
- * attention is paid to performance
+ * Generate a [B, num_heads, M, N] uint8 tensor of CK philox random bytes (the
+ * same mask CK's fused forward uses). Dimensions are passed explicitly so no
+ * full-size scratch tensor is materialized, and ``device_index`` selects the
+ * device generator/stream so backward regenerates the identical mask on any
+ * device. The launch is asynchronous: the mask is produced on the device stream
+ * and consumed by the caller on the same stream (no host sync).
  */
 at::Tensor rand_uniform_int(
-    double dropout_prob,
-    const at::Tensor& out_pattern) // [Batches, num_head, query_len, key_len]
-{
-  int B = out_pattern.size(0);
-  int num_heads = out_pattern.size(1);
-  int M = out_pattern.size(2);
-  int N = out_pattern.size(3);
-
-  hipStream_t stream = c10::cuda::getCurrentHIPStream().stream();
+    double /*dropout_prob*/,
+    int64_t B,
+    int64_t num_heads,
+    int64_t M,
+    int64_t N,
+    int64_t device_index) {
+  const auto dev = static_cast<at::DeviceIndex>(device_index);
+  hipStream_t stream = c10::cuda::getCurrentHIPStream(dev).stream();
 
   at::CUDAGeneratorImpl* gen =
       at::get_generator_or_default<at::CUDAGeneratorImpl>(
-          c10::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+          c10::nullopt, at::cuda::detail::getDefaultCUDAGenerator(dev));
 
   at::PhiloxCudaState rng_engine_inputs;
   {
@@ -51,14 +54,12 @@ at::Tensor rand_uniform_int(
   }
 
   const auto seeds = at::cuda::philox::unpack(rng_engine_inputs);
-
   int64_t philox_seed = std::get<0>(seeds);
   int64_t philox_offset = std::get<1>(seeds);
 
-  at::Tensor randvals;
-
-  randvals = at::empty(
-      {B, num_heads, M, N}, out_pattern.options().dtype(at::ScalarType::Byte));
+  at::Tensor randvals = at::empty(
+      {B, num_heads, M, N},
+      at::TensorOptions().dtype(at::ScalarType::Byte).device(at::kCUDA, dev));
 
   {
     // only work for batched mode
@@ -66,20 +67,23 @@ at::Tensor rand_uniform_int(
 
     const auto kargs = FmhaRandUniformKernel_::MakeKargs(
         randvals.data_ptr(),
-        M,
-        N,
-        num_heads,
-        B,
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(num_heads),
+        static_cast<int>(B),
         static_cast<int>(randvals.stride(2)),
         static_cast<int>(randvals.stride(3)),
         static_cast<int>(randvals.stride(1)),
         static_cast<int>(randvals.stride(0)),
         {philox_seed, philox_offset});
 
-    dim3 kGridSize = FmhaRandUniformKernel_::GridSize(B, num_heads, M, N);
+    dim3 kGridSize = FmhaRandUniformKernel_::GridSize(
+        static_cast<int>(B),
+        static_cast<int>(num_heads),
+        static_cast<int>(M),
+        static_cast<int>(N));
     constexpr dim3 kBlockSize = FmhaRandUniformKernel_::BlockSize();
-    constexpr ck_tile::index_t kBlockPerCu =
-        FmhaRandUniformKernel_::kBlockPerCu;
+    constexpr ck_tile::index_t kBlockPerCu = FmhaRandUniformKernel_::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
@@ -87,19 +91,19 @@ at::Tensor rand_uniform_int(
             FmhaRandUniformKernel_{}, kGridSize, kBlockSize, 0, kargs));
   }
 
-  (void)hipStreamSynchronize(stream);
-
   return randvals;
-} // namespace
+}
 
 } // namespace
 
 TORCH_LIBRARY_FRAGMENT(xformers, m) {
   m.def(TORCH_SELECTIVE_SCHEMA(
-      "xformers::_ck_rand_uniform(float p, Tensor out) -> Tensor"));
+      "xformers::_ck_rand_uniform(float p, int b, int num_heads, int m, int n, int device_index) -> Tensor"));
 }
 
-TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
+// No Tensor argument to carry a dispatch key (dims + device_index are scalars),
+// so register backend-agnostically; the kernel targets device_index itself.
+TORCH_LIBRARY_IMPL(xformers, CompositeExplicitAutograd, m) {
   m.impl(
       TORCH_SELECTIVE_NAME("xformers::_ck_rand_uniform"),
       TORCH_FN(rand_uniform_int));

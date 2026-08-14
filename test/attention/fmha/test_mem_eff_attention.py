@@ -241,9 +241,12 @@ def _vec_binom_test(x, n, p):
 
 def _get_drop_mask(op, batch_size, q_len, kv_len, p, device):
     assert op == fmha.ck.FwOp, f"Op {op.NAME} does not expose dropout mask"
-    mask = torch.empty((batch_size, 1, q_len, kv_len), device=device)
-    # rand_uniform is an int8_t tensor
-    rand_uniform = torch.ops.xformers._ck_rand_uniform(p, mask)
+    dev = torch.device(device)
+    dev_index = dev.index if dev.index is not None else 0
+    # rand_uniform is a uint8 tensor, allocated on the device from dims.
+    rand_uniform = torch.ops.xformers._ck_rand_uniform(
+        p, batch_size, 1, q_len, kv_len, dev_index
+    )
     mask = (rand_uniform <= int((1.0 - p) * 255.0)).to(torch.float32)
     mask = mask.reshape(batch_size, q_len, kv_len)
 
