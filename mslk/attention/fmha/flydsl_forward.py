@@ -16,6 +16,7 @@ attn_bias types, BMHK and BMGHK. Dense-path cross-attention is rejected via
 ``not_supported_reasons``.
 """
 
+import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
@@ -63,11 +64,7 @@ _WINDOW_BIAS_TYPES = (
     BlockDiagonalCausalLocalAttentionFromBottomRightMask,
 )
 
-# Varlen-local (windowed) types; the top-left one drives causal_top_left.
-_VARLEN_WINDOW_TYPES = (
-    BlockDiagonalCausalLocalAttentionMask,
-    BlockDiagonalCausalLocalAttentionFromBottomRightMask,
-)
+# Varlen-local (windowed) top-left type; drives causal_top_left.
 _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
 # Head dims the kernel builds natively; other dims in [1, 256] are zero-padded up to
@@ -98,7 +95,6 @@ _PAGED_BIAS_TYPES = (
     PagedBlockDiagonalPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-_PAGED_KERNEL_PAGE_SIZE = 64
 _PAGED_HEAD_DIMS = (64, 128)
 # The generic paged kernel tiles KV at PAGE_SIZE == BLOCK_N == 64; paged-gappy
 # reshapes any physical page_size to 64-row sub-pages (see _apply_bmhk).
@@ -113,10 +109,6 @@ _PAGED_GAPPY_TYPES = (PagedBlockDiagonalGappyKeysMask,)
 _PADDED_GAPPY_BIAS_TYPES = (
     BlockDiagonalPaddedKeysMask,
     BlockDiagonalGappyKeysMask,
-    BlockDiagonalCausalWithOffsetPaddedKeysMask,
-    BlockDiagonalCausalWithOffsetGappyKeysMask,
-)
-_PADDED_GAPPY_CAUSAL_TYPES = (
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     BlockDiagonalCausalWithOffsetGappyKeysMask,
 )
@@ -320,8 +312,6 @@ class FwOp(AttentionFwOpBase):
     def _apply_bmhk(
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
-        import math
-
         from mslk.attention.flydsl import flydsl_flash_attn_func
 
         bias = inp.attn_bias
@@ -392,12 +382,6 @@ class FwOp(AttentionFwOpBase):
             kw["max_seqlen_q"] = max_q
             kw["max_seqlen_kv"] = max_kv
             kw["cross_seqlen"] = cross
-
-        # Contiguous cu_seqlens (prefix-0 + cumsum) from per-seq lengths.
-        def _cu_seqlens(seqlens, device):
-            cu = torch.zeros(len(seqlens) + 1, dtype=torch.int32, device=device)
-            cu[1:] = torch.tensor(seqlens, dtype=torch.int32, device=device).cumsum(0)
-            return cu
 
         # Pack q/k/v to flat [total, H, D] for the varlen path.
         def _flatten_qkv():
