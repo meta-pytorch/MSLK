@@ -8,9 +8,8 @@
 
 """FlyDSL preshuffle GEMM for FP8 rowwise scaling (gfx950).
 
-Public API:
-    flydsl_preshuffle(src)  -- shuffle weights for the FlyDSL layout
-    flydsl_preshuffle_gemm(XQ, WQ, x_scale, w_scale, ...)  -- run the GEMM
+Provides single and batched FP8 preshuffle GEMM via FlyDSL. Also registers
+as the ROCm implementation of the ``mslk`` rowwise FP8 ops on gfx950.
 """
 
 from dataclasses import dataclass
@@ -18,56 +17,81 @@ from math import prod
 from typing import Optional
 
 import torch
-from mslk.flydsl.common import is_flydsl_available, require_flydsl
+from mslk.utils.device import is_gfx950
 from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
-# Default tile configurations for gfx950 preshuffle GEMM
+# Tile configuration for the preshuffle GEMM kernel
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class KernelConfig:
-    """Tile configuration for the FlyDSL preshuffle GEMM kernel."""
+    """Tile and launch parameters for one FlyDSL preshuffle GEMM variant."""
 
-    tile_m: int
-    tile_n: int
-    tile_k: int
-    lds_stage: int
-    use_cshuffle_epilog: int = 0
-    use_async_copy: int = 0
-    waves_per_eu: int = 0
-    xcd_swizzle: int = 0
+    tile_m: int  # M-dimension tile size (rows of activation per workgroup)
+    tile_n: int  # N-dimension tile size (columns of weight per workgroup)
+    tile_k: int  # K-dimension tile size (reduction loop step)
+    lds_stage: int  # number of LDS pipeline stages (software pipelining depth)
+    use_cshuffle_epilog: int = 0  # 1 to use cross-lane shuffle in the epilogue
+    use_async_copy: int = 0  # 1 to use async global→LDS copy instructions
+    waves_per_eu: int = 0  # occupancy hint; 0 = let the compiler decide
+    xcd_swizzle: int = 0  # XCD (cross-chiplet die) swizzle pattern index
 
 
-# Default configs for gfx950 heuristic selection.
 DEFAULT_CONFIGS_GFX950: dict[int, KernelConfig] = {
-    -1: KernelConfig(128, 256, 256, 2, 0, 0, 2, 0),
-    -2: KernelConfig(16, 64, 512, 2, 0, 0, 2, 0),
-    -3: KernelConfig(32, 64, 512, 2, 0, 0, 2, 0),
-    -4: KernelConfig(128, 128, 128, 2, 0, 0, 2, 0),
+    -1: KernelConfig(64, 128, 256, 2, xcd_swizzle=1, waves_per_eu=2),
+    -2: KernelConfig(16, 64, 512, 2, waves_per_eu=1),
+    -3: KernelConfig(32, 64, 512, 2, xcd_swizzle=1),
+    -4: KernelConfig(64, 64, 128, 2, xcd_swizzle=1),
+    -5: KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2),
+    -6: KernelConfig(64, 128, 128, 2, xcd_swizzle=1),
 }
 
+# Profile-guided overrides: (m_upper_bound, n, k) -> KernelConfig
+# Entries are checked in order; first match where m <= m_upper_bound wins.
+_SHAPE_OVERRIDES_GFX950: list[tuple[int, int, int, KernelConfig]] = [
+    # N=1280, K=8192: sweep-tuned per M range
+    (1, 1280, 8192, KernelConfig(64, 128, 256, 2, xcd_swizzle=1, waves_per_eu=2)),
+    (64, 1280, 8192, KernelConfig(32, 128, 256, 2, xcd_swizzle=4, waves_per_eu=2)),
+    (256, 1280, 8192, KernelConfig(64, 64, 128, 2, xcd_swizzle=1)),
+    (512, 1280, 8192, KernelConfig(64, 256, 128, 2, xcd_swizzle=1)),
+    (2048, 1280, 8192, KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2)),
+    (8192, 1280, 8192, KernelConfig(128, 256, 128, 2, waves_per_eu=2)),
+    # N=8192, K=1024: sweep-tuned per M range
+    (1, 8192, 1024, KernelConfig(16, 64, 512, 2, waves_per_eu=1)),
+    (256, 8192, 1024, KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2)),
+    (8192, 8192, 1024, KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2)),
+]
 
-def select_default_config(m: int, n: int, k: int) -> KernelConfig:
+
+def select_default_config(m: int, n: int, k: int, batch: int = 1) -> KernelConfig:
     """Select a default FlyDSL tile config based on shape heuristics."""
-    fits = [
-        c
-        for c in DEFAULT_CONFIGS_GFX950.values()
-        if n % c.tile_n == 0 and k % c.tile_k == 0
-    ]
+    for m_upper, n_val, k_val, cfg in _SHAPE_OVERRIDES_GFX950:
+        if n == n_val and k == k_val and m <= m_upper:
+            return cfg
+
+    configs = DEFAULT_CONFIGS_GFX950
+    fits = [c for c in configs.values() if n % c.tile_n == 0 and k % c.tile_k == 0]
     if not fits:
         raise RuntimeError(
             f"No FlyDSL preshuffle config fits shape ({m}, {n}, {k}). "
             f"N must be divisible by tile_n and K by tile_k."
         )
     want_tm = min(256, max(16, 1 << (m - 1).bit_length())) if m > 0 else 16
-    return min(fits, key=lambda c: (abs(c.tile_m - want_tm), -c.tile_n, -c.tile_k))
+
+    def _sort_key(c: KernelConfig) -> tuple:
+        m_tiles = max(1, -(-m // c.tile_m))
+        n_tiles = n // c.tile_n
+        low_occupancy = m_tiles * n_tiles * batch < 64
+        return (low_occupancy, abs(c.tile_m - want_tm), -c.tile_n, -c.tile_k)
+
+    return min(fits, key=_sort_key)
 
 
 # ---------------------------------------------------------------------------
-# Weight shuffle
+# Weight preshuffle
 # ---------------------------------------------------------------------------
 
 
@@ -111,6 +135,8 @@ def _get_compile_fn():  # type: ignore[return]
     if _import_done:
         return _compile_fn
     _import_done = True
+    from mslk.flydsl.common import is_flydsl_available
+
     if not is_flydsl_available():
         return None
     try:
@@ -122,8 +148,12 @@ def _get_compile_fn():  # type: ignore[return]
     return _compile_fn
 
 
+def _as_i8(t: Tensor) -> Tensor:
+    return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+
 # ---------------------------------------------------------------------------
-# GEMM entry point
+# Single GEMM
 # ---------------------------------------------------------------------------
 
 
@@ -157,6 +187,8 @@ def flydsl_preshuffle_gemm(
     Returns:
         Output tensor (..., M, N) in ``dtype``.
     """
+    from mslk.flydsl.common import require_flydsl
+
     require_flydsl()
 
     m = prod(XQ.shape[:-1])
@@ -226,7 +258,7 @@ def flydsl_preshuffle_gemm(
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = out.contiguous()
-    _dummy_bias = torch.empty(0, dtype=out.dtype, device=out.device)
+    _dummy_bias = torch.empty(1, dtype=out.dtype, device=out.device)
     run_compiled(
         exe,
         ptr_arg(out_contig.view(-1)),
@@ -246,15 +278,130 @@ def flydsl_preshuffle_gemm(
 
 
 # ---------------------------------------------------------------------------
-# Op registration (replaces CK on gfx950)
+# Batched GEMM
 # ---------------------------------------------------------------------------
 
-if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+
+def flydsl_preshuffle_batched_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Optional[Tensor] = None,
+    tile_m: Optional[int] = None,
+    tile_n: Optional[int] = None,
+    tile_k: Optional[int] = None,
+    lds_stage: int = 2,
+    use_cshuffle_epilog: int = 0,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Batched FP8 preshuffle GEMM via Grid-Z batching.
+
+    Args:
+        XQ: FP8 activation tensor (B, M, K).
+        WQ: FP8 weight tensor (B, N, K), pre-shuffled via ``flydsl_preshuffle``.
+        x_scale: Per-token activation scale (B, M) or (B, M, 1), float32.
+        w_scale: Per-channel weight scale (B, N) or (B, 1, N), float32.
+        out: Optional pre-allocated output tensor (B, M, N).
+        dtype: Output dtype (bfloat16 or float16).
+    """
+    from mslk.flydsl.common import require_flydsl
+
+    require_flydsl()
+
+    assert XQ.dim() == 3, f"Expected 3D XQ, got {XQ.dim()}D"
+    assert WQ.dim() == 3, f"Expected 3D WQ, got {WQ.dim()}D"
+    B, M, K = XQ.shape
+    N = WQ.shape[1]
+
+    if out is None:
+        out = torch.empty(B, M, N, dtype=dtype, device=XQ.device)
+
+    compile_fn = _get_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("FlyDSL preshuffle kernel compiler not available")
+
+    if tile_m is None or tile_n is None or tile_k is None:
+        cfg = select_default_config(M, N, K, batch=B)
+        tile_m = tile_m or cfg.tile_m
+        tile_n = tile_n or cfg.tile_n
+        tile_k = tile_k or cfg.tile_k
+        lds_stage = cfg.lds_stage
+        use_cshuffle_epilog = cfg.use_cshuffle_epilog
+        use_async_copy = cfg.use_async_copy
+        waves_per_eu = cfg.waves_per_eu
+        xcd_swizzle = cfg.xcd_swizzle
+
+    if "float8" in str(XQ.dtype):
+        in_dtype = "fp8"
+    elif XQ.dtype == torch.int8:
+        in_dtype = "int8"
+    else:
+        raise ValueError(f"Unsupported input dtype {XQ.dtype}")
+
+    out_dtype = "bf16" if dtype == torch.bfloat16 else "fp16"
+    wpe = None if waves_per_eu <= 0 else waves_per_eu
+
+    exe = compile_fn(
+        N=N,
+        K=K,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        lds_stage=lds_stage,
+        use_cshuffle_epilog=bool(use_cshuffle_epilog),
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=wpe,
+        xcd_swizzle=int(xcd_swizzle),
+        batched=True,
+    )
+
+    import flydsl.expr as fx  # pyre-ignore[21]
+    from mslk.flydsl.jit import ptr_arg, run_compiled
+
+    out_contig = out.contiguous()
+    XQ_i8 = _as_i8(XQ.contiguous())
+    WQ_i8 = _as_i8(WQ.contiguous())
+    xs_contig = x_scale.contiguous()
+    ws_contig = w_scale.contiguous()
+
+    dummy_bias = torch.empty(1, dtype=dtype, device=XQ.device)
+    stream = fx.Stream(torch.cuda.current_stream())
+
+    run_compiled(
+        exe,
+        ptr_arg(out_contig.view(-1)),
+        ptr_arg(XQ_i8.view(-1)),
+        ptr_arg(WQ_i8.view(-1)),
+        ptr_arg(xs_contig.view(-1)),
+        ptr_arg(ws_contig.view(-1)),
+        ptr_arg(dummy_bias),
+        M,
+        N,
+        B,
+        stream,
+    )
+    if out_contig is not out:
+        out.copy_(out_contig)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Register FlyDSL as the ROCm implementation of mslk rowwise FP8 ops on gfx950
+# ---------------------------------------------------------------------------
+if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
+    from mslk.flydsl.common import is_flydsl_available
+
     if is_flydsl_available():
         _preshuffle_cache: dict = {}
 
         def _get_preshuffled(WQ: Tensor) -> Tensor:
-            """Cache preshuffled weights by data pointer."""
             key = WQ.data_ptr()
             cached = _preshuffle_cache.get(key)
             if cached is not None and cached.shape == WQ.shape:
@@ -275,7 +422,12 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
         ) -> Tensor:
             WQ_shuf = _get_preshuffled(WQ)
             return flydsl_preshuffle_gemm(
-                XQ, WQ_shuf, x_scale, w_scale, out=output, dtype=dtype
+                XQ,
+                WQ_shuf,
+                x_scale,
+                w_scale,
+                out=output,
+                dtype=dtype,
             )
 
         if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
@@ -341,4 +493,32 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
                     bias,
                     use_fast_accum,
                     dtype=torch.float16,
+                )
+
+    # --- batched op ---
+    if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
+        from mslk.flydsl.common import is_flydsl_available as _is_flydsl_batched
+
+        if _is_flydsl_batched():
+
+            @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
+            def _f8f8bf16_rowwise_batched_flydsl(
+                XQ: Tensor,
+                WQ: Tensor,
+                x_scale: Tensor,
+                w_scale: Tensor,
+                bias: Optional[Tensor] = None,
+                use_fast_accum: bool = True,
+                output: Optional[Tensor] = None,
+            ) -> Tensor:
+                if bias is not None:
+                    raise NotImplementedError(
+                        "FlyDSL batched preshuffle GEMM does not support bias"
+                    )
+                return flydsl_preshuffle_batched_gemm(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    out=output,
                 )
