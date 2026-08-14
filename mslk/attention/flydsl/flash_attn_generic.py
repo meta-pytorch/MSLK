@@ -132,6 +132,7 @@ def build_flash_attn_func_module_primary(
             causal_top_left=causal_top_left,
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
+            num_kv_splits=num_kv_splits,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -160,6 +161,7 @@ def build_flash_attn_func_module_primary(
             causal_top_left=causal_top_left,
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
+            num_kv_splits=num_kv_splits,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -1058,6 +1060,7 @@ def build_flash_attn_func_module_primary(
             causal_top_left=causal_top_left,
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
+            num_kv_splits=num_kv_splits,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1086,6 +1089,7 @@ def build_flash_attn_func_module_primary(
             causal_top_left=causal_top_left,
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
+            num_kv_splits=num_kv_splits,
         )
 
         def _pad_dispatch(*args, **kwargs):
