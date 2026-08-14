@@ -339,7 +339,11 @@ class FwOp(AttentionFwOpBase):
         out, ctx = cls._apply_bmhk(flat, needs_gradient)
         out = out.unflatten(2, (G, Hq))
         if ctx is not None:
-            ctx = Context(lse=ctx.lse.unflatten(1, (G, Hq)), out=out, op_bw=ctx.op_bw)
+            # Update the existing context in place so dropout rng_state (and any
+            # other fields) survive; rebuilding a Context would drop rng_state and
+            # break ck.BwOp for 5-D dropout inputs.
+            ctx.lse = ctx.lse.unflatten(1, (G, Hq))
+            ctx.out = out
         return out, ctx
 
     # ------------------------------------------------------------------- BMHK
