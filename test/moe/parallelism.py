@@ -9,7 +9,7 @@
 import functools
 import os
 from datetime import timedelta
-from typing import Optional
+from typing import cast, Optional
 
 import torch
 from fairscale.nn.model_parallel.initialize import (
@@ -98,7 +98,8 @@ def init_parallel(
 
     if not model_parallel_is_initialized():
         assert get_world_size() == model_parallel_size * data_parallel_size, (
-            f"world size must be equal to mp*dp, but got {get_world_size()} != {model_parallel_size} * {data_parallel_size}"
+            "world size must be equal to mp*dp, but got "
+            f"{get_world_size()} != {model_parallel_size} * {data_parallel_size}"
         )
         initialize_model_parallel(model_parallel_size)
 
@@ -118,7 +119,7 @@ def init_parallel(
             ranks = list(range(base_rank, base_rank + mp_size_for_routed_experts))
             group = torch.distributed.new_group(ranks, timeout=timeout)
             if global_rank in ranks:
-                _ROUTED_EXPERTS_MP_GROUP = group
+                _ROUTED_EXPERTS_MP_GROUP = cast(ProcessGroup, group)
 
     global _EP_GROUP
     assert _EP_GROUP is None
@@ -129,4 +130,4 @@ def init_parallel(
         ranks = list(range(i, get_world_size(), num_ep_groups))
         group = torch.distributed.new_group(ranks, timeout=timeout)
         if global_rank in ranks:
-            _EP_GROUP = group
+            _EP_GROUP = cast(ProcessGroup, group)
