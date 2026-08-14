@@ -24,6 +24,15 @@ Key features vs calling build_* directly:
 - Validates shapes, dtypes, and arch before compiling.
 - Accepts ``debug_counts`` tensor to enable the lazy-rescale branch counter
   (gfx950 DUALWAVE_SWP dualwave_swp_debug_lazy_counts=True path).
+
+Known dualwave defects (tracked; routing below escapes affected cases to the
+generic light kernel, which moves those users off the faster dualwave path):
+  * f16 dualwave softmax overflows at large logits (narrow exponent) -> NaN, so
+    f16 is forced to the light path (see ``_paged_light_ok`` / the varlen and
+    dense f16 escapes below).
+  * dualwave cross-attention NaNs for >=5 KV tiles / hardcodes 1/sqrt(D), so
+    cross-length cases are kept off dualwave.
+TODO(): Fix the flyDSL dualwave f16 cross-attn NaN
 """
 
 from __future__ import annotations
