@@ -1372,7 +1372,10 @@ def _make_flash_attn_generic_traits(
     elif path_tag.upper() in ("N32", "N128"):
         path = path_tag.upper()
     elif dtype_str in ("f16", "bf16") and head_dim == 128:
-        # N128 is faster than N32 for D=128 f16/bf16.
+        # N128 is faster than N32 for D=128 f16/bf16. This intentionally applies to
+        # NON-causal D=128 as well (previously N128 was gated on `causal`), so it
+        # changes kernel selection for existing non-causal D=128 callers, not only
+        # the new forward op. See PR summary.
         path = "N128"
     else:
         path = "N32"
