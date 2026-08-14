@@ -3777,10 +3777,14 @@ class GenericStoreHelper:
         inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
         v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(traits.D_CHUNKS)]
 
-        # Empty splits (no KV positions) leave m_final=-inf/l=0; floor m to a finite
-        # sentinel (dualwave uses -1e30) and the combine skips them via the l>0 guard.
+        # Empty splits (no KV positions) leave m_final=-inf/l=0. Under fm_fast the
+        # sm_scale multiply of -inf is poison and fmax cannot be relied on to clamp
+        # it, so a poisoned value could win reduce_m_max and zero the output. Select
+        # the literal sentinel directly on split_empty (as the dualwave
+        # store_empty_split does); the combine still skips these via the l>0 guard.
         m_log2_raw = _fmul(ctx.c_sm_scale_log2e, m_final, ctx.fm_fast)
         m_log2 = _fmax(m_log2_raw, fx.Float32(-1e30), ctx.fm_fast)
+        m_log2 = ctx.split_empty.select(fx.Float32(-1e30), m_log2)
 
         opart_rsrc, mrow_rsrc, lrow_rsrc = self._splitk_workspace_resources()
         local_opart_base = _splitk_local_opart_row_base(
