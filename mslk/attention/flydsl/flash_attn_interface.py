@@ -156,7 +156,7 @@ def _num_kv_splits_heuristic(
     while _generic_splitk_list(max_check) <= max_splits:
         max_check += 1
 
-    num_splits = 2
+    num_splits = 1
     for i in range(2, max_check):
         num_splits = _generic_splitk_list(i)
         if blocks * num_splits >= num_cu:
