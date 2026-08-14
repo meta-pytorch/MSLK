@@ -249,6 +249,41 @@ class FwOp(AttentionFwOpBase):
         ):
             reasons.append("dropout only supported on the dense self-attention path")
 
+        # Native paged KV has no backward: the dualwave route emits no LSE and there
+        # is no paged backward op, so a gradient request (return_lse on that route)
+        # would fail at run time. Decline so grad cases dispatch elsewhere.
+        _needs_grad = (
+            d.query.requires_grad or d.key.requires_grad or d.value.requires_grad
+        )
+        if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
+            reasons.append("native paged KV does not support gradients (no backward)")
+
+        # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
+        # ignored (only gappy paged folds sm_scale).
+        if d.scale is not None and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
+            reasons.append("custom scale is not supported for native paged KV")
+
+        # Q/K/V must be last-dim contiguous and 16-byte aligned for the kernel's
+        # 128-bit vector loads (raw buffer-resource loads do not tolerate otherwise).
+        for _name, _t in (("query", d.query), ("key", d.key), ("value", d.value)):
+            if _t.stride(-1) != 1:
+                reasons.append(f"{_name} last dim must be contiguous (stride==1)")
+            elif _t.data_ptr() % 16 != 0:
+                reasons.append(f"{_name} base pointer must be 16-byte aligned")
+
+        # Tensor bias must match the query dtype: the kernel loads bias bytes as the
+        # query dtype, so an fp32 bias would be reinterpreted as bf16/f16.
+        _bias_t: Optional[torch.Tensor] = None
+        if isinstance(d.attn_bias, torch.Tensor):
+            _bias_t = d.attn_bias
+        elif isinstance(d.attn_bias, LowerTriangularMaskWithTensorBias):
+            _bias_t = d.attn_bias._bias
+        if _bias_t is not None and _bias_t.dtype != d.query.dtype:
+            reasons.append(
+                f"attn_bias dtype {_bias_t.dtype} must match query dtype "
+                f"{d.query.dtype}"
+            )
+
         return reasons
 
     @classmethod
