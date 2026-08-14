@@ -27,10 +27,9 @@ _IDS = [i + "-BMHK" for i in _gen["ids"]]
     ids=_IDS,
 )
 def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
-    Mq = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt[5]
-    Mkv = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt[6]
-    # Bottom-right/local masks set effective kv_len to max(Mq, Mkv).
-    eff_kv = max(Mq, Mkv)
+    # Actual KV length; the softmax accumulates over Mkv positions, which is what
+    # drives the f16/bf16 precision floor (not max(Mq, Mkv)).
+    kv_len = opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt[6]
     try:
         _stock_test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt)
     except ValueError as e:
@@ -39,11 +38,14 @@ def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
         if "does not support inputs" in str(e) or "is not supported" in str(e):
             pytest.skip("flydslF declined (not_supported_reasons)")
         raise
-    except AssertionError:
-        # At scale=3 with kv_len >= 256, near-zero-output elements hit the f16/bf16
-        # mantissa floor (kernel accumulates in f32; not a defect). Smaller shapes
-        # must still pass, so xfail only the multi-tile case.
-        if eff_kv >= 256:
+    except AssertionError as e:
+        # Expect ONLY the final numerical comparison to fail, and only at the
+        # f16/bf16 precision floor (kv_len >= 256, create_tensors scale=3, kernel
+        # accumulates in f32; not a defect). The stock test's NaN / OOB-canary /
+        # nondeterminism / shape / dtype assertions have distinct messages and are
+        # re-raised so real regressions are never masked. "total failing elements"
+        # is unique to assert_allclose's numerical message.
+        if "total failing elements" in str(e) and kv_len >= 256:
             pytest.xfail(
                 "f16/bf16 precision floor at create_tensors scale=3 with "
                 "multi-KV-tile softmax (kernel numerics sound; see docstring)"
