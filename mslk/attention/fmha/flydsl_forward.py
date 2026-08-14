@@ -80,6 +80,19 @@ def _pad_head_dim(d: int) -> int:
     return d
 
 
+def _pack_varlen_lse(lse: torch.Tensor, q_seqinfo: Any) -> torch.Tensor:
+    """Padded per-batch LSE [B, H, max_seqlen_q] -> packed [1, H, total_q].
+
+    Mirrors ck.FwOp's packed layout so ck.BwOp (VARLEN_LSE_PACKED=True) reads the
+    right rows. Padded tail rows (q_row >= seqlen_q) are dropped per batch.
+    """
+    parts = [
+        sl[:, : end - start]
+        for sl, (start, end) in zip(lse.unbind(0), q_seqinfo.intervals())
+    ]
+    return torch.cat(parts, dim=1).unsqueeze(0)
+
+
 # Varlen (packed cu_seqlens) mask types; q/k/v arrive as [1, total, H, D].
 _VARLEN_BIAS_TYPES = (
     BlockDiagonalMask,
@@ -163,8 +176,9 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     SUPPORTS_BMGHK = True
     SUPPORTS_PARTIAL = False
-    # Varlen LSE is returned padded per-batch as [B, H, max_seqlen_q], not packed.
-    VARLEN_LSE_PACKED = False
+    # The kernel writes padded per-batch LSE [B, H, max_seqlen_q]; _apply_bmhk
+    # repacks varlen LSE to [1, H, total_q] so this matches ck.BwOp (True).
+    VARLEN_LSE_PACKED = True
     NAME = "flydslF"
 
     # Match ck.FwOp's tolerances (same MFMA reduced-precision accumulation).
@@ -551,6 +565,18 @@ class FwOp(AttentionFwOpBase):
         else:
             # Dense self-attention.
             out, lse = _run(inp.query, inp.key, inp.value)
+
+        # The kernel returns varlen LSE padded per-batch as [B, H, max_seqlen_q].
+        # Repack it to the [1, H, total_q] packed layout (VARLEN_LSE_PACKED=True) so
+        # ck.BwOp and automatic dispatch see a consistent LSE for varlen gradients.
+        if lse is not None and isinstance(
+            bias,
+            _VARLEN_BIAS_TYPES
+            + _PADDED_GAPPY_BIAS_TYPES
+            + _PAGED_BIAS_TYPES
+            + _PAGED_GAPPY_TYPES,
+        ):
+            lse = _pack_varlen_lse(lse, bias.q_seqinfo)
 
         ctx: Optional[Context] = None
         if needs_gradient:
