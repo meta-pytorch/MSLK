@@ -583,6 +583,19 @@ def _bf16_ptr_to_f32(ctx, ptr: ir.Value):
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
 
+def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
+    """Bounded f16/bf16 load from a buffer resource, extended to f32.
+
+    The resource's num_records bounds the access, so an out-of-range byte offset
+    (a tail q_row >= Sq) reads 0 in hardware instead of faulting -- no index clamp.
+    """
+    c0 = buffer_ops._create_i32_constant(0)
+    raw = rocdl.raw_ptr_buffer_load(
+        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+    )
+    return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
+
+
 def _pointer_store(value: ir.Value, ptr: ir.Value):
     return llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
@@ -2370,35 +2383,39 @@ class GenericFlashAttnContext:
         )
 
     def init_bias(self, Bias, bias_stride_b, bias_stride_h, bias_stride_q):
-        # Point bias_ptr at this (batch, head) plane; per-tile loads then add
-        # q_row*stride_q + kv_col (kv unit-stride). Head stride 0 => broadcast.
-        traits = self.traits
-        self.bias_stride_b = fx.Int32(bias_stride_b)
-        self.bias_stride_h = fx.Int32(bias_stride_h)
+        # Bounded per-(batch, head) plane resource: the base folds the plane offset
+        # (index-typed, so int64-safe) and num_records bounds q_row to Sq, so the
+        # hardware zero-fills OOB rows -- no per-element index clamp on the load.
+        eb = 2  # bytes per element; the generic path is f16/bf16 only
         self.bias_stride_q = fx.Int32(bias_stride_q)
-        bias_plane_off = (
-            fx.Int32(self.batch_idx) * self.bias_stride_b
-            + fx.Int32(self.q_head_idx) * self.bias_stride_h
-        )
-        self.bias_ptr = buffer_ops.get_element_ptr(
-            _extract_aligned_pointer(Bias),
-            as_mlir_value(bias_plane_off),
-            elem_type=self.elem_type,
+        plane_off_bytes = (
+            fx.Index(self.batch_idx) * fx.Index(bias_stride_b)
+            + fx.Index(self.q_head_idx) * fx.Index(bias_stride_h)
+        ) * fx.Index(eb)
+        self.bias_rsrc = buffer_ops.create_buffer_resource(
+            Bias,
+            max_size=False,
+            num_records_bytes=as_mlir_value(
+                self.seqlen_q_b * fx.Index(bias_stride_q * eb)
+            ),
+            base_byte_offset=as_mlir_value(plane_off_bytes),
         )
 
     def init_dropout(self, Dropout, drop_stride_b, drop_stride_h, drop_stride_q):
-        # Same plane-pointer scheme as init_bias.
-        self.drop_stride_b = fx.Int32(drop_stride_b)
-        self.drop_stride_h = fx.Int32(drop_stride_h)
+        # Same bounded-plane-resource scheme as init_bias.
+        eb = 2  # bytes per element; the generic path is f16/bf16 only
         self.drop_stride_q = fx.Int32(drop_stride_q)
-        drop_plane_off = (
-            fx.Int32(self.batch_idx) * self.drop_stride_b
-            + fx.Int32(self.q_head_idx) * self.drop_stride_h
-        )
-        self.drop_ptr = buffer_ops.get_element_ptr(
-            _extract_aligned_pointer(Dropout),
-            as_mlir_value(drop_plane_off),
-            elem_type=self.elem_type,
+        plane_off_bytes = (
+            fx.Index(self.batch_idx) * fx.Index(drop_stride_b)
+            + fx.Index(self.q_head_idx) * fx.Index(drop_stride_h)
+        ) * fx.Index(eb)
+        self.drop_rsrc = buffer_ops.create_buffer_resource(
+            Dropout,
+            max_size=False,
+            num_records_bytes=as_mlir_value(
+                self.seqlen_q_b * fx.Index(drop_stride_q * eb)
+            ),
+            base_byte_offset=as_mlir_value(plane_off_bytes),
         )
 
     def init_q_row(self):
@@ -3395,21 +3412,19 @@ class GenericSoftmaxHelper:
         traits = ctx.traits
         kv_start_i32 = fx.Int32(kv_start)
         col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        # The bounded plane resource (init_bias) zero-fills OOB rows (q_row>=Sq) in
+        # hardware, so no index clamp is needed; a within-row kv overrun reads a
+        # neighboring in-bounds value that is masked to -inf afterward.
         row_base_i32 = ctx.q_row_i32 * ctx.bias_stride_q
         k_sub_i32 = fx.Int32(traits.K_SUB_N)
+        eb = fx.Int32(2)  # bytes per element (generic path is f16/bf16 only)
         inv = ctx.c_inv_sm_scale
         for r in range_constexpr(16):
             kv_col = col_base_i32 + fx.Int32(moff[r])
-            off_lo = row_base_i32 + kv_col
-            off_hi = off_lo + k_sub_i32
-            gep_lo = buffer_ops.get_element_ptr(
-                ctx.bias_ptr, as_mlir_value(off_lo), elem_type=ctx.elem_type
-            )
-            gep_hi = buffer_ops.get_element_ptr(
-                ctx.bias_ptr, as_mlir_value(off_hi), elem_type=ctx.elem_type
-            )
-            b_lo = _bf16_ptr_to_f32(ctx, gep_lo)
-            b_hi = _bf16_ptr_to_f32(ctx, gep_hi)
+            off_lo = (row_base_i32 + kv_col) * eb
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            b_lo = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_lo)
+            b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
             s_raw_lo[r] = _fadd(s_raw_lo[r], _fmul(b_lo, inv, ctx.fm_fast), ctx.fm_fast)
             s_raw_hi[r] = _fadd(s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast)
         return s_raw_lo, s_raw_hi
@@ -3421,20 +3436,17 @@ class GenericSoftmaxHelper:
         traits = ctx.traits
         kv_start_i32 = fx.Int32(kv_start)
         col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
+        # lanes are already zero post-softmax, so no index clamp is needed.
         row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
         k_sub_i32 = fx.Int32(traits.K_SUB_N)
+        eb = fx.Int32(2)  # bytes per element (generic path is f16/bf16 only)
         for r in range_constexpr(16):
             kv_col = col_base_i32 + fx.Int32(moff[r])
-            off_lo = row_base_i32 + kv_col
-            off_hi = off_lo + k_sub_i32
-            gep_lo = buffer_ops.get_element_ptr(
-                ctx.drop_ptr, as_mlir_value(off_lo), elem_type=ctx.elem_type
-            )
-            gep_hi = buffer_ops.get_element_ptr(
-                ctx.drop_ptr, as_mlir_value(off_hi), elem_type=ctx.elem_type
-            )
-            m_lo = _bf16_ptr_to_f32(ctx, gep_lo)
-            m_hi = _bf16_ptr_to_f32(ctx, gep_hi)
+            off_lo = (row_base_i32 + kv_col) * eb
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            m_lo = _bf16_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
+            m_hi = _bf16_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
             p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
             p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
         return p_vals_lo, p_vals_hi
