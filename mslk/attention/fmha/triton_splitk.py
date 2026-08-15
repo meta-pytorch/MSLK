@@ -21,6 +21,7 @@ from typing import (
 )
 
 import torch
+from mslk.utils.device import supports_float8_fnuz
 
 from ._triton.available import is_triton_available
 from .attn_bias import (
@@ -862,6 +863,12 @@ class FwOp(AttentionFwOpBase):
         )
 
         IS_HIP = torch.version.hip is not None
+        # fp8 byte format must match how the KV cache was quantized: gfx942 e4m3fnuz,
+        # gfx950/CUDA e4m3fn. Derive from supports_float8_fnuz (NOT hardcoded per-HIP).
+        if IS_HIP:
+            FP8_FNUZ = supports_float8_fnuz(throw_on_hip_incompatibility=False)
+        else:
+            FP8_FNUZ = False
 
         if inp.quantize_pv_to_fp8:
             v = v.view(torch.int8)
@@ -937,6 +944,7 @@ class FwOp(AttentionFwOpBase):
             HAS_ADDITIVE_BIAS=attn_bias_tensor is not None,
             NUM_PROGRAMS_DIM2_CONST=split_k,
             IS_HIP=IS_HIP,
+            FP8_FNUZ=FP8_FNUZ,
             QUANTIZE_PV_TO_FP8=inp.quantize_pv_to_fp8,
             QUANTIZE_QK_TO_FP8=inp.quantize_qk_to_fp8,
             USE_FP32_SCALES=inp.use_fp32_scales,

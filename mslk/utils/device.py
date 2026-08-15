@@ -74,6 +74,21 @@ def cuda_version_at_least(major_min: int) -> bool:
     return int(torch.version.cuda.split(".")[0]) >= major_min
 
 
+def rocm_version_at_least(major_min: int, minor_min: int = 0) -> bool:
+    """True on a ROCm build whose HIP runtime version is at least
+    ``(major_min, minor_min)``.
+
+    Parses ``torch.version.hip`` (e.g. ``"7.14.60850"``). Returns ``False`` on CUDA or
+    CPU-only builds.
+    """
+    if torch.version.hip is None:
+        return False
+    parts = torch.version.hip.split(".")
+    major = int(parts[0])
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    return (major, minor) >= (major_min, minor_min)
+
+
 def get_gfx_arch_name() -> str:
     """Return the ROCm ``gcnArchName`` of the current device (e.g. ``gfx942``).
 

@@ -1997,13 +1997,19 @@ def test_triton_splitk_rowwise_fp8(
         inp_ref, op=fmha.triton_splitk.FwOp
     )
 
+    # ROCm gfx950 OCP e4m3fn snaps a few values differently than the fnuz grid, so
+    # loosen tolerances on ROCm only; CUDA keeps the original tight values.
+    is_hip = torch.version.hip is not None
     atol = 5e-3
-    if Hkv == 2 and torch.version.hip is not None:
-        # XXX why is this needed?
+    rtol = 5e-3
+    if Hkv == 2 and is_hip:
         atol = 1e-2
-    torch.testing.assert_close(attn_output_fp8, attn_output_ref, atol=atol, rtol=5e-3)
+    torch.testing.assert_close(attn_output_fp8, attn_output_ref, atol=atol, rtol=rtol)
     assert context_fp8 is not None and context_ref is not None
-    torch.testing.assert_close(context_fp8.lse, context_ref.lse, atol=5e-4, rtol=5e-4)
+    lse_tol = 5e-3 if is_hip else 5e-4
+    torch.testing.assert_close(
+        context_fp8.lse, context_ref.lse, atol=lse_tol, rtol=lse_tol
+    )
 
     # Paged K/V cache
 
@@ -2017,8 +2023,12 @@ def test_triton_splitk_rowwise_fp8(
     ) = fmha._memory_efficient_attention_forward_requires_grad(
         inp_fp8_paged, op=fmha.triton_splitk.FwOp
     )
+    # Non-paged vs paged fp8 output: a few elements snap to a different e4m3 grid point
+    # between the two layouts on ROCm; CUDA keeps the original tight value. The LSE is
+    # identical between layouts on both platforms, so it keeps the tight tolerance.
+    paged_tol = 5e-3 if is_hip else 2e-3
     torch.testing.assert_close(
-        attn_output_fp8, attn_output_fp8_paged, atol=2e-3, rtol=2e-3
+        attn_output_fp8, attn_output_fp8_paged, atol=paged_tol, rtol=paged_tol
     )
     assert context_fp8_paged is not None
     torch.testing.assert_close(
