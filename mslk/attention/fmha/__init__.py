@@ -21,6 +21,7 @@ from . import (
     flash,
     flash3,
     flash_mtia,
+    flydsl,
     triton_splitk,
 )
 from .attn_bias import (
@@ -969,6 +970,8 @@ ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
     flash_mtia.BwOp,
     flash3.BwOp,
 ]
+if torch.version.hip:
+    ALL_BW_OPS.append(flydsl.BwOp)
 
 __all__ = [
     "AttentionBias",
