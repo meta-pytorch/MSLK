@@ -167,9 +167,10 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
             except AssertionError as e:
                 # Only a finite numerical mismatch is the expected precision floor;
                 # a NaN/Inf LSE or a shape/dtype error must surface, not be hidden.
-                if "total failing elements" not in str(e) or not torch.isfinite(
-                    lse
-                ).all():
+                if (
+                    "total failing elements" not in str(e)
+                    or not torch.isfinite(lse).all()
+                ):
                     raise
                 pytest.xfail("f16/bf16 LSE precision floor at kv_len>=256, scale=3")
         else:

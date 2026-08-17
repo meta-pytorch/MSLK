@@ -223,9 +223,7 @@ def test_dropout_backward_bmghk_flydsl(seq_len, g_len, hq_len, p, dtype):
     if not flyF.supports(inp):
         pytest.skip(f"{flyF.NAME}: unsupported input")
 
-    grad_out = torch.randn(
-        (1, q_len, g_len, hq_len, k_len), device=device, dtype=dtype
-    )
+    grad_out = torch.randn((1, q_len, g_len, hq_len, k_len), device=device, dtype=dtype)
 
     torch.manual_seed(77)
     out_f, ctx_f = flyF.apply(inp, needs_gradient=True)

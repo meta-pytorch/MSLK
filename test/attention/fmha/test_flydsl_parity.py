@@ -110,7 +110,10 @@ def test_flydsl_varlen_exported_fw_bw(dtype):
         torch.manual_seed(0)
         t = [
             torch.randn(
-                (1, total, H, D), device=device, dtype=dtype, requires_grad=requires_grad
+                (1, total, H, D),
+                device=device,
+                dtype=dtype,
+                requires_grad=requires_grad,
             )
             for _ in range(3)
         ]
