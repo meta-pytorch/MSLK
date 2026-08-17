@@ -7,7 +7,7 @@
 """FlyDSL-vs-CK parity sweep and exported forward/backward end-to-end test.
 
 This is the reproducible source behind the PR's parity claim: it force-compares
-``flydsl_forward.FwOp`` against ``ck.FwOp`` (the operator it drops in for) across a
+``flydsl.FwOp`` against ``ck.FwOp`` (the operator it drops in for) across a
 matrix of dtype / causal / shape / head-dim / bias-type, checking the forward
 output and (when gradients are requested) the packed LSE. Cases the FlyDSL op
 declines are skipped, so the effective case count is the supported subset of the
@@ -23,7 +23,7 @@ from typing import List, Tuple
 import pytest
 import torch
 from mslk.attention import fmha
-from mslk.attention.fmha import flydsl_forward
+from mslk.attention.fmha import flydsl
 
 from .utils import assert_allclose, rocm_only
 
@@ -54,7 +54,7 @@ def _make_bias(kind: str):
 @pytest.mark.parametrize("shape", _SELF_SHAPES, ids=[str(s) for s in _SELF_SHAPES])
 @pytest.mark.parametrize("bias_kind", _BIAS)
 def test_flydsl_matches_ck(dtype, head_dim, shape, bias_kind):
-    if not flydsl_forward.FwOp.is_available():
+    if not flydsl.FwOp.is_available():
         pytest.skip("flydslF unavailable")
     if not fmha.ck.FwOp.is_available():
         pytest.skip("ck.FwOp unavailable")
@@ -68,20 +68,20 @@ def test_flydsl_matches_ck(dtype, head_dim, shape, bias_kind):
     v = torch.randn((B, Mkv, H, head_dim), device=device, dtype=dtype)
 
     inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=attn_bias)
-    if not flydsl_forward.FwOp.supports(inp):
+    if not flydsl.FwOp.supports(inp):
         pytest.skip("flydslF declined this case")
     if not fmha.ck.FwOp.supports(inp):
         pytest.skip("ck.FwOp declined this case")
 
     out_fly = fmha.memory_efficient_attention_forward(
-        q, k, v, attn_bias, op=flydsl_forward.FwOp
+        q, k, v, attn_bias, op=flydsl.FwOp
     )
     out_ck = fmha.memory_efficient_attention_forward(
         q, k, v, attn_bias, op=fmha.ck.FwOp
     )
     # Both are MFMA f32-accumulate kernels; compare at the op's own tolerance.
-    atol = flydsl_forward.FwOp.ERROR_ATOL[dtype]
-    rtol = flydsl_forward.FwOp.ERROR_RTOL[dtype]
+    atol = flydsl.FwOp.ERROR_ATOL[dtype]
+    rtol = flydsl.FwOp.ERROR_RTOL[dtype]
     assert_allclose(out_fly.float(), out_ck.float(), "fwd parity", atol=atol, rtol=rtol)
 
 
@@ -94,7 +94,7 @@ def test_flydsl_varlen_exported_fw_bw(dtype):
     packed LSE (VARLEN_LSE_PACKED=True) and dispatch must pick a backward operator
     (ck.BwOp). Compare against ck.FwOp+ck.BwOp end to end.
     """
-    if not flydsl_forward.FwOp.is_available() or not fmha.ck.FwOp.is_available():
+    if not flydsl.FwOp.is_available() or not fmha.ck.FwOp.is_available():
         pytest.skip("flydslF / ck.FwOp unavailable")
     if not fmha.ck.BwOp.is_available():
         pytest.skip("ck.BwOp unavailable")
@@ -121,13 +121,13 @@ def test_flydsl_varlen_exported_fw_bw(dtype):
 
     q, k, v = mk(True)
     inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=attn_bias)
-    if not flydsl_forward.FwOp.supports(inp):
+    if not flydsl.FwOp.supports(inp):
         pytest.skip("flydslF declined this varlen case")
 
-    out_fly, ctx_fly = flydsl_forward.FwOp.apply(inp, needs_gradient=True)
+    out_fly, ctx_fly = flydsl.FwOp.apply(inp, needs_gradient=True)
     # Packed LSE: [1, H, total_q].
     assert ctx_fly.lse.shape == (1, H, total), ctx_fly.lse.shape
-    assert flydsl_forward.FwOp.VARLEN_LSE_PACKED is True
+    assert flydsl.FwOp.VARLEN_LSE_PACKED is True
 
     out_ck, ctx_ck = fmha.ck.FwOp.apply(inp, needs_gradient=True)
     assert ctx_ck.lse.shape == ctx_fly.lse.shape

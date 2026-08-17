@@ -6,7 +6,7 @@
 
 """FlyDSL-vs-CK forward FMHA sweep (correctness + latency).
 
-Runs ``flydsl_forward.FwOp`` and ``ck.FwOp`` on identical inputs across the
+Runs ``flydsl.FwOp`` and ``ck.FwOp`` on identical inputs across the
 CK-supported bias-type matrix (built with the test suite's ``create_tensors`` so
 the varlen / paged / gappy layouts are exactly what the tests use), timing both
 ops and computing the relative error wherever both accept the case. This is the
@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 import click
 import torch
 from mslk.attention import fmha
-from mslk.attention.fmha import flydsl_forward
+from mslk.attention.fmha import flydsl
 
 
 def _load_create_tensors():
@@ -197,7 +197,7 @@ def _bench_case(
         return Row(dtype_str, bias, B, q, kv, H, D, None, None, None, f"build: {e}")
 
     inp = fmha.Inputs(query=qt, key=kt, value=vt, attn_bias=ab)
-    if not flydsl_forward.FwOp.supports(inp):
+    if not flydsl.FwOp.supports(inp):
         return Row(
             dtype_str, bias, B, q, kv, H, D, None, None, None, "flydslF declined"
         )
@@ -205,13 +205,13 @@ def _bench_case(
         return Row(dtype_str, bias, B, q, kv, H, D, None, None, None, "ck declined")
 
     mea = fmha.memory_efficient_attention_forward
-    out_fly = mea(qt, kt, vt, ab, op=flydsl_forward.FwOp)
+    out_fly = mea(qt, kt, vt, ab, op=flydsl.FwOp)
     out_ck = mea(qt, kt, vt, ab, op=fmha.ck.FwOp)
     denom = out_ck.float().norm().clamp_min(1e-6)
     relerr = float((out_fly.float() - out_ck.float()).norm() / denom)
 
     fly_us = _time_us(
-        lambda: mea(qt, kt, vt, ab, op=flydsl_forward.FwOp), iters, warmup, use_graph
+        lambda: mea(qt, kt, vt, ab, op=flydsl.FwOp), iters, warmup, use_graph
     )
     ck_us = _time_us(
         lambda: mea(qt, kt, vt, ab, op=fmha.ck.FwOp), iters, warmup, use_graph
@@ -260,7 +260,7 @@ def _print_representative(rows: List[Row], heads: int) -> None:
     help="Time via CUDA-graph replay (kernel time, excludes per-call Python).",
 )
 def invoke_main(dtypes, head_dims, heads, full, iters, warmup, use_graph) -> None:
-    if not flydsl_forward.FwOp.is_available():
+    if not flydsl.FwOp.is_available():
         raise SystemExit("flydslF unavailable on this device/arch")
     create_tensors = _load_create_tensors()
     dts = [d.strip() for d in dtypes.split(",") if d.strip()]

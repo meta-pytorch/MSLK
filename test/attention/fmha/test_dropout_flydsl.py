@@ -6,7 +6,7 @@
 
 """Dropout tests for the FlyDSL forward op.
 
-flydsl_forward.FwOp reproduces CK's exact philox dropout: the op materializes the
+flydsl.FwOp reproduces CK's exact philox dropout: the op materializes the
 mask via ``torch.ops.xformers._ck_rand_uniform`` (the same generator CK's fused
 forward uses) and records the philox ``[seed, offset]`` in ``ctx.rng_state`` so
 ``ck.BwOp`` regenerates the identical mask. These tests mirror ``test_dropout_ck``
@@ -45,7 +45,7 @@ def _drop_mask(batch_size, num_heads, q_len, kv_len, p, device):
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("seq_len", [32, 256])
 def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, dtype):
-    op = fmha.flydsl_forward.FwOp
+    op = fmha.flydsl.FwOp
     device = "cuda"
     scale = 3
     # Dense self-attention only (q_len == kv_len). BMHK so we exercise >1 head.
@@ -130,7 +130,7 @@ def test_dropout_backward_flydsl(seq_len, h_len, k_len, p, dtype):
     # full fw+bw against CK end-to-end under the same seed.
     if not fmha.ck.BwOp.is_available():
         pytest.skip("ck.BwOp unavailable")
-    flyF = fmha.flydsl_forward.FwOp
+    flyF = fmha.flydsl.FwOp
     device = "cuda"
     scale = 3
     q_len = kv_len = seq_len
@@ -202,7 +202,7 @@ def test_dropout_backward_bmghk_flydsl(seq_len, g_len, hq_len, p, dtype):
     # instead of raising. Compare the full fw+bw against ck end to end.
     if not fmha.ck.BwOp.is_available():
         pytest.skip("ck.BwOp unavailable")
-    flyF = fmha.flydsl_forward.FwOp
+    flyF = fmha.flydsl.FwOp
     device = "cuda"
     scale = 3
     k_len = 128

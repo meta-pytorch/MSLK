@@ -6,17 +6,17 @@
 
 """Run the standard test_forward body scoped to the FlyDSL forward op (BMHK).
 
-Reuses the stock case generation + test body, but only for flydsl_forward.FwOp, and
+Reuses the stock case generation + test body, but only for flydsl.FwOp, and
 adds the op-specific skip-on-decline / xfail policy.
 """
 
 import pytest
-from mslk.attention.fmha import flydsl_forward
+from mslk.attention.fmha import flydsl
 
 from .case_generation import _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
 from .test_forward import test_forward as _stock_test_forward
 
-_gen = _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv([flydsl_forward.FwOp])
+_gen = _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv([flydsl.FwOp])
 _ARGVALUES = [(*v, False, "BMHK") for v in _gen["argvalues"]]
 _IDS = [i + "-BMHK" for i in _gen["ids"]]
 

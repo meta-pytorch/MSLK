@@ -155,9 +155,9 @@ def test_logsumexp(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv):
     if op is fmha.cutlass.FwOp:
         # CUTLASS kernel pads the last dimension of LSE to 32
         lse = lse[:, :, : ref_lse.shape[2]]
-    if op in (fmha.ck.FwOp, fmha.flydsl_forward.FwOp):
+    if op in (fmha.ck.FwOp, fmha.flydsl.FwOp):
         # MFMA kernels: large LSE * reduced-precision accumulation needs an rtol too.
-        if op is fmha.flydsl_forward.FwOp and kv_len >= 256:
+        if op is fmha.flydsl.FwOp and kv_len >= 256:
             # At scale=3, the actual KV length >= 256 hits the f16/bf16 LSE floor
             # (see test_forward). Expect ONLY the numerical comparison to fail;
             # re-raise shape/dtype assertions ("total failing elements" is unique to
