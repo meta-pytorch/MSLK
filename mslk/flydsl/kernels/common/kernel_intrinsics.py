@@ -10,7 +10,7 @@
 
 Scalar/vector math intrinsics, DPP cross-lane helpers, wave reductions, global
 loads, and MFMA selection wrappers shared across FlyDSL kernels. Not attention
-specific — see mslk.attention.fmha.flydsl.utils, which re-exports these.
+specific — see mslk.attention.flydsl.utils, which re-exports these.
 """
 
 import flydsl.expr as fx  # pyre-ignore[21]

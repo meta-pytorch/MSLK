@@ -1181,9 +1181,9 @@ def test_flydsl_fp8_decoder(
     the real fp8-cache usage, not per-call quantization. Covers MQA (kv_heads=1) and
     GQA (kv_heads>1), compared to a full-precision reference within fp8 tolerance.
     """
-    from mslk.attention.fmha.flydsl.fp8_paged_cache import dense_kv_to_fp8_paged
-    from mslk.attention.fmha.flydsl.pa_decode_fp8 import pa_decode_ps_launch
-    from mslk.attention.fmha.flydsl.pa_decode_fp8_dispatch import (
+    from mslk.attention.flydsl.fp8_paged_cache import dense_kv_to_fp8_paged
+    from mslk.attention.flydsl.pa_decode_fp8 import pa_decode_ps_launch
+    from mslk.attention.flydsl.pa_decode_fp8_dispatch import (
         is_fp8_paged_decode_available,
     )
 

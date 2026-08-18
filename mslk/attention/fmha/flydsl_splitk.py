@@ -10,16 +10,16 @@ from typing import Any, Iterable, List, Optional, Tuple
 import torch
 from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
+from ..flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
-from .flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .utils.op_common import get_operator, register_operator
 
 # FlyDSL is a mandatory ROCm-only backend but absent on CUDA/CPU builds; guard the
 # kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
 # in apply() raises a clear error before pa_decode_launch is ever called.
 try:
-    from .flydsl.pa_decode_dense import pa_decode_launch
+    from ..flydsl.pa_decode_dense import pa_decode_launch
 except ImportError:
     pa_decode_launch = None
 
