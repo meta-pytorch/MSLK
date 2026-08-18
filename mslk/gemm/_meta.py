@@ -706,3 +706,21 @@ if (
         total_M = XQ.shape[0]
         N = WQ.shape[1]  # WQ is [G, N, K//2] for grouped_stacked (no transpose)
         return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
+if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped_preshuffle"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_groupwise_grouped_preshuffle")
+    def _f8f8bf16_groupwise_grouped_preshuffle_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        M_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        # Lives here rather than beside the FlyDSL kernel so that shape
+        # inference does not require depending on //mslk/mslk/gemm:flydsl_ops,
+        # which would drag the FlyDSL wheel into the binary.
+        TotalM = XQ.shape[0]
+        N = WQ.shape[1]
+        return XQ.new_empty((TotalM, N), dtype=torch.bfloat16)
