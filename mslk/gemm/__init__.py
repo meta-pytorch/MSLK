@@ -31,14 +31,17 @@ from . import _meta  # noqa: F401, E402
 if torch.version.hip is not None:
     from mslk.flydsl.common import is_flydsl_available
 
-    # Register the Triton ROCm implementations for mx8mx4bf16, mx8mx8bf16, and
-    # f8f8bf16_groupwise(_grouped).  Each import triggers a
-    # @torch.library.impl(..., "CUDA") decoration that overrides the default
-    # (non-existent) CUDA impl so the ops dispatch to the Triton kernels on AMD.
+    # Register Triton implementations for ROCm.  Each import triggers the
+    # @torch.library.impl("mslk::...", "CUDA") decoration in the respective
+    # module, which overrides the default (non-existent) CUDA impl so that
+    # torch.ops.mslk.* dispatches to the Triton kernel on AMD.
     from .triton import (  # noqa: F401
+        f8i4bf16_rowwise_gemm as _f8i4bf16_rowwise_gemm,
         fp8_groupwise_gemm,
         fp8_groupwise_grouped_gemm,
         grouped_gemm as _grouped_gemm,
+        int4_gemm as _int4_gemm,
+        int4_grouped_gemm as _int4_grouped_gemm,
         mx8mx4_gemm,
         mx8mx8_gemm,
     )
