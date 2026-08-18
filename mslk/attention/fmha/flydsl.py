@@ -1235,9 +1235,7 @@ class FwOp(AttentionFwOpBase):
             H = inp.query.shape[2]
             Skv = inp.key.shape[1]
             keep = (
-                torch.rand(
-                    B, H, Sq, Skv, device=inp.query.device, dtype=torch.float32
-                )
+                torch.rand(B, H, Sq, Skv, device=inp.query.device, dtype=torch.float32)
                 >= inp.p
             )
             # uint8 keep-mask (0/1), half the memory of a bf16/f16 mask. The
