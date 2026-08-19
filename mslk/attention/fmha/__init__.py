@@ -961,8 +961,8 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash.FwOp,
     flash_mtia.FwOp,
     flash3.FwOp,
-    triton_splitk.FwOp,
     flydsl.FwOp,
+    triton_splitk.FwOp,
 ]
 
 ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
