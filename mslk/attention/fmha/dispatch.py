@@ -132,8 +132,6 @@ def _dispatch_fw_priority_list(
         priority_list_ops = deque(
             [
                 ck.FwOp,
-                # After CK so it does not displace the default, but available for
-                # inputs CK declines or when explicitly selected.
                 flydsl.FwOp,
             ]
         )
