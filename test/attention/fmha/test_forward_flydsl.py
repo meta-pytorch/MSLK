@@ -6,8 +6,9 @@
 
 """Run the standard test_forward body scoped to the FlyDSL forward op (BMHK).
 
-Reuses the stock case generation + test body, but only for flydsl.FwOp, and
-adds the op-specific skip-on-decline / xfail policy.
+Reuses the stock case generation + test body, but only for flydsl.FwOp. Guarded
+by @rocm_only (expunged, not skipped, on internal CI) and adds the op-specific
+decline / xfail policy.
 """
 
 import pytest
@@ -15,12 +16,14 @@ from mslk.attention.fmha import flydsl
 
 from .case_generation import _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
 from .test_forward import test_forward as _stock_test_forward
+from .utils import rocm_only, UNSUPPORTED_OP_PASSES
 
 _gen = _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv([flydsl.FwOp])
 _ARGVALUES = [(*v, False, "BMHK") for v in _gen["argvalues"]]
 _IDS = [i + "-BMHK" for i in _gen["ids"]]
 
 
+@rocm_only
 @pytest.mark.parametrize(
     "opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt",
     _ARGVALUES,
@@ -34,8 +37,11 @@ def test_forward_flydsl(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt):
         _stock_test_forward(opFW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv_packed_fmt)
     except ValueError as e:
         # The op declines unsupported cases; the stock sweep force-feeds all of
-        # them, so treat a decline as a skip.
+        # them. Mirror the stock test_forward's create_tensors path: pass (don't
+        # skip) on internal CI, skip elsewhere.
         if "does not support inputs" in str(e) or "is not supported" in str(e):
+            if UNSUPPORTED_OP_PASSES:
+                return
             pytest.skip("flydslF declined (not_supported_reasons)")
         raise
     except AssertionError as e:
