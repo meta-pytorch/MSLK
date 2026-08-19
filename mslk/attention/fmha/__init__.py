@@ -59,7 +59,6 @@ MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
-# FlyDSL forward op. Backward falls back to the CK backward (no FlyDSL bw yet).
 MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
