@@ -994,8 +994,6 @@ class FwOp(AttentionFwOpBase):
         PagedBlockDiagonalGappyKeysMask,
     )
 
-    # Dropout (dense): reuses CK's philox mask and records [seed, offset] in
-    # ctx.rng_state so ck.BwOp reproduces it. See _apply_bmhk.
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
