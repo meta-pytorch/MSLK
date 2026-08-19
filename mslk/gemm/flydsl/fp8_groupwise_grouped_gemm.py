@@ -32,7 +32,7 @@ Tensor contract:
 import os
 
 import torch
-from mslk.flydsl.common import is_flydsl_available
+from mslk.flydsl.common import require_flydsl
 from mslk.flydsl.jit import run_compiled
 from mslk.utils.device import supports_float8_fnuz
 
@@ -227,7 +227,11 @@ def _dispatch_grouped_gemm(
     persists the winner (keyed on nextPow2(TotalM) and b_preshuffled); otherwise
     a fixed default tile is used with no benchmarking (the CI / graph-capture-safe
     path).
+
+    The registrations below deliberately do not probe for FlyDSL, so this is
+    the first point at which it is required.
     """
+    require_flydsl()
     assert XQ.ndim == 2, f"XQ must be [TotalM, K], got {XQ.shape}"
     assert WQ.ndim == 3, f"WQ must be [G, N, K], got {WQ.shape}"
     assert M_sizes.ndim == 1, f"M_sizes must be [G], got {M_sizes.shape}"
@@ -312,27 +316,9 @@ def matmul_f8f8bf16_groupwise_grouped(
     )
 
 
-if (
-    is_flydsl_available()
-    and torch.version.hip is not None
-    and hasattr(torch.ops, "mslk")
-):
-    # FlyDSL supplies the ROCm implementation of both ops; their schemas are
-    # declared in csrc/gemm/gemm_ops.cpp. Skip an op whose schema is missing, as
-    # in a python-only build, and tolerate a repeat import rebinding it.
-    def _register(op_name, cuda_fn, meta_fn=None) -> None:
-        if not hasattr(torch.ops.mslk, op_name.split("::")[1]):
-            return
-        try:
-            torch.library.impl(op_name, "CUDA")(cuda_fn)
-            if meta_fn is not None:
-                torch.library.impl(op_name, "Meta")(meta_fn)
-        except RuntimeError:
-            pass
-
-    _register(
-        _OP_NAME,
-        matmul_f8f8bf16_groupwise_grouped_preshuffle,
-        _f8f8bf16_groupwise_grouped_preshuffle_meta,
-    )
-    _register("mslk::f8f8bf16_groupwise_grouped", matmul_f8f8bf16_groupwise_grouped)
+# This module registers nothing. Both mslk::f8f8bf16_groupwise_grouped and its
+# _preshuffle sibling are registered in mslk/gemm/__init__.py, whose impls import
+# this module on the first call. Keeping registration out of here is what lets
+# //mslk:gemm_ops avoid depending on //mslk/mslk/gemm:flydsl_ops, and so keeps the
+# FlyDSL wheel out of every binary that merely imports mslk.gemm. Shape inference
+# for the preshuffle op lives in mslk/gemm/_meta.py for the same reason.
