@@ -8,7 +8,7 @@
 
 """Public dispatcher for the FlyDSL native-fp8 paged-attention decode.
 
-Native-fp8 paged KV with a symmetric per-token scale (vLLM/Gluon layout); distinct
+Native-fp8 paged KV with a symmetric per-token scale (vLLM layout); distinct
 from the Triton int32-packed asymmetric-scale path, hence a separate guarded entry.
 
 Expected inputs (same CUDA device):

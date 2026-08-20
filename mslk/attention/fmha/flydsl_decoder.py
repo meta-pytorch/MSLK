@@ -10,7 +10,7 @@ from typing import Any, Iterable, List, Optional, Set, Tuple
 import torch
 from mslk.flydsl.common import require_flydsl
 
-from ..flydsl.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
+from ..flydsl.decode.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, Context, Inputs
 from .utils.op_common import get_operator, register_operator
@@ -19,7 +19,7 @@ from .utils.op_common import get_operator, register_operator
 # kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
 # in apply() raises a clear error before pa_decode_launch is ever called.
 try:
-    from ..flydsl.pa_decode_dense import pa_decode_launch
+    from ..flydsl.decode.pa_decode_dense import pa_decode_launch
 except ImportError:
     pa_decode_launch = None
 

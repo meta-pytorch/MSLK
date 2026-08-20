@@ -8,8 +8,8 @@
 
 """FlyDSL native-FP8 symmetric-scale paged-attention decode (persistent scheduling).
 
-Ports only the persistent-scheduling small-block compute path (compile_pa_decode_ps
-+ pa_decode_ps_kernel) from the upstream FlyDSL reference.
+Implements the persistent-scheduling small-block compute path (compile_pa_decode_ps
++ pa_decode_ps_kernel).
 
 Grid = (batch, kv_heads, max_context_partition_num); each CTA walks 256-token
 sub-partitions with online-softmax loop-carried state. K/V pages come from a
@@ -45,8 +45,8 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21
 from .utils import dpp_xor_f32, maxnumf as _maxnumf, rcp_f32 as _rcp_f32, WARP_SIZE
 
 # ── Kernel geometry constants ────────────────────────────────────────
-KV_BLOCK_SIZE = 1024  # physical page size (matches SP3 kBlockSize)
-KV_COMPUTE_BLOCK = 256  # tile size (matches SP3 kTileKV)
+KV_BLOCK_SIZE = 1024  # physical page size
+KV_COMPUTE_BLOCK = 256  # tile size
 NUM_WARPS = 4
 BLOCK_THREADS = NUM_WARPS * WARP_SIZE  # 256
 MFMA_N = 16
@@ -75,13 +75,11 @@ LDS_SCALE_BYTES = (
 FP8_MAX = 240.0
 LOG2E = 1.4426950408889634
 
-# Match the Gluon PA decode kernel's AGPR allocation:
-# .amdhsa_accum_offset 200, .amdhsa_next_free_vgpr 248 => 48 AGPRs,
-# with FP8 MFMA using up to a[44:47].
+# AGPR allocation for the FP8 MFMA path: 48 AGPRs (FP8 MFMA uses up to a[44:47]).
 PA_MFMA_AGPR_ALLOC = "48,48"
 PA_MFMA_AGPR_LLVM_OPTIONS = {"amdgpu-mfma-vgpr-form": False}
 
-# Tiles per block (1024 tokens / 256 tokens per tile = 4, matches SP3 kNumBlockTiles)
+# Tiles per block (1024 tokens / 256 tokens per tile = 4)
 TILES_PER_BLOCK = KV_BLOCK_SIZE // KV_COMPUTE_BLOCK  # 4
 
 _PACKED_FP8_QUERY_DTYPES = tuple(
@@ -1104,15 +1102,14 @@ def get_recommended_splits(
         return _cdiv(window_token_count - 1, context_partition_size) + 1
 
     props = torch.cuda.get_device_properties(torch.device("cuda"))
-    occupancy = 2  # matches reference Gluon get_occupancy()
+    occupancy = 2
     num_sm = props.multi_processor_count * occupancy
     denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
     n = _cdiv(num_sm, denom) * split_kv_blocks
     return max(4, min(n, 8))
 
 
-# block_size 16/64 handled directly by the small-block PS path here (the
-# reference routes them through the metadata worklist path).
+# block_size 16/64 handled directly by the small-block PS path here.
 _PA_DECODE_PS_SMALL_BLOCK_SIZES = (16, 64)
 
 
@@ -2002,9 +1999,8 @@ def compile_pa_decode_ps_reduce(
       temporary_output[..,p,g,:] = (sum_t P[t]*V[t]) / sum_t P[t]  (bf16, NORMALIZED)
       exp_sums[..,p,g]           = sum_t P[t]   (f32)
       max_logits[..,p,g]         = max logit    (f32)
-    This vLLM/Gluon NORMALIZED-partial convention differs from
-    `pa_decode_reduce`'s un-normalized-numerator contract, hence this dedicated
-    reduce.  Merge:
+    This NORMALIZED-partial convention differs from `pa_decode_reduce`'s
+    un-normalized-numerator contract, hence this dedicated reduce.  Merge:
       gmax = max_p max_logits[p]
       w[p] = exp2((max_logits[p] - gmax) * LOG2E)  (logits are natural-domain)
       out  = (sum_p w[p] * exp_sums[p] * norm_out[p]) / sum_p w[p]*exp_sums[p]

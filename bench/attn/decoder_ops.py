@@ -27,13 +27,13 @@ from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.utils.triton.fp8_utils import get_fp8_constants
 
 try:
-    from mslk.attention.flydsl.fp8_paged_cache import dense_kv_to_fp8_paged
-    from mslk.attention.flydsl.pa_decode_fp8 import (
+    from mslk.attention.flydsl.decode.fp8_paged_cache import dense_kv_to_fp8_paged
+    from mslk.attention.flydsl.decode.pa_decode_fp8 import (
         get_recommended_splits,
         KV_COMPUTE_BLOCK,
         pa_decode_ps_launch,
     )
-    from mslk.attention.flydsl.pa_decode_fp8_dispatch import (
+    from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
         is_fp8_paged_decode_available,
     )
     from mslk.flydsl.common import is_flydsl_available
