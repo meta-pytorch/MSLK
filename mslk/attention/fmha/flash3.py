@@ -191,8 +191,12 @@ def mask_non_zeros(s_q: int, s_k: int, window_left: int, window_right: int) -> i
 # No need to take care of this for the bwd because we don't "unexpand" the keys
 # and values (in the fwd we expand to help with the seqlen/headdim swap trick).
 def sdpa_flop_count(
-    query_shape, key_shape, value_shape, window_left: int, window_right: int
-):
+    query_shape: Tuple[int, ...],
+    key_shape: Tuple[int, ...],
+    value_shape: Tuple[int, ...],
+    window_left: int,
+    window_right: int,
+) -> int:
     """
     Count flops for self-attention.
 
