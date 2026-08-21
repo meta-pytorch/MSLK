@@ -14,7 +14,7 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from mslk.gemm.triton.matmul_perf_model import early_config_prune, estimate_matmul_time
 from mslk.gemm.triton.utils import map_dtype_to_triton, TmaAutoTuneHelper
-from mslk.utils.device import supports_float8_fnuz
+from mslk.utils.device import is_gfx950, supports_float8_fnuz
 from mslk.utils.triton.fp8_utils import get_fp8_constants, reinterpret_fp8_type
 from packaging import version
 from torch._tensor import Tensor
@@ -2368,6 +2368,26 @@ MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K = [
     for block_m, block_n, block_k, group_m, split_k, waves_per_eu, matrix_instr_nonkdim, kpack, num_warps, num_stages in _MATMUL_CONFIG_TUPLES_PINGPONG_4K_8K_16K
     if not _should_skip_config(block_k, matrix_instr_nonkdim)
 ]
+
+# Triton 3.8 enables async copy by default on gfx950. Add the tuned schedule
+# without changing the config set used by the production Triton 3.5 pin.
+if is_gfx950() and version.parse(triton.__version__) >= version.parse("3.8.0"):
+    MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K.append(
+        triton.Config(
+            {
+                "BLOCK_M": 32,
+                "BLOCK_N": 32,
+                "BLOCK_K": 256,
+                "GROUP_M": 1,
+                "SPLIT_K": 1,
+                "waves_per_eu": 4,
+                "matrix_instr_nonkdim": 16,
+                "kpack": 1,
+            },
+            num_warps=4,
+            num_stages=3,
+        )
+    )
 
 # Set this to enable full autotuning for proper benchmarking.
 # This should only be used when invoking the kernel through
