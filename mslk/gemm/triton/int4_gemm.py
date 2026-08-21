@@ -36,7 +36,7 @@ Activation pre-split strategy (avoids LDS bank conflicts):
 """
 
 import inspect
-from typing import List
+from typing import Any, Dict, List
 
 import torch
 import triton  # @manual
@@ -86,7 +86,9 @@ def _get_configs() -> List[Config]:
     return configs
 
 
-def _prune_configs(configs, named_args, **kwargs):
+def _prune_configs(
+    configs: List[Config], named_args: Dict[str, Any], **kwargs
+) -> List[Config]:
     group_size = named_args["group_size"]
     M = named_args["M"]
     N = named_args["N"]
