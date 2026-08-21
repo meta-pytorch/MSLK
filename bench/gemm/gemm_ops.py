@@ -11,24 +11,9 @@ from enum import auto, Enum
 import torch
 
 import mslk.gemm  # noqa: F401 — ensure mslk namespace exists
-
-_STUB_SCHEMAS = [
-    ("f8i4bf16_rowwise", "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor"),
-]
-for _name, _schema in _STUB_SCHEMAS:
-    if not hasattr(torch.ops, "mslk") or not hasattr(torch.ops.mslk, _name):
-        torch.library.define(f"mslk::{_name}", _schema)
-
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
-
-if is_flydsl_available():
-    from mslk.gemm.flydsl.preshuffle_gemm import (
-        flydsl_preshuffle,
-        flydsl_preshuffle_batched_gemm,
-        flydsl_preshuffle_gemm,
-    )
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.quantize.shuffle import (
     ck_preshuffle,
@@ -51,6 +36,20 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_tensor,
 )
 from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
+
+if is_flydsl_available():
+    from mslk.gemm.flydsl.preshuffle_gemm import (  # noqa: E402
+        flydsl_preshuffle,
+        flydsl_preshuffle_batched_gemm,
+        flydsl_preshuffle_gemm,
+    )
+
+_STUB_SCHEMAS = [
+    ("f8i4bf16_rowwise", "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor"),
+]
+for _name, _schema in _STUB_SCHEMAS:
+    if not hasattr(torch.ops, "mslk") or not hasattr(torch.ops.mslk, _name):
+        torch.library.define(f"mslk::{_name}", _schema)
 
 try:
     from tinygemm.utils import group_quantize_tensor
