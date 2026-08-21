@@ -739,3 +739,55 @@ if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped_preshuffle"):
         TotalM = XQ.shape[0]
         N = WQ.shape[1]
         return XQ.new_empty((TotalM, N), dtype=torch.bfloat16)
+
+
+# The rowwise grouped ops FlyDSL serves on ROCm. Their shape functions live here
+# for the same reason as the groupwise one above: inference must not require
+# depending on //mslk/mslk/gemm:flydsl_ops.
+if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_stacked_preshuffle"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_rowwise_grouped_stacked_preshuffle")
+    def _f8f8bf16_rowwise_grouped_stacked_preshuffle_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        M_sizes: torch.Tensor,
+    ) -> torch.Tensor:
+        return XQ.new_empty((XQ.shape[0], WQ.shape[1]), dtype=torch.bfloat16)
+
+
+def _rowwise_grouped_dynamic_meta(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    zero_start_index_M: torch.Tensor,
+    zeroing_output_tensor: bool = True,
+) -> torch.Tensor:
+    # One slab per group, of the height every group was given.
+    G, expected_m, _ = XQ.shape
+    return XQ.new_empty((G, expected_m, WQ.shape[1]), dtype=torch.bfloat16)
+
+
+def _rowwise_grouped_mm_meta(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    offsets: torch.Tensor | None,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    # Written in place and returned, so the shape is fixed by the argument
+    # whichever rank combination the operands select.
+    return out
+
+
+for _op, _fake in (
+    ("f8f8bf16_rowwise_grouped_dynamic", _rowwise_grouped_dynamic_meta),
+    ("f8f8bf16_rowwise_grouped_dynamic_preshuffle", _rowwise_grouped_dynamic_meta),
+    ("f8f8bf16_rowwise_grouped_mm", _rowwise_grouped_mm_meta),
+    ("f8f8bf16_rowwise_grouped_mm_preshuffle", _rowwise_grouped_mm_meta),
+):
+    if hasattr(torch.ops.mslk, _op):
+        torch.library.register_fake(f"mslk::{_op}")(_fake)

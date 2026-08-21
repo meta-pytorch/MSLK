@@ -101,3 +101,22 @@ def is_flydsl_version_at_least(minimum: str = MIN_FLYDSL_VERSION) -> bool:
     if current is None:
         return False
     return _version_tuple(current) >= _version_tuple(minimum)
+
+
+# Conservative default for architectures missing from FlyDSL's capacity table.
+_LDS_CAPACITY_FALLBACK_BYTES = 64 * 1024
+
+
+def lds_capacity_bytes(arch=None):
+    """LDS bytes available to one workgroup on ``arch``.
+
+    This is arch-dependent and the difference is large: CDNA3 (gfx942/MI300) has
+    64 KiB while CDNA4 (gfx950/MI350) has 160 KiB. Sourced from FlyDSL's
+    SMEM_CAPACITY_MAP so the limit stays in sync with the compiler that enforces
+    it; unknown architectures fall back to the conservative 64 KiB.
+    """
+    try:
+        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+    except Exception:
+        return _LDS_CAPACITY_FALLBACK_BYTES
+    return SMEM_CAPACITY_MAP.get(str(arch), _LDS_CAPACITY_FALLBACK_BYTES)
