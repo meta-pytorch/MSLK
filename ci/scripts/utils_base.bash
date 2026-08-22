@@ -275,13 +275,22 @@ set_clang_symlinks () {
     return 1
   fi
 
-  # shellcheck disable=SC2155
-  local env_prefix=$(env_name_or_prefix "${env_name}")
+  local env_prefix
+  env_prefix=$(env_name_or_prefix "${env_name}") || return 1
 
-  # shellcheck disable=SC2155,SC2086
-  local cc_path=$(conda run ${env_prefix} which clang)
-  # shellcheck disable=SC2155,SC2086
-  local cxx_path=$(conda run ${env_prefix} which clang++)
+  local cc_path
+  # shellcheck disable=SC2086
+  cc_path=$(conda run ${env_prefix} which clang) || return 1
+  local cxx_path
+  # shellcheck disable=SC2086
+  cxx_path=$(conda run ${env_prefix} which clang++) || return 1
+  local conda_prefix
+  # shellcheck disable=SC2086
+  conda_prefix=$(conda run ${env_prefix} printenv CONDA_PREFIX) || return 1
+  if [ -z "${conda_prefix}" ]; then
+    echo "Unable to resolve CONDA_PREFIX for ${env_name}" >&2
+    return 1
+  fi
 
   # Set the symlinks, override if needed
   #
@@ -293,10 +302,10 @@ set_clang_symlinks () {
   #
   # As such, clang is installed only during the build step, where we are
   # exercising building MSLK in clang.
-  print_exec ln -sf "${cc_path}" "$(dirname "$cc_path")/cc"
-  print_exec ln -sf "${cc_path}" "$(dirname "$cc_path")/gcc"
-  print_exec ln -sf "${cxx_path}" "$(dirname "$cxx_path")/c++"
-  print_exec ln -sf "${cxx_path}" "$(dirname "$cxx_path")/g++"
+  print_exec ln -sf "${cc_path}" "${conda_prefix}/bin/cc" || return 1
+  print_exec ln -sf "${cc_path}" "${conda_prefix}/bin/gcc" || return 1
+  print_exec ln -sf "${cxx_path}" "${conda_prefix}/bin/c++" || return 1
+  print_exec ln -sf "${cxx_path}" "${conda_prefix}/bin/g++" || return 1
 }
 
 __fetch_cuda_version_array () {
@@ -324,6 +333,7 @@ __fetch_rocm_version_array () {
     echo "[INFO] Extracted ROCm version: ${rocm_version}"
     # Extract version numbers (e.g., "5.7.0" -> array of [5, 7, 0])
     IFS='.' read -ra rocm_version_arr <<< "$rocm_version"
+    # shellcheck disable=SC2206
     export rocm_version_arr=(${rocm_version//./ })
 
   else
