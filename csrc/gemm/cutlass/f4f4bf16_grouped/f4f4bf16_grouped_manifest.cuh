@@ -21,7 +21,8 @@ at::Tensor f4f4bf16_grouped_128_64_256_1_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor f4f4bf16_grouped_256_256_128_2_1_1(
     at::Tensor XQ, // FP4
@@ -32,7 +33,8 @@ at::Tensor f4f4bf16_grouped_256_256_128_2_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor f4f4bf16_grouped_256_256_256_2_1_1(
     at::Tensor XQ, // FP4
@@ -43,7 +45,8 @@ at::Tensor f4f4bf16_grouped_256_256_256_2_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor f4f4bf16_grouped_256_64_256_2_1_1(
     at::Tensor XQ, // FP4
@@ -54,7 +57,8 @@ at::Tensor f4f4bf16_grouped_256_64_256_2_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor f4f4bf16_grouped_256_128_256_2_1_1(
     at::Tensor XQ, // FP4
@@ -65,7 +69,8 @@ at::Tensor f4f4bf16_grouped_256_128_256_2_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor f4f4bf16_grouped_128_128_256_1_1_1(
     at::Tensor XQ, // FP4
@@ -76,7 +81,8 @@ at::Tensor f4f4bf16_grouped_128_128_256_1_1_1(
     std::optional<at::Tensor> offsets,
     std::optional<at::Tensor> M_sizes,
     std::optional<at::Tensor> global_scale,
-    std::optional<at::Tensor> starting_row_after_padding);
+    std::optional<at::Tensor> starting_row_after_padding,
+    int64_t mxfp4_block_size = 32);
 
 using Kernel_f4f4bf16_grouped = at::Tensor (*)(
     at::Tensor,
@@ -87,7 +93,8 @@ using Kernel_f4f4bf16_grouped = at::Tensor (*)(
     std::optional<at::Tensor>,
     std::optional<at::Tensor>,
     std::optional<at::Tensor>,
-    std::optional<at::Tensor>);
+    std::optional<at::Tensor>,
+    int64_t);
 
 const std::unordered_map<std::string, Kernel_f4f4bf16_grouped>&
 get_f4f4bf16_grouped_kernels() {

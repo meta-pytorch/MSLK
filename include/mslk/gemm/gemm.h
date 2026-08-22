@@ -147,7 +147,8 @@ at::Tensor f4f4bf16_grouped_stacked(
     at::Tensor M_sizes,
     std::optional<at::Tensor> global_scale = std::nullopt,
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
-    bool use_mx = true);
+    bool use_mx = true,
+    int64_t mxfp4_block_size = 32);
 
 at::Tensor bf16x9_gemm(
     at::Tensor A,
