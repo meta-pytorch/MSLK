@@ -44,7 +44,6 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
     """
     assert D % WARP_SIZE == 0, f"D={D} must be a multiple of WARP_SIZE={WARP_SIZE}"
 
-    elem_dtype = dtype_to_elem_type(dtype_str)
     VEC_WIDTH = 8  # 128-bit / 16-bit = 8 elements
     THREADS_PER_ROW = D // VEC_WIDTH  # 16 for D=128
     ROWS_PER_BLOCK = BLOCK_THREADS // THREADS_PER_ROW  # 16 for D=128
@@ -65,6 +64,11 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
     ):
         from flydsl.expr import buffer_ops as _bops
         from flydsl.expr.typing import Vector as Vec
+
+        # Derive elem type from dtype_str INSIDE the kernel so dtype_str is a
+        # closure freevar and enters FlyDSL's JIT cache key. Otherwise bf16/f16
+        # share one cached artifact (their keys omit the elem_dtype type object).
+        elem_dtype = dtype_to_elem_type(dtype_str)
 
         bid = fx.block_idx.x
         tid = fx.thread_idx.x

@@ -10,8 +10,22 @@
 from contextlib import contextmanager
 
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf as _scf
+from flydsl.compiler.jit_argument import JitArgumentRegistry
+
+_TORCH_TENSOR_JIT_CTOR = JitArgumentRegistry.get(torch.Tensor)[0]
+
+
+def tensor_cache_sig(t):
+    """Per-tensor JIT cache signature (dtype/rank/contiguity/32-bit stride width).
+
+    Launcher-side ``CompiledFunction`` caches key on this so they recompile exactly
+    when ``JitFunction._build_full_cache_key`` would, while skipping that rebuild on
+    the warm path.
+    """
+    return _TORCH_TENSOR_JIT_CTOR(t).__cache_signature__()
 
 
 @contextmanager

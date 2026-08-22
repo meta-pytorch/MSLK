@@ -59,6 +59,7 @@ MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
+MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
     cute_blackwell.BwOp,
@@ -960,6 +961,7 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flash.FwOp,
     flash_mtia.FwOp,
     flash3.FwOp,
+    flydsl.FwOp,
     triton_splitk.FwOp,
 ]
 
@@ -985,6 +987,7 @@ __all__ = [
     "memory_efficient_attention",
     "MemoryEfficientAttentionCkOp",
     "MemoryEfficientAttentionCkDecoderOp",
+    "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
     "attn_bias",

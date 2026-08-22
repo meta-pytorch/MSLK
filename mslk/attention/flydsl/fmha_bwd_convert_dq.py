@@ -28,7 +28,6 @@ def compile_fmha_bwd_convert_dq(*, dtype_str: str = "bf16"):
           dq_out  : [n_elems, 1] output dtype (bf16/fp16)
           n_elems : total element count (B*M*H*D)
     """
-    elem_dtype = dtype_to_elem_type(dtype_str)
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def convert_dq_kernel(
@@ -38,6 +37,11 @@ def compile_fmha_bwd_convert_dq(*, dtype_str: str = "bf16"):
     ):
         from flydsl.expr import buffer_ops as _bops
         from flydsl.expr.typing import Vector as Vec
+
+        # Derive elem type from dtype_str INSIDE the kernel so dtype_str is a
+        # closure freevar and enters FlyDSL's JIT cache key. Otherwise bf16/f16
+        # share one cached artifact (their keys omit the elem_dtype type object).
+        elem_dtype = dtype_to_elem_type(dtype_str)
 
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
