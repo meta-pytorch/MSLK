@@ -577,6 +577,40 @@ def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
     return llvm.LoadOp(result_type, _llvm_value(ptr)).result
 
 
+def _bf16_ptr_to_f32(ctx, ptr: ir.Value):
+    """Load one f16/bf16 element and extend to an f32 MLIR value."""
+    raw = _pointer_load(ctx.elem_type, ptr)
+    return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
+
+
+def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
+    """Bounded f16/bf16 load from a buffer resource, extended to f32.
+
+    The resource's num_records bounds the access, so an out-of-range byte offset
+    (a tail q_row >= Sq) reads 0 in hardware instead of faulting -- no index clamp.
+    """
+    c0 = buffer_ops._create_i32_constant(0)
+    raw = rocdl.raw_ptr_buffer_load(
+        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+    )
+    return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
+
+
+def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
+    """Bounded uint8 (0/1 dropout keep-mask) load from a buffer resource, to f32.
+
+    Same bounded-resource semantics as _bf16_buffer_load_f32 (an OOB tail row
+    reads 0 in hardware). The keep bit converts 0/1 -> 0.0/1.0; the 1/(1-p)
+    inverted-dropout scale is a constant factor applied to the attention output
+    by the caller (it factors out of the per-(q,k) sum), not here.
+    """
+    c0 = buffer_ops._create_i32_constant(0)
+    raw = rocdl.raw_ptr_buffer_load(
+        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+    )
+    return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
+
+
 def _pointer_store(value: ir.Value, ptr: ir.Value):
     return llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
 
@@ -1117,8 +1151,19 @@ class FlashAttnGenericTraits:
     HEAD_DIM: int
     DTYPE_STR: str
     CAUSAL: bool
+    # Top-left causal (kv_col <= q_row, delta=0) vs default bottom-right
+    # (kv_col <= q_row + seqlen_kv - seqlen_q). Only differs for cross-length.
+    CAUSAL_TOP_LEFT: bool
     VARLEN: bool
     CROSS_SEQLEN: bool
+    # Gappy KV: per-seq KV base comes from an absolute KvSeqStart[b] (non-paged) or
+    # a logical start offset (paged), instead of the cumulative CuSeqKv layout.
+    GAPPY_KV: bool
+    # Split-K: partition the KV loop across NUM_KV_SPLITS workgroups (grid.y), each
+    # writing an unnormalized partial O/m/l; a combine kernel reduces them. Fills the
+    # GPU on short-q / low-occupancy shapes. SPLITK == (NUM_KV_SPLITS > 1).
+    NUM_KV_SPLITS: int
+    SPLITK: bool
     PAGED: bool
     KV_CACHE_LAYOUT: str
     KV_VECTORIZED: bool
@@ -1191,10 +1236,22 @@ class FlashAttnGenericTraits:
     K_VEC_HI_N_OFFSET: int
     QK_PREFETCH_DEPTH: int
     RETURN_LSE: bool
+    # Sliding-window (local) attention: keep KV columns in
+    # (q_row - WINDOW_LEFT, q_row]. WINDOW_LEFT < 0 disables the lower bound.
+    WINDOW_LEFT: int
+    # Additive bias B[q_row, kv_col] added to QK*scale; Bias tensor + per-axis
+    # strides (head stride 0 => broadcast).
+    HAS_BIAS: bool
+    # Dropout mask M[q_row, kv_col] (0 or 1/(1-p)) multiplied into post-softmax P;
+    # Dropout tensor + strides, same ABI as Bias.
+    HAS_DROPOUT: bool
 
     @property
     def cache_tag(self):
         return (
+            self.HAS_BIAS,
+            self.HAS_DROPOUT,
+            self.WINDOW_LEFT,
             self.RETURN_LSE,
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
@@ -1202,13 +1259,15 @@ class FlashAttnGenericTraits:
             self.HEAD_DIM,
             self.DTYPE_STR,
             self.CAUSAL,
+            self.CAUSAL_TOP_LEFT,
             self.VARLEN,
             self.CROSS_SEQLEN,
+            self.GAPPY_KV,
             self.PAGED,
             self.KV_CACHE_LAYOUT,
             self.KV_VECTORIZED,
-            False,  # SPLITK is not supported by the generic builder.
-            1,
+            self.SPLITK,
+            self.NUM_KV_SPLITS,
             self.BLOCK_M,
             self.BLOCK_N,
             self.BLOCK_N_OUT,
@@ -1286,12 +1345,15 @@ def _make_flash_attn_generic_traits(
     head_dim,
     gpu_arch,
     causal=True,
+    causal_top_left=False,
     dtype_str="f16",
     flat_work_group_size=None,
     block_m=None,
     path_tag="auto",
     varlen=False,
     cross_seqlen=False,
+    gappy_kv=False,
+    num_kv_splits=1,
     paged=False,
     kv_cache_layout="linear",
     waves_per_eu=2,
@@ -1301,6 +1363,9 @@ def _make_flash_attn_generic_traits(
     sm_scale=None,
     skip_kv_pad_mask=None,
     return_lse=False,
+    window_left=-1,
+    has_bias=False,
+    has_dropout=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1314,9 +1379,18 @@ def _make_flash_attn_generic_traits(
     block_size = flat_work_group_size
     rows_per_wave = block_m // num_waves
 
-    if path_tag.upper() in ("N32", "N128"):
+    # Window / bias / dropout are N32-only (the N128 dual-subtile path does not
+    # gather per-subtile mask/bias), so force N32 when any is active.
+    _windowed = window_left >= 0
+    if _windowed or has_bias or has_dropout:
+        path = "N32"
+    elif path_tag.upper() in ("N32", "N128"):
         path = path_tag.upper()
-    elif dtype_str in ("f16", "bf16") and causal and head_dim == 128:
+    elif dtype_str in ("f16", "bf16") and head_dim == 128:
+        # N128 is faster than N32 for D=128 f16/bf16. This intentionally applies to
+        # NON-causal D=128 as well (previously N128 was gated on `causal`), so it
+        # changes kernel selection for existing non-causal D=128 callers, not only
+        # the new forward op. See PR summary.
         path = "N128"
     else:
         path = "N32"
@@ -1470,8 +1544,12 @@ def _make_flash_attn_generic_traits(
         HEAD_DIM=head_dim,
         DTYPE_STR=dtype_str,
         CAUSAL=bool(causal),
+        CAUSAL_TOP_LEFT=bool(causal_top_left),
         VARLEN=bool(varlen),
         CROSS_SEQLEN=bool(cross_seqlen),
+        GAPPY_KV=bool(gappy_kv),
+        NUM_KV_SPLITS=int(num_kv_splits),
+        SPLITK=int(num_kv_splits) > 1,
         PAGED=paged,
         KV_CACHE_LAYOUT=kv_cache_layout,
         KV_VECTORIZED=kv_vectorized,
@@ -1544,6 +1622,9 @@ def _make_flash_attn_generic_traits(
         K_VEC_HI_N_OFFSET=k_vec_hi_n_offset,
         QK_PREFETCH_DEPTH=qk_prefetch_depth,
         RETURN_LSE=bool(return_lse),
+        WINDOW_LEFT=int(window_left),
+        HAS_BIAS=bool(has_bias),
+        HAS_DROPOUT=bool(has_dropout),
     )
 
 
@@ -2138,6 +2219,12 @@ class GenericFlashAttnContext:
 
     def init_block_mapping(self):
         traits = self.traits
+        # Split-K adds a grid.y dimension carrying the KV-split index; the x-decode
+        # of (batch, q_tile, head) is unchanged.
+        if const_expr(traits.SPLITK):
+            self.split_idx = fx.Index(gpu.block_idx.y)
+        else:
+            self.split_idx = fx.Index(0)
         self.q_head_idx = self.block_id % traits.NUM_HEADS_Q
         self.batch_q_tile_id = self.block_id // traits.NUM_HEADS_Q
         self.num_q_tiles = (self.seq_len_v + traits.BLOCK_M - 1) // traits.BLOCK_M
@@ -2176,12 +2263,44 @@ class GenericFlashAttnContext:
         self.c_zero_i32 = fx.Int32(0)
         self.c_sm_scale_log2e = fx.Float32(sm_scale * _LOG2E)
         self.sm_scale_v = fx.Float32(sm_scale)
+        # Bias is added in the raw-QK domain: the softmax later multiplies scores
+        # by sm_scale*log2e, so to realize (QK*scale + bias) we add bias/sm_scale.
+        self.c_inv_sm_scale = fx.Float32(1.0 / sm_scale)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
         self.width_i32 = fx.Int32(traits.WARP_SIZE)
         self.shuf_32_i32 = fx.Int32(32)
         self.lane_xor_32_byte = (fx.Int32(self.lane) ^ self.shuf_32_i32) * fx.Int32(4)
 
-    def init_sequence_lengths(self, CuSeqQ, CuSeqKv):
+    def init_workspace(self, Workspace, batch_size):
+        # Split-K partials live in a fp32 workspace laid out identically to the
+        # dualwave path (packed-16bit O partial + fp32 m + fp32 l per split), so the
+        # shared DualwaveSplitKCombine kernel reads it verbatim. z_total counts all
+        # (batch, split) slots; the generic grid folds batch into grid.x, so it is
+        # computed from batch_size rather than gpu.grid_dim.z.
+        traits = self.traits
+        if const_expr(traits.SPLITK):
+            self.ws_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(Workspace)))
+            self.ws_opart_per_split_elems = (
+                fx.Index(traits.NUM_HEADS_Q)
+                * self.seq_len_v
+                * fx.Index(traits.HEAD_DIM // 2)
+            )
+            self.ws_ml_per_split_elems = fx.Index(traits.NUM_HEADS_Q) * self.seq_len_v
+            self.ws_opart_per_split_bytes = self.ws_opart_per_split_elems * fx.Index(4)
+            self.ws_ml_per_split_bytes = self.ws_ml_per_split_elems * fx.Index(4)
+            z_total = fx.Index(batch_size) * fx.Index(traits.NUM_KV_SPLITS)
+            self.ws_mrow_abs_bytes = z_total * self.ws_opart_per_split_bytes
+            self.ws_lrow_abs_bytes = (
+                self.ws_mrow_abs_bytes + z_total * self.ws_ml_per_split_bytes
+            )
+        else:
+            self.ws_base_i64 = None
+            self.ws_opart_per_split_bytes = None
+            self.ws_ml_per_split_bytes = None
+            self.ws_mrow_abs_bytes = None
+            self.ws_lrow_abs_bytes = None
+
+    def init_sequence_lengths(self, CuSeqQ, CuSeqKv, KvSeqStart=None):
         traits = self.traits
         if const_expr(traits.VARLEN):
             cuq_div = fx.logical_divide(
@@ -2193,9 +2312,6 @@ class GenericFlashAttnContext:
             self.q_tok_base = _cu_load(
                 cuq_div, self.batch_idx, self.load_atom_32, self.v1i32_type
             )
-            self.kv_tok_base = _cu_load(
-                cuk_div, self.batch_idx, self.load_atom_32, self.v1i32_type
-            )
             self.seqlen_q_b = (
                 _cu_load(
                     cuq_div,
@@ -2205,6 +2321,12 @@ class GenericFlashAttnContext:
                 )
                 - self.q_tok_base
             )
+            # KV length always from the CuSeqKv cumulative deltas. The KV base is the
+            # cumulative start for varlen, or an absolute per-seq KvSeqStart[b] for
+            # gappy (non-paged) / a logical start offset for paged-gappy.
+            kv_cum_base = _cu_load(
+                cuk_div, self.batch_idx, self.load_atom_32, self.v1i32_type
+            )
             self.seqlen_kv_b = (
                 _cu_load(
                     cuk_div,
@@ -2212,11 +2334,28 @@ class GenericFlashAttnContext:
                     self.load_atom_32,
                     self.v1i32_type,
                 )
-                - self.kv_tok_base
+                - kv_cum_base
             )
+            if const_expr(traits.GAPPY_KV):
+                kvs_div = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(KvSeqStart), fx.make_layout(1, 1)
+                )
+                self.kv_seq_start = _cu_load(
+                    kvs_div, self.batch_idx, self.load_atom_32, self.v1i32_type
+                )
+                # Non-paged gappy folds the absolute start into the KV base; paged
+                # keeps base 0 and applies kv_seq_start as a logical offset per tile.
+                if const_expr(not traits.PAGED):
+                    self.kv_tok_base = self.kv_seq_start
+                else:
+                    self.kv_tok_base = kv_cum_base
+            else:
+                self.kv_tok_base = kv_cum_base
+                self.kv_seq_start = fx.Index(0)
         else:
             self.q_tok_base = self.batch_idx * self.seq_len_v
             self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
+            self.kv_seq_start = fx.Index(0)
             self.seqlen_q_b = self.seq_len_v
             self.seqlen_kv_b = self.seq_len_kv_v
 
@@ -2261,6 +2400,42 @@ class GenericFlashAttnContext:
             base_byte_offset=q_batch_byte_off,
         )
 
+    def init_bias(self, Bias, bias_stride_b, bias_stride_h, bias_stride_q):
+        # Bounded per-(batch, head) plane resource: the base folds the plane offset
+        # (index-typed, so int64-safe) and num_records bounds q_row to Sq, so the
+        # hardware zero-fills OOB rows -- no per-element index clamp on the load.
+        eb = 2  # bytes per element; the generic path is f16/bf16 only
+        self.bias_stride_q = fx.Int32(bias_stride_q)
+        plane_off_bytes = (
+            fx.Index(self.batch_idx) * fx.Index(bias_stride_b)
+            + fx.Index(self.q_head_idx) * fx.Index(bias_stride_h)
+        ) * fx.Index(eb)
+        self.bias_rsrc = buffer_ops.create_buffer_resource(
+            Bias,
+            max_size=False,
+            num_records_bytes=as_mlir_value(
+                self.seqlen_q_b * fx.Index(bias_stride_q * eb)
+            ),
+            base_byte_offset=as_mlir_value(plane_off_bytes),
+        )
+
+    def init_dropout(self, Dropout, drop_stride_b, drop_stride_h, drop_stride_q):
+        # Same bounded-plane-resource scheme as init_bias.
+        eb = 1  # bytes per element; the dropout keep-mask is uint8 (0/1)
+        self.drop_stride_q = fx.Int32(drop_stride_q)
+        plane_off_bytes = (
+            fx.Index(self.batch_idx) * fx.Index(drop_stride_b)
+            + fx.Index(self.q_head_idx) * fx.Index(drop_stride_h)
+        ) * fx.Index(eb)
+        self.drop_rsrc = buffer_ops.create_buffer_resource(
+            Dropout,
+            max_size=False,
+            num_records_bytes=as_mlir_value(
+                self.seqlen_q_b * fx.Index(drop_stride_q * eb)
+            ),
+            base_byte_offset=as_mlir_value(plane_off_bytes),
+        )
+
     def init_q_row(self):
         # B operand: j = lane_mod_32, k-subblock = lane_div_32*MFMA_LANE_K. Q is
         # num_records-bounded (q_rsrc) so OOB rows read 0 -- no q_in_bounds select.
@@ -2271,7 +2446,12 @@ class GenericFlashAttnContext:
         traits = self.traits
         q_end = self.q_start + traits.BLOCK_M
         if const_expr(traits.CAUSAL):
-            self.delta_i32 = fx.Int32(self.seqlen_kv_b) - fx.Int32(self.seqlen_q_b)
+            # Bottom-right: delta = seqlen_kv - seqlen_q. Top-left: delta = 0 so the
+            # diagonal is kv_col <= q_row regardless of the length difference.
+            if const_expr(traits.CAUSAL_TOP_LEFT):
+                self.delta_i32 = fx.Int32(0)
+            else:
+                self.delta_i32 = fx.Int32(self.seqlen_kv_b) - fx.Int32(self.seqlen_q_b)
             self.causal_end_raw_i32 = fx.Int32(q_end) + self.delta_i32
             causal_end_i32 = fx.Int32(
                 (self.causal_end_raw_i32 > fx.Int32(0)).select(
@@ -2284,6 +2464,48 @@ class GenericFlashAttnContext:
             )
         else:
             self.kv_upper = self.seqlen_kv_b
+
+        # Sliding-window lower bound: KV tiles whose highest column is still below
+        # the window's left edge for the LOWEST q row in this tile are fully masked,
+        # so start the KV loop past them. Keep kv_col > q_row + delta - WINDOW_LEFT;
+        # the first survivable column across the tile is at q_start (min q row), so
+        # skip whole BLOCK_N_OUT tiles below it. Window implies causal (delta set).
+        self.kv_lower = fx.Index(0)
+        if const_expr(traits.WINDOW_LEFT >= 0 and traits.CAUSAL):
+            step_w = fx.Index(traits.BLOCK_N_OUT)
+            first_col_i32 = (
+                fx.Int32(self.q_start)
+                + self.delta_i32
+                - fx.Int32(traits.WINDOW_LEFT)
+                + fx.Int32(1)
+            )
+            first_col_i32 = (first_col_i32 > fx.Int32(0)).select(
+                first_col_i32, fx.Int32(0)
+            )
+            win_lo = fx.Index(first_col_i32)
+            self.kv_lower = (win_lo // step_w) * step_w
+
+        # Split-K: partition [kv_lower, kv_upper) into NUM_KV_SPLITS contiguous windows
+        # of whole BLOCK_N_OUT tiles. Non-split builds keep the whole range (kv_lower is
+        # 0 unless a window narrowed it above).
+        if const_expr(traits.SPLITK):
+            step = fx.Index(traits.BLOCK_N_OUT)
+            base_lower = self.kv_lower
+            span = (self.kv_upper > base_lower).select(
+                self.kv_upper - base_lower, fx.Index(0)
+            )
+            num_tiles = (span + step - fx.Index(1)) // step
+            chunk = (num_tiles + fx.Index(traits.NUM_KV_SPLITS - 1)) // fx.Index(
+                traits.NUM_KV_SPLITS
+            )
+            t0 = self.split_idx * chunk
+            t1 = t0 + chunk
+            lo = base_lower + t0 * step
+            hi = base_lower + t1 * step
+            self.kv_lower = (lo < self.kv_upper).select(lo, self.kv_upper)
+            self.kv_upper = (hi < self.kv_upper).select(hi, self.kv_upper)
+            # This split is empty when its window has no KV positions.
+            self.split_empty = self.kv_lower >= self.kv_upper
 
     def global_idx_q(self, token_idx, col):
         traits = self.traits
@@ -2381,6 +2603,41 @@ class GenericPageIdLoader:
         )
         return fx.Index(Vec(v, (1,), fx.Int32)[0])
 
+    def _bt_load(self, tile_idx):
+        # Load block_table[batch, tile_idx], clamped to the row width so prefetch /
+        # tail tiles that index past a sequence's pages stay in a valid page (those
+        # rows are masked out by kv_upper) instead of faulting on an OOB fetch.
+        ctx = self.ctx
+        last_col = self.bt_stride_v - fx.Index(1)
+        tile_idx = (tile_idx < last_col).select(tile_idx, last_col)
+        tile_idx = (tile_idx > fx.Index(0)).select(tile_idx, fx.Index(0))
+        bt_off = ctx.batch_idx * self.bt_stride_v + tile_idx
+        v = fly.copy_atom_call_ssa(
+            [ctx.v1i32_type],
+            ctx.load_atom_32,
+            fx.slice(self.bt_div, (None, fx.Int32(bt_off))),
+        )
+        return fx.Index(Vec(v, (1,), fx.Int32)[0])
+
+    def gappy_tile_pages(self, base_logical):
+        # A tile covers 64 logical KV positions [base_logical, base_logical+64), and
+        # PAGE_SIZE == BLOCK_N == 64, so it spans at most two physical pages. Load
+        # both once per tile (2 block_table loads) instead of one per row.
+        ps = fx.Index(self.ctx.traits.PAGE_SIZE)
+        tile_base_page = base_logical // ps
+        p0 = self._bt_load(tile_base_page)
+        p1 = self._bt_load(tile_base_page + fx.Index(1))
+        return (p0, p1, tile_base_page)
+
+    def page_row_idx_cached(self, pages, logical):
+        # Select p0/p1 by which of the tile's two pages `logical` falls in (pure
+        # arithmetic, no memory load).
+        ps = fx.Index(self.ctx.traits.PAGE_SIZE)
+        p0, p1, tile_base_page = pages
+        crosses = (logical // ps) > tile_base_page
+        pid = crosses.select(p1, p0)
+        return pid * ps + logical % ps
+
 
 class GenericKvGmemToLdsLoader:
     """KV address/load leaf helper; the caller keeps pipeline scheduling local."""
@@ -2457,7 +2714,22 @@ class GenericKvGmemToLdsLoader:
         return self.ctx.sigma_kv(n)
 
     def _tile_page_id(self, tile_start):
+        # Normal paged: one page id per tile. Gappy paged: the per-seq logical start
+        # can be non-page-aligned, so a tile spans up to two physical pages -- return
+        # both (loaded once per tile) and select per row in _paged_row_idx.
+        if const_expr(self.ctx.traits.GAPPY_KV):
+            return self.page_ids.gappy_tile_pages(self.ctx.kv_seq_start + tile_start)
         return self.page_ids.page_id(tile_start)
+
+    def _paged_row_idx(self, pid, tile_start, row_total):
+        # Physical KV row for a paged load. Normal paged: row_idx = pid*PAGE_SIZE +
+        # row. Gappy paged: resolve the row's page from the cached 2-page tile window.
+        ctx = self.ctx
+        traits = ctx.traits
+        if const_expr(traits.GAPPY_KV):
+            logical = ctx.kv_seq_start + tile_start + row_total
+            return self.page_ids.page_row_idx_cached(pid, logical)
+        return pid * fx.Index(traits.PAGE_SIZE) + row_total
 
     def coop_load_k(self, tile_start, buf_id=0):
         """Cooperative K load (row-major, XOR-swizzled)."""
@@ -2472,7 +2744,7 @@ class GenericKvGmemToLdsLoader:
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
-                row_idx = pid * fx.Index(traits.PAGE_SIZE) + row + row_offset
+                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
             else:
                 row_idx = self.row_clamp(tile_start + row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
@@ -2507,10 +2779,8 @@ class GenericKvGmemToLdsLoader:
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
-                row_idx = (
-                    pid * fx.Index(traits.PAGE_SIZE)
-                    + ctx.load_row_in_batch
-                    + row_offset
+                row_idx = self._paged_row_idx(
+                    pid, tile_start, ctx.load_row_in_batch + row_offset
                 )
             else:
                 row_idx = self.row_clamp(
@@ -2570,7 +2840,7 @@ class GenericKvGmemToLdsLoader:
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
-                row_idx = pid * fx.Index(traits.PAGE_SIZE) + row + row_offset
+                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
             else:
                 row_idx = self.row_clamp(tile_start + row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
@@ -2616,10 +2886,8 @@ class GenericKvGmemToLdsLoader:
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
-                row_idx = (
-                    pid * fx.Index(traits.PAGE_SIZE)
-                    + ctx.load_row_in_batch
-                    + row_offset
+                row_idx = self._paged_row_idx(
+                    pid, tile_start, ctx.load_row_in_batch + row_offset
                 )
             else:
                 row_idx = self.row_clamp(
@@ -2668,7 +2936,7 @@ class GenericKvGmemToLdsLoader:
             pid = self._tile_page_id(tile_start)
         for r in range_constexpr(ctx.vp_rows_per_thread):
             if const_expr(traits.PAGED):
-                row_idx = pid * fx.Index(traits.PAGE_SIZE) + ctx.vp_row_base + r
+                row_idx = self._paged_row_idx(pid, tile_start, ctx.vp_row_base + r)
             else:
                 row_idx = self.row_clamp(tile_start + ctx.vp_row_base + r)
             vecs.append(
@@ -3154,19 +3422,83 @@ class GenericSoftmaxHelper:
             moff = (0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27)
         return kv_start_i32 + lane_off, moff
 
+    def add_bias(self, s_raw_lo, s_raw_hi, kv_start):
+        # Add B[q_row, kv_col] to the 32 fragment scores (lo/hi differ by K_SUB_N in
+        # kv_col). s_raw is raw QK, so add bias/sm_scale (c_inv_sm_scale) to realize
+        # QK*scale + bias; -inf propagates.
+        ctx = self.ctx
+        traits = ctx.traits
+        kv_start_i32 = fx.Int32(kv_start)
+        col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        # The bounded plane resource (init_bias) zero-fills OOB rows (q_row>=Sq) in
+        # hardware, so no index clamp is needed; a within-row kv overrun reads a
+        # neighboring in-bounds value that is masked to -inf afterward.
+        row_base_i32 = ctx.q_row_i32 * ctx.bias_stride_q
+        k_sub_i32 = fx.Int32(traits.K_SUB_N)
+        eb = fx.Int32(2)  # bytes per element (generic path is f16/bf16 only)
+        inv = ctx.c_inv_sm_scale
+        for r in range_constexpr(16):
+            kv_col = col_base_i32 + fx.Int32(moff[r])
+            off_lo = (row_base_i32 + kv_col) * eb
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            b_lo = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_lo)
+            b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
+            s_raw_lo[r] = _fadd(s_raw_lo[r], _fmul(b_lo, inv, ctx.fm_fast), ctx.fm_fast)
+            s_raw_hi[r] = _fadd(s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast)
+        return s_raw_lo, s_raw_hi
+
+    def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
+        # Multiply the 32 post-softmax probabilities by the uint8 keep bit
+        # M[q_row, kv_col] (0 or 1). Same fragment gather as add_bias, applied
+        # after online_softmax. The 1/(1-p) scale is applied to the output.
+        ctx = self.ctx
+        traits = ctx.traits
+        kv_start_i32 = fx.Int32(kv_start)
+        col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
+        # lanes are already zero post-softmax, so no index clamp is needed.
+        row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
+        k_sub_i32 = fx.Int32(traits.K_SUB_N)
+        eb = fx.Int32(1)  # bytes per element (uint8 keep-mask)
+        for r in range_constexpr(16):
+            kv_col = col_base_i32 + fx.Int32(moff[r])
+            off_lo = (row_base_i32 + kv_col) * eb
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            # keep bit is 0/1; the 1/(1-p) scale is applied to the output by the
+            # caller (constant factor, so it factors out of the per-(q,k) sum).
+            m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
+            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
+            p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
+            p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
+        return p_vals_lo, p_vals_hi
+
     def apply_kv_mask(self, s_raw_lo, s_raw_hi, kv_start):
         ctx = self.ctx
         traits = ctx.traits
         kv_start_i32 = fx.Int32(kv_start)
         if const_expr(traits.CAUSAL):
-            # Keep the runtime tile_needs_mask guard (below-diagonal tiles skip the 32
-            # selects) but drive the scf.if with the 32 scalar scores as explicit state
-            # (a Python list cannot cross a dynamic `if`) -> byte-identical to the unrolled
-            # form. The score at logical n_pos holds physical kv = kv_start + sigma(n_pos).
+            # tile_needs_mask lets below-diagonal tiles skip the 32 selects; the
+            # scf.if carries the 32 scores as explicit state (a list can't cross it).
             q_start_i32 = fx.Int32(ctx.q_start) + ctx.delta_i32
             q_mask_limit_i32 = ctx.q_row_i32 + ctx.delta_i32
             max_kv_col_i32 = kv_start_i32 + fx.Int32(traits.BLOCK_N - 1)
             tile_needs_mask = max_kv_col_i32 > q_start_i32
+            # Top-left (delta=0) with q>k: the diagonal admits padding columns
+            # (kv >= seqlen_kv), so force the tail tile through the mask path and
+            # apply an explicit kv_col < seqlen_kv bound below. Bottom-right self-bounds.
+            top_left = const_expr(traits.CAUSAL_TOP_LEFT)
+            seq_len_kv_i32 = fx.Int32(ctx.seqlen_kv_b) if top_left else None
+            if top_left:
+                tile_needs_mask = tile_needs_mask | (max_kv_col_i32 >= seq_len_kv_i32)
+            # Sliding-window: a tile needs masking when its lowest kv column falls
+            # outside the left edge for the highest q row in the block; the
+            # per-element select below applies the exact per-row bound.
+            has_window = const_expr(traits.WINDOW_LEFT >= 0)
+            if has_window:
+                window_left_i32 = fx.Int32(traits.WINDOW_LEFT)
+                q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
+                window_lo_edge_i32 = q_end_i32 - window_left_i32
+                tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
             col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
             c_neg_inf = ctx.c_neg_inf
 
@@ -3174,14 +3506,34 @@ class GenericSoftmaxHelper:
                 out = []
                 for r in range_constexpr(16):
                     kv_col = col_base_i32 + fx.Int32(moff[r])
-                    out.append(
-                        (kv_col > q_mask_limit_i32).select(c_neg_inf, scores[2 * r])
+                    kv_col_hi = kv_col + fx.Int32(traits.K_SUB_N)
+                    # Causal upper bound: kv_col <= q_mask_limit.
+                    masked_lo = (kv_col > q_mask_limit_i32).select(
+                        c_neg_inf, scores[2 * r]
                     )
-                    out.append(
-                        (kv_col + fx.Int32(traits.K_SUB_N) > q_mask_limit_i32).select(
-                            c_neg_inf, scores[2 * r + 1]
+                    masked_hi = (kv_col_hi > q_mask_limit_i32).select(
+                        c_neg_inf, scores[2 * r + 1]
+                    )
+                    if top_left:
+                        # Drop padding columns kv_col >= seqlen_kv (top-left q>k).
+                        masked_lo = (kv_col >= seq_len_kv_i32).select(
+                            c_neg_inf, masked_lo
                         )
-                    )
+                        masked_hi = (kv_col_hi >= seq_len_kv_i32).select(
+                            c_neg_inf, masked_hi
+                        )
+                    if has_window:
+                        # Left window bound: keep kv_col > q_row - WINDOW_LEFT,
+                        # i.e. drop kv_col <= q_mask_limit - WINDOW_LEFT.
+                        win_edge_i32 = q_mask_limit_i32 - fx.Int32(traits.WINDOW_LEFT)
+                        masked_lo = (kv_col <= win_edge_i32).select(
+                            c_neg_inf, masked_lo
+                        )
+                        masked_hi = (kv_col_hi <= win_edge_i32).select(
+                            c_neg_inf, masked_hi
+                        )
+                    out.append(masked_lo)
+                    out.append(masked_hi)
                 return out
 
             mask_names = tuple("_sm%d" % i for i in range(32))
@@ -3237,7 +3589,10 @@ class GenericSoftmaxHelper:
                 local_max = _fmax(local_max, s_raw_hi[r], fm_fast)
         row_max = _fmax(local_max, self.reduction_peer(local_max), fm_fast)
         m_new_raw = _fmax(m_running, row_max, fm_fast)
-        if const_expr(traits.CAUSAL):
+        # Clamp the running max off -inf so a fully-masked row (all scores -inf)
+        # avoids -inf-(-inf)=NaN; finalize emits 0 for that l_final==0 row. Applies
+        # to causal (below-diagonal rows) and bias (a row of all -inf columns).
+        if const_expr(traits.CAUSAL or traits.HAS_BIAS):
             m_new_raw = _fmax(m_new_raw, ctx.c_neg_floor, fm_fast)
 
         diff_m_scaled = _fmul(
@@ -3411,6 +3766,78 @@ class GenericStoreHelper:
     def __init__(self, ctx):
         self.ctx = ctx
 
+    def _splitk_workspace_resources(self):
+        ctx = self.ctx
+        split_z = _splitk_workspace_split_z(ctx.traits, ctx.batch_idx, ctx.split_idx)
+        return _splitk_workspace_resources(
+            ctx.ws_base_i64,
+            split_z,
+            ctx.ws_opart_per_split_bytes,
+            ctx.ws_ml_per_split_bytes,
+            ctx.ws_mrow_abs_bytes,
+            ctx.ws_lrow_abs_bytes,
+        )
+
+    def _store_splitk_partial_o_row(self, v_o, local_opart_row_base, opart_rsrc):
+        # v_o packs identically to the dualwave store, so the shared 128b packer +
+        # workspace column layout are reused; the combine kernel reads them back.
+        ctx = self.ctx
+        traits = ctx.traits
+        for dc in range_constexpr(traits.D_CHUNKS):
+            for g in range_constexpr(2):
+                w0, w1, w2, w3 = _packed_o_128_dwords(
+                    traits, v_o, dc, g, ctx.lane_div_32, ctx.elem_dtype
+                )
+                _ws_store_quad_i32(
+                    [w0, w1, w2, w3],
+                    local_opart_row_base
+                    + _splitk_o_partial_dword_col(traits, dc, g, ctx.lane_div_32),
+                    opart_rsrc,
+                )
+
+    def store_splitk_partial(self, loop_results, q_row):
+        # Store the NORMALIZED O partial plus this split's (m, l) so the shared
+        # combine reweights by exp2(m_i - m_max) * l_i. m is emitted in dualwave's
+        # log2 domain (sm_scale*log2e*m_final) to match DualwaveSplitKCombine math.
+        ctx = self.ctx
+        traits = ctx.traits
+        m_final = loop_results[0]
+        l_final = loop_results[1]
+        o_finals = [loop_results[2 + dc] for dc in range_constexpr(traits.D_CHUNKS)]
+
+        inv_l_rcp = rocdl.rcp(T.f32, l_final)
+        inv_l = (fx.Float32(l_final) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
+        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
+        v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(traits.D_CHUNKS)]
+
+        # Empty splits (no KV positions) leave m_final=-inf/l=0. Under fm_fast the
+        # sm_scale multiply of -inf is poison and fmax cannot be relied on to clamp
+        # it, so a poisoned value could win reduce_m_max and zero the output. Select
+        # the literal sentinel directly on split_empty (as the dualwave
+        # store_empty_split does); the combine still skips these via the l>0 guard.
+        m_log2_raw = _fmul(ctx.c_sm_scale_log2e, m_final, ctx.fm_fast)
+        m_log2 = _fmax(m_log2_raw, fx.Float32(-1e30), ctx.fm_fast)
+        m_log2 = ctx.split_empty.select(fx.Float32(-1e30), m_log2)
+
+        opart_rsrc, mrow_rsrc, lrow_rsrc = self._splitk_workspace_resources()
+        local_opart_base = _splitk_local_opart_row_base(
+            traits, ctx.q_head_idx, ctx.seq_len_v, q_row
+        )
+        local_ml_idx = _splitk_local_ml_idx(ctx.q_head_idx, ctx.seq_len_v, q_row)
+        seq_len_v = ctx.seq_len_v
+        lane = ctx.lane
+
+        @flyc.jit
+        def _store_splitk_partial_if_qrow():
+            if q_row < seq_len_v:
+                self._store_splitk_partial_o_row(v_o, local_opart_base, opart_rsrc)
+                if lane < fx.Index(32):
+                    _store_splitk_ml_row(
+                        m_log2, l_final, local_ml_idx, mrow_rsrc, lrow_rsrc
+                    )
+
+        _store_splitk_partial_if_qrow()
+
     def store_lse(self, lse_val, q_row):
         """Single-writer-per-row fp32 LSE store into ``[B, H, seq_len]``."""
         ctx = self.ctx
@@ -3487,7 +3914,9 @@ class GenericStoreHelper:
             self.store_lse(lse_val, q_row)
 
         inv_l_rcp = rocdl.rcp(T.f32, l_final)
-        if const_expr(traits.CAUSAL):
+        # Fully-masked row has l_final == 0 -> rcp*0 = NaN; emit 0 instead (matches
+        # CK). Rows can be fully masked under causal or an all -inf bias row.
+        if const_expr(traits.CAUSAL or traits.HAS_BIAS):
             inv_l = (fx.Float32(l_final) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         else:
             inv_l = inv_l_rcp

@@ -24,6 +24,15 @@ Key features vs calling build_* directly:
 - Validates shapes, dtypes, and arch before compiling.
 - Accepts ``debug_counts`` tensor to enable the lazy-rescale branch counter
   (gfx950 DUALWAVE_SWP dualwave_swp_debug_lazy_counts=True path).
+
+Known dualwave defects (tracked; routing below escapes affected cases to the
+generic light kernel, which moves those users off the faster dualwave path):
+  * f16 dualwave softmax overflows at large logits (narrow exponent) -> NaN, so
+    f16 is forced to the light path (see ``_paged_light_ok`` / the varlen and
+    dense f16 escapes below).
+  * dualwave cross-attention NaNs for >=5 KV tiles / hardcodes 1/sqrt(D), so
+    cross-length cases are kept off dualwave.
+TODO(): Fix the flyDSL dualwave f16 cross-attn NaN
 """
 
 from __future__ import annotations
@@ -86,14 +95,82 @@ def _dense_generic_tile(
     head_dim: int,
     dtype_str: str,
     device: torch.device,
+    has_bias: bool = False,
 ):
     if head_dim in (64, 128) and dtype_str in ("bf16", "f16"):
         main_blocks = batch * num_heads * ((seq_len + 127) // 128)
         if main_blocks < _dense_light_cu(device):
+            # Additive bias forces the N32 path and reloads the bias plane per Q
+            # tile; the block_m=64 light tile reloads it twice as often, so prefer
+            # block_m=128 when bias is present (ties at small S, wins at large S).
+            if has_bias:
+                return 128, 256, "N32"
             return 64, 128, "N32"
     if num_heads >= 32 and batch * seq_len >= _DENSE_M256_MIN_TOKENS:
         return 256, 512, "auto"
     return 128, 256, "auto"
+
+
+# Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
+_GENERIC_SPLITK_BLOCK_M = 64
+
+
+def _generic_splitk_list(i: int) -> int:
+    # Mirror CK generate_splits_list: 1,2,4,8,16,32,64,96,128,... .
+    if i <= 0:
+        return 1
+    if i <= 5:
+        return 1 << (i - 1)
+    return (i - 5) * 32
+
+
+def _num_kv_splits_heuristic(
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    num_cu: int,
+    max_splits: int = 8,
+) -> int:
+    """Port of CK get_num_kv_splits_heuristic for the generic BLOCK_M=64 kernel.
+
+    Returns the number of KV splits (1 = no split-K). CK varies the mtile by
+    head-dim, but the generic kernel always uses BLOCK_M=64, so the occupancy
+    estimate uses mtile=64 (or 16 for tiny q, matching CK's smallq branch).
+    """
+
+    def ceildiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    if head_dim > 256:
+        return 1
+
+    # Enough Q tiles to fill ~all CUs at the default pipeline mtile -> no split.
+    if seqlen_q >= _GENERIC_SPLITK_BLOCK_M:
+        default_blocks = (
+            num_batches * num_heads * ceildiv(seqlen_q, _GENERIC_SPLITK_BLOCK_M)
+        )
+        if default_blocks >= 0.8 * num_cu:
+            return 1
+
+    mtile = _GENERIC_SPLITK_BLOCK_M
+    if seqlen_q <= 16:
+        mtile = 16
+    blocks = num_batches * num_heads * ceildiv(seqlen_q, mtile)
+    if blocks >= 0.9 * num_cu:
+        return 1
+
+    max_splits = min(max_splits, num_cu)
+    max_check = 1
+    while _generic_splitk_list(max_check) <= max_splits:
+        max_check += 1
+
+    num_splits = 1
+    for i in range(2, max_check):
+        num_splits = _generic_splitk_list(i)
+        if blocks * num_splits >= num_cu:
+            break
+    return num_splits
 
 
 # ── build-cache helpers ────────────────────────────────────────────────────
@@ -113,6 +190,11 @@ def _build_dense(
     waves_per_eu: int,
     daz: bool,
     return_lse: bool = False,
+    window_left: int = -1,
+    sm_scale: Optional[float] = None,
+    has_bias: bool = False,
+    has_dropout: bool = False,
+    num_kv_splits: int = 1,
 ):
     """Build (and cache) one dense generic launcher variant."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -130,6 +212,11 @@ def _build_dense(
         waves_per_eu=waves_per_eu,
         daz=daz,
         return_lse=return_lse,
+        window_left=window_left,
+        sm_scale=sm_scale,
+        has_bias=has_bias,
+        has_dropout=has_dropout,
+        num_kv_splits=num_kv_splits,
     )
 
 
@@ -249,6 +336,11 @@ def _build_varlen_light(
     debug_lazy_counts: bool,
     enable_stagger: bool,
     return_lse: bool = False,
+    causal_top_left: bool = False,
+    window_left: int = -1,
+    sm_scale: Optional[float] = None,
+    gappy_kv: bool = False,
+    num_kv_splits: int = 1,
 ):
     """Build a lightweight packed-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -258,6 +350,7 @@ def _build_varlen_light(
         head_dim=head_dim,
         causal=causal,
         dtype_str=dtype_str,
+        sm_scale=sm_scale,
         num_kv_heads=num_kv_heads,
         cross_seqlen=cross_seqlen,
         varlen=True,
@@ -266,6 +359,10 @@ def _build_varlen_light(
         waves_per_eu=waves_per_eu,
         daz=daz,
         return_lse=return_lse,
+        causal_top_left=causal_top_left,
+        window_left=window_left,
+        gappy_kv=gappy_kv,
+        num_kv_splits=num_kv_splits,
     )
 
 
@@ -374,9 +471,12 @@ def _flydsl_flash_attn_paged(
     kv_cache_layout: str,
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_kv: Optional[torch.Tensor],
+    kv_seqstart: Optional[torch.Tensor],
     max_seqlen_q: Optional[int],
     cross_seqlen: Optional[bool],
     num_kv_splits: int,
+    return_lse: bool,
+    sm_scale: Optional[float],
     out: Optional[torch.Tensor],
     waves_per_eu: int,
     daz: bool,
@@ -399,9 +499,12 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: native paged KV supports kv_cache_layout in ('linear','vectorized'), "
             f"got {kv_cache_layout!r}"
         )
-    if block_table is None or seqlen_k is None:
+    # Gappy paged uses kv_seqstart + cu_seqlens_kv (per-seq lengths) instead of the
+    # vLLM seqlen_k bound.
+    if block_table is None or (seqlen_k is None and kv_seqstart is None):
         raise ValueError(
-            "flydsl_flash_attn_func: native paged KV (vllm) requires block_table and seqlen_k"
+            "flydsl_flash_attn_func: native paged KV (vllm) requires block_table and "
+            "seqlen_k (or kv_seqstart for gappy paged)"
         )
     vectorized = kv_cache_layout == "vectorized"
     if vectorized:
@@ -458,11 +561,14 @@ def _flydsl_flash_attn_paged(
         page_size = int(k.shape[1])
         Hkv = int(k.shape[2])
         k_head_dim = int(k.shape[3])
-    if page_size != _PAGED_PAGE_SIZE:
+    # Gappy paged uses the generic kernel (any D the generic path builds; the op
+    # reshapes the cache to 64-row sub-pages), so skip the native-paged D/page gates.
+    _gappy_paged = kv_seqstart is not None
+    if page_size != _PAGED_PAGE_SIZE and not _gappy_paged:
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports page_size={_PAGED_PAGE_SIZE} only, got {page_size}"
         )
-    if D not in (64, 128):
+    if D not in (64, 128) and not _gappy_paged:
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports head_dim=64 or 128, got {D}"
         )
@@ -522,14 +628,30 @@ def _flydsl_flash_attn_paged(
         launch_stream = (
             torch.cuda.current_stream(q.device) if stream is None else stream
         )
-        # Short paged attention uses generic light; unsupported cases stay on dualwave.
+        # The dualwave paged softmax overflows for f16 (narrow exponent) and for the
+        # causal path at large logits, so route those to the generic light kernel
+        # regardless of seqlen; bf16 non-causal keeps the faster dualwave kernel.
+        # Mirrors the varlen path's f16 escape.
         _arch = _gpu_arch(q.device)
-        _paged_light_ok = (
+        _gappy = kv_seqstart is not None
+        _paged_light_ok = _gappy or (
             (num_kv_splits <= 1)
             and D in (64, 128)
             and dtype_str in ("bf16", "f16")
-            and (not _arch.startswith("gfx950") or Sq <= _VARLEN_LIGHT_MAX_SEQ)
+            and (
+                dtype_str == "f16"
+                or causal
+                or not _arch.startswith("gfx950")
+                or Sq <= _VARLEN_LIGHT_MAX_SEQ
+            )
         )
+        if return_lse and not _paged_light_ok:
+            # Only the generic light path produces LSE; the dualwave native-paged
+            # kernel does not. (Short-q / gfx942 / paged-gappy take the light path.)
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: return_lse for native paged KV is only "
+                "supported on the generic (short-seq / gfx942) path"
+            )
         if _paged_light_ok:
             exe = _build_paged_light(
                 num_heads=H,
@@ -546,6 +668,9 @@ def _flydsl_flash_attn_paged(
                 setprio=dualwave_swp_setprio,
                 debug_lazy_counts=False,
                 enable_stagger=dualwave_swp_enable_stagger,
+                gappy_kv=_gappy,
+                return_lse=return_lse,
+                sm_scale=sm_scale,
             )
         else:
             exe = _build_paged(
@@ -580,8 +705,17 @@ def _flydsl_flash_attn_paged(
         if varlen:
             kwargs["cu_seqlens_q"] = cu_seqlens_q
             kwargs["cu_seqlens_kv"] = cu_seqlens_kv
+        if kv_seqstart is not None:
+            kwargs["kv_seqstart"] = kv_seqstart
         if cross:
             kwargs["seq_len_kv"] = skv
+        lse = (
+            torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
+            if return_lse
+            else None
+        )
+        if return_lse:
+            kwargs["lse"] = lse
         if splitk:
             ws_elems = dualwave_splitk_workspace_elems(
                 B, H, Sq, int(num_kv_splits), head_dim=D
@@ -590,7 +724,7 @@ def _flydsl_flash_attn_paged(
             kwargs["workspace"] = _ws
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
 
-    return out
+    return (out, lse) if return_lse else out
 
 
 @functools.lru_cache(maxsize=256)
@@ -609,6 +743,9 @@ def _build_paged_light(
     setprio: bool,
     debug_lazy_counts: bool,
     enable_stagger: bool,
+    gappy_kv: bool = False,
+    return_lse: bool = False,
+    sm_scale: Optional[float] = None,
 ):
     """Build a lightweight paged-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -628,6 +765,9 @@ def _build_paged_light(
         path_tag="N32",
         waves_per_eu=waves_per_eu,
         daz=daz,
+        gappy_kv=gappy_kv,
+        return_lse=return_lse,
+        sm_scale=sm_scale,
     )
 
 
@@ -644,6 +784,9 @@ def flydsl_flash_attn_func(
     # Varlen (packed cu_seqlens): pass both to enable the varlen path.
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
+    # Gappy KV: per-seq absolute KV start [B] into an un-repacked K/V store. With
+    # cu_seqlens_kv giving per-seq lengths, the kernel gathers each seq in-place.
+    kv_seqstart: Optional[torch.Tensor] = None,
     # Max per-batch Q seqlen (varlen only). Required for varlen to size grid_y
     # without synchronizing on cu_seqlens_q.
     max_seqlen_q: Optional[int] = None,
@@ -677,6 +820,17 @@ def flydsl_flash_attn_func(
     # When True, also return per-row log-sum-exp (natural log, sm_scale folded in,
     # shape [B, H, Sq]; varlen: [B, H, max_seqlen_q]). Not supported for fp8/paged KV.
     return_lse: bool = False,
+    # Sliding-window: keep KV in (q_row - window_left, q_row]; -1 disables.
+    window_left: int = -1,
+    # Softmax scale (None -> 1/sqrt(head_dim)); non-default forces the generic path.
+    sm_scale: Optional[float] = None,
+    # Additive bias broadcastable to [B, H, Sq, Skv], added to QK*scale.
+    bias: Optional[torch.Tensor] = None,
+    # Top-left causal (kv_col <= q_row) vs default bottom-right; cross-length only.
+    causal_top_left: bool = False,
+    # Dropout mask broadcastable to [B, H, Sq, Skv]; 0 or 1/(1-p), applied to post-
+    # softmax P.
+    dropout_mask: Optional[torch.Tensor] = None,
     # CUDA/HIP stream; defaults to the current stream for q.device.
     stream: Optional[torch.cuda.Stream] = None,
 ):
@@ -753,10 +907,40 @@ def flydsl_flash_attn_func(
         raise NotImplementedError(
             "flydsl_flash_attn_func: return_lse is not supported for fp8"
         )
-    if return_lse and paged_kv:
-        raise NotImplementedError(
-            "flydsl_flash_attn_func: return_lse is not supported for paged KV"
-        )
+    # LSE support for paged KV depends on which kernel the shape routes to: the
+    # generic light path (paged-gappy, or short-q / gfx942 native paged) produces
+    # LSE; the dualwave native-paged path does not. The precise check lives in
+    # _flydsl_flash_attn_paged where the light-vs-dualwave decision is made.
+    if window_left >= 0:
+        # Window lives in apply_kv_mask (dense + generic varlen); fp8/paged lack it.
+        if dtype_str == "fp8" or paged_kv:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
+                "supported for fp8 or paged KV"
+            )
+    if sm_scale is not None:
+        # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
+        # generic kernel and folds sm_scale.
+        _gappy_paged = paged_kv and kv_seqstart is not None
+        if dtype_str == "fp8" or (paged_kv and not _gappy_paged):
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: custom sm_scale is only supported on the "
+                "dense/varlen f16/bf16 paths (fp8/paged hardcode 1/sqrt(head_dim))"
+            )
+    if bias is not None:
+        _varlen_req = cu_seqlens_q is not None
+        if dtype_str == "fp8" or paged_kv or _varlen_req:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: attention bias is only supported on the "
+                "dense f16/bf16 path (not fp8/paged/varlen)"
+            )
+    if dropout_mask is not None:
+        _varlen_req = cu_seqlens_q is not None
+        if dtype_str == "fp8" or paged_kv or _varlen_req:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: dropout is only supported on the "
+                "dense f16/bf16 path (not fp8/paged/varlen)"
+            )
     if paged_kv:
         return _flydsl_flash_attn_paged(
             q,
@@ -770,9 +954,12 @@ def flydsl_flash_attn_func(
             kv_cache_layout=kv_cache_layout,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
+            kv_seqstart=kv_seqstart,
             max_seqlen_q=max_seqlen_q,
             cross_seqlen=cross_seqlen,
             num_kv_splits=num_kv_splits,
+            return_lse=return_lse,
+            sm_scale=sm_scale,
             out=out,
             waves_per_eu=waves_per_eu,
             daz=daz,
@@ -877,6 +1064,9 @@ def flydsl_flash_attn_func(
         )
 
     splitk = num_kv_splits > 1
+    # generic_splitk is chosen internally per-shape (below); it uses the generic
+    # BLOCK_M=64 kernel + dense combine, distinct from the dualwave `splitk` above.
+    generic_splitk = False
 
     # ── split-K eligibility guard (SKIP analogous to run_splitk_config) ────
     if splitk:
@@ -913,13 +1103,27 @@ def flydsl_flash_attn_func(
                 return_lse=return_lse,
             )
         elif varlen:
-            # Short varlen attention uses generic light; long/debug stays on dualwave.
+            # Generic light for short/cross/D256 varlen; long self-attn uses dualwave.
+            # (The dualwave cross path NaNs for >=5 KV tiles; D=256 is generic-only.)
             _arch = _gpu_arch(q.device)
             _prefer_light = (
                 (not debug_lazy)
-                and D in (64, 128)
+                and D in (64, 128, 256)
                 and dtype_str in ("bf16", "f16")
-                and (not _arch.startswith("gfx950") or Sq <= _VARLEN_LIGHT_MAX_SEQ)
+                and (
+                    cross
+                    or D == 256
+                    or window_left >= 0
+                    # dualwave varlen hardcodes 1/sqrt(head_dim), so custom scale
+                    # must use light.
+                    or sm_scale is not None
+                    # f16 overflows the dualwave softmax; use light.
+                    or dtype_str == "f16"
+                    or not _arch.startswith("gfx950")
+                    or Sq <= _VARLEN_LIGHT_MAX_SEQ
+                    # Gappy KV is only implemented on the generic (light) path.
+                    or kv_seqstart is not None
+                )
             )
             if _prefer_light:
                 exe = _build_varlen_light(
@@ -936,6 +1140,10 @@ def flydsl_flash_attn_func(
                     debug_lazy_counts=debug_lazy,
                     enable_stagger=dualwave_swp_enable_stagger,
                     return_lse=return_lse,
+                    causal_top_left=causal_top_left,
+                    window_left=window_left,
+                    sm_scale=sm_scale,
+                    gappy_kv=kv_seqstart is not None,
                 )
             else:
                 exe = _build_varlen(
@@ -971,16 +1179,34 @@ def flydsl_flash_attn_func(
                     enable_stagger=dualwave_swp_enable_stagger,
                 )
             else:
+                # f16 excluded from dualwave: its narrow exponent overflows the
+                # dualwave softmax at large logits -> NaN; bf16 is safe.
                 can_dualwave = (
                     D in (64, 128)
-                    and dtype_str in ("bf16", "f16")
+                    and dtype_str == "bf16"
                     and _arch.startswith("gfx950")
                 )
                 if debug_lazy and not can_dualwave:
                     raise NotImplementedError(
                         "flydsl_flash_attn_func: debug_counts requires the gfx950 DUALWAVE_SWP path"
                     )
-                if debug_lazy or (can_dualwave and _dense_routes_to_dualwave(B, Sq)):
+                # Window / custom scale / bias / dropout / cross are generic-only;
+                # never route them to dualwave (hardcodes 1/sqrt(D), NaNs on cross).
+                _windowed = window_left >= 0
+                _custom_scale = sm_scale is not None
+                _has_bias = bias is not None
+                _has_dropout = dropout_mask is not None
+                if (
+                    not _windowed
+                    and not _custom_scale
+                    and not _has_bias
+                    and not _has_dropout
+                    and not cross
+                    and (
+                        debug_lazy
+                        or (can_dualwave and _dense_routes_to_dualwave(B, Sq))
+                    )
+                ):
                     exe = _build_dense_dualwave(
                         num_heads=H,
                         num_kv_heads=num_kv_heads,
@@ -997,23 +1223,66 @@ def flydsl_flash_attn_func(
                         return_lse=return_lse,
                     )
                 else:
-                    block_m, flat_work_group_size, path_tag = _dense_generic_tile(
-                        B, Sq, H, D, dtype_str, q.device
-                    )
-                    exe = _build_dense(
-                        num_heads=H,
-                        num_kv_heads=num_kv_heads,
-                        head_dim=D,
-                        causal=causal,
-                        dtype_str=dtype_str,
-                        cross_seqlen=cross,
-                        block_m=block_m,
-                        flat_work_group_size=flat_work_group_size,
-                        path_tag=path_tag,
-                        waves_per_eu=waves_per_eu,
-                        daz=daz,
-                        return_lse=return_lse,
-                    )
+                    # Generic split-K for short-q dense self-attention that underfills
+                    # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Dropout
+                    # disables it (matches CK); bias/window/scale compose fine.
+                    _gen_splits = 1
+                    if (
+                        not _has_dropout
+                        and not cross
+                        and D in (64, 128, 256)
+                        and dtype_str in ("bf16", "f16")
+                    ):
+                        _gen_splits = _num_kv_splits_heuristic(
+                            B, H, Sq, D, _dense_light_cu(q.device)
+                        )
+                    if _gen_splits > 1:
+                        generic_splitk = True
+                        num_kv_splits = _gen_splits
+                        # BLOCK_M=64 short-q tile; N128 only for causal D128, else
+                        # N32 (matches the generic builder's own path selection).
+                        _sk_tag = "N128" if (causal and D == 128) else "N32"
+                        exe = _build_dense(
+                            num_heads=H,
+                            num_kv_heads=num_kv_heads,
+                            head_dim=D,
+                            causal=causal,
+                            dtype_str=dtype_str,
+                            cross_seqlen=cross,
+                            block_m=64,
+                            flat_work_group_size=128,
+                            path_tag=_sk_tag,
+                            waves_per_eu=waves_per_eu,
+                            daz=daz,
+                            return_lse=return_lse,
+                            window_left=window_left,
+                            sm_scale=sm_scale,
+                            has_bias=_has_bias,
+                            has_dropout=_has_dropout,
+                            num_kv_splits=_gen_splits,
+                        )
+                    else:
+                        block_m, flat_work_group_size, path_tag = _dense_generic_tile(
+                            B, Sq, H, D, dtype_str, q.device, has_bias=_has_bias
+                        )
+                        exe = _build_dense(
+                            num_heads=H,
+                            num_kv_heads=num_kv_heads,
+                            head_dim=D,
+                            causal=causal,
+                            dtype_str=dtype_str,
+                            cross_seqlen=cross,
+                            block_m=block_m,
+                            flat_work_group_size=flat_work_group_size,
+                            path_tag=path_tag,
+                            waves_per_eu=waves_per_eu,
+                            daz=daz,
+                            return_lse=return_lse,
+                            window_left=window_left,
+                            sm_scale=sm_scale,
+                            has_bias=_has_bias,
+                            has_dropout=_has_dropout,
+                        )
 
         # ── allocate output ─────────────────────────────────────────────────
         if out is None:
@@ -1070,6 +1339,8 @@ def flydsl_flash_attn_func(
                 stream=launch_stream,
                 **lse_kwargs,
             )
+            if kv_seqstart is not None:
+                kwargs["kv_seqstart"] = kv_seqstart
             if cross:
                 kwargs["seq_len_kv"] = int(max_seqlen_kv)
             if debug_lazy:
@@ -1095,6 +1366,38 @@ def flydsl_flash_attn_func(
                 kwargs.update(
                     q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
                 )
+            if bias is not None:
+                # Contiguous + broadcast to [B, H, Sq, Skv] (unit kv stride; a
+                # size-1 head axis gives stride 0 => head-broadcast).
+                bias_e = bias.contiguous().expand(B, H, Sq, Skv)
+                assert bias_e.stride(3) == 1, "bias kv axis must be unit-stride"
+                kwargs.update(
+                    bias=bias_e,
+                    bias_stride_b=int(bias_e.stride(0)),
+                    bias_stride_h=int(bias_e.stride(1)),
+                    bias_stride_q=int(bias_e.stride(2)),
+                )
+            if dropout_mask is not None:
+                # Same ABI as bias: unit kv stride, broadcast to [B, H, Sq, Skv].
+                drop_e = dropout_mask.contiguous().expand(B, H, Sq, Skv)
+                assert drop_e.stride(3) == 1, "dropout kv axis must be unit-stride"
+                kwargs.update(
+                    dropout=drop_e,
+                    dropout_stride_b=int(drop_e.stride(0)),
+                    dropout_stride_h=int(drop_e.stride(1)),
+                    dropout_stride_q=int(drop_e.stride(2)),
+                )
+            if generic_splitk:
+                # Dense combine writes O in [B, Sq, H, D] layout (stride_q_n = H*D).
+                _ws = torch.empty(
+                    dualwave_splitk_workspace_elems(
+                        B, H, Sq, int(num_kv_splits), head_dim=D
+                    ),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                kwargs["workspace"] = _ws
+                kwargs["stride_q_n"] = H * D
             exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
 
     return (out, lse) if return_lse else out
