@@ -188,7 +188,7 @@ __configure_mslk_build_rocm () {
   local mslk_variant_targets="$1"
 
   # Fetch ROCm version to $rocm_version_arr
-  __fetch_rocm_version_array ${env_name} || return 1
+  __fetch_rocm_version_array "${env_name}" || return 1
 
   # By default, we build for a limited number of target architectures to save on
   # build time.  This list needs to be updated if the CI ROCm machines have
@@ -214,6 +214,7 @@ __configure_mslk_build_rocm () {
   else
     # If BUILD_FROM_NOVA is unset, then we are building from a compute host with
     # sufficient resources, so we can build for more AMD Instinct architectures.
+    # shellcheck disable=SC2154
     if [[ ${rocm_version_arr[0]} -ge 7 ]]; then
       local arch_list="gfx908,gfx90a,gfx942,gfx950"
     else
@@ -525,9 +526,11 @@ __build_mslk_common_pre_steps () {
   # shellcheck disable=SC2086
   print_exec conda run --no-capture-output ${env_prefix} python setup.py clean
 
-  echo "[BUILD] Printing git status ..."
-  print_exec git status
-  print_exec git diff
+  if [[ -z "${BUILD_FB_CODE}" || "${BUILD_FB_CODE}" == "0" ]]; then
+    echo "[BUILD] Printing git status ..."
+    print_exec git status
+    print_exec git diff
+  fi
 }
 
 __verify_library_symbols () {
