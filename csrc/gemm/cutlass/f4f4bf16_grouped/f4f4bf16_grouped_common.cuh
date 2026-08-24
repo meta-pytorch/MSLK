@@ -8,6 +8,8 @@
 
 #define CUTLASS_NAMESPACE mslk
 
+#include <type_traits>
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -31,6 +33,7 @@ namespace mslk::gemm {
 namespace cutlass = cutlass_mslk;
 
 using MXFP4 = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+using MXFP4_16 = cutlass::mx_float4_16_t<cutlass::float_e2m1_t>;
 using NVFP4 = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 
 inline int64_t _byte_align(int64_t offset) {
@@ -77,7 +80,11 @@ __global__ void set_stacked_kernel_args_kernel(
     LayoutSFB* layout_SFB,
     ElementGlobalScale* global_scale,
     const ElementGlobalScale** global_scale_ptr,
-    int64_t* starting_row_after_padding) {
+    int64_t* starting_row_after_padding,
+    // No default: the only caller passes the compile-time scale_block_size for
+    // its InputQuantType. A default of 32 would let a future caller silently
+    // misindex NVFP4/MXFP4_16 scale offsets, which both use 16.
+    int ele_per_quantize_group) {
   uint32_t group_index = blockIdx.x * blockDim.x + threadIdx.x;
   // If this thread corresponds to a valid group, write kernel args to device
   // memory.
@@ -108,10 +115,6 @@ __global__ void set_stacked_kernel_args_kernel(
       int64_t offset_M = 0;
       int64_t accumulated_x_scale = 0;
       int64_t accumulated_w_scale = 0;
-      int ele_per_quantize_group = 16;
-      if (global_scale == nullptr) {
-        ele_per_quantize_group = 32;
-      }
       for (int i = 0; i < group_index; i++) {
         offset_M += M_sizes[i];
         /* It's calculated this way since the scales are at least padded to
@@ -219,18 +222,26 @@ at::Tensor f4f4bf16_grouped_impl(
   using ClusterShape =
       cute::Shape<cute::Int<TBS_M>, cute::Int<TBS_N>, cute::Int<TBS_K>>;
 
+  // Select kernel schedule based on quant type:
+  // - NVFP4: NvF4 schedule (SfVecSize=16, E4M3 scales)
+  // - MXFP4: Mxf4 schedule (SfVecSize=32, E8M0 scales)
+  // - MXFP4_16: NvF4 schedule (SfVecSize=16, E8M0 scales -- same SfVecSize as
+  // NVFP4)
+  static constexpr bool is_mxfp4_16 = std::is_same_v<InputQuantType, MXFP4_16>;
+  static constexpr bool use_nvf4_schedule = is_nvfp4 || is_mxfp4_16;
+  static constexpr bool use_2sm = (TB_M == 256) && (TBS_M % 2 == 0);
   using KernelSchedule = cute::conditional_t<
-      is_nvfp4,
+      use_nvf4_schedule,
       cute::conditional_t<
-          (TB_M == 256) && (TBS_M % 2 == 0),
+          use_2sm,
           cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmNvf4Sm100,
           cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100>,
       cute::conditional_t<
-          (TB_M == 256) && (TBS_M % 2 == 0),
+          use_2sm,
           cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf4Sm100,
           cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf4Sm100>>;
   using EpilogueSchedule = cute::conditional_t<
-      (TB_M == 256) && (TBS_M % 2 == 0),
+      use_2sm,
       cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm,
       cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>;
 
@@ -393,6 +404,17 @@ at::Tensor f4f4bf16_grouped_impl(
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
+  // Determine scale block size from InputQuantType.
+  // NVFP4 and MXFP4_16: 16 elements per scale group.
+  // MXFP4 (standard): 32 elements per scale group.
+  constexpr int scale_block_size =
+      std::is_same_v<InputQuantType, MXFP4> ? 32 : 16;
+
+  // Verify CUTLASS config's SFVecSize matches our scale_block_size
+  // (confirmed at compile time).
+  static_assert(
+      CollectiveMainloop::Sm1xxBlkScaledConfig::SFVecSize == scale_block_size);
+
   const int64_t M = XQ.size(-2);
   const int64_t N = WQ.size(-2);
   const int64_t K = WQ.size(-1) * 2; // 2 FP4 values are packed into uint8
@@ -490,7 +512,8 @@ at::Tensor f4f4bf16_grouped_impl(
                  : nullptr,
         is_nvfp4 ? global_scale_ptr : nullptr,
         reinterpret_cast<int64_t*>(
-            starting_row_after_padding.value().data_ptr()));
+            starting_row_after_padding.value().data_ptr()),
+        scale_block_size);
     // Set the number of groups to the kernel to be at most the number of
     // non-zero rows.
     kernel_groups = int(std::min(M, G));
