@@ -2372,8 +2372,14 @@ class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
         return xq, wq, x_scale, w_scale, offsets
 
     def compute(self, xq, wq, x_scale, w_scale, offsets):
+        # triton_quantize_mx4_unpack returns raw uint8; the op requires the
+        # packed-FP4 and E8M0 dtype views ("XQ must be FP4" otherwise).
         return torch.ops.mslk.f4f4bf16_grouped_mm(
-            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+            xq.view(torch.float4_e2m1fn_x2),
+            wq.view(torch.float4_e2m1fn_x2).transpose(-2, -1),
+            x_scale.view(torch.float8_e8m0fnu),
+            w_scale.view(torch.float8_e8m0fnu),
+            offsets,
         )
 
     @property
@@ -2382,6 +2388,65 @@ class CutlassMXFP4GroupwiseGroupedMm(GemmOpBase):
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
             Accelerator.AMD_GFX950,
+        }
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP4
+
+
+@register_gemm_op
+class CutlassMXFP4_16GroupwiseGroupedMm(GemmOpBase):
+    """
+    MXFP4 grouped matmul with block_size=16 (MXFP4_16).
+
+    Same op as CutlassMXFP4GroupwiseGroupedMm, but quantizes at group_size 16
+    and passes mxfp4_block_size=16, so f4f4bf16_grouped_mm dispatches the
+    MXFP4_16 instantiation (NvF4 schedule, SfVecSize 16, E8M0 scales) instead
+    of the standard 32-element MXFP4 one. Exists so the two block sizes can be
+    compared on identical shapes.
+    """
+
+    def preprocess(self, x, w):
+        wq, w_scale = zip(*[triton_quantize_mx4_unpack(i, group_size=16) for i in w])
+        wq = torch.stack(wq, dim=0).contiguous()  # [G, N, K//2]
+        w_scale = torch.stack(w_scale, dim=0).contiguous()  # [G, N, K//16]
+        return x, wq, w_scale
+
+    def quantize(self, x, wq, w_scale):
+        xq_list, x_scale_list = [], []
+        for xi in x:
+            q, s = triton_quantize_mx4_unpack(xi, group_size=16)
+            xq_list.append(q)
+            x_scale_list.append(s)
+        xq = torch.cat(xq_list, dim=0).contiguous()  # [total_M, K//2]
+        x_scale = torch.stack(x_scale_list, dim=0).contiguous()  # [G, M, K//16]
+        G = len(x)
+        M_each = x[0].shape[0]
+        offsets = torch.arange(
+            M_each, G * M_each + 1, M_each, dtype=torch.int32, device=xq.device
+        )
+        return xq, wq, x_scale, w_scale, offsets
+
+    def compute(self, xq, wq, x_scale, w_scale, offsets):
+        return torch.ops.mslk.f4f4bf16_grouped_mm(
+            xq.view(torch.float4_e2m1fn_x2),
+            wq.view(torch.float4_e2m1fn_x2).transpose(-2, -1),
+            x_scale.view(torch.float8_e8m0fnu),
+            w_scale.view(torch.float8_e8m0fnu),
+            offsets,
+            mxfp4_block_size=16,
+        )
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {
+            Accelerator.NVIDIA_SM100,
+            Accelerator.NVIDIA_SM103,
         }
 
     @property
