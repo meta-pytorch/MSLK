@@ -1957,6 +1957,23 @@ class TritonBF16Int4GroupedShuffled(GemmOpBase):
 
 
 @register_gemm_op
+class TritonFP8Int4Rowwise(CutlassFP8Int4Rowwise):
+    """ROCm Triton FP8xINT4 rowwise GEMM."""
+
+    def compute(self, xq, wq, x_scale, w_scale, w_zp):
+        from mslk.gemm.triton.f8i4bf16_rowwise_gemm import matmul_f8i4bf16_rowwise
+
+        return matmul_f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
+
+    def quantize_and_compute(self, xq, wq, x_scale, w_scale, w_zp):
+        return self.compute(xq, wq, x_scale, w_scale, w_zp)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
+
+
+@register_gemm_op
 class TinyGemmBF16Int4Groupwise(GemmOpBase):
     """
     Mixed Precision BF16 Activations with Int4 Weights using tinygemm.

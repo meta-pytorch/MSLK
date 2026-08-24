@@ -78,6 +78,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "bf16i4bf16_shuffled_grouped(Tensor X, Tensor WQ, Tensor w_scale_group, Tensor w_zero_group, Tensor M_sizes) -> Tensor");
   m.def(
       "bf16i4bf16_shuffled_batched(Tensor X, Tensor WQ, Tensor w_scale, Tensor w_zp) -> Tensor");
+  m.def(
+      "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");
   m.def("preshuffle_i4(Tensor WQ, Tensor w_scale) -> (Tensor, Tensor)");
 #ifdef USE_ROCM
   // Sibling of f8f8bf16_groupwise_grouped taking weights already swizzled into
@@ -113,8 +115,6 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   m.def(
       "f4f4bf16_ultra_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor offsets, Tensor x_global_scale, Tensor w_global_scale, Tensor(a!)? output=None) -> Tensor");
   m.def("bf16x9_gemm(Tensor A, Tensor B, Tensor(a!)? output=None) -> Tensor");
-  m.def(
-      "f8i4bf16_rowwise(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_zp) -> Tensor");
   m.def(
       "f8i4bf16_shuffled(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor w_scale_group) -> Tensor");
   m.def(
