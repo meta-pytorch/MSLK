@@ -22,6 +22,8 @@ from . import (
     flash3,
     flash_mtia,
     flydsl,
+    flydsl_decoder,
+    flydsl_splitk,
     triton_splitk,
 )
 from .attn_bias import (
@@ -60,6 +62,8 @@ MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
+MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
+MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
     cute_blackwell.FwOp,
     cute_blackwell.BwOp,
@@ -986,6 +990,8 @@ __all__ = [
     "MemoryEfficientAttentionFlashMtiaAttentionOp",
     "memory_efficient_attention",
     "MemoryEfficientAttentionCkOp",
+    "MemoryEfficientAttentionFlyDSLDecoderOp",
+    "MemoryEfficientAttentionSplitKFlyDSLOp",
     "MemoryEfficientAttentionCkDecoderOp",
     "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
