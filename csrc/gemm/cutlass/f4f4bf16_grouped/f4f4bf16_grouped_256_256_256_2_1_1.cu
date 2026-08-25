@@ -35,13 +35,7 @@ at::Tensor f4f4bf16_grouped_256_256_256_2_1_1(
         global_scale,
         starting_row_after_padding);
   } else if (mxfp4_block_size == 16) {
-    // NOTE: deliberately 128,128,256,1,1,1 and not this file's own tile shape.
-    // The other MXFP4_16 tile instantiations fault with an illegal memory
-    // access (see mslk/test/gemm/test_mxfp4_16_grouped_mm.py, which was written
-    // to reproduce it), so every MXFP4_16 workload is routed to the one shape
-    // that is known good. This does mean per-name tuning does not select a
-    // tile for MXFP4_16 yet.
-    return f4f4bf16_grouped_impl<MXFP4_16, 128, 128, 256, 1, 1, 1>(
+    return f4f4bf16_grouped_impl<MXFP4_16, 256, 256, 256, 2, 1, 1>(
         XQ,
         WQ,
         x_scale,

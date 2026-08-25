@@ -6,9 +6,12 @@
 # LICENSE file in the root directory of this source tree.
 """Test f4f4bf16_grouped_mm with mxfp4_block_size=16 (offset-based API).
 
-Reproduces the crash seen in MetaShuffling MoE with MXFP4_16:
-- Some workers crash with 'illegal memory access'
-- Pattern suggests certain M_group_size values trigger the issue
+Written to reproduce an 'illegal memory access' seen in MetaShuffling MoE with
+MXFP4_16, which reproduced for M >= 192 per expert. The 2SM epilogue was being
+built with a void C type, which misconfigures its stride layout; the tile
+configs worked around it by routing every MXFP4_16 workload to a single 1SM
+shape. Both are fixed, so the large-M cases below are now a regression guard
+against reintroducing either.
 """
 
 import unittest
@@ -183,6 +186,17 @@ class TestMXFP4_16GroupedMM(unittest.TestCase):
         """Test with N=8192 (w13 GEMM dimension)."""
         print("\ntest_n8192:")
         self._run_test(4, [64, 64, 64, 64], 8192, 4096)
+
+    def test_1sm_tile_small_n_k(self):
+        """E=4, 64 tokens/expert, N=K=2048.
+
+        The only shape family in this file that the heuristic routes to a 1SM
+        tile (`128_64_256_1_1_1`): M <= 64 with N <= 2048 and K <= 2048. Every
+        other case here lands on a 2SM tile, so without this the 1SM MXFP4_16
+        path -- which keeps a void epilogue C type -- would be uncovered.
+        """
+        print("\ntest_1sm_tile_small_n_k:")
+        self._run_test(4, [64, 64, 64, 64], 2048, 2048)
 
     def test_mixed_counts(self):
         """E=32 with varying token counts."""
