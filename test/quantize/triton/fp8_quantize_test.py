@@ -281,6 +281,10 @@ class TestFp8Quantize(unittest.TestCase):
 
         _test_scale_fp8_row((2, 3), torch.device("cuda"))
         _test_scale_fp8_row((2, 3), torch.device("cpu"))
+        # Shapes whose last block of columns is partial, including ones that
+        # take more than one iteration of the kernel's column loop.
+        for shape in [(4, 513), (3, 1000), (2, 1025)]:
+            _test_scale_fp8_row(shape, torch.device("cuda"))
 
     def test_quantize_fp8_group(self) -> None:
         def _test_quantize_fp8_group(
