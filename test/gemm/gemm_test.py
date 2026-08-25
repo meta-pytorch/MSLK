@@ -1366,6 +1366,37 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
 
 
 @skipUnlessRocm()
+class FP8Int4TritonROCmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from mslk.gemm.triton.f8i4bf16_rowwise_gemm import matmul_f8i4bf16_rowwise
+
+        cls.matmul_rowwise = staticmethod(matmul_f8i4bf16_rowwise)
+
+    def test_rowwise_accuracy_and_dispatch(self) -> None:
+        M, N, K, group_size = 1, 256, 1024, 128
+        x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.01
+        xq, x_scale = quantize_fp8_row(x)
+        wq_unpacked, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq_unpacked).contiguous().to(device="cuda")
+        w_scale = w_scale.contiguous().to(device="cuda")
+        w_zp = w_zp.contiguous().to(device="cuda")
+
+        y_direct = self.matmul_rowwise(xq, wq, x_scale, w_scale, w_zp)
+        y_op = torch.ops.mslk.f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
+        x_dequant = xq.float() * x_scale[:, None]
+        w_dequant = (
+            wq_unpacked.reshape(N, -1, group_size).float() * w_scale.T[..., None]
+            + w_zp.T[..., None]
+        ).reshape(N, K)
+        y_ref = (x_dequant @ w_dequant.T).to(torch.bfloat16)
+
+        torch.testing.assert_close(y_direct, y_ref, atol=8.0e-2, rtol=8.0e-2)
+        torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
+
+
+@skipUnlessRocm()
 class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
     """
     Tests for the Triton BF16xINT4 grouped GEMM on AMD GPUs.

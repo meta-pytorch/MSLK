@@ -1069,6 +1069,28 @@ def test_decoder_ck(
     )
 
 
+@rocm_only
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
+@pytest.mark.parametrize("padding", [32, 4096])
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+def test_decoder_flydsl(
+    n_heads: int,
+    kv_heads: Optional[int],
+    padding: int,
+    bsz: int,
+    dtype: str,
+) -> None:
+    _test_decoder(
+        fmha.flydsl_decoder.FwOp,
+        kv_heads=kv_heads,
+        n_heads=n_heads,  # qheads per kv head
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+    )
+
+
 @sm100_or_better_only
 @pytest.mark.parametrize("kv_heads", [1, 2, 16], ids=_kv_heads_label)
 @pytest.mark.parametrize("n_heads", [1, 4, 16])
@@ -1121,6 +1143,130 @@ def test_ck_splitk_decoder(
         bsz=bsz,
         dtype=dtype,
         d=d,
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize(
+    "op",
+    [
+        fmha.flydsl_splitk.FwOp_S1,
+        fmha.flydsl_splitk.FwOp_S2,
+        fmha.flydsl_splitk.FwOp_S4,
+    ],
+)
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
+@pytest.mark.parametrize("n_heads", [16])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1), (32, 1), (4096, 8)])
+def test_flydsl_splitk_decoder(
+    op,
+    kv_heads: Optional[int],
+    n_heads: int,
+    padding: int,
+    bsz: int,
+    dtype: str,
+    d: int,
+) -> None:
+    _test_decoder(
+        op,
+        kv_heads=kv_heads,
+        n_heads=n_heads,
+        padding=padding,
+        bsz=bsz,
+        dtype=dtype,
+        d=d,
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize("dtype", ["f16", "bf16"])
+@pytest.mark.parametrize("n_heads", [1, 16])
+@pytest.mark.parametrize("kv_heads", [1, 2], ids=lambda x: f"kvh{x}")
+@pytest.mark.parametrize("padding, bsz", [(512, 2), (2048, 4), (32, 8)])
+@pytest.mark.parametrize("d", [128, 256])
+def test_flydsl_fp8_decoder(
+    dtype: str,
+    n_heads: int,
+    kv_heads: int,
+    padding: int,
+    bsz: int,
+    d: int,
+) -> None:
+    """Correctness of the FlyDSL native-fp8 paged decode kernel.
+
+    Builds a persistent fp8 paged KV cache with precomputed per-token scales via
+    ``dense_kv_to_fp8_paged``, then runs ``pa_decode_ps_launch`` directly against it —
+    the real fp8-cache usage, not per-call quantization. Covers MQA (kv_heads=1) and
+    GQA (kv_heads>1), compared to a full-precision reference within fp8 tolerance.
+    """
+    from mslk.attention.flydsl.decode.fp8_paged_cache import dense_kv_to_fp8_paged
+    from mslk.attention.flydsl.decode.pa_decode_fp8 import pa_decode_ps_launch
+    from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
+        is_fp8_paged_decode_available,
+    )
+
+    if not is_fp8_paged_decode_available():
+        pytest.skip("FlyDSL native-fp8 paged decode unavailable (needs gfx950)")
+    if d % 16 != 0:
+        pytest.skip("fp8 kernel requires head_dim % 16 == 0")
+    if kv_heads > 1 and n_heads == 1:
+        pytest.skip("GQA needs n_heads (query heads per group) > 1")
+
+    dtype_ = {"f16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    torch.manual_seed(1)
+    dev = "cuda"
+    B, G, Hq, D = bsz, kv_heads, n_heads, d
+
+    # Packed BMGHK for the reference/bias: one KV head per group broadcast to Hq.
+    k_folded = (1, B * padding, G, 1, D)
+    k_shape = (1, B * padding, G, Hq, D)
+    kf = torch.randn(k_folded, dtype=dtype_, device=dev)
+    vf = torch.randn(k_folded, dtype=dtype_, device=dev)
+    k = kf.expand(k_shape)
+    v = vf.expand(k_shape)
+    q = torch.randn((1, B, G, Hq, D), dtype=dtype_, device=dev)
+    seq = torch.randint(1, padding + 1, (B,), dtype=torch.int32, device=dev)
+
+    # Build the fp8 paged cache ONCE (precomputed scales), then run the kernel over it.
+    # Per-batch dense KV [B, padding, G, 1, D] is what the cache builder expects.
+    k_dense = kf[0].unflatten(0, (B, padding))
+    v_dense = vf[0].unflatten(0, (B, padding))
+    key_cache, value_cache, key_scale, value_scale, block_tables = (
+        dense_kv_to_fp8_paged(k_dense, v_dense, block_size=16)
+    )
+    BG = B * G
+    context_lengths = seq.view(B, 1).expand(B, G).reshape(BG).contiguous()
+    q_flat = q.reshape(BG, Hq, D).contiguous()
+    out = torch.zeros(BG, Hq, D, dtype=q.dtype, device=dev)
+    pa_decode_ps_launch(
+        out,
+        q_flat,
+        key_cache,
+        value_cache,
+        context_lengths,
+        float(D**-0.5),
+        key_scale=key_scale,
+        value_scale=value_scale,
+        block_tables=block_tables,
+        max_context_partition_num=0,
+    )
+
+    attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * B,
+        kv_seqlen=seq.tolist(),
+        kv_padding=padding,
+    )
+    ref_output = ref_attention_for_test(q, k, v, attn_bias)
+    out = out.reshape(ref_output.shape)
+
+    # fp8 (e4m3fn) has ~2 mantissa bits -> loose tolerance vs the full-precision ref.
+    assert_allclose(
+        out.to(ref_output.dtype),
+        ref_output,
+        atol=0.2,
+        rtol=0.15,
     )
 
 
@@ -2017,19 +2163,13 @@ def test_triton_splitk_rowwise_fp8(
         inp_ref, op=fmha.triton_splitk.FwOp
     )
 
-    # ROCm gfx950 OCP e4m3fn snaps a few values differently than the fnuz grid, so
-    # loosen tolerances on ROCm only; CUDA keeps the original tight values.
-    is_hip = torch.version.hip is not None
     atol = 5e-3
-    rtol = 5e-3
-    if Hkv == 2 and is_hip:
+    if Hkv == 2 and torch.version.hip is not None:
+        # XXX why is this needed?
         atol = 1e-2
-    torch.testing.assert_close(attn_output_fp8, attn_output_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(attn_output_fp8, attn_output_ref, atol=atol, rtol=5e-3)
     assert context_fp8 is not None and context_ref is not None
-    lse_tol = 5e-3 if is_hip else 5e-4
-    torch.testing.assert_close(
-        context_fp8.lse, context_ref.lse, atol=lse_tol, rtol=lse_tol
-    )
+    torch.testing.assert_close(context_fp8.lse, context_ref.lse, atol=5e-4, rtol=5e-4)
 
     # Paged K/V cache
 
@@ -2043,12 +2183,8 @@ def test_triton_splitk_rowwise_fp8(
     ) = fmha._memory_efficient_attention_forward_requires_grad(
         inp_fp8_paged, op=fmha.triton_splitk.FwOp
     )
-    # Non-paged vs paged fp8 output: a few elements snap to a different e4m3 grid point
-    # between the two layouts on ROCm; CUDA keeps the original tight value. The LSE is
-    # identical between layouts on both platforms, so it keeps the tight tolerance.
-    paged_tol = 5e-3 if is_hip else 2e-3
     torch.testing.assert_close(
-        attn_output_fp8, attn_output_fp8_paged, atol=paged_tol, rtol=paged_tol
+        attn_output_fp8, attn_output_fp8_paged, atol=2e-3, rtol=2e-3
     )
     assert context_fp8_paged is not None
     torch.testing.assert_close(

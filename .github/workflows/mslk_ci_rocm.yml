@@ -37,6 +37,10 @@ on:
       - 'mslk/attention/flydsl/**'
       - 'test/attention/flydsl/**'
       - 'test/flydsl/**'
+      # FlyDSL paged-attention decode backend (fmha op layer) and tests
+      - 'mslk/attention/fmha/flydsl_decoder.py'
+      - 'mslk/attention/fmha/flydsl_splitk.py'
+      - 'test/attention/fmha/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels

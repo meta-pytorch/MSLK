@@ -69,20 +69,21 @@ def _get_configs() -> List[Config]:
         for bn in [32, 64, 128, 256]:
             for bk in [32, 64, 128]:
                 for sk in [1, 2, 4, 8]:
-                    for nw in _num_warps_for_tile(bm, bn):
-                        configs.append(
-                            Config(
-                                {
-                                    "BLOCK_M": bm,
-                                    "BLOCK_N": bn,
-                                    "BLOCK_K": bk,
-                                    "GROUP_SIZE_M": 8,
-                                    "SPLIT_K": sk,
-                                },
-                                num_warps=nw,
-                                num_stages=2,
+                    for gsm in [4, 8]:
+                        for nw in _num_warps_for_tile(bm, bn):
+                            configs.append(
+                                Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "BLOCK_K": bk,
+                                        "GROUP_SIZE_M": gsm,
+                                        "SPLIT_K": sk,
+                                    },
+                                    num_warps=nw,
+                                    num_stages=2,
+                                )
                             )
-                        )
     return configs
 
 
@@ -93,12 +94,14 @@ def _prune_configs(
     M = named_args["M"]
     N = named_args["N"]
     K2 = named_args["K2"]
+    has_x_scale = kwargs.get("HAS_X_SCALE", False)
     pruned = []
     for c in configs:
         bm = c.kwargs["BLOCK_M"]
         bn = c.kwargs["BLOCK_N"]
         bk = c.kwargs["BLOCK_K"]
         sk = c.kwargs.get("SPLIT_K", 1)
+        gsm = c.kwargs.get("GROUP_SIZE_M", 4)
         if group_size % (2 * bk) != 0:
             continue
         if K2 % (bk * sk) != 0:
@@ -106,6 +109,17 @@ def _prune_configs(
         if sk > 1 and M >= 512:
             continue
         if bm > max(M, 32) or bn > max(N, 32):
+            continue
+        if has_x_scale:
+            if bn < 128 and N >= 128:
+                continue
+            if bk > 64:
+                continue
+            if sk == 2:
+                continue
+            if gsm != 4:
+                continue
+        elif gsm != 8:
             continue
         pruned.append(c)
     return pruned
@@ -132,12 +146,13 @@ def _prune_configs(
 )
 @triton.jit
 def _bf16i4_rowwise_kernel(
-    X_even_ptr,  # [M, K//2]  bfloat16 — even K columns of activations
-    X_odd_ptr,  # [M, K//2]  bfloat16 — odd  K columns of activations
+    X_even_ptr,  # [M, K//2]  bfloat16 or FP8 — even K columns of activations
+    X_odd_ptr,  # [M, K//2]  bfloat16 or FP8 — odd  K columns of activations
     W_ptr,  # [N, K//2]  int8 packed (lo nibble = even K, hi = odd K)
-    Y_ptr,  # [M, N]     bfloat16
+    Y_ptr,  # [SPLIT_K, M, N]  float32 workspace
     scale_ptr,  # [num_groups, N]
     zero_ptr,  # [num_groups, N]
+    x_scale_ptr,  # [M] float32 per-row activation scale (used when HAS_X_SCALE)
     M,
     N,
     K2,  # K // 2
@@ -160,6 +175,7 @@ def _bf16i4_rowwise_kernel(
     EVEN_MN: tl.constexpr,
     GRID_MN: tl.constexpr,
     FUSE_DOT: tl.constexpr,
+    HAS_X_SCALE: tl.constexpr,
 ) -> None:
     """
     Computes Y[M, N] = X[M, K] @ dequant(W)[K, N].
@@ -232,10 +248,10 @@ def _bf16i4_rowwise_kernel(
     if EVEN_MN and EVEN_K:
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
         ).to(tl.int32)
@@ -245,12 +261,12 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=k_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=k_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=k_mask,
@@ -263,12 +279,12 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -281,17 +297,19 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
             other=0,
         ).to(tl.int32)
+    x_even = x_even.to(tl.bfloat16)
+    x_odd = x_odd.to(tl.bfloat16)
     group_idx = (k2_slice_start * 2) // group_size
     if EVEN_MN:
         s = tl.load(
@@ -332,12 +350,12 @@ def _bf16i4_rowwise_kernel(
                 X_even_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
             ).to(tl.int32)
@@ -349,14 +367,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_k_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_k_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_k_mask,
@@ -371,14 +389,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_wk_mask,
@@ -393,14 +411,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_wk_mask,
@@ -424,7 +442,20 @@ def _bf16i4_rowwise_kernel(
                 mask=offs_n_raw < N,
             ).to(tl.float32)
 
-        if FUSE_DOT:
+        if HAS_X_SCALE:
+            acc = tl.dot(
+                x_even,
+                tl.trans(w_lo_dq.to(tl.bfloat16)),
+                acc,
+                out_dtype=tl.float32,
+            )
+            acc = tl.dot(
+                x_odd,
+                tl.trans(w_hi_dq.to(tl.bfloat16)),
+                acc,
+                out_dtype=tl.float32,
+            )
+        elif FUSE_DOT:
             # `dim` exists only on newer triton (guarded by FUSE_DOT/_TL_CAT_HAS_DIM);
             # the pinned stable stub lacks it, so Pyre flags the keyword.
             x_fused = tl.cat(x_even, x_odd, dim=1)  # pyre-ignore[28]
@@ -448,12 +479,25 @@ def _bf16i4_rowwise_kernel(
                 out_dtype=tl.float32,
             )
 
+        next_x_even = next_x_even.to(tl.bfloat16)
+        next_x_odd = next_x_odd.to(tl.bfloat16)
+
         # Rotate buffers
         x_even = next_x_even
         x_odd = next_x_odd
         w_q = next_w_q
         s = next_s
         z = next_z
+
+    # ---- per-row activation scale (FP8 path) ----
+    if HAS_X_SCALE:
+        if EVEN_MN:
+            xs = tl.load(x_scale_ptr + offs_m).to(tl.float32)
+        else:
+            xs = tl.load(x_scale_ptr + offs_m, mask=offs_m < M, other=1.0).to(
+                tl.float32
+            )
+        acc = acc * xs[:, None]
 
     # ---- store output ----
     # Write partial sum for this K-slice into workspace[pid_z, m, n].
@@ -565,6 +609,7 @@ def matmul_bf16i4_rowwise(
     # workspace[pid_z]. Allocated with empty (no zeroing) since the reduction kernel
     # only reads slices [0:split_k] — unwritten slices beyond split_k are never touched.
     workspace = torch.empty((_MAX_SPLIT_K, M, N), dtype=torch.float32, device=X.device)
+    _dummy_x_scale = torch.empty(1, dtype=torch.float32, device=X.device)
 
     _bf16i4_rowwise_kernel[grid](
         x_even,
@@ -573,6 +618,7 @@ def matmul_bf16i4_rowwise(
         workspace,
         w_scale_group,
         w_zero_group,
+        _dummy_x_scale,
         M,
         N,
         K2,
@@ -587,6 +633,7 @@ def matmul_bf16i4_rowwise(
         w_scale_group.stride(0),
         w_scale_group.stride(1),
         FUSE_DOT=_TL_CAT_HAS_DIM,
+        HAS_X_SCALE=False,
     )
 
     split_k = _bf16i4_rowwise_kernel.best_config.kwargs["SPLIT_K"]

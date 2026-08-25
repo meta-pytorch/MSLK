@@ -34,7 +34,11 @@ from mslk.flydsl.common import _BUNDLED_AOT_CACHE
 
 # Module paths of AOT-eligible FlyDSL kernel modules. Each must expose
 # AOT_CONFIGS, AOT_ARCHS, and compile_aot_config(config, arch).
-_AOT_KERNEL_MODULES: List[str] = []
+_AOT_KERNEL_MODULES: List[str] = [
+    "mslk.attention.flydsl.decode.pa_decode_dense",
+    "mslk.attention.flydsl.decode.pa_decode_reduce",
+    "mslk.attention.flydsl.decode.pa_decode_fp8",
+]
 
 _DEFAULT_MAX_WORKERS: int = 64
 

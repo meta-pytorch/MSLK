@@ -94,7 +94,8 @@ __global__ void set_grouped_gemm_args_kernel(
 
   // NVFP4 groups 16 elements for a single scale factor, MXFP4 & MXFP8
   // groups 32 elements.
-  const int64_t scale_factor_block_size = global_scale == nullptr ? 32 : 16;
+  // Scale block size from CUTLASS config: NVFP4=16, MXFP4=32, MXFP4_16=16.
+  constexpr int64_t scale_factor_block_size = Sm1xxBlkScaledConfig::SFVecSize;
 
   // Handle offsets API (torch compliant API for 2D-2D and 2D-3D inputs)
   CUDA_KERNEL_ASSERT(

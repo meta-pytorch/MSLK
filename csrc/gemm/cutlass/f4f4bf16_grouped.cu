@@ -243,7 +243,8 @@ Kernel_f4f4bf16_grouped get_kernel_via_tuning(
     std::optional<at::Tensor> offsets = std::nullopt,
     std::optional<at::Tensor> M_sizes = std::nullopt,
     std::optional<at::Tensor> global_scale = std::nullopt,
-    std::optional<at::Tensor> starting_row_after_padding = std::nullopt) {
+    std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
+    int64_t mxfp4_block_size = 32) {
   static TuningCache cache("f4f4bf16_grouped");
 
   M = nextPowerOf2OrRoundUp(M, 1024, 1024);
@@ -266,7 +267,8 @@ Kernel_f4f4bf16_grouped get_kernel_via_tuning(
       offsets,
       M_sizes,
       global_scale,
-      starting_row_after_padding);
+      starting_row_after_padding,
+      mxfp4_block_size);
   return kernel;
 }
 
@@ -283,7 +285,8 @@ at::Tensor dispatch_fp4_grouped_kernel(
     std::optional<at::Tensor> M_sizes = std::nullopt,
     std::optional<at::Tensor> global_scale = std::nullopt,
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
-    bool use_mx = true) {
+    bool use_mx = true,
+    int64_t mxfp4_block_size = 32) {
   TORCH_CHECK(
       offsets.has_value() ^ M_sizes.has_value(),
       "Exactly one of M_sizes or offsets must be present.");
@@ -302,7 +305,8 @@ at::Tensor dispatch_fp4_grouped_kernel(
           offsets,
           M_sizes,
           global_scale,
-          starting_row_after_padding);
+          starting_row_after_padding,
+          mxfp4_block_size);
     }
     return get_kernel_via_heuristics(M, N, K);
   }();
@@ -316,7 +320,8 @@ at::Tensor dispatch_fp4_grouped_kernel(
       offsets,
       M_sizes,
       global_scale,
-      starting_row_after_padding);
+      starting_row_after_padding,
+      mxfp4_block_size);
 }
 
 at::Tensor f4f4bf16_grouped_stacked(
@@ -327,7 +332,8 @@ at::Tensor f4f4bf16_grouped_stacked(
     at::Tensor M_sizes,
     std::optional<at::Tensor> global_scale = std::nullopt,
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
-    bool use_mx = true) {
+    bool use_mx = true,
+    int64_t mxfp4_block_size = 32) {
   int64_t total_M = XQ.size(0);
   int64_t N = WQ.size(1);
   int64_t K = WQ.size(2);
@@ -370,7 +376,8 @@ at::Tensor f4f4bf16_grouped_stacked(
       M_sizes,
       global_scale,
       starting_row_after_padding,
-      use_mx);
+      use_mx,
+      mxfp4_block_size);
 }
 
 at::Tensor f4f4bf16_grouped_mm(
@@ -380,7 +387,8 @@ at::Tensor f4f4bf16_grouped_mm(
     at::Tensor w_scale,
     at::Tensor offsets,
     std::optional<at::Tensor> output_maybe,
-    std::optional<at::Tensor> global_scale = std::nullopt) {
+    std::optional<at::Tensor> global_scale = std::nullopt,
+    int64_t mxfp4_block_size = 32) {
   TORCH_CHECK(offsets.dtype() == at::kInt, "offsets must be int32.");
   TORCH_CHECK(offsets.dim() == 1, "offsets must be 1D tensor.");
   TORCH_CHECK(XQ.is_contiguous(), "XQ must be row major.");
@@ -393,17 +401,23 @@ at::Tensor f4f4bf16_grouped_mm(
   TORCH_CHECK(x_scale.is_contiguous(), "x_scale must be contiguous.");
   TORCH_CHECK(w_scale.is_contiguous(), "w_scale must be contiguous.");
 
-  const bool use_mx = [&]() {
+  // Determine quantization mode: NVFP4 (e4m3 scales + global_scale) or
+  // MXFP4 (e8m0 scales, no global_scale).
+  // mx_mode: 0 = NVFP4, 1 = MXFP4 (bs32), 2 = MXFP4_16 (bs16)
+  const int mx_mode = [&]() {
     if (x_scale.dtype() == at::kFloat8_e4m3fn) {
       TORCH_CHECK(
           global_scale.has_value(), "global_scale must be provided for NVFP4.")
       TORCH_CHECK(
           global_scale->dtype() == at::kFloat, "global_scale must be FP32.")
-      return false;
+      return 0;
     } else if (x_scale.dtype() == at::kFloat8_e8m0fnu) {
       TORCH_CHECK(
           !global_scale.has_value(), "global_scale must be unset for MXFP4.")
-      return true;
+      TORCH_CHECK(
+          mxfp4_block_size == 16 || mxfp4_block_size == 32,
+          "mxfp4_block_size must be 16 or 32.")
+      return mxfp4_block_size == 16 ? 2 : 1;
     } else {
       TORCH_CHECK(
           false, "Scales must be FP8 e8m0 for MXFP4 or FP8 e4m3 for NVFP4")
@@ -469,7 +483,8 @@ at::Tensor f4f4bf16_grouped_mm(
       std::nullopt, // M_sizes
       global_scale,
       std::nullopt, // starting_row_after_padding
-      use_mx);
+      mx_mode > 0,
+      mxfp4_block_size);
 }
 
 #else
@@ -481,7 +496,8 @@ at::Tensor f4f4bf16_grouped_mm(
     at::Tensor w_scale,
     at::Tensor offsets,
     std::optional<at::Tensor> output,
-    std::optional<at::Tensor> global_scale = std::nullopt) {
+    std::optional<at::Tensor> global_scale = std::nullopt,
+    int64_t mxfp4_block_size = 32) {
   throw std::runtime_error(
       "CUDA version is older than 12.8"); // requires CUDA>=12.8
 }
@@ -494,7 +510,8 @@ at::Tensor f4f4bf16_grouped_stacked(
     at::Tensor M_sizes,
     std::optional<at::Tensor> global_scale = std::nullopt,
     std::optional<at::Tensor> starting_row_after_padding = std::nullopt,
-    bool use_mx = true) {
+    bool use_mx = true,
+    int64_t mxfp4_block_size = 32) {
   throw std::runtime_error(
       "CUDA version is older than 12.8"); // requires CUDA>=12.8
 }
