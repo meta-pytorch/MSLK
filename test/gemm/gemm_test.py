@@ -168,15 +168,17 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
 
 
 def _fp8_gemm_cases() -> list[tuple]:
-    modes = ["rowwise"] + (
-        # Blockwise fp8 GEMM is numerically broken on AMD/MI300 (~99% relative
-        # RMS error at all K); the loose tolerance only masked it while K was
-        # small. Keep it NVIDIA-only until the CK kernel
-        # (mslk/csrc/gemm/ck/fp8_blockwise_gemm.hip) is fixed. See T275007617.
-        ["blockwise"]
-        if torch.version.cuda is not None and compute_capability_in(9, 9)
-        else []
-    )
+    # Blockwise FP8 GEMM support:
+    #  * CUDA (SM90): CUTLASS blockwise kernel.
+    #  * ROCm: FlyDSL blockwise kernel (mslk/gemm/flydsl/fp8_blockwise_gemm.py),
+    #    which replaced the numerically broken CK DeviceGemmMultiD_ABScale kernel.
+    #    Gated on FlyDSL availability since it is the ROCm implementation.
+    from mslk.flydsl.common import is_flydsl_available
+
+    blockwise_supported = (
+        torch.version.cuda is not None and compute_capability_in(9, 9)
+    ) or (torch.version.hip is not None and is_flydsl_available())
+    modes = ["rowwise"] + (["blockwise"] if blockwise_supported else [])
 
     def case(
         M: int,
@@ -3543,6 +3545,48 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLBlockwisePreshuffleGemmTest(unittest.TestCase):
+    """Companion of the blockwise mode in ``test_gemm``: exercises the
+    ``f8f8bf16_blockwise_preshuffle`` op (B pre-swizzled into the MFMA layout)
+    against a pure-torch block-scale reference, including M-tail shapes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @parameterized.expand(
+        [
+            (1, 512, 256),  # M-tail: single row
+            (33, 512, 256),  # M-tail: ragged
+            (256, 128, 256),  # small
+            (2048, 256, 4096),  # skinny K
+            (2048, 2048, 4096),  # medium
+            (4096, 4096, 8192),  # large
+        ]
+    )
+    def test_gemm(self, M: int, K: int, N: int) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_block(x, 128, 128)
+        wq, w_scale = quantize_fp8_block(
+            w, 128, 128, output_device=torch.device(self.device)
+        )
+
+        out = torch.ops.mslk.f8f8bf16_blockwise_preshuffle(
+            xq, preshuffle_b_mfma(wq), x_scale, w_scale, 128, 128, 128
+        )
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.3e-1, rtol=1.3e-1)
 
 
 if __name__ == "__main__":

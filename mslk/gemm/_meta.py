@@ -723,6 +723,30 @@ if (
         return torch.empty((total_M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
+if hasattr(torch.ops.mslk, "f8f8bf16_blockwise_preshuffle"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_blockwise_preshuffle")
+    def _f8f8bf16_blockwise_preshuffle_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        block_m: int = 128,
+        block_n: int = 128,
+        block_k: int = 128,
+    ) -> torch.Tensor:
+        # Lives here (not beside the FlyDSL kernel) so shape inference doesn't
+        # require depending on //mslk/mslk/gemm:flydsl_ops.
+        x_dims = XQ.dim()
+        N = WQ.shape[0]
+        if x_dims == 2:
+            M = XQ.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+        B = XQ.shape[0]
+        M = XQ.shape[1]
+        return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
 if hasattr(torch.ops.mslk, "f8f8bf16_groupwise_grouped_preshuffle"):
 
     @torch.library.register_fake("mslk::f8f8bf16_groupwise_grouped_preshuffle")

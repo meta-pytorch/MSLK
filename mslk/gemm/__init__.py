@@ -142,3 +142,63 @@ if torch.version.hip is not None:
 
         except RuntimeError:
             pass  # already registered (e.g. module imported more than once)
+
+    if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
+        # ROCm blockwise FP8 GEMM: the CK DeviceGemmMultiD_ABScale kernel is
+        # retired (it was numerically broken on gfx942/gfx950), and FlyDSL is the
+        # implementation. The C++ schema stays platform-agnostic; the C++ op impl
+        # is CUDA-only (see gemm_ops.cpp), so registering the ROCm impl here does
+        # not double-register. Resolved on first call so registration never
+        # imports FlyDSL (keeping the wheel out of every mslk.gemm consumer).
+        #
+        # The _preshuffle sibling (ROCm-only schema) shares this kernel via
+        # b_preshuffled=True for callers that cache the swizzled weight.
+        @functools.lru_cache(maxsize=1)
+        def _blockwise_module() -> ModuleType:
+            from mslk.flydsl.common import is_flydsl_available
+
+            if not is_flydsl_available():
+                raise RuntimeError(
+                    "mslk::f8f8bf16_blockwise on ROCm requires the FlyDSL backend. "
+                    "Add //mslk/mslk/gemm:flydsl_ops to your target's deps."
+                )
+            return importlib.import_module("mslk.gemm.flydsl.fp8_blockwise_gemm")
+
+        try:
+
+            @torch.library.impl("mslk::f8f8bf16_blockwise", "CUDA")
+            def _f8f8bf16_blockwise_rocm(
+                XQ: torch.Tensor,
+                WQ: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_scale: torch.Tensor,
+                block_m: int = 128,
+                block_n: int = 128,
+                block_k: int = 128,
+            ) -> torch.Tensor:
+                return _blockwise_module().matmul_f8f8bf16_blockwise(
+                    XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
+                )
+
+        except RuntimeError:
+            pass  # already registered (e.g. module imported more than once)
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_blockwise_preshuffle"):
+            try:
+
+                @torch.library.impl("mslk::f8f8bf16_blockwise_preshuffle", "CUDA")
+                def _f8f8bf16_blockwise_preshuffle_rocm(
+                    XQ: torch.Tensor,
+                    WQ: torch.Tensor,
+                    x_scale: torch.Tensor,
+                    w_scale: torch.Tensor,
+                    block_m: int = 128,
+                    block_n: int = 128,
+                    block_k: int = 128,
+                ) -> torch.Tensor:
+                    return _blockwise_module().matmul_f8f8bf16_blockwise_preshuffle(
+                        XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
+                    )
+
+            except RuntimeError:
+                pass  # already registered (e.g. module imported more than once)
