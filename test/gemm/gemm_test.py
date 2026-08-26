@@ -168,11 +168,8 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
 
 
 def _fp8_gemm_cases() -> list[tuple]:
-    # Blockwise FP8 GEMM support:
-    #  * CUDA (SM90): CUTLASS blockwise kernel.
-    #  * ROCm: FlyDSL blockwise kernel (mslk/gemm/flydsl/fp8_blockwise_gemm.py),
-    #    which replaced the numerically broken CK DeviceGemmMultiD_ABScale kernel.
-    #    Gated on FlyDSL availability since it is the ROCm implementation.
+    # Blockwise FP8 GEMM: CUDA uses CUTLASS; ROCm uses the FlyDSL kernel that
+    # replaced the broken CK kernel (gated on FlyDSL availability).
     from mslk.flydsl.common import is_flydsl_available
 
     blockwise_supported = (

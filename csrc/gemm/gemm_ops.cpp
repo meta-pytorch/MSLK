@@ -85,10 +85,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
   // module via torch.library.impl at Python import time.
   m.def(
       "f8f8bf16_groupwise_grouped_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor M_sizes) -> Tensor");
-  // Sibling of f8f8bf16_blockwise taking weights already swizzled into the MFMA
-  // B layout (mslk.quantize.shuffle.preshuffle_b_mfma); schema only on ROCm,
-  // implemented by the FlyDSL blockwise module via torch.library.impl at Python
-  // import time.
+  // Sibling of f8f8bf16_blockwise taking MFMA-preshuffled weights
+  // (mslk.quantize.shuffle.preshuffle_b_mfma); ROCm-only, implemented by FlyDSL.
   m.def(
       "f8f8bf16_blockwise_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, int block_m=128, int block_n=128, int block_k=128) -> Tensor");
   m.def(
@@ -133,9 +131,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 #if !defined(USE_MTIA)
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
 #ifndef USE_ROCM
-  // On ROCm, f8f8bf16_blockwise is implemented by FlyDSL and registered from
-  // Python (mslk/gemm/__init__.py); the CK kernel has been retired. On CUDA it
-  // remains the C++ CUTLASS kernel.
+  // On ROCm this op is implemented by FlyDSL (registered from Python); the CK
+  // kernel is retired. On CUDA it stays the C++ CUTLASS kernel.
   m.impl("f8f8bf16_blockwise", f8f8bf16_blockwise);
 #endif
   m.impl("f8f8bf16_rowwise", f8f8bf16_rowwise);

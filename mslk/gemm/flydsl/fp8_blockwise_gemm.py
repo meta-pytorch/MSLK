@@ -50,15 +50,12 @@ from mslk.flydsl.jit import run_compiled
 # chosen per call (fixed default, or autotune when MSLK_AUTOTUNE_ENABLE).
 _SCALE_BLOCK = 128
 
-# Default tile when autotuning is disabled. tile_n=tile_k=128 divide every
-# supported (128-aligned) N/K, and tile_m tiles M via partial-tile masking. This
-# is the CI / CUDA-graph-capture-safe path (compiled once, then replayed).
+# Default tile when autotuning is disabled; divides every 128-aligned N/K and is
+# CUDA-graph-capture-safe (compiled once, then replayed).
 _DEFAULT_TILE = (128, 128, 128)
 
-# Candidate tiles swept by autotune. tile_n/tile_k are pinned to the scale-block
-# granularity (128) so a tile never straddles a scale block; tile_m is free.
-# Configs that overflow LDS (e.g. (256,256,128) on the plain-B path) are rejected
-# at compile and skipped by the selector.
+# Candidate tiles swept by autotune (tile_n/tile_k pinned to the 128 scale-block
+# granularity). Configs that overflow LDS are rejected at compile and skipped.
 _AUTOTUNE_TILES = (
     (64, 128, 128),
     (128, 128, 128),
@@ -111,17 +108,8 @@ def _launch_kernel(
     return output
 
 
-# ---------------------------------------------------------------------------
-# Tile autotune (opt-in via MSLK_AUTOTUNE_ENABLE) -- Phase B path.
-#
-# The tuner is used only to *select* the winning tile once per shape bucket; the
-# selection is cached and every subsequent call takes the same low-overhead
-# direct-launch path as the fixed default (a runtime autotuner wrapper's per-call
-# Python dispatch dominates the tens-of-microseconds runtime of small GEMMs and
-# can make the tuned path slower than the fixed default). Selection
-# compiles/synchronizes, so it must run outside CUDA-graph capture (the first,
-# warm-up call); cache hits are capture-safe.
-# ---------------------------------------------------------------------------
+# Tile autotune (opt-in via MSLK_AUTOTUNE_ENABLE): select the best tile once per
+# shape bucket, cache it, then always take the low-overhead direct-launch path.
 _TILE_CACHE: dict = {}
 
 
@@ -183,9 +171,7 @@ def _select_tile(XQ, WQ, x_scale, w_scale, output, m, n, k, b_preshuffled):
     return best_tile
 
 
-# ---------------------------------------------------------------------------
-# Public dispatch
-# ---------------------------------------------------------------------------
+# ---- Public dispatch ----
 
 
 def _dispatch_blockwise(
@@ -287,8 +273,5 @@ def matmul_f8f8bf16_blockwise_preshuffle(
     )
 
 
-# This module registers nothing. mslk::f8f8bf16_blockwise[_preshuffle] are
-# registered in mslk/gemm/__init__.py (on ROCm), whose impls import this module
-# on the first call -- the same opt-in pattern used for
-# f8f8bf16_groupwise_grouped, which keeps the FlyDSL wheel out of every binary
-# that merely imports mslk.gemm.
+# This module registers nothing: mslk::f8f8bf16_blockwise[_preshuffle] are
+# registered (lazily) in mslk/gemm/__init__.py, keeping FlyDSL an opt-in dep.

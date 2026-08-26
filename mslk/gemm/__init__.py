@@ -144,15 +144,8 @@ if torch.version.hip is not None:
             pass  # already registered (e.g. module imported more than once)
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
-        # ROCm blockwise FP8 GEMM: the CK DeviceGemmMultiD_ABScale kernel is
-        # retired (it was numerically broken on gfx942/gfx950), and FlyDSL is the
-        # implementation. The C++ schema stays platform-agnostic; the C++ op impl
-        # is CUDA-only (see gemm_ops.cpp), so registering the ROCm impl here does
-        # not double-register. Resolved on first call so registration never
-        # imports FlyDSL (keeping the wheel out of every mslk.gemm consumer).
-        #
-        # The _preshuffle sibling (ROCm-only schema) shares this kernel via
-        # b_preshuffled=True for callers that cache the swizzled weight.
+        # ROCm blockwise FP8 GEMM (CK retired, C++ op is CUDA-only): FlyDSL impl,
+        # resolved on first call so registration never imports FlyDSL.
         @functools.lru_cache(maxsize=1)
         def _blockwise_module() -> ModuleType:
             from mslk.flydsl.common import is_flydsl_available

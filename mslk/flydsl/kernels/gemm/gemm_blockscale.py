@@ -141,9 +141,8 @@ def make_compute_tile_blockwise(
                 s_b_vals.append(sbv)
 
             if _is_gfx950:
-                # Wide 16x16x128 MFMA with neutral E8M0 (no-op HW scale);
-                # accumulate the whole scale block, then apply the FP32 scale
-                # once in software.
+                # Wide 16x16x128 MFMA with neutral E8M0 scale; accumulate the
+                # whole scale block, then apply the FP32 scale in software.
                 combined_scales = []
                 for mi in range_constexpr(m_repeat):
                     mi_combined = []
@@ -428,9 +427,8 @@ def compile_fp8_blockwise_gemm(
         d_rsrc = buffer_ops.create_buffer_resource(
             arg_d, max_size=False, num_records_bytes=m_in * n_in * fx.Index(2)
         )
-        # scale_a: [ceil(M/scale_block_m), scale_k] FP32, element (mb, kb) at
-        # mb*scale_k + kb. scale_b: [scale_n, scale_k] FP32, element (nb, kb) at
-        # nb*scale_k + kb.
+        # scale_a [ceil(M/scale_block_m), scale_k] at mb*scale_k+kb;
+        # scale_b [scale_n, scale_k] at nb*scale_k+kb (both FP32).
         sa_rows = (m_in + fx.Index(scale_block_m - 1)) // fx.Index(scale_block_m)
         sa_rsrc = buffer_ops.create_buffer_resource(
             arg_scale_a,
@@ -553,17 +551,15 @@ def compile_fp8_blockwise_gemm(
 
         mfma_res_ty = T.f32x4
 
-        # Per-fragment M scale-block index: fragment mi covers rows
-        # [bx_m + mi*16, bx_m + mi*16 + 16), which lie in one 128-row scale block
+        # Per-fragment M scale-block index: mi's 16 rows lie in one scale block
         # (16 | scale_block_m), so m_blk is a single scalar per mi.
         m_blk_list = []
         for mi in range_constexpr(m_repeat):
             m_row0 = bx_m + fx.Index(mi * 16)
             m_blk_list.append(m_row0 // fx.Index(scale_block_m))
 
-        # ---- compute_tile: native 2D block scaling ----
-        # Built by a module-level factory so its Python control flow is not
-        # AST-rewritten by @flyc.kernel (see make_compute_tile_blockwise).
+        # compute_tile (native 2D block scaling): built by a module-level factory
+        # so its Python control flow isn't AST-rewritten by @flyc.kernel.
         compute_tile = make_compute_tile_blockwise(
             _is_gfx950=_is_gfx950,
             sb_per_tile=sb_per_tile,
