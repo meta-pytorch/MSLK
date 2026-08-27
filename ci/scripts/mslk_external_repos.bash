@@ -28,7 +28,7 @@ fetch_external_repos () {
   print_exec pushd "${mslk_root}/external"  || return 1
 
   declare -A repos=(
-    ["composable_kernel"]="https://github.com/ROCm/composable_kernel.git@7fe50dc3da2069d6645d9deb8c017a876472a977"
+    ["composable_kernel"]="https://github.com/ROCm/composable_kernel.git@fcc9372c009c8e0a23fece77b582da83b04a654f"
     ["cutlass"]="https://github.com/jwfromm/cutlass.git@571edeb2d0ac872a8392fc49285b156b07884b4e"
     ["hipify_torch"]="https://github.com/ROCmSoftwarePlatform/hipify_torch.git@63b6a7b541fa7f08f8475ca7d74054db36ff2691"
   )

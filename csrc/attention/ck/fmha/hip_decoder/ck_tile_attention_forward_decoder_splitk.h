@@ -83,8 +83,14 @@ struct ForwardDecoderSplitKArgument {
   const int32_t split_k;
 };
 
-template <typename scalar_t, int32_t vec_size = 4, typename compute_t = float>
+template <
+    typename scalar_t,
+    int32_t vec_size = 4,
+    typename compute_t = float,
+    int32_t BlockSize = 64>
 struct ForwardDecoderSplitKReduceKernelImpl {
+  static constexpr int32_t kBlockSize = BlockSize;
+
   CK_TILE_DEVICE void operator()(
       ForwardDecoderSplitKArgument<scalar_t, compute_t> arg) {
     // Each block handles a single batch and head and query and group
@@ -178,8 +184,11 @@ template <
     int32_t n_loop_unroll,
     int32_t n_loop_unroll_tail,
     int32_t KV_M_MAX,
-    typename compute_t>
+    typename compute_t,
+    int32_t BlockSize>
 struct ForwardDecoderSplitKAttnKernelImpl {
+  static constexpr int32_t kBlockSize = BlockSize;
+
   CK_TILE_DEVICE void operator()(
       ForwardDecoderSplitKArgument<scalar_t, compute_t> arg) {
     static_assert(

@@ -46,6 +46,7 @@ struct batched_forward_mask_bias_dropout_dispatch {
       false, // kIsGroupMode
       AttentionVariant<FmhaTraits>,
       FmhaMask,
+      false, // kUseTrLoad
       FmhaTraits>;
 
   static void Run(BatchedForwardParams& param, hipStream_t stream) {
@@ -90,7 +91,7 @@ struct batched_forward_mask_bias_dropout_dispatch {
               false, // kHasBiasGrad place-holder
               true, // kStoreLSE
               kHasDropout,
-              false, // kDoFp8StaticQuant place-holder
+              ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,
               occupancy>;
 
           using FmhaPipelineProblem =
@@ -99,7 +100,7 @@ struct batched_forward_mask_bias_dropout_dispatch {
           using FmhaFwdPipeline_ = std::conditional_t<
               MaxK <= 256,
               ck_tile::BlockFmhaPipelineQRKSVS<FmhaPipelineProblem>,
-              ck_tile::BlockFmhaPipelineQSKSVS<FmhaPipelineProblem>>;
+              MslkBlockFmhaPipelineQSKSVS<FmhaPipelineProblem>>;
 
           using FmhaFwdEpilogue_ =
               ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
@@ -123,6 +124,9 @@ struct batched_forward_mask_bias_dropout_dispatch {
           param.k_ptr,
           param.v_ptr,
           param.attn_bias_ptr,
+          nullptr, // q_descale_ptr
+          nullptr, // k_descale_ptr
+          nullptr, // v_descale_ptr
           nullptr, // rand_val_ptr
           param.logsumexp_ptr,
           param.out_ptr,
@@ -133,8 +137,6 @@ struct batched_forward_mask_bias_dropout_dispatch {
           param.Hq, // nhead_q
           param.Hq / param.Hkv, // nhead_ratio_qk
           param.scale,
-          1.0f, // scale_p
-          1.0f, // scale_o
           0.0f, // logits_soft_cap
           param.q_strides[1], // q, k, v, bias, randval, out tensor seq-dim
                               // stride
@@ -162,6 +164,7 @@ struct batched_forward_mask_bias_dropout_dispatch {
           (param.window_size > 0) ? param.window_size - 1
                                   : -1, // window_left_size
           (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+          0, // sink_size
           param.custom_mask_type,
           param.dropout_prob, // dropout ratio
           false, // is_store_randval
@@ -170,12 +173,12 @@ struct batched_forward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize =
         FmhaFwdKernel::GridSize(param.B, param.Hq, param.M, param.Kv, false);
-    constexpr dim3 kBlockSize = FmhaFwdKernel::BlockSize();
+    const dim3 kBlockSize = FmhaFwdKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaFwdKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaFwdKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 };

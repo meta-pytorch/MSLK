@@ -82,12 +82,12 @@ at::Tensor rand_uniform_int(
         static_cast<int>(num_heads),
         static_cast<int>(M),
         static_cast<int>(N));
-    constexpr dim3 kBlockSize = FmhaRandUniformKernel_::BlockSize();
+    const dim3 kBlockSize = FmhaRandUniformKernel_::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaRandUniformKernel_::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaRandUniformKernel_{}, kGridSize, kBlockSize, 0, kargs));
   }
 
