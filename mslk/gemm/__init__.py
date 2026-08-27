@@ -143,3 +143,56 @@ if torch.version.hip is not None:
 
         except RuntimeError:
             pass  # already registered (e.g. module imported more than once)
+
+    if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
+        # ROCm blockwise FP8 GEMM (CK retired, C++ op is CUDA-only): FlyDSL impl,
+        # resolved on first call so registration never imports FlyDSL.
+        @functools.lru_cache(maxsize=1)
+        def _blockwise_module() -> ModuleType:
+            from mslk.flydsl.common import is_flydsl_available
+
+            if not is_flydsl_available():
+                raise RuntimeError(
+                    "mslk::f8f8bf16_blockwise on ROCm requires the FlyDSL backend. "
+                    "Add //mslk/mslk/gemm:flydsl_ops to your target's deps."
+                )
+            return importlib.import_module("mslk.gemm.flydsl.fp8_blockwise_gemm")
+
+        try:
+
+            @torch.library.impl("mslk::f8f8bf16_blockwise", "CUDA")
+            def _f8f8bf16_blockwise_rocm(
+                XQ: torch.Tensor,
+                WQ: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_scale: torch.Tensor,
+                block_m: int = 128,
+                block_n: int = 128,
+                block_k: int = 128,
+            ) -> torch.Tensor:
+                return _blockwise_module().matmul_f8f8bf16_blockwise(
+                    XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
+                )
+
+        except RuntimeError:
+            pass  # already registered (e.g. module imported more than once)
+
+        if hasattr(torch.ops.mslk, "f8f8bf16_blockwise_preshuffle"):
+            try:
+
+                @torch.library.impl("mslk::f8f8bf16_blockwise_preshuffle", "CUDA")
+                def _f8f8bf16_blockwise_preshuffle_rocm(
+                    XQ: torch.Tensor,
+                    WQ: torch.Tensor,
+                    x_scale: torch.Tensor,
+                    w_scale: torch.Tensor,
+                    block_m: int = 128,
+                    block_n: int = 128,
+                    block_k: int = 128,
+                ) -> torch.Tensor:
+                    return _blockwise_module().matmul_f8f8bf16_blockwise_preshuffle(
+                        XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
+                    )
+
+            except RuntimeError:
+                pass  # already registered (e.g. module imported more than once)

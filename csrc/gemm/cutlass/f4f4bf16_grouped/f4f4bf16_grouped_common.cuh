@@ -252,12 +252,16 @@ at::Tensor f4f4bf16_grouped_impl(
   // Sm90ScalarBroadcastPtrArray: it requires non-void C type to maintain proper
   // stride layout for pointer-array access. For MXFP4, we can safely use void C
   // type since it doesn't use alpha_ptr_array.
-  using EpilogueElementC = cute::conditional_t<is_nvfp4, ElementC, void>;
+  // 2SM epilogue requires non-void C type for proper stride layout.
+  // MXFP4 1SM can use void C, but MXFP4_16 needs 2SM support, so
+  // use non-void C for both NVFP4 and MXFP4_16 when 2SM is selected.
+  static constexpr bool needs_nonvoid_c = is_nvfp4 || use_2sm;
+  using EpilogueElementC = cute::conditional_t<needs_nonvoid_c, ElementC, void>;
   using EpilogueLayoutC = cute::conditional_t<
-      is_nvfp4,
+      needs_nonvoid_c,
       typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
       void>;
-  static constexpr int EpilogueAlignmentC = is_nvfp4 ? AlignmentC : 0;
+  static constexpr int EpilogueAlignmentC = needs_nonvoid_c ? AlignmentC : 0;
 
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
