@@ -310,15 +310,26 @@ set_clang_symlinks () {
 
 __fetch_cuda_version_array () {
   local env_name="$1"
-  # shellcheck disable=SC2155
-  local env_prefix=$(env_name_or_prefix "${env_name}")
+  local env_prefix
+  env_prefix=$(env_name_or_prefix "${env_name}") || return 1
 
-  # shellcheck disable=SC2155,SC2086
-  local cuda_version=$(conda run ${env_prefix} nvcc --version | sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p')
+  local nvcc_version_output
+  # shellcheck disable=SC2086
+  if ! nvcc_version_output=$(conda run ${env_prefix} nvcc --version); then
+    echo "[INFO] Could not query NVCC in Conda environment ${env_name}!" >&2
+    return 1
+  fi
+
+  local cuda_version
+  cuda_version=$(sed -n 's/^.*release \([0-9]\+\.[0-9]\+\).*$/\1/p' <<< "${nvcc_version_output}")
+  if [[ ! "${cuda_version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "[INFO] Could not extract CUDA version from Conda NVCC output!" >&2
+    return 1
+  fi
   echo "[INFO] Extracted CUDA version: ${cuda_version}"
 
-  # shellcheck disable=SC2206
-  export cuda_version_arr=(${cuda_version//./ })
+  # shellcheck disable=SC2034
+  IFS=. read -r -a cuda_version_arr <<< "${cuda_version}"
 }
 
 __fetch_rocm_version_array () {
