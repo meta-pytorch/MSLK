@@ -172,6 +172,17 @@ if(mslk_hip_fmha_built)
   target_compile_definitions(mslk PRIVATE MSLK_HIP_FMHA_ENABLED)
 endif()
 
+# CUTLASS moved the SM100 FP8 MMA parameters off MMA_Traits and onto the op, so
+# SM100_MMA_F8F6F4_SS became a class template rather than a bare tag. Turn this
+# ON for a CUTLASS carrying the newer form. It cannot be derived from
+# CUTLASS_MAJOR: some trees report major 4 while still declaring the bare tag.
+option(MSLK_FMHA_F8F6F4_SS_IS_TEMPLATE
+  "Pinned CUTLASS declares SM100_MMA_F8F6F4_SS as a class template" OFF)
+
+if(MSLK_FMHA_F8F6F4_SS_IS_TEMPLATE)
+  target_compile_definitions(mslk PRIVATE MSLK_FMHA_F8F6F4_SS_IS_TEMPLATE)
+endif()
+
 ################################################################################
 # Install Shared Library and Python Files
 ################################################################################
