@@ -79,6 +79,117 @@ using FmhaFwdWarpTile1 = ck_tile::sequence<32, 32, 16>;
 using FmhaFwdWarpTile2 = ck_tile::sequence<16, 16, 16>;
 using FmhaFwdWarpTile3 = ck_tile::sequence<16, 16, 32>;
 
+template <typename Base>
+struct MslkBlockFmhaPipelineAdapter : Base {
+  using Base::operator();
+
+  template <
+      typename QDramBlockWindow,
+      typename KDramBlockWindow,
+      typename VDramBlockWindow,
+      typename BiasDramBlockWindow,
+      typename RandValDramBlockWindow,
+      typename LSEDramBlockWindow,
+      typename Mask,
+      typename PositionEncoding,
+      typename AttentionVariant,
+      typename AttentionVariantParams,
+      typename BlockIndices,
+      typename Dropout,
+      typename SinkValue>
+  CK_TILE_HOST_DEVICE auto operator()(
+      const QDramBlockWindow& q_dram_block_window,
+      const KDramBlockWindow& k_dram_block_window,
+      const VDramBlockWindow& v_dram_block_window,
+      const BiasDramBlockWindow& bias_dram_block_window,
+      RandValDramBlockWindow& randval_dram_block_window,
+      LSEDramBlockWindow& lse_dram_block_window,
+      Mask mask,
+      PositionEncoding position_encoding,
+      float scale_s,
+      const AttentionVariant& variant,
+      const AttentionVariantParams& variant_params,
+      const BlockIndices& block_indices,
+      void* smem_ptr,
+      Dropout& dropout,
+      const SinkValue&) const {
+    return Base::operator()(
+        q_dram_block_window,
+        k_dram_block_window,
+        v_dram_block_window,
+        bias_dram_block_window,
+        randval_dram_block_window,
+        lse_dram_block_window,
+        mask,
+        position_encoding,
+        scale_s,
+        variant,
+        variant_params,
+        block_indices,
+        smem_ptr,
+        dropout);
+  }
+
+  template <
+      typename QDramBlockWindow,
+      typename KDramBlockWindow,
+      typename VDramBlockWindow,
+      typename BiasDramBlockWindow,
+      typename RandValDramBlockWindow,
+      typename LSEDramBlockWindow,
+      typename Mask,
+      typename PositionEncoding,
+      typename AttentionVariant,
+      typename AttentionVariantParams,
+      typename BlockIndices,
+      typename Dropout,
+      typename SinkValue,
+      typename BlockMaskRowPtr>
+  CK_TILE_HOST_DEVICE auto operator()(
+      const QDramBlockWindow& q_dram_block_window,
+      const KDramBlockWindow& k_dram_block_window,
+      const VDramBlockWindow& v_dram_block_window,
+      const BiasDramBlockWindow& bias_dram_block_window,
+      RandValDramBlockWindow& randval_dram_block_window,
+      LSEDramBlockWindow& lse_dram_block_window,
+      Mask mask,
+      PositionEncoding position_encoding,
+      float scale_s,
+      const AttentionVariant& variant,
+      const AttentionVariantParams& variant_params,
+      const BlockIndices& block_indices,
+      void* smem_ptr,
+      Dropout& dropout,
+      const SinkValue& sink_value,
+      const BlockMaskRowPtr&) const {
+    return (*this)(
+        q_dram_block_window,
+        k_dram_block_window,
+        v_dram_block_window,
+        bias_dram_block_window,
+        randval_dram_block_window,
+        lse_dram_block_window,
+        mask,
+        position_encoding,
+        scale_s,
+        variant,
+        variant_params,
+        block_indices,
+        smem_ptr,
+        dropout,
+        sink_value);
+  }
+};
+
+template <typename Problem>
+using MslkBlockFmhaPipelineQSKSVS = MslkBlockFmhaPipelineAdapter<
+    ck_tile::BlockFmhaPipelineQSKSVS<Problem>>;
+
+template <typename Problem>
+using MslkBlockFmhaPipelineQRKSVSWholeKPrefetch =
+    MslkBlockFmhaPipelineAdapter<
+        ck_tile::BlockFmhaPipelineQRKSVSWholeKPrefetch<Problem>>;
+
 template <ck_tile::index_t MaxK, ck_tile::index_t MTile>
 struct FmhaFwdShape;
 

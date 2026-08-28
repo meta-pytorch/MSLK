@@ -362,6 +362,7 @@ struct grouped_infer_splitkv_smallq_mask_bias_dropout_dispatch {
             (param.window_size > 0) ? param.window_size - 1
                                     : -1, // window_left_size
             (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+            0, // sink_size
             param.custom_mask_type);
       else
         return FmhaFwdSplitKVKernel::MakeKargs(
@@ -409,6 +410,7 @@ struct grouped_infer_splitkv_smallq_mask_bias_dropout_dispatch {
             (param.window_size > 0) ? param.window_size - 1
                                     : -1, // window_left_size
             (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+            0, // sink_size
             param.custom_mask_type);
     }();
 
@@ -419,12 +421,12 @@ struct grouped_infer_splitkv_smallq_mask_bias_dropout_dispatch {
         param.max_seqlen_q,
         param.Kv,
         param.num_kv_splits);
-    constexpr dim3 kBlockSize = FmhaFwdSplitKVKernel::BlockSize();
+    const dim3 kBlockSize = FmhaFwdSplitKVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaFwdSplitKVKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaFwdSplitKVKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 
@@ -455,13 +457,13 @@ struct grouped_infer_splitkv_smallq_mask_bias_dropout_dispatch {
 
     dim3 kGridSize = FmhaSplitKVCombineKernel::GridSize(
         param.num_batches, param.Hq, param.max_seqlen_q, param.Kv);
-    constexpr dim3 kBlockSize = FmhaSplitKVCombineKernel::BlockSize();
+    const dim3 kBlockSize = FmhaSplitKVCombineKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaSplitKVCombineKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaSplitKVCombineKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 };

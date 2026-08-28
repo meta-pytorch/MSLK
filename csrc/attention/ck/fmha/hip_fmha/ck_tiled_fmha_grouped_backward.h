@@ -49,6 +49,7 @@ struct grouped_backward_mask_bias_dropout_dispatch {
       false, // non-deterministic
       FmhaMask,
       FmhaBlockDropout,
+      false, // kUseTrLoad
       FmhaTraits>;
 
   static constexpr bool NeedConvertGradQ = !std::is_same<
@@ -109,28 +110,18 @@ struct grouped_backward_mask_bias_dropout_dispatch {
 
       BOOL_SWITCH_2(
           pad_headdim_q, kPadHeadDimQ, pad_headdim_v, kPadHeadDimV, [&] {
-            using FmhaBwdTraits_ = ck_tile::TileFmhaTraits<
-                kPadSeqLenQ,
-                kPadSeqLenK,
+            using FmhaBwdTraits_ = ck_tile::TileFmhaBwdTraits<
                 kPadHeadDimQ,
                 kPadHeadDimV,
-                false, // kHasLogitsSoftCap
                 kBiasEnum,
                 kHasBiasGrad,
-                false, // kStoreLSE
-                false, // place-holder for kHasDropout, not used actually
-                false, // kDoFp8StaticQuant place-holder
                 occupancy>;
 
             using FmhaBwdPipelineProblem =
                 FmhaBwdPipelineProblemTemp<FmhaBwdTraits_, FmhaMask>;
 
-            constexpr auto FmhaBwdPipelineEnum_ =
-                FmhaBwdPipelineEnumSelector<MaxK>::value;
-
-            using FmhaBwdPipeline_ = typename FmhaBwdPipelineMaker<
-                FmhaBwdPipelineEnum_,
-                FmhaBwdPipelineProblem>::pipeline;
+            using FmhaBwdPipeline_ =
+                ck_tile::BlockFmhaBwdDQDKDVPipeline<FmhaBwdPipelineProblem>;
 
             using FmhaBwdKGradEpilogue_ =
                 ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
@@ -207,6 +198,8 @@ struct grouped_backward_mask_bias_dropout_dispatch {
           param.dot_out_ptr,
           1.0f - param.dropout_prob,
           param.seqstart_q_dev_ptr,
+          nullptr, // seqlen_q_ptr
+          nullptr, // cu_seqlen_q_ptr
           param.Kv,
           param.grad_out_strides[0], // stride_do
           param.out_strides[0], // stride_o
@@ -217,13 +210,13 @@ struct grouped_backward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize = FmhaBwdOGradDotOKernel::GridSize(
         param.num_batches, param.Hq, param.max_seqlen_q);
-    constexpr dim3 kBlockSize = FmhaBwdOGradDotOKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdOGradDotOKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdOGradDotOKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdOGradDotOKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 
@@ -232,7 +225,7 @@ struct grouped_backward_mask_bias_dropout_dispatch {
       GroupedBackwardParams& param,
       hipStream_t stream) {
     const auto kargs = [&] {
-      return FmhaBwdDQDKDVKernel::MakeKargs(
+      return FmhaBwdDQDKDVKernel::MakeKargsImpl(
           param.q_ptr,
           param.k_ptr,
           param.v_ptr,
@@ -247,7 +240,10 @@ struct grouped_backward_mask_bias_dropout_dispatch {
           NeedConvertGradQ ? param.grad_q_f32_ptr : param.grad_q_ptr,
           param.seqstart_q_dev_ptr,
           param.seqstart_k_dev_ptr,
+          nullptr, // seqlen_q_ptr
           param.seqlen_k_dev_ptr,
+          nullptr, // cu_seqlen_q_ptr
+          nullptr, // cu_seqlen_k_ptr
           param.K,
           param.Kv,
           param.Hq,
@@ -289,12 +285,12 @@ struct grouped_backward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize = FmhaBwdDQDKDVKernel::GridSize(
         param.num_batches, param.Hq, param.max_seqlen_k);
-    constexpr dim3 kBlockSize = FmhaBwdDQDKDVKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdDQDKDVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaBwdDQDKDVKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdDQDKDVKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 
@@ -308,6 +304,10 @@ struct grouped_backward_mask_bias_dropout_dispatch {
           param.grad_q_ptr,
           param.seqstart_q_dev_ptr,
           param.seqstart_k_dev_ptr,
+          nullptr, // seqlen_q_ptr
+          param.seqlen_k_dev_ptr,
+          nullptr, // cu_seqlen_q_ptr
+          nullptr, // cu_seqlen_k_ptr
           param.K, // headdim of q/k
           param.q_strides[0],
           param.grad_q_f32_strides[0],
@@ -318,13 +318,13 @@ struct grouped_backward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize = FmhaBwdConvertQGradKernel::GridSize(
         param.num_batches, param.Hq, param.max_seqlen_q);
-    constexpr dim3 kBlockSize = FmhaBwdConvertQGradKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdConvertQGradKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdConvertQGradKernel::kBlockPerCu;
 
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdConvertQGradKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 };

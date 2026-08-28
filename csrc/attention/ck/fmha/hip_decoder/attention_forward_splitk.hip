@@ -73,9 +73,14 @@ void instantiate_and_launch_kernels(
       kLoopUnroll,
       kLoopUnrollTail,
       kMaxKVSequenceLength,
-      compute_t>{};
-  auto reduce_kernel_impl = ck_tile::
-      ForwardDecoderSplitKReduceKernelImpl<ck_data_t, vec_size, compute_t>{};
+      compute_t,
+      kThreadsPerWavefront * kWavefrontsPerBlock>{};
+  auto reduce_kernel_impl =
+      ck_tile::ForwardDecoderSplitKReduceKernelImpl<
+          ck_data_t,
+          vec_size,
+          compute_t,
+          kThreadsPerWavefront>{};
 
   (void)ck_tile::launch_kernel(
       ck_tile::stream_config{stream, /* benchmark */ false},
