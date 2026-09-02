@@ -24,12 +24,12 @@ block-scale contract:
   Y[m, n] = sum_k (A[m, k] * x_scale[m // 128, k // 128])
                 * (B[n, k] * w_scale[n // 128, k // 128])
 
-Unlike the per-token groupwise kernel (``grouped_gemm_blockscale_contiguous``),
+Unlike the per-token groupwise kernel (``fp8_grouped_gemm``),
 the A scale here has ScaleBlockM=128, so one scalar covers a whole 16-row MFMA
 fragment (all lanes/rows in the block share it): the kernel issues one scalar A
 scale load per (M-block, K-block) instead of the groupwise path's per-token vec4
 loads. All the tile loading / MFMA / epilogue machinery is shared with the
-groupwise kernel via ``grouped_gemm_blockscale_common``; only the scale indexing
+groupwise kernel via ``fp8_grouped_gemm_common``; only the scale indexing
 and the (single-group) tile map differ, so this file adds a ``compute_tile`` and
 the launcher and reuses everything else.
 
@@ -59,7 +59,7 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.flydsl.kernels.gemm.grouped_gemm_blockscale_common import (
+from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
     init_accumulators,
@@ -109,7 +109,7 @@ def make_compute_tile_blockwise(
     Defined at module scope (NOT inside the ``@flyc.kernel`` body) so its plain
     Python ``if``/``else`` control flow runs during tracing instead of being
     AST-rewritten into scf branches -- the same structure the shared
-    ``grouped_gemm_blockscale_common`` helpers use.
+    ``fp8_grouped_gemm_common`` helpers use.
 
     Returns ``compute_tile(accs_in, k_tile_idx_py, lds_base, b_tile_in,
     scales_pf, *, a0_prefetch=None)``. Scales are loaded here (software FP32

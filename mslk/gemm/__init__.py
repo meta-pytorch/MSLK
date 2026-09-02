@@ -196,3 +196,65 @@ if torch.version.hip is not None:
 
             except RuntimeError:
                 pass  # already registered (e.g. module imported more than once)
+
+    @functools.lru_cache(maxsize=1)
+    def _flydsl_rowwise_grouped_module() -> ModuleType | None:
+        """The FlyDSL rowwise grouped module, or None when not opted into.
+
+        Resolved the same way as the groupwise one above, and for the same
+        reason: this package must not depend on
+        ``//mslk/mslk/gemm:flydsl_ops``.
+        """
+        try:
+            from mslk.flydsl.common import is_flydsl_available
+
+            if not is_flydsl_available():
+                return None
+            return importlib.import_module("mslk.gemm.flydsl.fp8_rowwise_grouped_gemm")
+        except ImportError:
+            return None
+
+    def _rowwise_grouped_impl(op: str, fn: str) -> Callable[..., torch.Tensor]:
+        """Bind one rowwise grouped op to its FlyDSL entry point, lazily.
+
+        gemm_ops.cpp leaves these slots free on ROCm, so FlyDSL is the only
+        implementation and there is nothing to arbitrate. Resolution is still
+        deferred to the first call so that registering does not import FlyDSL;
+        calling without having opted into flydsl_ops raises rather than
+        silently doing something else.
+        """
+
+        def _impl(*args: object) -> torch.Tensor:
+            mod = _flydsl_rowwise_grouped_module()
+            if mod is None:
+                raise RuntimeError(
+                    f"mslk::{op} requires the FlyDSL backend. Add "
+                    "//mslk/mslk/gemm:flydsl_ops to your target's deps."
+                )
+            return getattr(mod, fn)(*args)
+
+        return _impl
+
+    for _op, _fn in (
+        ("f8f8bf16_rowwise_grouped_stacked", "matmul_f8f8bf16_rowwise_grouped_stacked"),
+        (
+            "f8f8bf16_rowwise_grouped_stacked_preshuffle",
+            "matmul_f8f8bf16_rowwise_grouped_stacked_preshuffle",
+        ),
+        ("f8f8bf16_rowwise_grouped_dynamic", "matmul_f8f8bf16_rowwise_grouped_dynamic"),
+        (
+            "f8f8bf16_rowwise_grouped_dynamic_preshuffle",
+            "matmul_f8f8bf16_rowwise_grouped_dynamic_preshuffle",
+        ),
+        ("f8f8bf16_rowwise_grouped_mm", "matmul_f8f8bf16_rowwise_grouped_mm"),
+        (
+            "f8f8bf16_rowwise_grouped_mm_preshuffle",
+            "matmul_f8f8bf16_rowwise_grouped_mm_preshuffle",
+        ),
+    ):
+        if not hasattr(torch.ops.mslk, _op):
+            continue  # schema absent, as in a python-only build
+        try:
+            torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_grouped_impl(_op, _fn))
+        except RuntimeError:
+            pass  # already registered (e.g. module imported more than once)

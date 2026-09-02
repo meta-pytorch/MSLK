@@ -42,6 +42,8 @@ on:
       - 'mslk/attention/fmha/flydsl_decoder.py'
       - 'mslk/attention/fmha/flydsl_splitk.py'
       - 'test/attention/fmha/**'
+      # FlyDSL GEMM ops
+      - 'mslk/gemm/flydsl/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels

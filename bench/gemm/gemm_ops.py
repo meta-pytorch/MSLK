@@ -24,6 +24,7 @@ from mslk.quantize.shuffle import (
     ck_preshuffle,
     int4_row_quantize_zp,
     pack_int4,
+    preshuffle_b_mfma,
     quantize_int4_preshuffle,
 )
 from mslk.quantize.triton.fp4_quantize import (
@@ -1100,6 +1101,7 @@ class FP8RowwiseGrouped(GemmOpBase):
             Accelerator.NVIDIA_SM100,
             Accelerator.NVIDIA_SM103,
             Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
         }
 
     @property
@@ -1129,7 +1131,7 @@ class FP8RowwiseGrouped2D3D(FP8RowwiseGrouped):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX942}
+        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
@@ -1183,6 +1185,269 @@ class TorchFP8RowwiseGrouped(FP8RowwiseGrouped2D3D):
     @property
     def compute_dtype(self) -> ComputeDtype:
         return ComputeDtype.FP8
+
+
+# The rowwise grouped variants below are served by FlyDSL on ROCm. Each takes a
+# different group geometry, so each builds its own operands from the per-group
+# tensors the harness supplies, and each states the shapes it needs: the driver
+# reports an op that raises as unsupported for that shape and moves on.
+_ROCM_GROUPED = {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
+
+
+class _FlyDSLRowwiseGroupedBase(GemmOpBase):
+    """Shared plumbing for the FlyDSL-backed rowwise grouped variants."""
+
+    op_name: str = ""
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return _ROCM_GROUPED
+
+    @property
+    def supported(self) -> bool:
+        if not super().supported:
+            return False
+        # FlyDSL supplies these on ROCm, and the preshuffled siblings have no
+        # schema in a binary built before they were declared, so check both
+        # rather than assume the op is there and implemented.
+        return is_flydsl_available() and hasattr(torch.ops.mslk, self.op_name)
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+    @property
+    def compute_dtype(self) -> ComputeDtype:
+        return ComputeDtype.FP8
+
+
+def _uniform(values, what):
+    """Return the single distinct value, or say which variant cannot take it."""
+    distinct = set(values)
+    if len(distinct) != 1:
+        raise ValueError(f"every group must share one {what}, got {sorted(distinct)}")
+    return distinct.pop()
+
+
+@register_gemm_op
+class FP8RowwiseGroupedDynamic(_FlyDSLRowwiseGroupedBase):
+    """Rowwise grouped matmul over fixed per-group slabs.
+
+    Each group owns a slab of the tallest group's height and declares how many
+    of its rows hold real tokens, so ragged groups need no compaction.
+    """
+
+    op_name = "f8f8bf16_rowwise_grouped_dynamic"
+    preshuffled = False
+
+    def preprocess(self, x, w):
+        m_values = [i.shape[0] for i in x]
+        expected_m = max(m_values)
+        xp = x[0].new_zeros((len(x), expected_m, x[0].shape[1]))
+        for g, t in enumerate(x):
+            xp[g, : t.shape[0]] = t
+        wq, w_scale = zip(*[quantize_fp8_row(i) for i in w])
+        wq = torch.stack(wq, dim=0).contiguous()
+        if self.preshuffled:
+            wq = preshuffle_b_mfma(wq)
+        w_scale = torch.stack(w_scale, dim=0).contiguous()
+        zero_start = torch.tensor(m_values, dtype=torch.int64, device=x[0].device)
+        return xp, wq, w_scale, zero_start
+
+    def quantize(self, x, wq, w_scale, zero_start):
+        xq, x_scale = quantize_fp8_row(x)
+        return xq, wq, x_scale, w_scale, zero_start
+
+    def compute(self, xq, wq, x_scale, w_scale, zero_start):
+        return getattr(torch.ops.mslk, self.op_name)(
+            xq, wq, x_scale, w_scale, zero_start, True
+        )
+
+
+@register_gemm_op
+class FP8RowwiseGroupedDynamicPreshuffle(FP8RowwiseGroupedDynamic):
+    """As above, with weights already in the MFMA B layout."""
+
+    op_name = "f8f8bf16_rowwise_grouped_dynamic_preshuffle"
+    preshuffled = True
+
+
+@register_gemm_op
+class FP8RowwiseGrouped3D3D(_FlyDSLRowwiseGroupedBase):
+    """Rowwise batched matmul: nothing is grouped, one output slab per group."""
+
+    op_name = "f8f8bf16_rowwise_grouped_mm"
+    preshuffled = False
+
+    def preprocess(self, x, w):
+        _uniform([i.shape[0] for i in x], "row count")
+        xs = torch.stack(x, dim=0).contiguous()
+        wq, w_scale = zip(*[quantize_fp8_row(i) for i in w])
+        wq = torch.stack(wq, dim=0).contiguous()
+        if self.preshuffled:
+            wq = preshuffle_b_mfma(wq)
+        return xs, wq, torch.stack(w_scale, dim=0).contiguous()
+
+    def quantize(self, x, wq, w_scale):
+        G, M, _ = x.shape
+        xq, x_scale = quantize_fp8_row(x)
+        out = torch.empty((G, M, wq.shape[1]), dtype=torch.bfloat16, device=x.device)
+        return xq, wq, x_scale.view(G, -1), w_scale.view(G, -1), out
+
+    def compute(self, xq, wq, x_scale, w_scale, out):
+        return getattr(torch.ops.mslk, self.op_name)(
+            xq, wq, x_scale, w_scale, None, out
+        )
+
+
+@register_gemm_op
+class FP8RowwiseGrouped2D3DPreshuffle(FP8RowwiseGrouped2D3D):
+    """The 2D-3D grouped matmul with weights already in the MFMA B layout."""
+
+    def preprocess(self, x, w):
+        x, wq, w_scale, m_sizes = super().preprocess(x, w)
+        return x, preshuffle_b_mfma(wq), w_scale, m_sizes
+
+    def compute(self, xq, wq, x_scale, w_scale, offsets, out):
+        return torch.ops.mslk.f8f8bf16_rowwise_grouped_mm_preshuffle(
+            xq, wq, x_scale, w_scale, offsets, out
+        )
+
+    @property
+    def supported(self) -> bool:
+        if not super().supported:
+            return False
+        return is_flydsl_available() and hasattr(
+            torch.ops.mslk, "f8f8bf16_rowwise_grouped_mm_preshuffle"
+        )
+
+
+@register_gemm_op
+class FP8RowwiseGroupedPreshuffle(FP8RowwiseGrouped):
+    """The stacked grouped matmul with weights already in the MFMA B layout."""
+
+    def preprocess(self, x, w):
+        x, wq, w_scale, m_sizes = super().preprocess(x, w)
+        return x, preshuffle_b_mfma(wq), w_scale, m_sizes
+
+    def compute(self, xq, wq, x_scale, w_scale, m_sizes):
+        return torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked_preshuffle(
+            xq, wq, x_scale, w_scale, m_sizes
+        )
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        # The preshuffled sibling has no schema off ROCm, unlike its parent.
+        return _ROCM_GROUPED
+
+    @property
+    def supported(self) -> bool:
+        if not super().supported:
+            return False
+        return is_flydsl_available() and hasattr(
+            torch.ops.mslk, "f8f8bf16_rowwise_grouped_stacked_preshuffle"
+        )
+
+
+@register_gemm_op
+class FP8RowwiseGrouped3D2D(_FlyDSLRowwiseGroupedBase):
+    """Rowwise grouped matmul where the groups divide the output's columns.
+
+    Weights arrive as one [total_N, K] matrix the offsets divide, and the
+    output is [M, total_N] with the groups side by side.
+    """
+
+    op_name = "f8f8bf16_rowwise_grouped_mm"
+
+    def preprocess(self, x, w):
+        _uniform([i.shape[0] for i in x], "row count")
+        n_g = _uniform([i.shape[0] for i in w], "column count")
+        # A group's columns have to reach a store boundary or a store crosses
+        # into the next group. CK asserts this on the device; here the sizes are
+        # on the host, so say so before running.
+        if n_g % 8:
+            raise ValueError(f"every group's N must be a multiple of 8, got {n_g}")
+        xs = torch.stack(x, dim=0).contiguous()
+        wq, w_scale = zip(*[quantize_fp8_row(i) for i in w])
+        return xs, torch.cat(wq, dim=0).contiguous(), torch.cat(w_scale, dim=0)
+
+    def quantize(self, x, wq, w_scale):
+        G, M, _ = x.shape
+        xq, x_scale = quantize_fp8_row(x)
+        total_n = wq.shape[0]
+        n_g = total_n // G
+        offsets = torch.cumsum(torch.full((G,), n_g, dtype=torch.int), dim=0).to(
+            device=x.device, dtype=torch.int32
+        )
+        out = torch.empty((M, total_n), dtype=torch.bfloat16, device=x.device)
+        # The weights go to the op as one [total_N, K] matrix, but the harness
+        # measures bandwidth by indexing the first two operands per group, so
+        # hand it the per-group view; compute flattens it back, which is free.
+        return xq, wq.view(G, n_g, -1), x_scale.view(G, -1), w_scale, offsets, out
+
+    def compute(self, xq, wq, x_scale, w_scale, offsets, out):
+        torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq.view(-1, wq.shape[-1]), x_scale, w_scale, offsets, out
+        )
+        # The groups sit side by side in the columns, so hand the harness one
+        # slab each rather than let it split the rows. Both steps are views.
+        groups = x_scale.shape[0]
+        return out.view(out.shape[0], groups, out.shape[1] // groups).permute(1, 0, 2)
+
+
+@register_gemm_op
+class FP8RowwiseGrouped2D2D(_FlyDSLRowwiseGroupedBase):
+    """Rowwise grouped matmul where the groups divide the contraction.
+
+    Every group multiplies the same rows by the same columns over its own slice
+    of K, so each produces a whole output and nothing is packed.
+
+    The operands are concatenated along K, so neither can be indexed per group
+    along its first dimension. The harness measures bandwidth that way, so the
+    reported GB/s undercounts the operands here; the runtime and TFLOPS are
+    unaffected.
+    """
+
+    op_name = "f8f8bf16_rowwise_grouped_mm"
+
+    def preprocess(self, x, w):
+        _uniform([i.shape[0] for i in x], "row count")
+        _uniform([i.shape[0] for i in w], "column count")
+        # A group's K is the vectorised load width or the reduction reads past
+        # its slice. The op cannot check this, since the offsets reach it on the
+        # device, but the sizes are here on the host. Neither this kernel nor CK
+        # is accurate below it, so run only where the answer means something.
+        ragged = [i.shape[1] for i in x if i.shape[1] % 16]
+        if ragged:
+            raise ValueError(f"every group's K must be a multiple of 16, got {ragged}")
+        return x, w
+
+    def quantize(self, x, w):
+        # Each group quantises its own K slice, so the row and column scales
+        # are per group and the operands are concatenated along K.
+        xq, x_scale = zip(*[quantize_fp8_row(i) for i in x])
+        wq, w_scale = zip(*[quantize_fp8_row(i) for i in w])
+        offsets = torch.cumsum(
+            torch.tensor([i.shape[1] for i in x], dtype=torch.int), dim=0
+        ).to(device=x[0].device, dtype=torch.int32)
+        out = torch.empty(
+            (len(x), x[0].shape[0], w[0].shape[0]),
+            dtype=torch.bfloat16,
+            device=x[0].device,
+        )
+        return (
+            torch.cat(xq, dim=1).contiguous(),
+            torch.cat(wq, dim=1).contiguous(),
+            torch.cat([s.flatten() for s in x_scale]),
+            torch.cat([s.flatten() for s in w_scale]),
+            offsets,
+            out,
+        )
+
+    def compute(self, xq, wq, x_scale, w_scale, offsets, out):
+        return torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+            xq, wq, x_scale, w_scale, offsets, out
+        )
 
 
 @register_gemm_op
