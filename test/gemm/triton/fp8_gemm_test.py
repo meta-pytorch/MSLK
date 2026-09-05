@@ -12,9 +12,16 @@ from typing import Optional
 import torch
 
 if torch.cuda.is_available():
-    from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
+    import triton
+    from mslk.gemm.triton.fp8_gemm import (
+        MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K,
+        matmul_fp8_block,
+        matmul_fp8_row,
+    )
     from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
+    from mslk.utils.device import is_gfx950
     from mslk.utils.triton.fp8_utils import get_fp8_constants
+    from packaging import version
 
 
 @unittest.skipIf(
@@ -25,6 +32,26 @@ if torch.cuda.is_available():
 class TestFp8Matmul(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)
+
+    def test_gfx950_adds_triton_38_config(self) -> None:
+        matching_configs = [
+            (
+                config.kwargs["BLOCK_M"],
+                config.kwargs["BLOCK_N"],
+                config.kwargs["BLOCK_K"],
+                config.kwargs["waves_per_eu"],
+                config.num_warps,
+                config.num_stages,
+                config.kwargs["kpack"],
+            )
+            for config in MATMUL_CONFIGS_NON_PERSISTENT_PINGPONG_4K_8K_16K
+            if config.kwargs["BLOCK_M"] == 32 and config.kwargs["BLOCK_N"] == 32
+        ]
+
+        expected = []
+        if is_gfx950() and version.parse(triton.__version__) >= version.parse("3.8.0"):
+            expected = [(32, 32, 256, 4, 4, 3, 1)]
+        self.assertEqual(matching_configs, expected)
 
     def test_matmul_fp8_row(self) -> None:
         def _test_matmul_fp8_row(
