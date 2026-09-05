@@ -45,36 +45,14 @@ Tensor contract:
   out[m, n] = (sum_k XQ[m, k] * WQ[g, n, k]) * x_scale[m] * w_scale[g, n]
 """
 
-import functools
-
 import torch
 from mslk.flydsl.common import require_flydsl
 from mslk.gemm.flydsl import grouped_dispatch
-from mslk.utils.device import supports_float8_fnuz
 
-
-def _assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
-    """Reject a mismatched FP8 flavour.
-
-    The MFMA instructions read the operands in the arch's native FP8 format, and
-    the kernel passes them through as raw bytes, so an fnuz/OCP mismatch would be
-    applied with the wrong exponent bias rather than rejected.
-    """
-    expected = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    assert XQ.dtype == expected, f"XQ must be {expected}, got {XQ.dtype}"
-    assert WQ.dtype == expected, f"WQ must be {expected}, got {WQ.dtype}"
-
-
-@functools.lru_cache(maxsize=8)
-def _unused_group_meta(device: torch.device) -> torch.Tensor:
-    """Stand-in for the group-metadata operand under the batched layout.
-
-    That layout carries no per-group metadata and the kernel never reads the
-    argument, but the launcher's argument list is fixed at compile time. Caching
-    keeps a call free of an allocation and holds the address stable, which
-    CUDA-graph capture requires.
-    """
-    return torch.zeros((1,), dtype=torch.int32, device=device)
+# Both checks are common to every FlyDSL GEMM wrapper, so they live beside the
+# dispatch; these names are kept for the call sites below.
+_assert_fp8_operands = grouped_dispatch.assert_fp8_operands
+_unused_group_meta = grouped_dispatch.unused_group_meta
 
 
 def _dispatch_rowwise_grouped(

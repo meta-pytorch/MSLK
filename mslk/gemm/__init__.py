@@ -61,9 +61,9 @@ if torch.version.hip is not None:
     #
     # Targets that want the FlyDSL kernels depend on flydsl_ops themselves; the
     # lazy imports below then resolve, and Triton serves everyone else.
-    @functools.lru_cache(maxsize=1)
-    def _flydsl_gemm_module() -> ModuleType | None:
-        """The FlyDSL grouped-gemm module, or None when it is not opted into.
+    @functools.lru_cache(maxsize=8)
+    def _flydsl_gemm_module(name: str) -> ModuleType | None:
+        """A FlyDSL gemm module by name, or None when it is not opted into.
 
         Resolved through ``importlib`` rather than a static ``from .flydsl
         import ...``: this package deliberately does not depend on
@@ -75,11 +75,38 @@ if torch.version.hip is not None:
 
             if not is_flydsl_available():
                 return None
-            return importlib.import_module(
-                "mslk.gemm.flydsl.fp8_groupwise_grouped_gemm"
-            )
+            return importlib.import_module(f"mslk.gemm.flydsl.{name}")
         except ImportError:
             return None
+
+    if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_groupwise"):
+        # Arbitrated the same way as the grouped op below: FlyDSL where it is
+        # opted into, Triton otherwise.
+        @functools.lru_cache(maxsize=1)
+        def _groupwise_impl() -> Callable[..., torch.Tensor]:
+            # Both conditions matter: FlyDSL reports itself available on the
+            # RDNA parts, where this op's kernels cannot run, so the module is
+            # asked whether it can serve this GPU rather than merely imported.
+            mod = _flydsl_gemm_module("fp8_groupwise_gemm")
+            if mod is not None and mod.is_supported():
+                return mod.matmul_f8f8bf16_groupwise
+            from .triton.fp8_groupwise_gemm import matmul_f8f8bf16_groupwise as _impl
+
+            return _impl
+
+        try:
+
+            @torch.library.impl("mslk::f8f8bf16_groupwise", "CUDA")
+            def _f8f8bf16_groupwise_rocm(
+                XQ: torch.Tensor,
+                WQ: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_scale: torch.Tensor,
+            ) -> torch.Tensor:
+                return _groupwise_impl()(XQ, WQ, x_scale, w_scale)
+
+        except RuntimeError:
+            pass  # already registered (e.g. module imported more than once)
 
     if hasattr(torch.ops, "mslk") and hasattr(
         torch.ops.mslk, "f8f8bf16_groupwise_grouped"
@@ -89,7 +116,7 @@ if torch.version.hip is not None:
         # module registers it and the choice is arbitrated here, on first call.
         @functools.lru_cache(maxsize=1)
         def _groupwise_grouped_impl() -> Callable[..., torch.Tensor]:
-            mod = _flydsl_gemm_module()
+            mod = _flydsl_gemm_module("fp8_groupwise_grouped_gemm")
             if mod is not None:
                 return mod.matmul_f8f8bf16_groupwise_grouped
             from .triton.fp8_groupwise_grouped_gemm import (
@@ -130,7 +157,7 @@ if torch.version.hip is not None:
                 w_scale: torch.Tensor,
                 M_sizes: torch.Tensor,
             ) -> torch.Tensor:
-                mod = _flydsl_gemm_module()
+                mod = _flydsl_gemm_module("fp8_groupwise_grouped_gemm")
                 if mod is None:
                     raise RuntimeError(
                         "mslk::f8f8bf16_groupwise_grouped_preshuffle requires the "

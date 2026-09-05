@@ -268,24 +268,15 @@ def matmul_f8f8bf16_groupwise(
 
 
 # ---------------------------------------------------------------------------
-# Register as the ROCm implementation of mslk::f8f8bf16_groupwise
+# The ROCm implementation of mslk::f8f8bf16_groupwise
 # ---------------------------------------------------------------------------
 # The C++ schema is declared in gemm_ops.cpp (shared between CUDA and ROCm).
-# On ROCm the CUDA C++ implementation is absent; this module registers the
-# Triton kernel above as the dispatch target via torch.library.impl.
-
-if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
-    if hasattr(torch.ops.mslk, "f8f8bf16_groupwise"):
-        try:
-
-            @torch.library.impl("mslk::f8f8bf16_groupwise", "CUDA")
-            def _f8f8bf16_groupwise_rocm(
-                XQ: torch.Tensor,
-                WQ: torch.Tensor,
-                x_scale: torch.Tensor,
-                w_scale: torch.Tensor,
-            ) -> torch.Tensor:
-                return matmul_f8f8bf16_groupwise(XQ, WQ, x_scale, w_scale)
-
-        except RuntimeError:
-            pass  # already registered (e.g. module imported more than once)
+# On ROCm the CUDA C++ implementation is absent, so one of the kernels here has
+# to be the dispatch target.
+#
+# FALLBACK ONLY: FlyDSL owns this op wherever it is usable (see
+# mslk/gemm/flydsl/fp8_groupwise_gemm.py) and Triton is the fallback. Only one
+# CUDA implementation can win, so the two are arbitrated in
+# mslk/gemm/__init__.py, which registers whichever one applies. Registering here
+# as well would need the FlyDSL probe at import time, and importing FlyDSL is
+# fatal in a process that already holds Triton's MLIR/LLVM.

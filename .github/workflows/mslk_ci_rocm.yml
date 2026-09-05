@@ -44,6 +44,8 @@ on:
       - 'test/attention/fmha/**'
       # FlyDSL GEMM ops
       - 'mslk/gemm/flydsl/**'
+      # Arbitrates which backend serves each GEMM op on ROCm
+      - 'mslk/gemm/__init__.py'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       # AMD/ROCm Triton GEMM kernels
