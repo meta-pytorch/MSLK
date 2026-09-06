@@ -117,7 +117,7 @@ _PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
 # roll_k is deliberately absent: it is fixed policy rather than something that
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
-_KEY = ["m_bucket", "n", "k", "b_preshuffled", "scaling", "layout", "in_dtype"]
+_KEY = ["m_bucket", "n", "k", "g", "b_preshuffled", "scaling", "layout", "in_dtype"]
 
 
 def assert_fp8_operands(XQ: torch.Tensor, WQ: torch.Tensor) -> None:
@@ -254,6 +254,7 @@ def launch(
     m_bucket,
     n,
     k,
+    g,
     b_preshuffled,
     scaling,
     layout="sizes",
@@ -276,6 +277,11 @@ def launch(
     ``m_bucket`` only feeds the autotune key: bucketing total_M keeps nearby token
     counts on one tuned config. ``n``/``k`` are likewise passed for the key and
     for tile pruning, and are read back off the operands here.
+
+    ``g`` feeds the key alone. The group count changes both the grid, which
+    carries one partial tile per group, and whether an operand clears the
+    buffer-descriptor limit and has to be re-based per group; the best tile
+    differs enough between group counts that they cannot share a tuned entry.
 
     ``in_dtype`` names the operand element type the kernel is compiled for.
     ``x_scale``/``w_scale`` may be None where it carries no scales.
@@ -442,6 +448,7 @@ def dispatch(
         next_pow2(m_key),
         n_key,
         k_key,
+        G,
         b_preshuffled,
         scaling,
         layout,
