@@ -17,10 +17,11 @@ is what ``scaling="none"`` selects.
 * ``mslk::bf16bf16bf16_grouped_stacked`` -- groups packed along M with a ``[G]``
   int64 row count per group, and row-major ``[G, N, K]`` weights.
 
-This op has a CK implementation on ROCm, unlike the FP8 grouped ops, whose C++
-slots were already free. mslk/gemm/__init__.py arbitrates between the two on
-first call and gemm_ops.cpp leaves the ROCm slot unregistered, so CK serves it
-only where FlyDSL is not opted in or cannot run.
+CK served this op on ROCm until now, unlike the FP8 grouped ops, whose C++ slots
+were already free. gemm_ops.cpp no longer registers it there and nothing takes
+CK's place: FlyDSL is the only ROCm implementation, and calling the op without
+the backend raises rather than quietly reaching a slower kernel. That is
+deliberate -- CK and Triton are both being deprecated.
 
 CK's own source marks ``bf16bf16bf16_grouped``, ``_cat`` and ``_dynamic``
 "UNSUPPORTED AND DEPRECATED -- use _stacked", so they are deliberately not
@@ -50,8 +51,8 @@ def is_supported() -> bool:
 
     The kernel is built on MFMA, which the RDNA parts do not have -- and FlyDSL
     reports itself available on those, so having the backend says nothing about
-    whether this op can run. mslk/gemm/__init__.py falls back to CK when this is
-    False.
+    whether this op can run. mslk/gemm/__init__.py raises when this is False,
+    there being no other ROCm implementation left to fall back to.
     """
     return is_gfx950() or is_gfx942()
 
