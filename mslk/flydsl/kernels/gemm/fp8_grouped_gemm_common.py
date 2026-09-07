@@ -1318,11 +1318,18 @@ def make_compute_tile(
 
             def mfma_pack(acc_in, a0, a1, b0, b1):
                 # gfx942 has no K32 bf16 MFMA, so a pack is two K16 issues.
+                # Each issue wants its 4 bf16 per lane as a 4-wide 16-bit
+                # vector, which the intrinsic types as integers. That is the
+                # same 64 bits an LDS half already holds, so this only renames
+                # the bits -- but passing the raw i64 fails MLIR verification.
+                def v4(half):
+                    return Vector.from_elements([half], fx.Int64).bitcast(fx.Int16)
+
                 mid = rocdl.mfma_f32_16x16x16bf16_1k(
-                    mfma_res_ty_narrow, [a0, b0, acc_in, 0, 0, 0]
+                    mfma_res_ty_narrow, [v4(a0), v4(b0), acc_in, 0, 0, 0]
                 )
                 return rocdl.mfma_f32_16x16x16bf16_1k(
-                    mfma_res_ty_narrow, [a1, b1, mid, 0, 0, 0]
+                    mfma_res_ty_narrow, [v4(a1), v4(b1), mid, 0, 0, 0]
                 )
 
     else:
