@@ -29,7 +29,8 @@ from mslk.utils.device import supports_float8_fnuz
 # also sets the K-loop sub-block size, so tile_k must then be a multiple of it.
 SCALE_BLOCK = 128
 
-# Default config when autotuning is disabled. Valid for any supported shape
+# Default config when autotuning is disabled, for the scaled schemes; the
+# unscaled one takes UNSCALED_DEFAULT_TILE below. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
 # The wave grid stays at the historical 1x4 rather than the 2x2 this square tile
 # would favour: changing it moves every untuned call, which is a decision to
@@ -42,6 +43,16 @@ DEFAULT_TILE = {
     "waves_n": 4,
     "waves_per_eu": 2,
 }
+
+# The unscaled scheme needs its own default, because a 2-byte operand doubles
+# the LDS a tile costs. 128x128x128 in BF16 wants 2*128*128*2 for the ping-pong
+# A plus 128*128*2 for B, i.e. 98304 bytes against the 65536 a CDNA3 workgroup
+# has: on gfx942 the default does not merely run slowly, it raises before the
+# kernel is traced, which leaves the untuned path -- CI, graph capture -- with
+# nothing to run. Halving tile_k brings it to 49152, which fits both CDNA3 and
+# CDNA4. tile_k=64 is available only here: where there are scales it is tied to
+# the scale block.
+UNSCALED_DEFAULT_TILE = {**DEFAULT_TILE, "tile_k": 64}
 
 # Candidate tiles swept by autotune. Rowwise scaling allows tile_n below the
 # scale block, which block scaling cannot express, so the two schemes sweep
@@ -379,7 +390,7 @@ _launch_rowwise = tunable(
     configs=ROWWISE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
 )(launch)
 _launch_unscaled = tunable(
-    configs=UNSCALED_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+    configs=UNSCALED_TILES, default=UNSCALED_DEFAULT_TILE, key=_KEY, prune=_PRUNE
 )(launch)
 
 
