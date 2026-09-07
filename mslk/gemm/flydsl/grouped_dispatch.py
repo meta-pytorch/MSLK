@@ -233,6 +233,11 @@ def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
         elif layout == "k_offsets":
             # Each group produces a whole [M, N] output of its own.
             checks.append(("D (one group's output)", total_M * N * 2))
+            # A is the one operand no basing can shrink here: the groups divide
+            # the contraction, so a group owns a set of columns of [M, total_K]
+            # and its last row sits near the end of the matrix whatever its base
+            # is. The whole extent is what has to be reachable.
+            checks.append(("A (the whole activation matrix)", a_whole))
     for what, nbytes in checks:
         if nbytes >= _BUFFER_LIMIT_BYTES:
             raise ValueError(
