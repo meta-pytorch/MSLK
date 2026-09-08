@@ -7,7 +7,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Grouped FP8 GEMM kernel.
+"""Grouped GEMM kernel.
+
+The `in_dtype` argument selects the operand element type: "fp8", which the
+kernel was written for and is still named after, or "bf16". It decides the MFMA
+the K loop issues and the width of every operand address, and it fixes the
+scaling scheme, since only a quantised operand carries scales. Everything else
+-- the group resolution, the loaders, the LDS swizzle and the epilogue -- is
+shared, the operand staging being expressed in bytes throughout.
 
 The `layout` argument selects both which axis the groups divide and how their
 geometry is encoded. Where the groups divide M they are concatenated with
@@ -18,17 +25,24 @@ and are masked out of the store. Groups may instead occupy fixed per-group
 slabs, or divide N or K. Only the resolution step differs between them, so the
 loaders, the K loop and the epilogue are shared.
 
-Scales are FP32 (software scaling) on all architectures.
+Where there are scales they are FP32 (software scaling) on all architectures.
 
 Tensors:
-  - A: [M_total, K] FP8 - the rows of every group, packed or in per-group slabs
-  - B: [num_groups, N, K] FP8 - one weight matrix per group, in the MFMA B
+  - A: [M_total, K] - the rows of every group, packed or in per-group slabs
+  - B: [num_groups, N, K] - one weight matrix per group, in the MFMA B
     layout when b_preshuffled; a single [total_N, K] or [N, total_K] matrix
     where the groups divide N or K
   - m_sizes: [num_groups] - the group geometry, whose encoding the `layout`
     argument selects: INT64 row counts, INT32 cumulative offsets, or unused
   - D: [M_total, N] BF16 - output, which is the flattened [G * M, N] where the
     groups divide K and each produces a whole output of its own
+
+A and B carry `in_dtype` elements; the output is BF16 or FP16 whichever they
+are.
+
+BF16 operands carry their own exponent, so they have no scales: the scale
+arguments go unread, nothing is folded in the K loop, and the epilogue writes
+the accumulators straight out.
 
 Rowwise scaling carries one FP32 scale per row of A and per column of B, both
 constant along K, and applies them in the epilogue.
@@ -84,6 +98,9 @@ from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     resolve_group_cols,
     resolve_group_k,
     resolve_group_rows,
+    SCALING_BLOCK,
+    SCALING_NONE,
+    SCALING_ROW,
     setup_lds_allocation,
     setup_lds_allocation_plain,
     validate_lds_budget_plain,
@@ -111,15 +128,23 @@ def compile_fp8_grouped_gemm(
     scale_block_k: int = 128,
     scale_block_n: int = 128,
     out_dtype: str = "bf16",
+    waves_m: int = 1,
+    waves_n: int = 4,
     waves_per_eu: int | None = None,
     b_preshuffled: bool = True,
-    blockscale: bool = False,
+    in_dtype: str = "fp8",
+    scaling: str = SCALING_ROW,
     layout: str = "sizes",
     k_padding: bool = False,
     n_padding: bool = False,
+    group_based_b: bool = False,
+    group_based_rows: bool = False,
     roll_k: bool = False,
 ):
-    """Compile grouped FP8 GEMM kernel and return the JIT launcher.
+    """Compile the grouped GEMM kernel and return the JIT launcher.
+
+    Serves FP8 operands with block or rowwise scales and BF16 operands with
+    none; ``in_dtype`` and ``scaling`` select between them.
 
     Args:
         n: N dimension (output columns per group)
@@ -128,6 +153,14 @@ def compile_fp8_grouped_gemm(
         tile_m: M tile size (default 128)
         tile_n: N tile size (default 128)
         tile_k: K tile size (default 128)
+        waves_m: Waves dividing the tile's rows (default 1).
+        waves_n: Waves dividing the tile's columns (default 4). The block is
+            waves_m * waves_n * 64 threads and each wave owns a
+            (tile_m / waves_m) x (tile_n / waves_n) slab of the output tile.
+            Each wave reads its whole slab's worth of both operands out of LDS,
+            so LDS reads per unit of work go as
+            waves_m / tile_m + waves_n / tile_n, which is minimised by a grid
+            proportioned like the tile.
         scale_block_k: K-dimension scale block size (default 128)
         scale_block_n: N-dimension scale block size (default 128)
         out_dtype: Output data type ("bf16" or "f16")
@@ -140,21 +173,40 @@ def compile_fp8_grouped_gemm(
         n_padding: Emit the per-store column predicate so N need only reach an
             8-column store boundary rather than a whole tile. Forced on where
             the groups divide N, for the same reason.
+        group_based_b: Address B from the owning group's first row rather than
+            from the stack's, and bound the descriptor by that group. Required
+            once the whole stack exceeds the 4 GiB a buffer descriptor
+            addresses. The caller decides this from G * N * K, which is
+            host-known.
+        group_based_rows: Address A and D from the owning group's first row
+            rather than from the operand's, and bound each descriptor by that
+            group rather than by the whole operand. Required once A or D
+            exceeds the 4 GiB a buffer descriptor addresses, past which the
+            hardware reads zero and drops stores rather than faulting.
         b_preshuffled: When True (default) B is expected pre-swizzled into the
             MFMA layout and loaded HBM->registers (no B LDS). When False, B is
             plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
             like A. The two paths share the entire kernel body (tile-map group
             dispatch, scaling, wide-MFMA, CShuffle epilogue); only the B load
             stage and its LDS allocation differ.
-        blockscale: Selects the scaling scheme, which sets the expected layout of
+        in_dtype: Element type of A and B, "fp8" (default) or "bf16". It sets
+            the MFMA the K loop issues and the width of every operand address,
+            and it fixes `scaling`: fp8 is quantised and needs a scheme, bf16
+            carries its own exponent and needs "none". A bf16 tile spans twice
+            the LDS of the fp8 tile of the same shape, so the tile space the
+            LDS budget admits is correspondingly smaller.
+        scaling: Selects the scaling scheme, which sets the expected layout of
             scale_a / scale_b and where the scales are applied.
-            False (default) is rowwise: scale_a is [M_total] and scale_b is
-            [num_groups, N], one factor per row of A and per column of B, applied
-            once in the epilogue. Tiles are then free of scale-block alignment,
-            so tile_n may be smaller than scale_block_n.
-            True is block scaling: scale_a is per-group [M_g, scale_k] blocks and
-            scale_b is [num_groups, scale_k, scale_n], applied per scale block
-            inside the K loop, which requires the tile to align to the blocks.
+            "row" (default): scale_a is [M_total] and scale_b is [num_groups, N],
+            one factor per row of A and per column of B, applied once in the
+            epilogue. Tiles are then free of scale-block alignment, so tile_n may
+            be smaller than scale_block_n.
+            "block": scale_a is per-group [M_g, scale_k] blocks and scale_b is
+            [num_groups, scale_k, scale_n], applied per scale block inside the K
+            loop, which requires the tile to align to the blocks.
+            "none": the operands carry no scales at all, as bf16 does. Nothing is
+            folded in the K loop and nothing is applied in the epilogue, and the
+            scale arguments are ignored.
         layout: How the kernel learns which rows belong to which group. The
             encodings differ only in that resolution step; the loaders, the K
             loop and the epilogue are shared.
@@ -207,7 +259,7 @@ def compile_fp8_grouped_gemm(
     # and produces a whole output of its own.
     k_grouped = layout == "k_offsets"
     if k_grouped:
-        if blockscale or b_preshuffled:
+        if scaling != SCALING_ROW or b_preshuffled:
             raise ValueError(
                 "layout 'k_offsets' supports only rowwise scaling with plain B: "
                 "a scale block cannot straddle a group's K slice, and the "
@@ -220,7 +272,7 @@ def compile_fp8_grouped_gemm(
         roll_k = True
         k_padding = True
     if n_grouped:
-        if blockscale or b_preshuffled:
+        if scaling != SCALING_ROW or b_preshuffled:
             raise ValueError(
                 "layout 'n_offsets' supports only rowwise scaling with plain B: "
                 "ragged N would need per-group scale blocks, and the preshuffled "
@@ -230,6 +282,17 @@ def compile_fp8_grouped_gemm(
         # remainder the tail mask cannot be elided; N only has to reach a store
         # boundary, which validate_params checks below.
         n_padding = True
+
+    # The wave grid has to cut the tile into whole 16x16 MFMA tiles, since a
+    # wave's accumulators are counted in them and cannot straddle a boundary.
+    if waves_m < 1 or waves_n < 1:
+        raise ValueError(f"wave grid must be positive, got {waves_m}x{waves_n}")
+    if tile_m % (waves_m * 16) or tile_n % (waves_n * 16):
+        raise ValueError(
+            f"tile {tile_m}x{tile_n} does not divide into a {waves_m}x{waves_n} "
+            "wave grid of whole 16x16 MFMA tiles"
+        )
+    num_waves = waves_m * waves_n
 
     gpu_arch = get_hip_arch()
     # This FP8 kernel always uses the FP32 software-scaling path; the shared
@@ -248,27 +311,21 @@ def compile_fp8_grouped_gemm(
         k=k,
         tile_n=tile_n,
         tile_k=tile_k,
-        blockscale=blockscale,
+        scaling=scaling,
+        in_dtype=in_dtype,
         k_padding=k_padding,
         n_padding=n_padding,
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
         out_dtype=out_dtype,
     )
-    # Check the LDS budget before tracing: the compiler treats an overflow as a
-    # hard error that kills the process, which an autotuner cannot skip. Capacity
-    # is arch-dependent (64 KiB gfx942, 160 KiB gfx950).
-    if b_preshuffled:
-        # Preshuffled B goes HBM->registers; only A ping-pong / epilogue use LDS.
-        validate_lds_budget_preshuffle(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, arch=gpu_arch
+    if in_dtype != "fp8" and b_preshuffled:
+        # The preshuffled B layout, its HBM->register loader and the hot loop's
+        # instruction-group counts are all written around a one-byte element.
+        raise ValueError(
+            f"in_dtype {in_dtype!r} is supported with plain B only; pass "
+            "b_preshuffled=False"
         )
-    else:
-        # Plain B needs its own LDS buffer alongside A.
-        validate_lds_budget_plain(
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, b_pingpong=False, arch=gpu_arch
-        )
-    out_mlir = out_mlir_for(out_dtype)
 
     _c = compute_compile_constants(
         n=n,
@@ -279,13 +336,41 @@ def compile_fp8_grouped_gemm(
         scale_block_k=scale_block_k,
         scale_block_n=scale_block_n,
         k_padding=k_padding,
+        in_dtype=in_dtype,
+        scaling=scaling,
+        num_waves=num_waves,
     )
+    # Check the LDS budget before tracing: the compiler treats an overflow as a
+    # hard error that kills the process, which an autotuner cannot skip. Capacity
+    # is arch-dependent (64 KiB gfx942, 160 KiB gfx950).
+    if b_preshuffled:
+        # Preshuffled B goes HBM->registers; only A ping-pong / epilogue use LDS.
+        validate_lds_budget_preshuffle(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            elem_bytes=_c.elem_bytes,
+            arch=gpu_arch,
+        )
+    else:
+        # Plain B needs its own LDS buffer alongside A.
+        validate_lds_budget_plain(
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            elem_bytes=_c.elem_bytes,
+            b_pingpong=False,
+            arch=gpu_arch,
+        )
+    out_mlir = out_mlir_for(out_dtype)
+
     total_threads = _c.total_threads
     elem_bytes = _c.elem_bytes
     num_k_tiles = _c.num_k_tiles
     scale_k = _c.scale_k
     scale_n = _c.scale_n
     sb_per_tile = _c.sb_per_tile
+    ku_per_sb = _c.ku_per_sb
     k_unroll = _c.k_unroll
     kpack_bytes = _c.kpack_bytes
     tile_k_bytes = _c.tile_k_bytes
@@ -296,16 +381,16 @@ def compile_fp8_grouped_gemm(
     num_b_loads = _c.num_b_loads
 
     if b_preshuffled:
-        lds_alloc_offset, lds_tile_elems = setup_lds_allocation(
+        lds_alloc_offset, lds_tile_bytes = setup_lds_allocation(
             allocator=allocator,
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
             elem_bytes=elem_bytes,
         )
-        lds_b_offset_elems = None
+        lds_b_offset_bytes = None
     else:
-        lds_alloc_offset, lds_tile_elems, lds_b_offset_elems = (
+        lds_alloc_offset, lds_tile_bytes, lds_b_offset_bytes = (
             setup_lds_allocation_plain(
                 allocator=allocator,
                 tile_m=tile_m,
@@ -318,18 +403,33 @@ def compile_fp8_grouped_gemm(
 
     # Module name for caching
     _variant = "pingpong" if b_preshuffled else "plain"
-    _scaling = "blockscale" if blockscale else "rowwise"
+    _scaling = scaling if scaling != SCALING_ROW else "rowwise"
     _kpad = "_kpad" if k_padding else ""
     _roll = "_rollk" if roll_k else ""
     _wpe = f"_wpe{int(waves_per_eu)}" if waves_per_eu else ""
     _npad = "_npad" if n_padding else ""
+    # The wave grid changes the emitted kernel, so it has to reach the name or a
+    # second grid over the same tile would collide in the JIT cache.
+    _wg = f"_w{waves_m}x{waves_n}" if (waves_m, waves_n) != (1, 4) else ""
+    # The row basing changes the emitted kernel, so it has to reach the name or
+    # the two forms would collide in the JIT cache.
+    _gbr = "_gbr" if group_based_rows else ""
+    _gbb = "_gbb" if group_based_b else ""
     module_name = (
-        f"grouped_gemm_{_scaling}_{layout}_{_variant}_{out_dtype}"
+        f"grouped_gemm_{in_dtype}_{_scaling}_{layout}_{_variant}_{out_dtype}"
         f"_n{n}_k{k}_g{num_groups}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_kpad}{_npad}{_roll}{_wpe}{_wg}{_gbr}{_gbb}"
     ).replace("-", "_")
 
-    @flyc.kernel(name=module_name)
+    # The AMDGPU default caps a workgroup at 256 threads, so a grid of more than
+    # four waves has to declare its size up front. Below that the bound is
+    # already right, and declaring it anyway would perturb register allocation
+    # on every existing configuration for no reason.
+    _kernel_attrs = (
+        {"known_block_size": [total_threads, 1, 1]} if total_threads > 256 else {}
+    )
+
+    @flyc.kernel(name=module_name, **_kernel_attrs)
     def fp8_grouped_gemm_kernel(
         arg_d: fx.Tensor,
         arg_a: fx.Tensor,
@@ -357,11 +457,20 @@ def compile_fp8_grouped_gemm(
         # N-block position; bx_m (global row base) is loaded from the tile map below.
         by_n = by * fx.Index(tile_n)
 
-        # Wave/lane decomposition (256 threads = 4 waves x 64 lanes)
-        layout_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+        # Wave/lane decomposition (total_threads = num_waves x 64 lanes)
+        layout_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
         coord_wave_lane = fx.idx2crd(fx.Int32(tx), layout_wave_lane)
         wave_id = fx.get(coord_wave_lane, 0)
         lane_id = fx.get(coord_wave_lane, 1)
+
+        # Wave grid: wave w owns rows [wm * tile_m / waves_m, +tile_m / waves_m)
+        # and, via n_tile_base below, the matching slab of columns. A 1 x waves_n
+        # grid leaves every wave spanning the whole of tile_m, and the row
+        # derivations then take no offset at all.
+        if const_expr(waves_m > 1):
+            m_wave_base = (wave_id // fx.Index(waves_n)) * fx.Index(tile_m // waves_m)
+        else:
+            m_wave_base = None
 
         # Lane decomposition for MFMA (lane_id -> lane_div_16, lane_mod_16)
         layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
@@ -371,14 +480,18 @@ def compile_fp8_grouped_gemm(
 
         # LDS setup: ping-pong A buffers (preshuffle) or A ping-pong + single B
         # buffer (plain). B LDS is only needed for the plain path.
+        # The A/B arena is addressed as raw bytes -- T.f8 is its byte element
+        # type, not the dtype of the operands -- so its shapes, strides and
+        # column coordinates are all byte quantities. That is what lets the
+        # XOR16 swizzle and the LDS pack loads be shared across input dtypes.
         base_ptr = allocator.get_base()
         lds_a = SmemPtr(
-            base_ptr, lds_alloc_offset, T.f8, shape=(2 * tile_m * tile_k,)
+            base_ptr, lds_alloc_offset, T.f8, shape=(2 * tile_m * tile_k_bytes,)
         ).get()
-        lds_stride = tile_k
-        layout_lds = fx.make_layout((tile_m, tile_k), stride=(lds_stride, 1))
+        lds_stride = tile_k_bytes
+        layout_lds = fx.make_layout((tile_m, tile_k_bytes), stride=(lds_stride, 1))
         lds_base_pong = fx.Index(0)
-        lds_base_ping = fx.Index(lds_tile_elems)
+        lds_base_ping = fx.Index(lds_tile_bytes)
 
         if const_expr(not b_preshuffled):
             # Plain-B LDS buffer, placed just past the A ping-pong region.
@@ -386,34 +499,53 @@ def compile_fp8_grouped_gemm(
                 base_ptr,
                 lds_alloc_offset,
                 T.f8,
-                shape=((lds_b_offset_elems + tile_n * tile_k),),
+                shape=((lds_b_offset_bytes + tile_n * tile_k_bytes),),
             ).get()
-            layout_lds_b = fx.make_layout((tile_n, tile_k), stride=(tile_k, 1))
-            lds_base_b = fx.Index(lds_b_offset_elems)
+            layout_lds_b = fx.make_layout(
+                (tile_n, tile_k_bytes), stride=(tile_k_bytes, 1)
+            )
+            lds_base_b = fx.Index(lds_b_offset_bytes)
 
         # CShuffle epilogue LDS (aliased from same base, out-dtype element type)
         lds_out = SmemPtr(
             base_ptr, lds_alloc_offset, out_mlir(), shape=(tile_m * tile_n,)
         ).get()
 
-        # Buffer resources
-        # Where the groups divide K, A is [M, total_K] -- one set of rows shared
-        # by every group -- while the output and scale_a hold a slab per group.
-        a_nbytes = m_in * k_in
-        a_rsrc = buffer_ops.create_buffer_resource(
-            arg_a, max_size=False, num_records_bytes=a_nbytes
-        )
+        # Buffer resources. These extents are byte counts, so the K extent of a
+        # row has to be widened by the element size.
+        k_bytes_in = k_in if elem_bytes == 1 else k_in * fx.Index(elem_bytes)
 
-        # B is one [total_N, K] matrix when the groups divide N, and a stack of
-        # num_groups [N, K] ones otherwise.
-        if const_expr(n_grouped or k_grouped):
-            # One matrix the groups divide, by row under n_offsets and by column
-            # under k_offsets.
-            b_nbytes = n_in * k_in
-        else:
-            b_nbytes = num_groups_in * n_in * k_in
-        b_rsrc = buffer_ops.create_buffer_resource(
-            arg_b, max_size=False, num_records_bytes=b_nbytes
+        def rebased_resource(arg, num_records_bytes, byte_offset=None):
+            """Buffer descriptor over one slab of an operand, based at that slab.
+
+            A descriptor addresses at most 4 GiB: both its num_records and the
+            voffset a buffer_load adds are 32-bit. An out-of-range load reads
+            zero and an out-of-range store is dropped, so an operand past that
+            limit yields a wrong result rather than an error.
+
+            Folding the group into the base address keeps the descriptor over a
+            single group and does the group arithmetic in 64 bits. The offset
+            goes to `base_byte_offset`, which applies to the descriptor's base
+            pointer, so the group term never passes through a 32-bit quantity.
+            """
+            return buffer_ops.create_buffer_resource(
+                arg,
+                max_size=False,
+                num_records_bytes=num_records_bytes,
+                base_byte_offset=byte_offset,
+            )
+
+        # A's, B's and D's descriptors are all built further down, once the group
+        # is resolved: each is based at this block's group rather than at the
+        # whole operand, so that none of them has to address more than one
+        # group's worth. See `rebased_resource`.
+        b_nbytes = n_in * k_bytes_in
+        # What one descriptor must cover when it is not based at a group.
+        b_whole_nbytes = (
+            b_nbytes if (n_grouped or k_grouped) else num_groups_in * b_nbytes
+        )
+        b_rsrc_whole = (
+            None if group_based_b else rebased_resource(arg_b, b_whole_nbytes)
         )
 
         # The output is [M, total_N] when the groups divide N: m_in counts the
@@ -424,16 +556,18 @@ def compile_fp8_grouped_gemm(
             d_rows = num_groups_in * m_in
         else:
             d_rows = m_in
-        d_nbytes = d_rows * n_in * fx.Index(2)  # bf16/f16 = 2 bytes
-        d_rsrc = buffer_ops.create_buffer_resource(
-            arg_d, max_size=False, num_records_bytes=d_nbytes
-        )
+        d_row_bytes = n_in * fx.Index(2)  # bf16/f16 = 2 bytes
 
         # Scale buffers — gfx950 HW E8M0 path consumes int8 (one byte/scale,
         # pre-packed on host); gfx942 SW path consumes f32.
         scale_byte_size = 1 if _use_hw_scale else 4
 
-        if const_expr(blockscale):
+        if const_expr(scaling == SCALING_NONE):
+            # Unscaled operands: nothing reads these, and the caller has no
+            # scales to hand over, so the resources cover no bytes at all.
+            sa_nbytes = fx.Index(0)
+            sb_nbytes = fx.Index(0)
+        elif const_expr(scaling == SCALING_BLOCK):
             # scale_a: per-group [M_g, scale_k] blocks, scale_k values per row.
             sa_nbytes = fx.Index(scale_k) * m_in * fx.Index(scale_byte_size)
             # scale_b: [num_groups, scale_k, scale_n]
@@ -519,24 +653,35 @@ def compile_fp8_grouped_gemm(
             # Where the owning group's columns stop; the bound for both the B
             # row tail and the epilogue's column mask.
             n_bound = fx.Index(_col.col_limit)
-            b_group_off = fx.Index(0)
             # scale_b is one flat [total_N] here, so the group is already in by_n.
             sb_group_off = fx.Index(0)
         elif const_expr(k_grouped):
-            # B is a single [N, total_K] the groups slice by column, so it has no
-            # per-group row base -- the slice is expressed as a K offset instead.
+            # B is a single [N, total_K] the groups slice by column, so the slice
+            # is expressed as a K offset rather than a row base.
             # scale_b is still [G, N], one set of column scales per group.
             n_bound = None
-            b_group_off = fx.Index(0)
             sb_group_off = None
         else:
             n_bound = None
-            b_group_off = None
             sb_group_off = None
 
         # Early exit for surplus/no-op tiles.
         if is_valid:
             group_idx = fx.Index(group_id_i32)
+
+            # B is one [total_N, K] matrix when the groups divide N or K, and a
+            # stack of num_groups [N, K] ones otherwise. Only the stack has a
+            # group axis to fold into the base; the single matrix is already one
+            # slab, which every block reads whole.
+            if const_expr(group_based_b):
+                b_rsrc = rebased_resource(
+                    arg_b, b_nbytes, byte_offset=group_idx * b_nbytes
+                )
+            else:
+                # One descriptor over the whole stack, so the group stays in the
+                # coordinates rather than in the base. Built outside this
+                # conditional, since it does not depend on the group.
+                b_rsrc = b_rsrc_whole
 
             # Global row base of this tile and the exclusive row end of its group
             # (the group end masks the partial-tile tail in the epilogue store).
@@ -565,7 +710,45 @@ def compile_fp8_grouped_gemm(
                 k_base_div4 = None
                 k_bound = None
 
-            _t = compute_mfma_tiling(tile_m=tile_m, tile_n=tile_n)
+            if const_expr(group_based_rows):
+                # A and D are addressed from this group's first row rather than
+                # from the operand's, since a whole operand can exceed what one
+                # descriptor reaches. Rows inside the loader and the epilogue
+                # are then group-local, and the group's own extent bounds each
+                # descriptor.
+                a_group_rows = fx.Index(group_m_size_i32)
+                a_row_base = fx.Index(group_m_start_i32)
+                a_rsrc = rebased_resource(
+                    arg_a,
+                    a_group_rows * k_bytes_in,
+                    byte_offset=a_row_base * k_bytes_in,
+                )
+                # Where the groups divide N the output rows are already
+                # slab-local, so the group is in the column and there is no row
+                # base to take.
+                d_row_base = fx.Index(0) if const_expr(n_grouped) else a_row_base
+                d_base_bytes = d_row_base * d_row_bytes
+                if d_group_off is not None:
+                    # The groups divide K, so each owns a whole [M, N] output.
+                    d_base_bytes = d_base_bytes + d_group_off * fx.Index(2)
+                    # Folded into the base, so the store must not add it again.
+                    d_group_off = None
+                d_group_rows = d_rows if const_expr(n_grouped) else a_group_rows
+                d_rsrc = rebased_resource(
+                    arg_d, d_group_rows * d_row_bytes, byte_offset=d_base_bytes
+                )
+                a_loader_row_base = a_row_base
+            else:
+                # One descriptor spans each whole operand, so the rows stay
+                # global and nothing is subtracted.
+                a_rsrc = rebased_resource(arg_a, m_in * k_bytes_in)
+                d_rsrc = rebased_resource(arg_d, d_rows * d_row_bytes)
+                d_row_base = None
+                a_loader_row_base = None
+
+            _t = compute_mfma_tiling(
+                tile_m=tile_m, tile_n=tile_n, waves_m=waves_m, waves_n=waves_n
+            )
             m_repeat = _t.m_repeat
             n_per_wave = _t.n_per_wave
             num_acc_n = _t.num_acc_n
@@ -573,6 +756,7 @@ def compile_fp8_grouped_gemm(
             acc_init, accs = init_accumulators(_t.num_accs)
 
             _nb = make_n_block_coords(
+                waves_n=waves_n,
                 wave_id=wave_id,
                 by_n=by_n,
                 group_idx=group_idx,
@@ -582,6 +766,7 @@ def compile_fp8_grouped_gemm(
                 lane_mod_16=lane_mod_16,
                 kpack_bytes=kpack_bytes,
                 elem_bytes=elem_bytes,
+                b_group_based=group_based_b,
                 scale_block_n=scale_block_n,
                 scale_k=scale_k,
                 n_per_wave=n_per_wave,
@@ -602,6 +787,7 @@ def compile_fp8_grouped_gemm(
                 k=k,
                 tile_k=tile_k,
                 k_in=k_in,
+                elem_bytes=elem_bytes,
                 always=roll_k,
                 k_bound=k_bound,
             )
@@ -616,7 +802,9 @@ def compile_fp8_grouped_gemm(
                 a_rsrc=a_rsrc,
                 lds_a=lds_a,
                 layout_lds=layout_lds,
-                bx_m=bx_m,
+                # Group-local where a_rsrc is based at the group's first row;
+                # the plain global row otherwise.
+                bx_m=(bx_m if a_loader_row_base is None else bx_m - a_loader_row_base),
                 tx=tx,
                 tile_m=tile_m,
                 tile_k=tile_k,
@@ -639,6 +827,8 @@ def compile_fp8_grouped_gemm(
 
             # Base coordinates for A0 prefetch (mi=0, ku=0)
             row_a_lds_base = lane_mod_16  # mi=0
+            if const_expr(m_wave_base is not None):
+                row_a_lds_base = row_a_lds_base + m_wave_base
             col_offset_base_bytes = lane_div_16 * fx.Index(16)  # ku=0
 
             # ---- B load path: preshuffled (HBM->registers) vs plain (HBM->LDS->registers) ----
@@ -667,7 +857,16 @@ def compile_fp8_grouped_gemm(
                     lds_b=lds_b,
                     layout_lds_b=layout_lds_b,
                     by_n=by_n,
-                    group_idx=group_idx,
+                    # The base carries the group when B is based per group, so
+                    # the row offset must not carry it too.
+                    # No group term where the base already carries it, and
+                    # none where B has no group axis to carry: the layouts that
+                    # divide N or K give every block one shared matrix.
+                    b_group_off=(
+                        None
+                        if (group_based_b or n_grouped or k_grouped)
+                        else group_idx * n_in * (k_bytes_in // fx.Index(4))
+                    ),
                     tx=tx,
                     tile_n=tile_n,
                     tile_k=tile_k,
@@ -681,7 +880,6 @@ def compile_fp8_grouped_gemm(
                     k_in=k_in,
                     k_tail_mask=k_tail_mask,
                     n_padding=n_padding,
-                    b_group_off=b_group_off,
                     n_bound=n_bound,
                     k_base_div4=k_base_div4,
                 )
@@ -701,7 +899,6 @@ def compile_fp8_grouped_gemm(
 
             mfma_res_ty = T.f32x4
 
-            ku_per_sb = scale_block_k // 64
             rocdl.sched_barrier(0)
 
             if const_expr(b_preshuffled):
@@ -716,6 +913,7 @@ def compile_fp8_grouped_gemm(
                 )
 
             prefetch_scales = make_prefetch_scales(
+                m_wave_base=m_wave_base,
                 _use_hw_scale=_use_hw_scale,
                 sa_rsrc=sa_rsrc,
                 sb_rsrc=sb_rsrc,
@@ -733,6 +931,7 @@ def compile_fp8_grouped_gemm(
             )
 
             compute_tile = make_compute_tile(
+                m_wave_base=m_wave_base,
                 _use_hw_scale=_use_hw_scale,
                 _is_gfx950=_is_gfx950,
                 lds_load_packs_k64=lds_load_packs_k64,
@@ -756,7 +955,8 @@ def compile_fp8_grouped_gemm(
                 acc_init=acc_init,
                 group_m_start=fx.Index(group_m_start_i32),
                 group_m_size=fx.Index(group_m_size_i32),
-                blockscale=blockscale,
+                scaling=scaling,
+                in_dtype=in_dtype,
             )
 
             if const_expr(b_preshuffled):
@@ -915,10 +1115,11 @@ def compile_fp8_grouped_gemm(
             else:
                 accs = run_kloop(accs)
 
-            if const_expr(not blockscale):
+            if const_expr(scaling == SCALING_ROW):
                 # Rowwise scales are constant along K, so the whole reduction is
                 # scaled here in one pass rather than per K tile.
                 accs = make_rowwise_scaler(
+                    m_wave_base=m_wave_base,
                     sa_rsrc=sa_rsrc,
                     sb_rsrc=sb_rsrc,
                     group_idx=group_idx,
@@ -949,6 +1150,7 @@ def compile_fp8_grouped_gemm(
                 n_padding=n_padding,
                 n_bound=n_bound,
                 d_group_off=d_group_off,
+                d_row_base=d_row_base,
             )
 
             # Mask the partial-tile tail: skip stores for global rows at or beyond
@@ -963,6 +1165,7 @@ def compile_fp8_grouped_gemm(
 
             mfma_epilog(
                 use_cshuffle=True,
+                m_wave_base=m_wave_base,
                 arith=arith,
                 vector=vector,
                 gpu=gpu,
@@ -971,6 +1174,7 @@ def compile_fp8_grouped_gemm(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 e_vec=e_vec,
+                block_size=total_threads,
                 m_repeat=m_repeat,
                 num_acc_n=num_acc_n,
                 tx=tx,

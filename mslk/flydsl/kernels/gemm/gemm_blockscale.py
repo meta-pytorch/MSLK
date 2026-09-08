@@ -526,7 +526,6 @@ def compile_fp8_blockwise_gemm(
                 lds_b=lds_b,
                 layout_lds_b=layout_lds_b,
                 by_n=by_n,
-                group_idx=fx.Index(0),
                 tx=tx,
                 tile_n=tile_n,
                 tile_k=tile_k,

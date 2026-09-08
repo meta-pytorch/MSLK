@@ -90,7 +90,7 @@ def _dispatch_grouped_gemm(
         w_scale,
         M_sizes,
         b_preshuffled=b_preshuffled,
-        blockscale=True,
+        scaling="block",
     )
 
 
