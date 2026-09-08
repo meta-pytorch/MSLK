@@ -32,9 +32,6 @@ SCALE_BLOCK = 128
 # Default config when autotuning is disabled, for the scaled schemes; the
 # unscaled one takes UNSCALED_DEFAULT_TILE below. Valid for any supported shape
 # (tile_n = tile_k = 128 divide every supported N/K, including a small N=128).
-# The wave grid stays at the historical 1x4 rather than the 2x2 this square tile
-# would favour: changing it moves every untuned call, which is a decision to
-# take on measurement rather than on the shape of the tile alone.
 DEFAULT_TILE = {
     "tile_m": 128,
     "tile_n": 128,
@@ -44,14 +41,12 @@ DEFAULT_TILE = {
     "waves_per_eu": 2,
 }
 
-# The unscaled scheme needs its own default, because a 2-byte operand doubles
-# the LDS a tile costs. 128x128x128 in BF16 wants 2*128*128*2 for the ping-pong
-# A plus 128*128*2 for B, i.e. 98304 bytes against the 65536 a CDNA3 workgroup
-# has: on gfx942 the default does not merely run slowly, it raises before the
-# kernel is traced, which leaves the untuned path -- CI, graph capture -- with
-# nothing to run. Halving tile_k brings it to 49152, which fits both CDNA3 and
-# CDNA4. tile_k=64 is available only here: where there are scales it is tied to
-# the scale block.
+# The unscaled scheme takes a smaller tile_k, since a 2-byte operand doubles what
+# a tile occupies in LDS: 128x128x128 in BF16 needs 2*128*128*2 for the ping-pong
+# A plus 128*128*2 for B, which is 98304 bytes against the 65536 a CDNA3
+# workgroup has. tile_k=64 brings it to 49152 and fits both CDNA3 and CDNA4. Only
+# this scheme can move tile_k; where there are scales it is tied to the scale
+# block.
 UNSCALED_DEFAULT_TILE = {**DEFAULT_TILE, "tile_k": 64}
 
 # Candidate tiles swept by autotune. Rowwise scaling allows tile_n below the
@@ -83,9 +78,7 @@ _WAVES_PER_EU = (0, 2)
 # waves_m / tile_m + waves_n / tile_n, smallest when the grid is proportioned
 # like the tile: 1x4 suits a tile four times wider than tall, 2x2 a square one,
 # 4x1 a tall one. All three are four waves, so they cost the same in threads,
-# LDS and registers and differ only in shape. Grids past four waves are a
-# different trade -- more waves per tile against a smaller register budget each
-# -- and are left out until that is measured on its own.
+# LDS and registers and differ only in shape.
 _WAVE_GRIDS = ((1, 4), (2, 2), (4, 1))
 
 
@@ -197,11 +190,8 @@ def _addressing_plan(total_M, N, K, G, elem_bytes, layout):
     """Decide whether A and D need per-group basing, and reject the unreachable.
 
     Every operand keeps addressing its whole self while that self still fits one
-    descriptor, and switches to its group's base only when it does not. None of
-    the basing is free: on the preshuffled-B path, whose weights go
-    HBM->registers inside the K loop rather than through LDS, basing B costs
-    40-55% at tile_n=256, and basing A and D costs about a quarter of the
-    runtime on the FP8 groupwise shapes.
+    descriptor, and switches to its group's base only when it does not, since
+    per-group basing carries a runtime cost on every path that uses it.
 
     B's threshold is exact -- ``G * N * K`` is entirely host-known -- while A's
     and D's is a bound, since the packed layouts keep their group row counts on
@@ -296,8 +286,8 @@ def launch(
 
     ``g`` feeds the key alone. The group count changes both the grid, which
     carries one partial tile per group, and whether an operand clears the
-    buffer-descriptor limit and has to be re-based per group; the best tile
-    differs enough between group counts that they cannot share a tuned entry.
+    buffer-descriptor limit and has to be re-based per group, so group counts
+    do not share a tuned entry.
 
     ``in_dtype`` names the operand element type the kernel is compiled for.
     ``x_scale``/``w_scale`` may be None where it carries no scales.

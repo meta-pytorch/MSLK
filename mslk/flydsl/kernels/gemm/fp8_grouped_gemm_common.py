@@ -1318,10 +1318,8 @@ def make_compute_tile(
 
             def mfma_pack(acc_in, a0, a1, b0, b1):
                 # gfx942 has no K32 bf16 MFMA, so a pack is two K16 issues.
-                # Each issue wants its 4 bf16 per lane as a 4-wide 16-bit
-                # vector, which the intrinsic types as integers. That is the
-                # same 64 bits an LDS half already holds, so this only renames
-                # the bits -- but passing the raw i64 fails MLIR verification.
+                # Each issue takes its 4 bf16 per lane as a 4-wide vector of
+                # 16-bit integers, which is the same 64 bits an LDS half holds.
                 def v4(half):
                     return Vector.from_elements([half], fx.Int64).bitcast(fx.Int16)
 
@@ -1930,7 +1928,7 @@ def compute_mfma_tiling(*, tile_m, tile_n, waves_m=1, waves_n=4):
     """
     # Waves tile the output as waves_m x waves_n. LDS read traffic per unit work
     # is waves_m / tile_m + waves_n / tile_n, minimised when the wave grid is
-    # proportioned like the tile; the historical 1 x 4 split cannot do that.
+    # proportioned like the tile.
     num_waves = waves_m * waves_n
     m_repeat = (tile_m // waves_m) // 16
     n_per_wave = tile_n // waves_n
@@ -2007,10 +2005,8 @@ def make_n_block_coords(
     # axis alone, so a group's weights stay one contiguous [N, K] block, and the
     # group can sit either in the descriptor's base or in these coordinates.
     # Based per group, the layout spans n_in and the column carries no group
-    # term; spanning the whole stack, both take it back. The base is the only
-    # form a stack over 4 GiB can use, since the column is a 32-bit offset, but
-    # it is the more expensive one here: B goes HBM->registers inside the K loop
-    # on this path, so its descriptor is on the critical path of every load.
+    # term; spanning the whole stack, both take it back. Only the base form can
+    # address a stack over 4 GiB, the column being a 32-bit offset.
     c_n_total = n_in if b_group_based else num_groups_in * n_in
     b_layout = make_preshuffle_b_layout(
         arith,

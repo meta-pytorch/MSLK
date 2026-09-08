@@ -141,7 +141,10 @@ def compile_fp8_grouped_gemm(
     group_based_rows: bool = False,
     roll_k: bool = False,
 ):
-    """Compile grouped FP8 GEMM kernel and return the JIT launcher.
+    """Compile the grouped GEMM kernel and return the JIT launcher.
+
+    Serves FP8 operands with block or rowwise scales and BF16 operands with
+    none; ``in_dtype`` and ``scaling`` select between them.
 
     Args:
         n: N dimension (output columns per group)
@@ -155,11 +158,9 @@ def compile_fp8_grouped_gemm(
             waves_m * waves_n * 64 threads and each wave owns a
             (tile_m / waves_m) x (tile_n / waves_n) slab of the output tile.
             Each wave reads its whole slab's worth of both operands out of LDS,
-            so reads per unit work go as waves_m / tile_m + waves_n / tile_n,
-            which a grid proportioned like the tile minimises: at a square tile
-            2x2 reads a fifth less than the 1x4 default, while at 64x128 the two
-            are equal. Raising the product past 4 buys more waves per tile
-            rather than a better shape, and costs the register budget.
+            so LDS reads per unit of work go as
+            waves_m / tile_m + waves_n / tile_n, which is minimised by a grid
+            proportioned like the tile.
         scale_block_k: K-dimension scale block size (default 128)
         scale_block_n: N-dimension scale block size (default 128)
         out_dtype: Output data type ("bf16" or "f16")
@@ -173,28 +174,15 @@ def compile_fp8_grouped_gemm(
             8-column store boundary rather than a whole tile. Forced on where
             the groups divide N, for the same reason.
         group_based_b: Address B from the owning group's first row rather than
-            from the stack's, and bound the descriptor by that group. Needed
-            once the whole stack passes the 4 GiB a buffer descriptor reaches,
-            which a realistic expert count does: 128 experts of 16384x5120 in
-            BF16 is 21.5 GB. It is not free either, and least so where it might
-            have seemed so -- on the preshuffled path B goes HBM->registers
-            inside the K loop rather than staging through LDS, so its descriptor
-            sits on the critical path of every B load, and basing it costs
-            40-55% at tile_n=256. The host therefore sets it only for stacks
-            that need it, which it can decide exactly, G * N * K being wholly
+            from the stack's, and bound the descriptor by that group. Required
+            once the whole stack exceeds the 4 GiB a buffer descriptor
+            addresses. The caller decides this from G * N * K, which is
             host-known.
         group_based_rows: Address A and D from the owning group's first row
             rather than from the operand's, and bound each descriptor by that
-            group rather than by the whole operand. Needed once A or D passes
-            the 4 GiB a buffer descriptor reaches, past which the hardware reads
-            zero and drops stores rather than faulting -- a wrong answer at full
-            speed. It costs about a quarter of the runtime on the FP8 groupwise
-            shapes, measured at a pinned config and not explained by anything in
-            the emitted code -- the hot loop is the same size, the registers and
-            LDS are unchanged, and where the descriptor is built makes no
-            difference -- so the host sets it only for the shapes that have no
-            alternative. B is based at its group either way, which measures
-            free.
+            group rather than by the whole operand. Required once A or D
+            exceeds the 4 GiB a buffer descriptor addresses, past which the
+            hardware reads zero and drops stores rather than faulting.
         b_preshuffled: When True (default) B is expected pre-swizzled into the
             MFMA layout and loaded HBM->registers (no B LDS). When False, B is
             plain row-major [num_groups, N, K] and is staged HBM->LDS->registers
@@ -531,20 +519,14 @@ def compile_fp8_grouped_gemm(
             """Buffer descriptor over one slab of an operand, based at that slab.
 
             A descriptor addresses at most 4 GiB: both its num_records and the
-            voffset a buffer_load adds are 32-bit. A stack of per-group weights
-            passes that at a realistic expert count -- 128 experts of 16384x5120
-            BF16 is 21.5 GB -- and the hardware answers an out-of-range load with
-            zero, so the kernel would return a wrong result at full speed rather
-            than fail.
+            voffset a buffer_load adds are 32-bit. An out-of-range load reads
+            zero and an out-of-range store is dropped, so an operand past that
+            limit yields a wrong result rather than an error.
 
-            Folding the group into the base address instead keeps the descriptor
-            over one group, which no realistic shape exceeds, and does the
-            arithmetic that selects the group in 64 bits. `preshuffle_gemm.py`
-            bases its batched operands the same way.
-
-            The offset goes to `base_byte_offset`, which is applied to the
-            descriptor's base pointer, so the group term never passes through a
-            32-bit quantity on its way in.
+            Folding the group into the base address keeps the descriptor over a
+            single group and does the group arithmetic in 64 bits. The offset
+            goes to `base_byte_offset`, which applies to the descriptor's base
+            pointer, so the group term never passes through a 32-bit quantity.
             """
             return buffer_ops.create_buffer_resource(
                 arg,
@@ -697,8 +679,8 @@ def compile_fp8_grouped_gemm(
                 )
             else:
                 # One descriptor over the whole stack, so the group stays in the
-                # coordinates rather than in the base. Built before this branch,
-                # needing no group to build.
+                # coordinates rather than in the base. Built outside this
+                # conditional, since it does not depend on the group.
                 b_rsrc = b_rsrc_whole
 
             # Global row base of this tile and the exclusive row end of its group
@@ -730,13 +712,10 @@ def compile_fp8_grouped_gemm(
 
             if const_expr(group_based_rows):
                 # A and D are addressed from this group's first row rather than
-                # from the operand's, for the reason B always is: a whole operand
-                # can exceed what one descriptor reaches. A packed A at 300k rows
-                # of K=8192 in BF16 is 4.6 GB with only four groups, so this is
-                # not the many-expert case alone. Rows inside the loader and the
-                # epilogue are then group-local, and the group's own extent
-                # bounds each descriptor. This form is the slower one; see
-                # `group_based_rows`.
+                # from the operand's, since a whole operand can exceed what one
+                # descriptor reaches. Rows inside the loader and the epilogue
+                # are then group-local, and the group's own extent bounds each
+                # descriptor.
                 a_group_rows = fx.Index(group_m_size_i32)
                 a_row_base = fx.Index(group_m_start_i32)
                 a_rsrc = rebased_resource(

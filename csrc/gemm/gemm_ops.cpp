@@ -177,15 +177,13 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   //   i8i8bf16 / i8i8bf16_dynamic -> mslk/gemm/triton/int8_gemm.py
   //   bf16bf16bf16_grouped_grad / _wgrad -> mslk/gemm/triton/grouped_gemm.py
   //   bf16bf16bf16_grouped_stacked -> mslk/gemm/flydsl/bf16_grouped_gemm.py.
-  //     This one displaces a CK kernel that did serve ROCm, rather than
-  //     filling an empty slot, and nothing stands behind it: without the
-  //     FlyDSL backend the op raises here, CK and Triton both being on the way
-  //     out. A C++ registration could not have been the fallback anyway --
-  //     whichever of the two registers last owns the key outright.
+  //     FlyDSL is the only ROCm implementation; without that backend the op
+  //     raises. Registering it here as well would not provide a fallback,
+  //     since whichever registration runs last owns the dispatch key.
 #else
-  // The rowwise grouped ops share a schema with ROCm, where FlyDSL implements
-  // them from Python; these registrations serve CUTLASS on CUDA only. So does
-  // the stacked BF16 grouped op, whose ROCm CK kernel FlyDSL now displaces.
+  // The rowwise grouped ops and the stacked BF16 grouped op share a schema with
+  // ROCm, where FlyDSL implements them from Python; these registrations serve
+  // CUTLASS on CUDA only.
   m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);

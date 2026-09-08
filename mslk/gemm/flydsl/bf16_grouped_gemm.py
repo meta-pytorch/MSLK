@@ -17,16 +17,12 @@ is what ``scaling="none"`` selects.
 * ``mslk::bf16bf16bf16_grouped_stacked`` -- groups packed along M with a ``[G]``
   int64 row count per group, and row-major ``[G, N, K]`` weights.
 
-CK served this op on ROCm until now, unlike the FP8 grouped ops, whose C++ slots
-were already free. gemm_ops.cpp no longer registers it there and nothing takes
-CK's place: FlyDSL is the only ROCm implementation, and calling the op without
-the backend raises rather than quietly reaching a slower kernel. That is
-deliberate -- CK and Triton are both being deprecated.
+FlyDSL is the only ROCm implementation of this op: gemm_ops.cpp does not
+register it there, so calling it without the FlyDSL backend raises.
 
-CK's own source marks ``bf16bf16bf16_grouped``, ``_cat`` and ``_dynamic``
-"UNSUPPORTED AND DEPRECATED -- use _stacked", so they are deliberately not
-served here. ``_grad``/``_wgrad`` are backward passes on a different kernel
-shape and are left to Triton.
+``bf16bf16bf16_grouped``, ``_cat`` and ``_dynamic`` are marked "UNSUPPORTED AND
+DEPRECATED -- use _stacked" in CK and are not served here. ``_grad``/``_wgrad``
+are backward passes on a different kernel shape and are served by Triton.
 
 Tensor contract:
   X       : [total_M, K]   BF16  -- all groups concatenated along M
@@ -49,10 +45,9 @@ from mslk.utils.device import is_gfx942, is_gfx950
 def is_supported() -> bool:
     """Whether this module can serve the op on the current GPU.
 
-    The kernel is built on MFMA, which the RDNA parts do not have -- and FlyDSL
-    reports itself available on those, so having the backend says nothing about
-    whether this op can run. mslk/gemm/__init__.py raises when this is False,
-    there being no other ROCm implementation left to fall back to.
+    The kernel is built on MFMA, which the RDNA parts do not have, and FlyDSL
+    reports itself available on those, so the backend being present does not
+    imply this op can run. mslk/gemm/__init__.py raises when this is False.
     """
     return is_gfx950() or is_gfx942()
 
@@ -60,9 +55,8 @@ def is_supported() -> bool:
 def _assert_bf16_operands(X: torch.Tensor, W: torch.Tensor) -> None:
     """Reject operands the kernel would read as the wrong type.
 
-    It passes them through as raw bytes, so a mismatched dtype would be
-    contracted with the wrong exponent layout rather than rejected. The FP8
-    siblings check the same thing about the FP8 flavour.
+    Operands are passed through as raw bytes, so a mismatched dtype would be
+    contracted with the wrong exponent layout rather than rejected.
     """
     assert X.dtype == torch.bfloat16, f"X must be bfloat16, got {X.dtype}"
     assert W.dtype == torch.bfloat16, f"W must be bfloat16, got {W.dtype}"
@@ -77,11 +71,10 @@ def matmul_bf16bf16bf16_grouped_stacked(
 ) -> torch.Tensor:
     """BF16 grouped GEMM -> BF16, groups packed along M.
 
-    ``num_sms`` is accepted and ignored. CK takes it as a hint for a persistent
-    kernel that occupies a fixed number of CUs; this kernel launches one block
-    per output tile and lets the scheduler place them, so there is nothing for
-    the hint to bind to. It stays in the signature because the op's schema is
-    shared with the CUDA implementation.
+    ``num_sms`` is accepted and ignored: it hints at a persistent kernel
+    occupying a fixed number of CUs, while this kernel launches one block per
+    output tile and lets the scheduler place them. It stays in the signature
+    because the op's schema is shared with the CUDA implementation.
     """
     # Registration does not probe for FlyDSL, so this is the first point at
     # which it is required.

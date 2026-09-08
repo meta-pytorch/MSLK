@@ -175,12 +175,10 @@ if torch.version.hip is not None:
     if hasattr(torch.ops, "mslk") and hasattr(
         torch.ops.mslk, "bf16bf16bf16_grouped_stacked"
     ):
-        # FlyDSL is the only implementation of this op on ROCm, so there is
-        # nothing to arbitrate: CK served it until now and gemm_ops.cpp no
-        # longer registers it here. Calling it without having opted into
-        # flydsl_ops raises rather than silently reaching a slower kernel --
-        # deliberately, since CK and Triton are both on the way out. Nothing
-        # about registering may import FlyDSL, hence the first-call resolution.
+        # FlyDSL is the only ROCm implementation of this op: gemm_ops.cpp does
+        # not register it here, so calling it without the flydsl_ops dep raises
+        # rather than reaching another kernel. Registration must not import
+        # FlyDSL, hence the first-call resolution.
         try:
 
             @torch.library.impl("mslk::bf16bf16bf16_grouped_stacked", "CUDA")
