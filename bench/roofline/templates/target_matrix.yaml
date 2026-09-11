@@ -1,0 +1,83 @@
+# MSLK WP-1a Target Matrix Template
+# GPU: MI350X (gfx950)
+# Usage: Fill ceiling_value and baseline_achieved_pct after running benchmarks
+gpu_arch: "gfx950"
+tool_version: ""
+timestamp: ""
+measurement_conditions:
+  sclk_mhz: null
+  mclk_mhz: null
+  cache_state: "cold_l2"
+  bench_rep_ms: 200
+  stat_iterations: 5
+  cov_bound_pct: 3.0
+
+targets:
+  # ---- FP8 Rowwise Preshuffle FlyDSL (PR #434) ----
+
+  # Llama3 70B shapes
+  - kernel: FP8RowwisePreshuffleFlyDSL
+    model_source: llama3_70b
+    shapes:
+      # R3 — decode / skinny M, target against HBM BW
+      - {M: 1,   N: 1280, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 1,   N: 7168, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 1,   N: 8192, K: 3584, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 16,  N: 1280, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 32,  N: 1280, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 64,  N: 7168, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 75.0}
+      - {M: 128, N: 1280, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      - {M: 128, N: 7168, K: 8192, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      - {M: 128, N: 8192, K: 3584, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      # R4 — small K, target against AITER/CK best
+      - {M: 1,   N: 8192, K: 1024, regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+      - {M: 16,  N: 8192, K: 1024, regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+      - {M: 128, N: 8192, K: 1024, regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+
+  # Llama3 405B shapes
+  - kernel: FP8RowwisePreshuffleFlyDSL
+    model_source: llama3_405b
+    shapes:
+      # R3 — decode
+      - {M: 1,   N: 13312, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 1,   N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 1,   N: 16384, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 1,   N: 16384, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 128, N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      - {M: 128, N: 16384, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      # R2 — medium
+      - {M: 1024, N: 16384, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 80.0}
+      - {M: 2048, N: 16384, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 80.0}
+      # R1 — large compute-bound (prefill)
+      - {M: 4096, N: 16384, K: 16384, regime: R1, ceiling_type: mfma_peak, target_pct: 88.0}
+      - {M: 8192, N: 16384, K: 16384, regime: R1, ceiling_type: mfma_peak, target_pct: 90.0}
+
+  # Llama4 shapes
+  - kernel: FP8RowwisePreshuffleFlyDSL
+    model_source: llama4
+    shapes:
+      - {M: 1,   N: 896,  K: 5120, regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+      - {M: 1,   N: 5120, K: 640,  regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+      - {M: 1,   N: 2048, K: 5120, regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 128, N: 2048, K: 5120, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      - {M: 128, N: 5120, K: 1024, regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+
+  # ---- FP8 Rowwise Batched Preshuffle FlyDSL (grouped/MoE) ----
+  - kernel: FP8RowwiseBatchedPreshuffleFlyDSL
+    model_source: llama4
+    shapes:
+      # R5 — grouped/MoE, target against AITER best aggregate
+      - {M: 128, N: 2048, K: 5120, regime: R5, ceiling_type: empirical_best, target_pct: 90.0}
+      - {M: 128, N: 5120, K: 1024, regime: R5, ceiling_type: empirical_best, target_pct: 90.0}
+
+  # ---- Representative square shapes for roofline validation ----
+  - kernel: FP8RowwisePreshuffleFlyDSL
+    model_source: roofline_validation
+    shapes:
+      - {M: 8192,  N: 8192,  K: 8192,  regime: R1, ceiling_type: mfma_peak, target_pct: 90.0}
+      - {M: 4096,  N: 4096,  K: 4096,  regime: R1, ceiling_type: mfma_peak, target_pct: 88.0}
+      - {M: 1024,  N: 8192,  K: 8192,  regime: R2, ceiling_type: mfma_peak, target_pct: 80.0}
+      - {M: 128,   N: 8192,  K: 8192,  regime: R3, ceiling_type: hbm_bw, target_pct: 80.0}
+      - {M: 16,    N: 8192,  K: 8192,  regime: R3, ceiling_type: hbm_bw, target_pct: 75.0}
+      - {M: 1,     N: 8192,  K: 8192,  regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
+      - {M: 4096,  N: 1024,  K: 512,   regime: R4, ceiling_type: empirical_best, target_pct: 95.0}

@@ -9,7 +9,12 @@ import functools
 from enum import auto, Enum
 
 import torch
-from mslk.bench.common.utils import BenchOptions, do_bench
+from mslk.bench.common.utils import (
+    BenchOptions,
+    BenchStatResult,
+    do_bench,
+    summarize_bench_results,
+)
 from mslk.flydsl.common import is_flydsl_available
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 
@@ -168,6 +173,16 @@ class GemmOpBase(metaclass=abc.ABCMeta):
         """Benchmark runtime of this operator."""
         t = do_bench(lambda *a: self.compute(*a), args, opts)
         return t
+
+    def benchmark_statistical(
+        self,
+        *args,
+        opts: BenchOptions,
+        n_iterations: int,
+    ) -> BenchStatResult:
+        """Benchmark through the operator's timing path repeatedly."""
+        runtimes = [self.benchmark(*args, opts=opts) for _ in range(n_iterations)]
+        return summarize_bench_results(runtimes)
 
     @property
     def name(self) -> str:
