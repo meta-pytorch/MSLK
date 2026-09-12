@@ -63,6 +63,26 @@ _SHAPE_OVERRIDES_GFX950: list[tuple[int, int, int, KernelConfig]] = [
     (1, 8192, 1024, KernelConfig(16, 64, 512, 2, waves_per_eu=1)),
     (256, 8192, 1024, KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2)),
     (8192, 8192, 1024, KernelConfig(128, 256, 128, 2, xcd_swizzle=1, waves_per_eu=2)),
+    # N=8192, K=8192: sweep-tuned (WP-1a, 2026-09-08)
+    (1, 8192, 8192, KernelConfig(32, 64, 512, 2, xcd_swizzle=1)),
+    (64, 8192, 8192, KernelConfig(32, 64, 512, 2, xcd_swizzle=1)),
+    (128, 8192, 8192, KernelConfig(64, 64, 256, 2, xcd_swizzle=1)),
+    (512, 8192, 8192, KernelConfig(64, 64, 256, 2, xcd_swizzle=1)),
+    (2048, 8192, 8192, KernelConfig(64, 256, 128, 2, xcd_swizzle=4)),
+    (8192, 8192, 8192, KernelConfig(128, 256, 128, 2, waves_per_eu=2)),
+    # N=7168, K=8192: sweep-tuned (WP-1a, 2026-09-08)
+    (1, 7168, 8192, KernelConfig(32, 64, 512, 2, xcd_swizzle=1)),
+    (64, 7168, 8192, KernelConfig(32, 64, 512, 2, xcd_swizzle=1)),
+    (128, 7168, 8192, KernelConfig(64, 64, 256, 2, xcd_swizzle=1)),
+    (512, 7168, 8192, KernelConfig(64, 64, 256, 2, xcd_swizzle=1)),
+    (2048, 7168, 8192, KernelConfig(64, 256, 128, 2, xcd_swizzle=4)),
+    (8192, 7168, 8192, KernelConfig(128, 256, 128, 2, waves_per_eu=2)),
+    # N=8192, K=3584: sweep-tuned (WP-1a, 2026-09-08)
+    (1, 8192, 3584, KernelConfig(32, 64, 512, 2, xcd_swizzle=1)),
+    (128, 8192, 3584, KernelConfig(64, 64, 128, 2, xcd_swizzle=1)),
+    (512, 8192, 3584, KernelConfig(64, 64, 128, 2, xcd_swizzle=1)),
+    (2048, 8192, 3584, KernelConfig(64, 256, 128, 2, xcd_swizzle=4)),
+    (8192, 8192, 3584, KernelConfig(128, 256, 128, 2, waves_per_eu=2)),
 ]
 
 
