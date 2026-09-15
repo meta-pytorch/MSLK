@@ -69,6 +69,47 @@ def _detect_build_variant() -> str:
     return "cpu"
 
 
+# Conservative host-RAM budget per parallel NVCC job, in GiB.
+_BUILD_GB_PER_NVCC_JOB = 4
+# Absolute cap on default build parallelism: beyond this, extra jobs add
+# little for these huge translation units while risking OOM.
+_BUILD_MAX_PARALLEL_JOBS = 16
+
+
+def _available_memory_gb() -> Optional[float]:
+    """Best-effort host available memory in GiB, or None if unknown."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _default_build_parallel_jobs() -> int:
+    """Default ninja parallelism, bounded by CPU count and host memory."""
+    jobs = (os.cpu_count() or 4) // 2
+    mem_gb = _available_memory_gb()
+    if mem_gb is not None:
+        jobs = min(jobs, int(mem_gb // _BUILD_GB_PER_NVCC_JOB))
+    return max(1, min(jobs, _BUILD_MAX_PARALLEL_JOBS))
+
+
+def _build_parallel_level() -> str:
+    """Resolve CMAKE_BUILD_PARALLEL_LEVEL honoring explicit overrides first.
+
+    Precedence: CMAKE_BUILD_PARALLEL_LEVEL > MAX_JOBS (PyTorch convention) >
+    BUILD_PARALLELISM (MSLK CI scripts) > memory-aware default.
+    """
+    for var in ("CMAKE_BUILD_PARALLEL_LEVEL", "MAX_JOBS", "BUILD_PARALLELISM"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return str(_default_build_parallel_jobs())
+
+
 @dataclass(frozen=True)
 class MSLKBuild:
     args: argparse.Namespace
@@ -320,7 +361,11 @@ class MSLKBuild:
             return f"-D_GLIBCXX_USE_CXX11_ABI={value}"
 
         torch_root = os.path.dirname(torch.__file__)
-        os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str((os.cpu_count() or 4) // 2)
+        os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = _build_parallel_level()
+        print(
+            "[SETUP.PY] CMAKE_BUILD_PARALLEL_LEVEL="
+            f"{os.environ['CMAKE_BUILD_PARALLEL_LEVEL']}"
+        )
 
         cmake_args = [
             f"-DCMAKE_PREFIX_PATH={torch_root}",

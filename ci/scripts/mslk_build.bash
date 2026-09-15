@@ -704,6 +704,12 @@ build_mslk_package () {
     build_args[i]="--config-setting=--build-option=${build_args[i]}"
   done
 
+  # Cap ninja parallelism for the wheel build.
+  if [[ -n "${BUILD_PARALLELISM:-}" && -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+    export CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_PARALLELISM}"
+  fi
+  echo "[BUILD] CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-<unset: setup.py default applies>} ..."
+
   # Build the wheel.  Invoke using `python -m build`
   #   https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html
   echo "[BUILD] Building MSLK wheel (TARGET=${mslk_build_target}, VARIANT=${mslk_build_variant}) ..."
