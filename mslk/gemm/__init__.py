@@ -10,6 +10,7 @@ import functools
 import importlib
 from collections.abc import Callable
 from types import ModuleType
+from typing import Optional
 
 from mslk.utils.torch.library import load_library_buck
 
@@ -166,6 +167,42 @@ if torch.version.hip is not None:
                     )
                 return mod.matmul_f8f8bf16_groupwise_grouped_preshuffle(
                     XQ, WQ, x_scale, w_scale, M_sizes
+                )
+
+        except RuntimeError:
+            pass  # already registered (e.g. module imported more than once)
+
+    if hasattr(torch.ops, "mslk") and hasattr(
+        torch.ops.mslk, "bf16bf16bf16_grouped_stacked"
+    ):
+        # FlyDSL is the only ROCm implementation of this op: gemm_ops.cpp does
+        # not register it here, so calling it without the flydsl_ops dep raises
+        # rather than reaching another kernel. Registration must not import
+        # FlyDSL, hence the first-call resolution.
+        try:
+
+            @torch.library.impl("mslk::bf16bf16bf16_grouped_stacked", "CUDA")
+            def _bf16bf16bf16_grouped_stacked_rocm(
+                X: torch.Tensor,
+                W: torch.Tensor,
+                M_sizes: torch.Tensor,
+                out: Optional[torch.Tensor] = None,
+                num_sms: Optional[int] = None,
+            ) -> torch.Tensor:
+                mod = _flydsl_gemm_module("bf16_grouped_gemm")
+                if mod is None:
+                    raise RuntimeError(
+                        "mslk::bf16bf16bf16_grouped_stacked requires the FlyDSL "
+                        "backend on ROCm. Add //mslk/mslk/gemm:flydsl_ops to "
+                        "your target's deps."
+                    )
+                if not mod.is_supported():
+                    raise RuntimeError(
+                        "mslk::bf16bf16bf16_grouped_stacked needs MFMA, which "
+                        "this GPU does not have. Supported: gfx942, gfx950."
+                    )
+                return mod.matmul_bf16bf16bf16_grouped_stacked(
+                    X, W, M_sizes, out, num_sms
                 )
 
         except RuntimeError:

@@ -93,7 +93,7 @@ def _dispatch_rowwise_grouped(
         w_scale,
         M_sizes,
         b_preshuffled=b_preshuffled,
-        blockscale=False,
+        scaling="row",
     )
 
 
@@ -168,7 +168,7 @@ def _dispatch_rowwise_grouped_dynamic(
         w_scale,
         zero_start_index_M,
         b_preshuffled=b_preshuffled,
-        blockscale=False,
+        scaling="row",
         layout="padded",
         out=out.view(G * expected_m, N),
     )
@@ -273,7 +273,7 @@ def _rowwise_grouped_mm_2d3d(
         w_scale,
         offsets,
         b_preshuffled=b_preshuffled,
-        blockscale=False,
+        scaling="row",
         layout="offsets",
         out=out,
     )
@@ -317,7 +317,7 @@ def _rowwise_grouped_mm_3d3d(
         w_scale,
         _unused_group_meta(XQ.device),
         b_preshuffled=b_preshuffled,
-        blockscale=False,
+        scaling="row",
         layout="batched",
         out=out.view(G * M, N),
     )
@@ -364,7 +364,7 @@ def _rowwise_grouped_mm_3d2d(XQ, WQ, x_scale, w_scale, offsets, out):
         w_scale,
         offsets,
         b_preshuffled=False,
-        blockscale=False,
+        scaling="row",
         layout="n_offsets",
         out=out,
     )
@@ -415,7 +415,7 @@ def _rowwise_grouped_mm_2d2d(XQ, WQ, x_scale, w_scale, offsets, out):
         w_scale,
         offsets,
         b_preshuffled=False,
-        blockscale=False,
+        scaling="row",
         layout="k_offsets",
         out=out.view(G * M, N),
     )

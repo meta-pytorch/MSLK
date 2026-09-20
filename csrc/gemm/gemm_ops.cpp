@@ -159,7 +159,6 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
   m.impl("bf16bf16bf16_grouped_dynamic", bf16bf16bf16_grouped_dynamic);
-  m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
 
 #ifdef USE_ROCM
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
@@ -177,9 +176,15 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   //   f8f8bf16_groupwise -> mslk/gemm/triton/fp8_groupwise_gemm.py
   //   i8i8bf16 / i8i8bf16_dynamic -> mslk/gemm/triton/int8_gemm.py
   //   bf16bf16bf16_grouped_grad / _wgrad -> mslk/gemm/triton/grouped_gemm.py
+  //   bf16bf16bf16_grouped_stacked -> mslk/gemm/flydsl/bf16_grouped_gemm.py.
+  //     FlyDSL is the only ROCm implementation; without that backend the op
+  //     raises. Registering it here as well would not provide a fallback,
+  //     since whichever registration runs last owns the dispatch key.
 #else
-  // The rowwise grouped ops share a schema with ROCm, where FlyDSL implements
-  // them from Python; these registrations serve CUTLASS on CUDA only.
+  // The rowwise grouped ops and the stacked BF16 grouped op share a schema with
+  // ROCm, where FlyDSL implements them from Python; these registrations serve
+  // CUTLASS on CUDA only.
+  m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);
@@ -227,7 +232,6 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   m.impl("bf16bf16bf16_grouped", bf16bf16bf16_grouped);
   m.impl("bf16bf16bf16_grouped_cat", bf16bf16bf16_grouped_cat);
   m.impl("bf16bf16bf16_grouped_dynamic", bf16bf16bf16_grouped_dynamic);
-  m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
 
 #ifdef USE_ROCM
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
@@ -239,6 +243,7 @@ TORCH_LIBRARY_IMPL(mslk, CPU, m) {
   // back, which is what the note at the top of this block is about.
 #else
   // Shared with ROCm, where FlyDSL implements them from Python.
+  m.impl("bf16bf16bf16_grouped_stacked", bf16bf16bf16_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_stacked", f8f8bf16_rowwise_grouped_stacked);
   m.impl("f8f8bf16_rowwise_grouped_dynamic", f8f8bf16_rowwise_grouped_dynamic);
   m.impl("f8f8bf16_groupwise", f8f8bf16_groupwise);

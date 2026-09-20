@@ -110,7 +110,7 @@ def _matmul_gfx942(XQ, WQ, x_scale, w_scale, M, N, K):
         w_scale,
         grouped_dispatch.unused_group_meta(XQ.device),
         b_preshuffled=False,
-        blockscale=True,
+        scaling="block",
         layout="batched",
     )
 
