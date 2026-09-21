@@ -121,6 +121,15 @@ def is_gfx950() -> bool:
     return is_rocm() and gfx_arch_in(["gfx950"])
 
 
+def is_hopper() -> bool:
+    """True on NVIDIA Hopper GPUs (sm_90: H100/H200).
+
+    Requires a CUDA build: gfx90a (MI200-class) ROCm devices also report
+    capability (9, 0), so the capability check alone is not NVIDIA-specific.
+    """
+    return is_cuda() and compute_capability_in(9, 9)
+
+
 # When set to "1" / "true" / "yes", forces MSLK to use AMD fnuz FP8
 # (torch.float8_e4m3fnuz / tl.float8e4b8) even on gfx950 (MI350X), which
 # natively uses OCP FP8 (torch.float8_e4m3fn).  Useful for debugging or when
