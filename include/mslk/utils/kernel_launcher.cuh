@@ -22,8 +22,6 @@
 
 namespace mslk::utils {
 
-#define U64(x) static_cast<uint64_t>(x)
-
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers to detect TensorAccessorBuilder type (regardless of template params)
 ////////////////////////////////////////////////////////////////////////////////
@@ -167,12 +165,12 @@ struct KernelLauncher {
         "]");
   }
 
-  constexpr inline void checkThreadCountNotExceeded(
+  inline void checkThreadCountNotExceeded(
       const cudaDeviceProp& properties,
       const dim3& grid,
       const dim3& block) const {
-    const uint64_t threads_per_block =
-        U64(block.x) * U64(block.y) * U64(block.z);
+    const uint64_t threads_per_block = static_cast<uint64_t>(block.x) *
+        static_cast<uint64_t>(block.y) * static_cast<uint64_t>(block.z);
 
     TORCH_CHECK(
         threads_per_block <= properties.maxThreadsPerBlock,
@@ -188,34 +186,7 @@ struct KernelLauncher {
         " is greater than the limit of ",
         properties.maxThreadsPerBlock);
 
-#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700))
-    // ROCm has a limit of 2^32 elements per kernel launch, but doesn't
-    // automatically work around problem like CUDA does (V100 or newer
-    // architectures), see:
-    //    https://github.com/ROCm/hip/issues/2253
-    //    https://rocm.docs.amd.com/projects/HIP/en/docs-develop/reference/hip_runtime_api/modules/occupancy.html
-    const uint64_t total_threads = U64(grid.x) * U64(grid.y) * U64(grid.z) *
-        U64(block.x) * U64(block.y) * U64(block.z);
-
-    TORCH_CHECK(
-        total_threads < U64(std::numeric_limits<uint32_t>::max()),
-        context.description(),
-        " [grid dim ",
-        grid.x,
-        " x ",
-        grid.y,
-        " x ",
-        grid.z,
-        "] [block dim ",
-        block.x,
-        " x ",
-        block.y,
-        " x ",
-        block.z,
-        "]: Total number of threads ",
-        total_threads,
-        " is greater than the HIP limit of 2^32");
-#endif
+    device::check_launch_thread_product(grid, block, context.description());
   }
 
   constexpr inline void checkSharedMemoryPerBlockNotExceeded(
@@ -411,8 +382,6 @@ struct KernelLauncher {
     }
   }
 };
-
-#undef U64
 
 } // namespace mslk::utils
 
