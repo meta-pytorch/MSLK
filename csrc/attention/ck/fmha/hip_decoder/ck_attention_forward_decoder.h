@@ -12,6 +12,8 @@
 #include <ck/utility/data_type.hpp>
 #include <ck/utility/math.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_attention_inner_product.h"
 #include "ck_attention_math_ext.h"
 
@@ -454,6 +456,8 @@ struct FMHADecoderSeqlen1DeviceOp : public BaseOperator {
         throw std::runtime_error("Unsupported alignment for Q_size_k");
       }
 
+      mslk::utils::device::check_launch_thread_product(
+          argp->grid_dim, argp->block_dim, "MSLK-075");
       return launch_and_time_kernel(
           stream_config,
           Q_size_k_alignment_necessary == 4

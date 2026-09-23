@@ -8,16 +8,16 @@
 
 #pragma once
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <limits>
-#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -26,7 +26,6 @@ namespace mslk::utils::device {
 
 constexpr int32_t MAX_THREAD_BLOCKS_FACTOR = 64;
 constexpr int64_t kMaxGridDimX = std::numeric_limits<int32_t>::max();
-constexpr uint64_t kMaxThreadsPerLaunch = std::numeric_limits<uint32_t>::max();
 
 // Never skips all optional capping. ROCm still validates the fixed grid plane
 // against its legacy per-launch limit. On every platform, callers that choose
@@ -205,54 +204,6 @@ inline uint32_t cap_grid_dim_x_from_workload(
       static_cast<int64_t>(threads_per_block),
       stream,
       policy);
-}
-
-inline uint64_t check_launch_thread_product(
-    const dim3& grid,
-    const dim3& block,
-    const std::string_view context = {}) {
-  const auto check_dimensions = [&](const bool condition,
-                                    const auto&... message) {
-    TORCH_CHECK(
-        condition,
-        context,
-        " [grid dim ",
-        grid.x,
-        " x ",
-        grid.y,
-        " x ",
-        grid.z,
-        "] [block dim ",
-        block.x,
-        " x ",
-        block.y,
-        " x ",
-        block.z,
-        "]: ",
-        message...);
-  };
-  const std::array<uint32_t, 6> dimensions = {
-      grid.x, grid.y, grid.z, block.x, block.y, block.z};
-  uint64_t total_threads = 1;
-  for (const auto dimension : dimensions) {
-    check_dimensions(dimension > 0, "Launch dimensions must be positive");
-    check_dimensions(
-        total_threads <= std::numeric_limits<uint64_t>::max() / dimension,
-        "Total thread product overflows uint64_t");
-    total_threads *= dimension;
-  }
-
-#if defined(__HIP_PLATFORM_AMD__) || \
-    (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 700))
-  check_dimensions(
-      total_threads <= kMaxThreadsPerLaunch,
-      "Total number of threads ",
-      total_threads,
-      " must not exceed the legacy per-launch limit (",
-      kMaxThreadsPerLaunch,
-      ").");
-#endif
-  return total_threads;
 }
 
 template <typename func_t>

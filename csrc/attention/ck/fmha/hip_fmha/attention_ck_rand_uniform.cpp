@@ -16,6 +16,8 @@
 #include <ck_tile/core.hpp>
 #include <ck_tile/host/kernel_launch.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_rand_uniform_kernel.h"
 
 #ifdef HIPIFY_V2
@@ -85,6 +87,8 @@ at::Tensor rand_uniform_int(
     const dim3 kBlockSize = FmhaRandUniformKernel_::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaRandUniformKernel_::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-003");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(

@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_fwd_splitkv_setting.h"
 #include "ck_tiled_fmha_num_kv_split_switch.h"
@@ -321,6 +323,8 @@ struct batched_forward_splitkv_mask_bias_dropout_dispatch {
     const dim3 kBlockSize = FmhaFwdSplitKVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaFwdSplitKVKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-009");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(
@@ -362,6 +366,8 @@ struct batched_forward_splitkv_mask_bias_dropout_dispatch {
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaSplitKVCombineKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-013");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(

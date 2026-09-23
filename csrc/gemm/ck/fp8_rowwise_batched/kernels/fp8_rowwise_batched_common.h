@@ -9,6 +9,8 @@
 #include <ATen/ATen.h>
 #include <c10/hip/HIPStream.h>
 
+#include <limits>
+
 #ifdef HIPIFY_V2
 #define getCurrentHIPStream getCurrentCUDAStream
 #endif
@@ -21,6 +23,7 @@
 #include "ck/utility/data_type.hpp"
 
 #include "ck/tensor_operation/gpu/device/impl/device_batched_gemm_multiple_d_xdl_cshuffle_v3.hpp"
+#include "mslk/utils/device/launch_checks.h"
 
 // Define commonly used types.
 template <ck::index_t... Is>
@@ -128,10 +131,26 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
     at::Tensor w_scale,
     at::Tensor Y) {
   // Get input information.
-  int B = XQ.size(0);
-  int M = XQ.size(1);
-  int N = WQ.size(1);
-  int K = WQ.size(2);
+  const int64_t B64 = XQ.size(0);
+  const int64_t M64 = XQ.size(1);
+  const int64_t N64 = WQ.size(1);
+  const int64_t K64 = WQ.size(2);
+  constexpr auto ck_index_max = std::numeric_limits<ck::index_t>::max();
+  TORCH_CHECK(
+      B64 <= ck_index_max && M64 <= ck_index_max && N64 <= ck_index_max &&
+          K64 <= ck_index_max,
+      "MSLK-080 CK batched GEMM dimensions must fit ck::index_t; got B=",
+      B64,
+      ", M=",
+      M64,
+      ", N=",
+      N64,
+      ", K=",
+      K64);
+  const auto B = static_cast<ck::index_t>(B64);
+  const auto M = static_cast<ck::index_t>(M64);
+  const auto N = static_cast<ck::index_t>(N64);
+  const auto K = static_cast<ck::index_t>(K64);
 
   int StrideA = K;
   int StrideB = K;
@@ -139,11 +158,23 @@ at::Tensor f8f8bf16_rowwise_batched_impl(
   int StrideD1 = 0;
   int StrideE = N;
 
-  int BatchStrideA = M * StrideA;
-  int BatchStrideB = N * StrideB;
-  int BatchStrideD0 = N;
-  int BatchStrideD1 = M;
-  int BatchStrideE = M * StrideE;
+  const int64_t BatchStrideA64 = M64 * K64;
+  const int64_t BatchStrideB64 = N64 * K64;
+  const int64_t BatchStrideE64 = M64 * N64;
+  TORCH_CHECK(
+      BatchStrideA64 <= ck_index_max && BatchStrideB64 <= ck_index_max &&
+          BatchStrideE64 <= ck_index_max,
+      "MSLK-080 CK batched GEMM strides must fit ck::index_t; got A=",
+      BatchStrideA64,
+      ", B=",
+      BatchStrideB64,
+      ", E=",
+      BatchStrideE64);
+  const auto BatchStrideA = static_cast<ck::index_t>(BatchStrideA64);
+  const auto BatchStrideB = static_cast<ck::index_t>(BatchStrideB64);
+  const auto BatchStrideD0 = N;
+  const auto BatchStrideD1 = M;
+  const auto BatchStrideE = static_cast<ck::index_t>(BatchStrideE64);
 
   // Create gemm launcher and arguments.
   auto gemm = DeviceGemmInstance{};

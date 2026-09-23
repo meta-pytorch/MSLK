@@ -8,6 +8,8 @@
 #include <ck_tile/host/kernel_launch.hpp>
 #include <ck_tile/host/stream_config.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tile_attention_forward_decoder_splitk.h"
 
 #ifdef HIPIFY_V2
@@ -82,11 +84,15 @@ void instantiate_and_launch_kernels(
           compute_t,
           kThreadsPerWavefront>{};
 
+  mslk::utils::device::check_launch_thread_product(
+      attn_grid_size, attn_block_size, "MSLK-001");
   (void)ck_tile::launch_kernel(
       ck_tile::stream_config{stream, /* benchmark */ false},
       ck_tile::make_kernel(
           attn_kernel_impl, attn_grid_size, attn_block_size, lds_bytes, arg));
 
+  mslk::utils::device::check_launch_thread_product(
+      reduce_grid_size, reduce_block_size, "MSLK-002");
   (void)ck_tile::launch_kernel(
       ck_tile::stream_config{stream, /* benchmark */ false},
       ck_tile::make_kernel(

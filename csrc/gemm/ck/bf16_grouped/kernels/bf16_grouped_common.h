@@ -9,6 +9,8 @@
 #include <ATen/ATen.h>
 #include <c10/hip/HIPStream.h>
 
+#include <limits>
+
 #ifdef HIPIFY_V2
 #define getCurrentHIPStream getCurrentCUDAStream
 #endif
@@ -20,6 +22,7 @@
 #include "ck/utility/data_type.hpp"
 
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_gemm_multiple_d_xdl_cshuffle_tile_loop.hpp"
+#include "mslk/utils/device/launch_checks.h"
 
 // Define commonly used types.
 template <ck::index_t... Is>
@@ -123,11 +126,21 @@ OutputType bf16_grouped_impl(
     at::Tensor kernel_args,
     OutputType Y) {
   // Get input information.
-  int group_count;
+  constexpr auto ck_index_max = std::numeric_limits<ck::index_t>::max();
+  ck::index_t group_count;
   if constexpr (std::is_same_v<InputType, at::Tensor>) {
-    group_count = B.size(0);
+    const auto group_count64 = B.size(0);
+    TORCH_CHECK(
+        group_count64 <= ck_index_max,
+        "MSLK-079 CK grouped GEMM group count must fit ck::index_t; got ",
+        group_count64);
+    group_count = static_cast<ck::index_t>(group_count64);
   } else {
-    group_count = A.size();
+    TORCH_CHECK(
+        A.size() <= static_cast<size_t>(ck_index_max),
+        "MSLK-079 CK grouped GEMM group count must fit ck::index_t; got ",
+        A.size());
+    group_count = static_cast<ck::index_t>(A.size());
   }
   using GemmDesc = ck::tensor_operation::device::GemmDesc;
   // Create gemm shape containers.
@@ -142,14 +155,17 @@ OutputType bf16_grouped_impl(
   A_args.reserve(group_count);
   B_args.reserve(group_count);
   C_args.reserve(group_count);
-  int M, N, K;
+  ck::index_t M, N, K;
   // Populate arguments.
-  for (int i = 0; i < group_count; i++) {
+  for (ck::index_t i = 0; i < group_count; i++) {
     // Set the shape arguments for this gemm.
     if constexpr (std::is_same_v<InputType, at::Tensor>) {
-      M = A.size(A.dim() - 2);
-      N = B.size(1);
-      K = B.size(2);
+      M = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          A.size(A.dim() - 2), "MSLK-079 CK grouped GEMM", "M");
+      N = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          B.size(1), "MSLK-079 CK grouped GEMM", "N");
+      K = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          B.size(2), "MSLK-079 CK grouped GEMM", "K");
       // These pointers dont seem to actually be used since the kernel arguments
       // contains the correct version. For simplicity, we just point to the
       // start of the tensor.
@@ -157,9 +173,12 @@ OutputType bf16_grouped_impl(
       B_args.push_back(reinterpret_cast<BDataType*>(B.data_ptr()));
       C_args.push_back(reinterpret_cast<CDataType*>(Y.data_ptr()));
     } else {
-      M = A[i].size(0);
-      K = A[i].size(1);
-      N = B[i].size(0);
+      M = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          A[i].size(0), "MSLK-079 CK grouped GEMM", "M");
+      K = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          A[i].size(1), "MSLK-079 CK grouped GEMM", "K");
+      N = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+          B[i].size(0), "MSLK-079 CK grouped GEMM", "N");
       // Set pointers to inputs and outputs.
       A_args.push_back(reinterpret_cast<ADataType*>(A[i].data_ptr()));
       B_args.push_back(reinterpret_cast<BDataType*>(B[i].data_ptr()));

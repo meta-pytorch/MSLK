@@ -9,6 +9,8 @@
 #include <ATen/ATen.h>
 #include <c10/hip/HIPStream.h>
 
+#include <limits>
+
 #ifdef HIPIFY_V2
 #define getCurrentHIPStream getCurrentCUDAStream
 #endif
@@ -21,6 +23,7 @@
 #include "ck/utility/data_type.hpp"
 
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_gemm_multiple_d_xdl_cshuffle_tile_loop.hpp"
+#include "mslk/utils/device/launch_checks.h"
 
 // Define commonly used types.
 template <ck::index_t... Is>
@@ -116,20 +119,35 @@ struct DeviceGemmHelper {
       at::Tensor kernel_args,
       OutputType Y) {
     // Get input information.
-    int group_count;
+    constexpr auto ck_index_max = std::numeric_limits<ck::index_t>::max();
+    ck::index_t group_count;
     if constexpr (std::is_same_v<InputType, at::Tensor>) {
       if (XQ.dim() == 3 || WQ.dim() == 3) {
         // If WQ and XQ are 3D, the group count is G.
         // If WQ is 3D and XQ is 2D (and the reverse by symmetry), the group
         // count is the minimum of G and total_M/total_N. In all cases we just
         // compare the first dimension of XQ and WQ.
-        group_count = std::min(XQ.size(0), WQ.size(0));
+        const auto group_count64 = std::min(XQ.size(0), WQ.size(0));
+        TORCH_CHECK(
+            group_count64 <= ck_index_max,
+            "MSLK-077 CK grouped GEMM group count must fit ck::index_t; got ",
+            group_count64);
+        group_count = static_cast<ck::index_t>(group_count64);
       } else {
         // XQ and WQ are 2D. The group count is G.
-        group_count = Y.size(0);
+        const auto group_count64 = Y.size(0);
+        TORCH_CHECK(
+            group_count64 <= ck_index_max,
+            "MSLK-077 CK grouped GEMM group count must fit ck::index_t; got ",
+            group_count64);
+        group_count = static_cast<ck::index_t>(group_count64);
       }
     } else {
-      group_count = XQ.size();
+      TORCH_CHECK(
+          XQ.size() <= static_cast<size_t>(ck_index_max),
+          "MSLK-077 CK grouped GEMM group count must fit ck::index_t; got ",
+          XQ.size());
+      group_count = static_cast<ck::index_t>(XQ.size());
     }
 
     using GemmDesc = ck::tensor_operation::device::GemmDesc;
@@ -146,9 +164,9 @@ struct DeviceGemmHelper {
     B_args.reserve(group_count);
     C_args.reserve(group_count);
     D_args.reserve(group_count);
-    int M;
-    int K;
-    int N;
+    ck::index_t M;
+    ck::index_t K;
+    ck::index_t N;
     // Declare pointers to input and output buffers.
     ADataType* a_ptr;
     BDataType* b_ptr;
@@ -171,9 +189,12 @@ struct DeviceGemmHelper {
         d0_ptr = reinterpret_cast<D0DataType*>(w_scale.data_ptr());
         d1_ptr = reinterpret_cast<D1DataType*>(x_scale.data_ptr());
       } else {
-        M = XQ[i].size(0);
-        N = WQ[i].size(0);
-        K = XQ[i].size(1);
+        M = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+            XQ[i].size(0), "MSLK-077 CK grouped GEMM", "M");
+        N = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+            WQ[i].size(0), "MSLK-077 CK grouped GEMM", "N");
+        K = mslk::utils::device::checked_nonnegative_integral_cast<ck::index_t>(
+            XQ[i].size(1), "MSLK-077 CK grouped GEMM", "K");
         a_ptr = reinterpret_cast<ADataType*>(XQ[i].data_ptr());
         b_ptr = reinterpret_cast<BDataType*>(WQ[i].data_ptr());
         d0_ptr = reinterpret_cast<D0DataType*>(w_scale[i].data_ptr());

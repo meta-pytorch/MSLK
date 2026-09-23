@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_bwd_setting.h"
 #include "ck_tiled_fmha_params.h"
@@ -216,6 +218,8 @@ struct batched_backward_mask_bias_dropout_dispatch {
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdOGradDotOKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-004");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(
@@ -298,6 +302,8 @@ struct batched_backward_mask_bias_dropout_dispatch {
     const dim3 kBlockSize = FmhaBwdDQDKDVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaBwdDQDKDVKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-005");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(
@@ -330,6 +336,8 @@ struct batched_backward_mask_bias_dropout_dispatch {
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdConvertQGradKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-006");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
         ck_tile::make_kernel<kBlockPerCu>(

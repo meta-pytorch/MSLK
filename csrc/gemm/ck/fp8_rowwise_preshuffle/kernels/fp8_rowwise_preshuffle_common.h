@@ -7,6 +7,7 @@
  */
 
 #include <iostream>
+#include <limits>
 
 #include <ATen/ATen.h>
 #include <c10/hip/HIPStream.h>
@@ -22,6 +23,7 @@
 #include "ck/utility/data_type.hpp"
 
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3_b_preshuffle.hpp"
+#include "mslk/utils/device/launch_checks.h"
 
 // Define commonly used types.
 template <ck::index_t... Is>
@@ -166,9 +168,23 @@ at::Tensor f8f8bf16_rowwise_preshuffle_impl(
           ComputeType>;
 
   // Get input information.
-  int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
-  int N = WQ.size(0);
-  int K = WQ.size(1);
+  const int64_t M64 = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+  const int64_t N64 = WQ.size(0);
+  const int64_t K64 = WQ.size(1);
+  constexpr auto ck_index_max = std::numeric_limits<ck::index_t>::max();
+  TORCH_CHECK(
+      M64 <= ck_index_max && N64 <= ck_index_max && K64 <= ck_index_max,
+      "MSLK-076 CK GEMM dimensions must fit ck::index_t; got M=",
+      M64,
+      ", N=",
+      N64,
+      ", K=",
+      K64);
+  TORCH_CHECK(
+      KBatch > 0, "MSLK-076 CK GEMM KBatch must be positive; got ", KBatch);
+  const auto M = static_cast<ck::index_t>(M64);
+  const auto N = static_cast<ck::index_t>(N64);
+  const auto K = static_cast<ck::index_t>(K64);
 
   int StrideA = K;
   int StrideB = K;
