@@ -8,11 +8,15 @@
 
 import logging
 import os
+import socket
+import sys
 import textwrap
+import traceback
 from collections import deque
 from typing import Any, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import torch
+from torch._utils_internal import justknobs_check
 
 from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, flydsl, triton_splitk
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
@@ -29,6 +33,82 @@ _LOG_DISPATCH: bool = os.getenv("MSLK_FMHA_LOG_DISPATCH", "0").lower() in (
     "true",
     "yes",
 )
+
+
+try:
+    from rfe.scubadata.scubadata_py3 import Sample, ScubaData
+except ImportError:
+    Sample = None
+    ScubaData = None
+
+_USAGE_DATASET = "mslk_fmha_dispatch"
+_USAGE_KILLSWITCH = "mslk/fmha:report_dispatch"
+_USAGE_MAX_EVENTS = 20
+_USAGE_STACK_DEPTH = 30
+_usage_seen: set[tuple[str, str, str]] = set()
+
+
+def _add_workload_columns(sample: Any) -> None:
+    """Identify the process, since this dataset has no scheduler-provided columns."""
+    sample.addNormalValue("hostname", socket.gethostname())
+    sample.addNormalValue("binary", sys.argv[0] if sys.argv else "")
+    sample.addNormalValue("tw_job_name", os.environ.get("TW_JOB_NAME", ""))
+    sample.addNormalValue("mast_job_name", os.environ.get("MAST_HPC_JOB_NAME", ""))
+
+
+def _add_device_columns(sample: Any, device: torch.device) -> None:
+    sample.addNormalValue("device_type", device.type)
+    if device.type != "cuda":
+        return
+    props = torch.cuda.get_device_properties(device)
+    sample.addNormalValue("device_name", props.name)
+    sample.addNormalValue("gcn_arch", getattr(props, "gcnArchName", ""))
+    sample.addNormalValue("compute_capability", f"{props.major}.{props.minor}")
+    sample.addNormalValue("hip_version", torch.version.hip or "")
+    sample.addNormalValue("cuda_version", torch.version.cuda or "")
+
+
+def _report_dispatch(name: str, op: Any, inp: Inputs) -> None:
+    """Report an auto-dispatched operator.
+
+    Outside Meta infrastructure `rfe.scubadata` is absent, so the first guard
+    below returns before any work is done.
+
+    Callers that pin `op=` never reach `_run_priority_list`, so only genuine
+    dispatch is reported.
+    """
+    if Sample is None or ScubaData is None or len(_usage_seen) >= _USAGE_MAX_EVENTS:
+        return
+    try:
+        bias = type(inp.attn_bias).__name__
+        key = (name, op.NAME, bias)
+        if key in _usage_seen:
+            return
+        _usage_seen.add(key)
+        if not justknobs_check(_USAGE_KILLSWITCH):
+            return
+        frames = traceback.extract_stack(limit=_USAGE_STACK_DEPTH)[:-2]
+        sample = Sample()
+        sample.setTimeColumnNow()
+        sample.addNormalValue("op", op.NAME)
+        sample.addNormalValue("phase", name)
+        sample.addNormalValue("attn_bias", bias)
+        sample.addNormalValue("dtype", str(inp.query.dtype))
+        sample.addNormalValue("torch_version", torch.__version__)
+        sample.addNormalValue(
+            "caller", "\n".join(f"{f.filename}:{f.lineno} {f.name}" for f in frames)
+        )
+        sample.addIntValue("head_dim", inp.query.shape[-1])
+        sample.addIntValue("head_dim_v", inp.value.shape[-1])
+        sample.addIntValue("ndim", inp.query.ndim)
+        sample.addIntValue("dropout", int(inp.p > 0.0))
+        sample.addIntValue("is_partial", int(inp.is_partial))
+        _add_workload_columns(sample)
+        _add_device_columns(sample, inp.device)
+        with ScubaData(_USAGE_DATASET) as scuba:
+            scuba.addSample(sample)
+    except Exception:
+        logger.debug("MSLK dispatch usage report failed", exc_info=True)
 
 
 try:
@@ -102,6 +182,7 @@ def _run_priority_list(
         if not not_supported:
             if _LOG_DISPATCH:
                 logger.debug("MSLK dispatch (%s): selected op=%s", name, op.NAME)
+            _report_dispatch(name, op, inp)
             return op
         not_supported_reasons.append(not_supported)
 
