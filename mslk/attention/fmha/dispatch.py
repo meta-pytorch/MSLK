@@ -77,6 +77,8 @@ def _report_dispatch(name: str, op: Any, inp: Inputs) -> None:
     Callers that pin `op=` never reach `_run_priority_list`, so only genuine
     dispatch is reported.
     """
+    if torch.compiler.is_compiling():
+        return
     if Sample is None or ScubaData is None or len(_usage_seen) >= _USAGE_MAX_EVENTS:
         return
     try:
