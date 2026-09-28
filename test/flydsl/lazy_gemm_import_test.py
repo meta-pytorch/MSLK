@@ -19,14 +19,16 @@ This test owns its own target so that nothing else in the process can import
 FlyDSL first and mask a regression.
 """
 
+import importlib
 import sys
 import unittest
 
 
 class LazyGemmImportTest(unittest.TestCase):
-    def test_importing_gemm_does_not_import_flydsl(self) -> None:
+    def test_importing_and_reloading_gemm_does_not_import_flydsl(self) -> None:
         self.assertNotIn("flydsl", sys.modules, "FlyDSL imported before the test ran")
 
-        import mslk.gemm  # noqa: F401
+        gemm = importlib.import_module("mslk.gemm")
+        importlib.reload(gemm)
 
         self.assertNotIn("flydsl", sys.modules)

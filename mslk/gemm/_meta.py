@@ -166,7 +166,7 @@ if hasattr(torch.ops.mslk, "bf16bf16bf16_grouped_stacked"):
         num_sms: Optional[int] = None,
     ) -> torch.Tensor:
         if out is not None:
-            return out
+            return out.view(X.shape[0], W.shape[1])
         total_M = X.shape[0]
         N = W.shape[1]
         return torch.empty((total_M, N), dtype=torch.bfloat16, device=X.device)

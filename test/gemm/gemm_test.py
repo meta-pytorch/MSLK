@@ -1234,6 +1234,112 @@ class FP8Tests(unittest.TestCase):
         # BF16 loopover gemm reference
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
+    @skipUnlessRocm()
+    def test_bf16_grouped_k_tail_alignment(self) -> None:
+        from mslk.gemm.flydsl.bf16_grouped_gemm import is_supported
+
+        if not is_supported():
+            self.skipTest("requires a compatible FlyDSL backend")
+        M_sizes = torch.tensor([16, 24], dtype=torch.int64, device=self.device)
+        total_m = int(M_sizes.sum().item())
+        n, k = 512, 520
+        x = torch.randn((total_m, k), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((2, n, k), dtype=torch.bfloat16, device=self.device)
+
+        actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, M_sizes)
+        expected = torch.cat(
+            [
+                x[:16].float().matmul(w[0].float().T),
+                x[16:].float().matmul(w[1].float().T),
+            ]
+        ).to(torch.bfloat16)
+
+        torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+
+    @skipUnlessRocm()
+    def test_packed_large_operand_uses_tile_descriptors(self) -> None:
+        from mslk.gemm.flydsl.grouped_dispatch import (
+            _addressing_plan,
+            _BUFFER_LIMIT_BYTES,
+        )
+
+        total_m = _BUFFER_LIMIT_BYTES // (512 * 2)
+        self.assertEqual(
+            _addressing_plan(total_m, 512, 512, 1, 2, "sizes", 128),
+            (False, "tile"),
+        )
+
+    @skipUnlessRocm()
+    def test_irreducibly_large_work_tile_is_rejected(self) -> None:
+        from mslk.gemm.flydsl.grouped_dispatch import (
+            _addressing_plan,
+            _BUFFER_LIMIT_BYTES,
+        )
+
+        k = _BUFFER_LIMIT_BYTES // (32 * 2)
+        with self.assertRaisesRegex(ValueError, "A \\(one work tile\\)"):
+            _addressing_plan(32, 1, k, 1, 2, "sizes", 32)
+
+    @skipUnlessRocm()
+    def test_packed_tile_descriptor_variant_compiles(self) -> None:
+        from mslk.flydsl.kernels.gemm.fp8_grouped_gemm import compile_fp8_grouped_gemm
+
+        launcher = compile_fp8_grouped_gemm(
+            n=512,
+            k=512,
+            num_groups=2,
+            tile_m=128,
+            tile_n=128,
+            tile_k=64,
+            b_preshuffled=False,
+            in_dtype="bf16",
+            scaling="none",
+            layout="sizes",
+            row_basing="tile",
+        )
+        self.assertTrue(callable(launcher))
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_out_must_be_contiguous(self) -> None:
+        m, n, k = 16, 512, 512
+        x = torch.randn((m, k), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((1, n, k), dtype=torch.bfloat16, device=self.device)
+        m_sizes = torch.tensor([m], dtype=torch.int64, device=self.device)
+        out = torch.empty((n, m), dtype=torch.bfloat16, device=self.device).T
+
+        with self.assertRaisesRegex(AssertionError, "out must be contiguous"):
+            torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes, out)
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_non_current_device(self) -> None:
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires two GPUs")
+        current_device = torch.cuda.current_device()
+        other_device = 1 if current_device == 0 else 0
+        device = torch.device("cuda", other_device)
+        m, n, k = 16, 512, 512
+        x = torch.randn((m, k), dtype=torch.bfloat16, device=device)
+        w = torch.randn((1, n, k), dtype=torch.bfloat16, device=device)
+        m_sizes = torch.tensor([m], dtype=torch.int64, device=device)
+
+        actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
+        expected = x.float().matmul(w[0].float().T).to(torch.bfloat16)
+
+        self.assertEqual(torch.cuda.current_device(), current_device)
+        self.assertEqual(actual.device, device)
+        torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+
+    @skipUnlessRocm()
+    def test_bf16_grouped_rejects_device_mismatch(self) -> None:
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires two GPUs")
+        x = torch.randn((16, 512), dtype=torch.bfloat16, device="cuda:0")
+        w = torch.randn((1, 512, 512), dtype=torch.bfloat16, device="cuda:1")
+        m_sizes = torch.tensor([16], dtype=torch.int64, device="cuda:0")
+
+        with self.assertRaisesRegex(AssertionError, "W must be on"):
+            torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
+
     @parameterized.expand(
         [
             (1, 512, 512, 512, True),  # small MNK (also small G)

@@ -53,18 +53,22 @@ def default_epilog(
     arith,
     range_constexpr,
     m_repeat: int,
+    m_wave_base=None,
     lane_div_16,
     bx_m,
     body_row: Callable,
 ):
     """Iterate the standard MFMA 16x16 row mapping and call `body_row(...)`.
 
-    The mapping matches the common MFMA fragment layout used across kernels in this repo.
+    The mapping matches the common MFMA fragment layout used across kernels in
+    this repo.
 
     Args:
       arith: flydsl arith ext module.
       range_constexpr: compile-time unrolled range helper.
-      m_repeat: tile_m // 16 (python int).
+      m_repeat: rows of the wave's slab, (tile_m // waves_m) // 16 (python int).
+      m_wave_base: first row of the wave's slab within the tile (index Value), or
+        None where the wave grid gives every wave the whole of tile_m.
       lane_div_16: index Value (0..3).
       bx_m: base row (index Value). For MoE, this is the base sorted-row for the tile.
       body_row: callback invoked as:
@@ -76,6 +80,8 @@ def default_epilog(
 
     for mi in range_constexpr(m_repeat):
         mi_base = arith.constant(mi * 16, index=True)
+        if m_wave_base is not None:
+            mi_base = mi_base + m_wave_base
         for ii in range_constexpr(4):
             row_off = lane_div_16_mul4 + ii_idx_list[ii]
             row_in_tile = mi_base + row_off
@@ -85,6 +91,7 @@ def default_epilog(
 
 def c_shuffle_epilog(
     *,
+    m_wave_base=None,
     arith,
     vector,
     gpu,
@@ -128,21 +135,32 @@ def c_shuffle_epilog(
       - `store_pair(...)` is called for each (row_local, col_pair0) half2 after shuffle.
 
     `store_pair` can implement either global stores or atomics.
+
+    The two phases map threads to rows differently, and only one of them is a
+    wave's own business. The write phase drains a thread's accumulators, so it
+    follows the wave grid and takes `m_wave_base`. The read phase then spreads
+    all `block_size` threads over the whole tile to make the global stores
+    coalesce, which is what staging through LDS buys; that mapping covers
+    `tile_m` regardless of how the waves are arranged, so shifting it by a
+    per-wave offset would leave rows unwritten and read past the buffer.
     """
     if int(block_size) <= 0 or (int(block_size) % int(cshuffle_nlane)) != 0:
         raise ValueError(
-            f"block_size ({block_size}) must be divisible by cshuffle_nlane ({cshuffle_nlane})"
+            f"block_size ({block_size}) must be divisible by cshuffle_nlane "
+            f"({cshuffle_nlane})"
         )
     cshuffle_mlane = int(block_size) // int(cshuffle_nlane)
     if (int(tile_m) % cshuffle_mlane) != 0:
         raise ValueError(
-            f"tile_m must be divisible by CShuffleMLane ({cshuffle_mlane}), got tile_m={tile_m}"
+            f"tile_m must be divisible by CShuffleMLane ({cshuffle_mlane}), "
+            f"got tile_m={tile_m}"
         )
     if int(e_vec) <= 0:
         raise ValueError(f"e_vec must be positive, got {e_vec}")
     if (int(tile_n) % (int(cshuffle_nlane) * int(e_vec))) != 0:
         raise ValueError(
-            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane * e_vec}, got tile_n={tile_n}"
+            "tile_n must be divisible by (CShuffleNLane*EVec) = "
+            f"{cshuffle_nlane * e_vec}, got tile_n={tile_n}"
         )
 
     # ===================== Split-LDS mode (early return) =====================
@@ -161,12 +179,14 @@ def c_shuffle_epilog(
         CShuffleNLane_s = min(int(cshuffle_nlane), _half_n // EVec)
         if _half_threads % CShuffleNLane_s != 0:
             raise ValueError(
-                f"half_threads={_half_threads} not divisible by CShuffleNLane_split={CShuffleNLane_s}"
+                f"half_threads={_half_threads} not divisible by "
+                f"CShuffleNLane_split={CShuffleNLane_s}"
             )
         CShuffleMLane_s = _half_threads // CShuffleNLane_s
         if int(tile_m) % CShuffleMLane_s != 0:
             raise ValueError(
-                f"tile_m={tile_m} not divisible by CShuffleMLane_split={CShuffleMLane_s}"
+                f"tile_m={tile_m} not divisible by "
+                f"CShuffleMLane_split={CShuffleMLane_s}"
             )
         m_reps_s = int(tile_m) // CShuffleMLane_s
         n_reps_s = _half_n // (CShuffleNLane_s * EVec)
@@ -215,6 +235,7 @@ def c_shuffle_epilog(
             arith=arith,
             range_constexpr=range_constexpr,
             m_repeat=m_repeat,
+            m_wave_base=m_wave_base,
             lane_div_16=lane_div_16,
             bx_m=bx_m,
             body_row=_write_row_split,
@@ -258,7 +279,7 @@ def c_shuffle_epilog(
         for mr in range_constexpr(m_reps_s):
             row_local, row, row_ctx, row_pred = _precomputed_rows_s[mr]
 
-            def _do_store_row_split():
+            def _do_store_row_split(row_local=row_local, row=row, row_ctx=row_ctx):
                 row_base_lds = row_local * _half_n_idx
                 for nr in range_constexpr(n_reps_s):
                     col_base_nr = arith.constant(
@@ -329,6 +350,7 @@ def c_shuffle_epilog(
         arith=arith,
         range_constexpr=range_constexpr,
         m_repeat=m_repeat,
+        m_wave_base=m_wave_base,
         lane_div_16=lane_div_16,
         bx_m=bx_m,
         body_row=_write_row,
@@ -371,8 +393,8 @@ def c_shuffle_epilog(
             else None
         )
 
-        # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)` and `scf`
-        # is provided, we can skip the entire N-loop for invalid rows (cheaper than per-store checks).
+        # If `precompute_row` returns `(ctx, pred_i1)` and `scf` is provided,
+        # skip the entire N-loop for invalid rows instead of checking each store.
         row_ctx = row_ctx_raw
         row_pred = None
         if (
@@ -389,7 +411,7 @@ def c_shuffle_epilog(
     for mr in range_constexpr(m_reps_shuffle):
         row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
 
-        def _do_store_row():
+        def _do_store_row(row_local=row_local, row=row, row_ctx=row_ctx):
             row_base_lds = row_local * tile_n_idx
             if _lds_row_base_offset is not None:
                 row_base_lds = row_base_lds + _lds_row_base_offset
@@ -420,6 +442,7 @@ def c_shuffle_epilog(
 def mfma_epilog(
     *,
     use_cshuffle: bool,
+    m_wave_base=None,
     # Common (always required)
     arith,
     range_constexpr,
@@ -452,6 +475,7 @@ def mfma_epilog(
         if body_row is None:
             raise ValueError("mfma_epilog(use_cshuffle=False) requires `body_row`.")
         return default_epilog(
+            m_wave_base=m_wave_base,
             arith=arith,
             range_constexpr=range_constexpr,
             m_repeat=m_repeat,
@@ -461,6 +485,7 @@ def mfma_epilog(
         )
 
     return c_shuffle_epilog(
+        m_wave_base=m_wave_base,
         arith=arith,
         vector=vector,
         gpu=gpu,

@@ -552,6 +552,7 @@ at::Tensor bf16bf16bf16_grouped_stacked(
       "Input XQ must be type bfloat16.");
 
   TORCH_CHECK(W.is_cuda() && W.is_contiguous());
+  TORCH_CHECK(X.device() == W.device(), "X and W must be on the same device.");
   TORCH_CHECK(W.dim() == 3, "Input W must be 3D (G,N,K).");
   TORCH_CHECK(
       W.dtype() == at::kBFloat16,
@@ -559,15 +560,29 @@ at::Tensor bf16bf16bf16_grouped_stacked(
   TORCH_CHECK(
       W.size(1) >= 512 && W.size(2) >= 512,
       "N and K must be at least 512 for grouped gemm. For smaller inputs, consider unrolling.");
+  TORCH_CHECK(
+      K % 64 == 0,
+      "K must be divisible by 64 for the CK grouped GEMM fallback.");
 
   TORCH_CHECK(
       X.device() == M_sizes.device(),
       "M_sizes and inputs must be on the same device.");
   TORCH_CHECK(M_sizes.dtype() == at::kLong, "M_sizes must be int64.");
 
-  // Allocate an empty output array. We will set its values to zero as part
-  // of kernel setup.
-  at::Tensor Y = at::empty({total_M, N}, X.options().dtype(at::kBFloat16));
+  at::Tensor Y;
+  if (out.has_value()) {
+    Y = out.value();
+    TORCH_CHECK(Y.is_cuda(), "out must be a CUDA tensor.");
+    TORCH_CHECK(Y.device() == X.device(), "out and inputs must be on the same device.");
+    TORCH_CHECK(Y.is_contiguous(), "out must be contiguous.");
+    TORCH_CHECK(Y.dtype() == at::kBFloat16, "out must be type bfloat16.");
+    TORCH_CHECK(
+        Y.numel() == total_M * N,
+        "out must contain total_M * N elements.");
+    Y = Y.view({total_M, N});
+  } else {
+    Y = at::empty({total_M, N}, X.options().dtype(at::kBFloat16));
+  }
 
   // Early exit for empty input.
   if (total_M == 0) {
@@ -579,7 +594,7 @@ at::Tensor bf16bf16bf16_grouped_stacked(
 
   auto selected_kernel = grouped_heuristic_dispatch<at::Tensor, at::Tensor>(group_count, total_M, N, K);
 
-  return selected_kernel(X, W, kernel_args, Y);
+  return selected_kernel(X, W, kernel_args, Y).view({total_M, N});
 }
 
 } // namespace mslk::gemm

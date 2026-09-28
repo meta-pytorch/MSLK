@@ -10,6 +10,7 @@ import functools
 import importlib
 from collections.abc import Callable
 from types import ModuleType
+from typing import Optional
 
 from mslk.utils.torch.library import load_library_buck
 
@@ -170,6 +171,74 @@ if torch.version.hip is not None:
 
         except RuntimeError:
             pass  # already registered (e.g. module imported more than once)
+
+    if hasattr(torch.ops, "mslk") and hasattr(
+        torch.ops.mslk, "bf16bf16bf16_grouped_stacked"
+    ):
+
+        @functools.lru_cache(maxsize=None)
+        def _bf16bf16bf16_grouped_stacked_impl(
+            device_index: int,
+        ) -> Callable[..., torch.Tensor]:
+            with torch.cuda.device(device_index):
+                mod = _flydsl_gemm_module("bf16_grouped_gemm")
+                if mod is not None and mod.is_supported():
+                    return mod.matmul_bf16bf16bf16_grouped_stacked
+            return torch.ops.mslk._bf16bf16bf16_grouped_stacked_ck
+
+        def _bf16bf16bf16_grouped_stacked_rocm(
+            X: torch.Tensor,
+            W: torch.Tensor,
+            M_sizes: torch.Tensor,
+            out: Optional[torch.Tensor] = None,
+            num_sms: Optional[int] = None,
+        ) -> torch.Tensor:
+            assert X.ndim == 2, f"X must be [total_M, K], got {X.shape}"
+            assert W.ndim == 3, f"W must be [G, N, K], got {W.shape}"
+            assert M_sizes.ndim == 1, f"M_sizes must be [G], got {M_sizes.shape}"
+            assert X.is_cuda, "X must be a CUDA tensor"
+            device = X.device
+            assert W.device == device, f"W must be on {device}, got {W.device}"
+            assert M_sizes.device == device, (
+                f"M_sizes must be on {device}, got {M_sizes.device}"
+            )
+            total_m, k = X.shape
+            groups, n, weight_k = W.shape
+            assert weight_k == k, f"K mismatch: X K={k}, W K={weight_k}"
+            assert M_sizes.shape[0] == groups, (
+                f"M_sizes length {M_sizes.shape[0]} must equal G={groups}"
+            )
+            assert X.dtype == torch.bfloat16, f"X must be bfloat16, got {X.dtype}"
+            assert W.dtype == torch.bfloat16, f"W must be bfloat16, got {W.dtype}"
+            assert M_sizes.dtype == torch.int64, (
+                f"M_sizes must be int64, got {M_sizes.dtype}"
+            )
+            assert X.is_contiguous(), "X must be contiguous"
+            assert W.is_contiguous(), "W must be contiguous"
+            assert M_sizes.is_contiguous(), "M_sizes must be contiguous"
+            if out is not None:
+                assert out.device == device, (
+                    f"out must be on {device}, got {out.device}"
+                )
+                assert out.dtype == torch.bfloat16, (
+                    f"out must be bfloat16, got {out.dtype}"
+                )
+                assert out.numel() == total_m * n, (
+                    f"out must hold {total_m * n} elements, got {out.numel()}"
+                )
+                assert out.is_contiguous(), "out must be contiguous"
+            device_index = X.get_device()
+            with torch.cuda.device(device_index):
+                return _bf16bf16bf16_grouped_stacked_impl(device_index)(
+                    X, W, M_sizes, out, num_sms
+                )
+
+        if not torch._C._dispatch_has_kernel_for_dispatch_key(
+            "mslk::bf16bf16bf16_grouped_stacked", "CUDA"
+        ):
+            torch.library.impl("mslk::bf16bf16bf16_grouped_stacked", "CUDA")(
+                _bf16bf16bf16_grouped_stacked_rocm
+            )
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
         # ROCm blockwise FP8 GEMM (CK retired, C++ op is CUDA-only): FlyDSL impl,
