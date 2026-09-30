@@ -185,6 +185,61 @@ def _is_flydsl_available() -> bool:
         return False
 
 
+def _paged_launch_tensors(bias, device, sub):
+    """Per-call paged launch metadata, memoised on the bias.
+
+    The sub-page block-table expansion and the KV cumsum are pure functions of
+    the mask, but were rebuilt on every call: measured ~20 us of the ~64 us
+    per-call fixed cost on short shapes (9 dispatched kernels against AITER's
+    2). Decode replays the same mask thousands of times, so cache them.
+
+    Invalidation is by storage identity and version counter, so a caller that
+    swaps in a new block table -- or mutates one in place, which bumps
+    ``_version`` -- gets a rebuild rather than stale indices.
+
+    Bypassed while a CUDA graph is being captured, so the graph records the
+    rebuild: a cache hit there would bake in the eager warm-up call's metadata
+    and ignore in-place updates of the mask between replays.
+    """
+    capturing = torch.cuda.is_current_stream_capturing()
+    block_tables = bias.block_tables
+    seqlen = bias.k_seqinfo.seqlen
+    qseqstart = bias.q_seqinfo.seqstart
+    key = (
+        block_tables.data_ptr(),
+        block_tables._version,
+        tuple(block_tables.shape),
+        seqlen.data_ptr(),
+        seqlen._version,
+        qseqstart.data_ptr(),
+        qseqstart._version,
+        int(sub),
+        str(device),
+    )
+    cached = getattr(bias, "_flydsl_launch_cache", None)
+    if not capturing and cached is not None and cached[0] == key:
+        return cached[1]
+
+    seqlen_k = seqlen.to(device)
+    kseq = torch.nn.functional.pad(
+        seqlen_k.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    bt = block_tables.to(torch.int32).to(device)
+    if sub > 1:
+        bt = (
+            bt.unsqueeze(-1) * sub + torch.arange(sub, dtype=torch.int32, device=device)
+        ).reshape(bt.shape[0], bt.shape[1] * sub)
+    bt = bt.contiguous()
+    value = (bt, kseq, seqlen_k, qseqstart.to(device))
+    if capturing:
+        return value
+    try:
+        bias._flydsl_launch_cache = (key, value)
+    except (AttributeError, TypeError):
+        pass  # frozen mask type: fall back to recomputing each call
+    return value
+
+
 @register_operator
 class FwOp(AttentionFwOpBase):
     """FlyDSL flash-attention forward (gfx942 generic / gfx950 dualwave)."""
@@ -507,24 +562,16 @@ class FwOp(AttentionFwOpBase):
             sub = page_size // _KERNEL_PAGE_SIZE
             k = inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk)
             v = inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk)
-            seqlen_k = bias.k_seqinfo.seqlen.to(q.device)
             # cu_seqlens_kv = cumulative per-seq KV lengths; pages via block_table.
-            kseq = torch.nn.functional.pad(
-                seqlen_k.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
-            )
+            # Memoised on the bias -- see _paged_launch_tensors.
+            bt, kseq, seqlen_k, qseqstart = _paged_launch_tensors(bias, q.device, sub)
             _set_varlen_kw(
-                bias.q_seqinfo.seqstart.to(q.device),
+                qseqstart,
                 kseq,
                 int(bias.q_seqinfo.max_seqlen),
                 int(bias.k_seqinfo.max_seqlen),
                 True,
             )
-            bt = bias.block_tables.to(torch.int32).to(q.device)
-            if sub > 1:
-                bt = (
-                    bt.unsqueeze(-1) * sub
-                    + torch.arange(sub, dtype=torch.int32, device=q.device)
-                ).reshape(bt.shape[0], bt.shape[1] * sub)
             kw["block_table"] = bt
             kw["seqlen_k"] = seqlen_k
             kw["kv_cache_layout"] = "linear"
