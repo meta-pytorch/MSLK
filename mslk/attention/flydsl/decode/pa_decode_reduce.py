@@ -70,6 +70,9 @@ def _compile_reduce(
     _HEAD = head_size
     _MAX_PARTS = max_parts
     _FAST = _MAX_PARTS <= WARP_SIZE
+    # Slow path stages stats in LDS one wave at a time; pad so every lane has a
+    # slot and the staging loop needs no bound branch.
+    _PAD_PARTS = ((_MAX_PARTS + WARP_SIZE - 1) // WARP_SIZE) * WARP_SIZE
     _OUT_FX = _fx_dtype(output_dtype_str)
     _CHUNKS = _HEAD // WARP_SIZE
 
@@ -79,7 +82,7 @@ def _compile_reduce(
         global_sym_name=f"pa_red_p{_MAX_PARTS}_h{_HEAD}_{output_dtype_str}",
     )
     if not _FAST:
-        allocator.ptr = 2 * _MAX_PARTS * 4  # max + sum, f32 each
+        allocator.ptr = 2 * _PAD_PARTS * 4  # max + sum, f32 each
 
     @flyc.kernel(known_block_size=(WARP_SIZE, 1, 1))
     def _kernel(
@@ -109,6 +112,7 @@ def _compile_reduce(
         c_zero = arith.constant(0.0, type=T.f32)
         c_one = arith.constant(1.0, type=T.f32)
         c_neginf = arith.constant(float("-inf"), type=T.f32)
+        c_gmax_floor = arith.constant(-3.0e38, type=T.f32)
 
         po_rsrc = buffer_ops.create_buffer_resource(partial_out_ptr, max_size=True)
         pm_rsrc = buffer_ops.create_buffer_resource(partial_max_ptr, max_size=True)
@@ -125,13 +129,29 @@ def _compile_reduce(
             c_mp = arith.constant(_MAX_PARTS, type=T.i32)
             active = lane < c_mp
 
-            pm_off = pm_base + lane * s_pm_part
+            # Clamp the address the same way the slow path does. The load is
+            # issued by all WARP_SIZE lanes and only masked afterwards, so with
+            # _MAX_PARTS < WARP_SIZE the inactive lanes address up to
+            # (WARP_SIZE - _MAX_PARTS) * s_pm_part past the end of pm/ps. Those
+            # resources are max_size=True, so nothing bounds-checks them and the
+            # read walks raw memory -- it faults only when the overrun happens to
+            # clear the allocator's slab. Re-reading the last valid partition
+            # costs nothing; `active` still discards the value.
+            lane_ld = arith.select(
+                arith.unwrap(active),
+                arith.unwrap(lane),
+                arith.constant(_MAX_PARTS - 1, type=T.i32),
+            )
+            pm_off = pm_base + fx.Int32(lane_ld) * s_pm_part
             p_max_r = buffer_ops.buffer_load(pm_rsrc, pm_off, vec_width=1, dtype=T.f32)
             p_sum_r = buffer_ops.buffer_load(ps_rsrc, pm_off, vec_width=1, dtype=T.f32)
             part_max = arith.select(active, p_max_r, c_neginf)
             part_sum = arith.select(active, p_sum_r, c_zero)
 
             gmax = arith.unwrap(wave_reduce_max_f32(fx.Float32(part_max)))
+            # An empty request leaves every partition at -inf; keep gmax finite so
+            # the weights come out 0 rather than exp(-inf - -inf) = NaN.
+            gmax = arith.maximumf(gmax, c_gmax_floor)
             diff = arith.subf(part_max, gmax)
             w_f32 = arith.select(active, arith.unwrap(exp_f32(diff)), c_zero)
             gsum = arith.unwrap(
@@ -173,29 +193,36 @@ def _compile_reduce(
 
         else:
             smem = allocator.get_base()
-            lm_lds = SmemPtr(smem, 0, T.f32, shape=(_MAX_PARTS,)).get()
-            ls_lds = SmemPtr(smem, _MAX_PARTS * 4, T.f32, shape=(_MAX_PARTS,)).get()
+            lm_lds = SmemPtr(smem, 0, T.f32, shape=(_PAD_PARTS,)).get()
+            ls_lds = SmemPtr(smem, _PAD_PARTS * 4, T.f32, shape=(_PAD_PARTS,)).get()
 
-            for step in range_constexpr((_MAX_PARTS + WARP_SIZE - 1) // WARP_SIZE):
-                p = step * WARP_SIZE + lane
-                if const_expr(p < _MAX_PARTS):
-                    pm_off = pm_base + arith.constant(p, type=T.i32) * s_pm_part
-                    lm = buffer_ops.buffer_load(
-                        pm_rsrc, pm_off, vec_width=1, dtype=T.f32
-                    )
-                    ls = buffer_ops.buffer_load(
-                        ps_rsrc, pm_off, vec_width=1, dtype=T.f32
-                    )
-                    vector.store(
-                        fx.Vector.from_elements([lm], dtype=fx.Float32),
-                        lm_lds,
-                        [fx.Index(arith.constant(p, type=T.i32))],
-                    )
-                    vector.store(
-                        fx.Vector.from_elements([ls], dtype=fx.Float32),
-                        ls_lds,
-                        [fx.Index(arith.constant(p, type=T.i32))],
-                    )
+            # `p` is lane-dependent, so it cannot be a const_expr/arith.constant.
+            #
+            # The LDS arrays are padded to a whole number of waves, so every lane
+            # has a slot to write and no branch is needed; the load index is clamped
+            # instead, which duplicates a valid entry into the padding. The padded
+            # slots are never read back: the accumulation loops below are
+            # range_constexpr over _MAX_PARTS.
+            for step in range_constexpr(_PAD_PARTS // WARP_SIZE):
+                p = fx.Int32(step * WARP_SIZE) + lane
+                p_ld = arith.select(
+                    arith.unwrap(p < fx.Int32(_MAX_PARTS)),
+                    arith.unwrap(p),
+                    arith.constant(_MAX_PARTS - 1, type=T.i32),
+                )
+                pm_off = pm_base + fx.Int32(p_ld) * s_pm_part
+                lm = buffer_ops.buffer_load(pm_rsrc, pm_off, vec_width=1, dtype=T.f32)
+                ls = buffer_ops.buffer_load(ps_rsrc, pm_off, vec_width=1, dtype=T.f32)
+                vector.store(
+                    fx.Vector.from_elements([lm], dtype=fx.Float32),
+                    lm_lds,
+                    [fx.Index(p)],
+                )
+                vector.store(
+                    fx.Vector.from_elements([ls], dtype=fx.Float32),
+                    ls_lds,
+                    [fx.Index(p)],
+                )
             gpu.barrier()
 
             gmax = c_neginf
@@ -204,6 +231,7 @@ def _compile_reduce(
                     T.vec(1, T.f32), lm_lds, [fx.Index(arith.constant(p, type=T.i32))]
                 )[0]
                 gmax = arith.maximumf(gmax, arith.unwrap(fx.Float32(v)))
+            gmax = arith.maximumf(gmax, c_gmax_floor)
 
             gsum = c_zero
             accs = [c_zero] * _CHUNKS
@@ -217,6 +245,10 @@ def _compile_reduce(
                 lm_v = arith.unwrap(fx.Float32(vm))
                 ls_v = arith.unwrap(fx.Float32(vs))
                 w = arith.unwrap(exp_f32(arith.subf(lm_v, gmax)))
+                # partial_out is the UN-normalized numerator sum(p*v), so the
+                # numerator weight is w alone; part_sum only enters the
+                # denominator. (The fast path above does the same: it accumulates
+                # vals * norm_w, never vals * part_sum.)
                 gsum = arith.addf(gsum, arith.mulf(w, ls_v))
                 poff = po_base_hq + arith.constant(p, type=T.i32) * s_po_part
                 for c in range_constexpr(_CHUNKS):
@@ -224,7 +256,7 @@ def _compile_reduce(
                     val = buffer_ops.buffer_load(
                         po_rsrc, poff + hd, vec_width=1, dtype=T.f32
                     )
-                    accs[c] = arith.addf(accs[c], arith.mulf(val, arith.mulf(w, ls_v)))
+                    accs[c] = arith.addf(accs[c], arith.mulf(val, w))
 
             safe = arith.select(gsum > c_zero, gsum, c_one)
             for c in range_constexpr(_CHUNKS):
@@ -371,7 +403,8 @@ AOT_ARCHS: List[str] = ["gfx942", "gfx950"]
 AOT_CONFIGS: List[Dict[str, Any]] = [
     {"head_size": hs, "max_parts": mp, "output_dtype_str": dt}
     for hs in (64, 128, 256)
-    for mp in (1, 2, 4, 8, 16, 32, 64)
+    # Matches pa_decode_dense._SPLIT_KS; 128 and 256 take the slow path.
+    for mp in (1, 2, 4, 8, 16, 32, 64, 128, 256)
     for dt in ("f32", "f16", "bf16")
 ]
 
