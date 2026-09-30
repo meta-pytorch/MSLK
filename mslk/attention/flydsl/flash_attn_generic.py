@@ -37,6 +37,9 @@ from ._common import tensor_cache_sig as _fmha_tensor_cache_sig
 from .flash_attn_utils import (
     _make_flash_attn_generic_traits,
     _waitcnt_vm_n,
+    combine_lanes_per_row,
+    combine_rows_per_block,
+    combine_split_groups,
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
@@ -48,6 +51,7 @@ from .flash_attn_utils import (
     GenericSoftmaxHelper,
     GenericStoreHelper,
     scf_if_dispatch,
+    wait_lds_copies,
 )
 
 
@@ -427,7 +431,7 @@ def build_flash_attn_func_module_primary(
                     else:
                         kv_gmem_to_lds.coop_load_k(pre_k_start, pre_k_slot)
                 if const_expr(traits.ENABLE_DMA):
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                 else:
                     rocdl.sched_group_barrier(rocdl.mask_vmem_rd, 1, 0)
                 gpu.barrier()
@@ -445,7 +449,7 @@ def build_flash_attn_func_module_primary(
                         _k_buf_id = _cur_buf_id
                     else:
                         _k_buf_id = fx.Index(1) - _cur_buf_id
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                     _next_k_buf_id = fx.Index(1) - _k_buf_id
                     if const_expr(kv_sub + 1 < traits.N_SUBTILES):
@@ -603,12 +607,12 @@ def build_flash_attn_func_module_primary(
                     gpu.barrier()
                 elif const_expr(traits.ENABLE_DMA):
                     v_base = kv_gmem_to_lds.v_buf_base(0)
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                 elif const_expr(traits.KV_VECTORIZED and traits.V_NOMAJOR_DMA):
                     v_slot = 0
                     v_base = kv_gmem_to_lds.v_buf_base(v_slot)
-                    rocdl.s_waitcnt(0)
+                    wait_lds_copies(0)
                     gpu.barrier()
                 else:
                     v_slot = 0
@@ -672,10 +676,17 @@ def build_flash_attn_func_module_primary(
 
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
-    # reads the workspace verbatim (one wave row covers four O columns per lane).
-    COMBINE_BLOCK = 256
-    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
-    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+    # reads the workspace verbatim.
+    # Threads per combine block; a block is the unit of CU assignment.
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
+    COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
+    # A row owns a whole wave: HEAD_DIM/combine_chunk lanes carry the head dim
+    # and the remaining lanes divide the split dimension between them, merged
+    # by an in-wave butterfly. A partial wave would drop split groups, so the
+    # block must be whole waves.
+    if combine_split_groups(traits.HEAD_DIM) > 1:
+        COMBINE_BLOCK = max(64, COMBINE_BLOCK // 64 * 64)
+    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_generic_combine_kernel(
@@ -711,17 +722,21 @@ def build_flash_attn_func_module_primary(
         c_ctx.init_descriptors()
 
         combine = DualwaveSplitKCombineHelper(c_ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        # Each split group reduces its own share against its own max, then the
+        # groups are merged across the wave.
+        m_max = combine.reduce_m_max()
+        acc, den = combine.accumulate_splits(m_max)
+        m_max, den, acc = combine.merge_split_groups(m_max, den, acc)
         o_pack = combine.pack_output(acc, den)
+        # Every group ends up with the merged result; one of them stores it.
+        _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
 
         def _store_in_bounds():
             combine.store_output(o_pack)
             if const_expr(traits.RETURN_LSE):
                 combine.store_lse(m_max, den)
 
-        scf_if_dispatch(c_ctx.row_in_bounds, _store_in_bounds)
+        scf_if_dispatch(_owns_store, _store_in_bounds)
 
     @flyc.jit
     def launch_flash_attn_generic(
