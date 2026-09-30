@@ -8,6 +8,7 @@
 
 import logging
 import math
+import unittest.mock
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Type
 
@@ -26,7 +27,7 @@ from mslk.attention import fmha
 from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
 from mslk.attention.fmha.attn_bias_utils import pack_kv_cache
 from mslk.attention.fmha.common import AttentionFwOpBase, pack_fp8_tensorwise_per_head
-from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list
+from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list, _usage_seen
 from mslk.attention.fmha.unbind import unbind
 from scipy.stats import binomtest  # type: ignore
 from torch.utils.checkpoint import checkpoint
@@ -2102,9 +2103,10 @@ def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
     q.grad, k.grad, v.grad = None, None, None
 
     # Compiled version
-    fmha_c = torch.compile(fmha_fn, fullgraph=True, dynamic=False)
-    out = fmha_c(q, k, v, bias)
-    out.backward(grad)
+    with unittest.mock.patch.dict(_usage_seen, clear=True):
+        fmha_c = torch.compile(fmha_fn, fullgraph=True, dynamic=False)
+        out = fmha_c(q, k, v, bias)
+        out.backward(grad)
 
     assert_allclose(
         out,
