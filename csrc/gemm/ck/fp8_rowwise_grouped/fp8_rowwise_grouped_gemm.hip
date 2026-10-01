@@ -588,8 +588,8 @@ OutputType _f8f8bf16_rowwise_grouped(
   int64_t MaxN = 0;
   int64_t MaxK = 0;
   for (int i = 0; i < group_count; i++) {
-    MaxN = max(MaxN, WQ[i].size(0));
-    MaxK = max(MaxK, XQ[i].size(1));
+    MaxN = std::max(MaxN, WQ[i].size(0));
+    MaxK = std::max(MaxK, XQ[i].size(1));
   }
   RowwiseGroupedKernel<at::TensorList, at::Tensor> selected_kernel =
       rowwise_grouped_heuristic_dispatch<at::TensorList, at::Tensor>(

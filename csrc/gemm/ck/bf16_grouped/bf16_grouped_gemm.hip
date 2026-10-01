@@ -438,9 +438,9 @@ OutputType _bf16bf16bf16_grouped(
     int64_t MaxN = 0;
     int64_t MaxK = 0;
     for (int i = 0; i < group_count; i++) {
-      MaxM = max(MaxM, A[i].size(0));
-      MaxN = max(MaxN, B[i].size(0));
-      MaxK = max(MaxK, A[i].size(1));
+      MaxM = std::max(MaxM, A[i].size(0));
+      MaxN = std::max(MaxN, B[i].size(0));
+      MaxK = std::max(MaxK, A[i].size(1));
     }
     auto selected_kernel = grouped_heuristic_dispatch<at::TensorList, at::Tensor>(group_count, MaxM, MaxN, MaxK);
     Y = selected_kernel(A, B, kernel_args, Y);
@@ -517,9 +517,9 @@ at::Tensor bf16bf16bf16_grouped_dynamic(
   int64_t MaxN = 0;
   int64_t MaxK = 0;
   for (int i = 0; i < group_count; i++) {
-    MaxM = max(MaxM, A[i].size(0));
-    MaxN = max(MaxN, B[i].size(0));
-    MaxK = max(MaxK, A[i].size(1));
+    MaxM = std::max(MaxM, A[i].size(0));
+    MaxN = std::max(MaxN, B[i].size(0));
+    MaxK = std::max(MaxK, A[i].size(1));
   }
   auto selected_kernel = grouped_heuristic_dispatch<at::Tensor, at::Tensor>(group_count, MaxM, MaxN, MaxK);
   // Run kernel to populate output.
