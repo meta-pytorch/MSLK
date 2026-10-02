@@ -169,12 +169,11 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
 
 def _fp8_gemm_cases() -> list[tuple]:
     # Blockwise FP8 GEMM: CUDA uses CUTLASS; ROCm uses the FlyDSL kernel that
-    # replaced the broken CK kernel (gated on FlyDSL availability).
-    from mslk.flydsl.common import is_flydsl_available
-
+    # replaced the broken CK kernel, falling back to Triton's matmul_fp8_block
+    # wherever FlyDSL cannot serve the arch.
     blockwise_supported = (
         torch.version.cuda is not None and compute_capability_in(9, 9)
-    ) or (torch.version.hip is not None and is_flydsl_available())
+    ) or torch.version.hip is not None
     modes = ["rowwise"] + (["blockwise"] if blockwise_supported else [])
 
     def case(
@@ -210,9 +209,9 @@ def _fp8_gemm_cases() -> list[tuple]:
         case(2048, 256, 4096, cudagraph=True),
         case(2048, 256, 4096, multi_dim=True),
     ]
+    cases += [case(2048, 256, 4096, use_triton=True)]
     if torch.version.cuda is not None:
         cases += [
-            case(2048, 256, 4096, use_triton=True),
             case(2048, 256, 4096, fast_accum=False),  # slow accumulation
         ]
     return [(*case, mode) for mode in modes for case in cases]
