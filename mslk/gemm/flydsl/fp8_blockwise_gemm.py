@@ -39,12 +39,14 @@ Two ops share the kernel:
   weight once at load time and cache it.
 """
 
+import functools
 import os
 from typing import Optional
 
 import torch
 from mslk.flydsl.common import require_flydsl
 from mslk.flydsl.jit import run_compiled
+from mslk.utils.device import is_gfx942, is_gfx950
 
 # Only the scale-block granularity is fixed by the op; tile_m/tile_n/tile_k are
 # chosen per call (fixed default, or autotune when MSLK_AUTOTUNE_ENABLE).
@@ -267,6 +269,11 @@ def _dispatch_blockwise(
         b_preshuffled=b_preshuffled,
     )
     return output
+
+
+@functools.lru_cache(maxsize=1)
+def is_supported() -> bool:
+    return is_gfx950() or is_gfx942()
 
 
 def matmul_f8f8bf16_blockwise(
