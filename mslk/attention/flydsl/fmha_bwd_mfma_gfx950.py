@@ -99,6 +99,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     gpu_arch: str = "gfx950",
     deterministic: bool = False,
     ck_scope_dvdk: bool = False,
+    has_bias: bool = False,
+    emit_dbias: bool = False,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -378,6 +380,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         seqstart_k: fx.Tensor,
         total_m: fx.Int32,
         batch_size: fx.Int32,
+        Bias: fx.Tensor,
+        bias_stride_b: fx.Int32,
+        bias_stride_h: fx.Int32,
+        bias_stride_q: fx.Int32,
+        dBias: fx.Tensor,
+        dbias_sink: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -560,6 +568,23 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         k_rsrc = _bops.create_buffer_resource(K)
         v_rsrc = _bops.create_buffer_resource(V)
         do_rsrc = _bops.create_buffer_resource(dO)
+
+        # The forward folded Bias into LSE, so P cannot be recomputed without it.
+        # Dense [B, H, Mq, Mk]; broadcast shapes are rejected host-side.
+        if const_expr(has_bias):
+            bias_rsrc = _bops.create_buffer_resource(Bias)
+            bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
+                bias_stride_h
+            )
+        # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
+        # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
+        if const_expr(emit_dbias):
+            dbias_rsrc = _bops.create_buffer_resource(dBias)
+            # dBias is host-allocated contiguous, so its pitches come from the kernel's
+            # own dims, not the input strides, which may be non-contiguous in B/H.
+            dbias_plane_base = (
+                (batch_idx * n_heads_idx + head_idx) * seq_M_idx * seq_N_idx
+            )
 
         from flydsl._mlir import ir as _ir_d
 
@@ -1270,6 +1295,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
 
                 log2e_scale_cst = fx.Float32(_LOG2E * scale)
                 scale_cst = fx.Float32(scale)
+                # _softmax_p folds scale into one FMA, so apply the bias as
+                # bias/scale on the raw QK accumulator (the forward's trick).
+                if const_expr(has_bias):
+                    inv_scale_cst = fx.Float32(1.0 / scale)
                 for m_sub in range_constexpr(M_SUBTILES):
                     # ---- GEMM1a: S = Q @ K^T ; GEMM1b: dP = dO @ V^T ---- (gemm1/all)
                     if const_expr(_do_gemm1):
@@ -1492,6 +1521,37 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             m_valid = m_row_abs < this_seqlen_q
                                             lse_val = Vec(lse_grp)[r]
                                             s_val = Vec(s_accs[ai])[r]
+                                            if const_expr(has_bias):
+                                                b_off = (
+                                                    bias_plane_base
+                                                    + fx.Index(m_row_abs)
+                                                    * fx.Index(bias_stride_q)
+                                                    + fx.Index(n_row_abs)
+                                                )
+                                                b_elem = _bops.buffer_load(
+                                                    bias_rsrc,
+                                                    b_off,
+                                                    vec_width=1,
+                                                    dtype=elem_dtype,
+                                                )
+                                                b_f32 = Vec.from_elements(
+                                                    [b_elem], elem_dtype
+                                                ).to(fx.Float32)[0]
+                                                s_val = fx.Float32(
+                                                    arith.addf(
+                                                        _raw(s_val),
+                                                        _raw(
+                                                            fx.Float32(
+                                                                arith.mulf(
+                                                                    _raw(b_f32),
+                                                                    _raw(inv_scale_cst),
+                                                                    fastmath=fm,
+                                                                )
+                                                            )
+                                                        ),
+                                                        fastmath=fm,
+                                                    )
+                                                )
                                             valid_mn = _am(m_valid & n_ok)
                                             if const_expr(causal):
                                                 valid_mn = valid_mn & (
@@ -1547,6 +1607,24 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             )
                                             m_local = m_within + (m_sub * 32)
                                             n_local = n_within
+                                            if const_expr(emit_dbias):
+                                                # Bound only on the P pass;
+                                                # recompute, don't reuse.
+                                                db_off_ok = fx.Int32(
+                                                    dbias_plane_base
+                                                    + (m_local + m_start) * seq_N_idx
+                                                    + (n_local + n_start)
+                                                )
+                                                _bops.buffer_store(
+                                                    _raw(ds_val),
+                                                    dbias_rsrc,
+                                                    fx.Index(
+                                                        valid_mn.select(
+                                                            db_off_ok,
+                                                            fx.Int32(dbias_sink),
+                                                        )
+                                                    ),
+                                                )
                                             # Default [n,m] m-contiguous store, UNLESS _use_ds_tr
                                             # (paired with the ds_read_tr A-operand read below --
                                             # _dq_ds_pack_gemm4_tr) -- then use the
@@ -1976,6 +2054,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         seqstart_q: fx.Tensor,
         seqstart_k: fx.Tensor,
         total_m: fx.Int32,
+        Bias: fx.Tensor,
+        bias_stride_b: fx.Int32,
+        bias_stride_h: fx.Int32,
+        bias_stride_q: fx.Int32,
+        dBias: fx.Tensor,
+        dbias_sink: fx.Int32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2014,6 +2098,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             seqstart_k,
             total_m,
             B,
+            Bias,
+            bias_stride_b,
+            bias_stride_h,
+            bias_stride_q,
+            dBias,
+            dbias_sink,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),

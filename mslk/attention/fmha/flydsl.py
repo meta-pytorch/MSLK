@@ -692,6 +692,50 @@ def _num_kv_heads(key: torch.Tensor) -> int:
     return 1 if key.stride(2) == 0 else key.shape[2]
 
 
+def _tensor_bias_bwd_reasons(d: Inputs) -> List[str]:
+    """Constraints on an additive tensor bias in the FlyDSL backward.
+
+    The broadcast rejection is ported from ck.BwOp: backprop through a
+    broadcast bias is declined outright rather than silently mis-reduced, so
+    the bias must already be materialised at the full attention shape. On top
+    of that, the kernel addresses the plane as `m*stride(2) + n`, which assumes
+    a unit last-dim stride, and loads bias elements as the query dtype.
+
+    Query is always BMHK here -- `not_supported_reasons` indexes
+    `d.query.shape[2]` unconditionally, and SUPPORTS_BMGHK is False.
+    """
+    bias = d.attn_bias
+    assert isinstance(bias, torch.Tensor)
+    reasons: List[str] = []
+    gpu_arch = torch.cuda.get_device_properties(d.query.device).gcnArchName
+    if "gfx950" not in gpu_arch:
+        reasons.append(
+            f"a tensor `attn_bias` is implemented for gfx950 only (got {gpu_arch})"
+        )
+    expected_bias_shape = (
+        d.query.shape[0],
+        d.query.shape[2],
+        d.query.shape[1],
+        d.key.shape[1],
+    )
+    if tuple(bias.shape) != expected_bias_shape:
+        reasons.append(
+            "Broadcasting the `attn_bias` tensor is not supported "
+            f"(shape: {tuple(bias.shape)}"
+            f"/ expected: {expected_bias_shape})"
+        )
+    elif bias.stride(-1) != 1:
+        reasons.append(
+            "`attn_bias` must be contiguous in its last dimension "
+            f"(stride(-1) = {bias.stride(-1)})"
+        )
+    if bias.dtype != d.query.dtype:
+        reasons.append(
+            f"attn_bias dtype {bias.dtype} must match query dtype {d.query.dtype}"
+        )
+    return reasons
+
+
 # Cache of flyc.compile()'d kernels, keyed on the compile-time-constant params
 # baked into the kernel body (D, dtype, tile sizes, scale, causal, GQA ratio,
 # varlen). `flyc.compile()`'s underlying MLIR/LLVM artifact is itself cached
@@ -730,7 +774,9 @@ def _flydsl_bwd(
     causal: bool,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    attn_bias: Optional[torch.Tensor] = None,
+    needs_dbias: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
     from mslk.attention.flydsl.fmha_bwd_mfma import (
@@ -853,6 +899,35 @@ def _flydsl_bwd(
     _seqstart_q_arg = seqstart_q if varlen else _dummy_seqstart
     _seqstart_k_arg = seqstart_k if varlen else _dummy_seqstart
 
+    # Dense [B, H, Mq, Mk] with unit last-dim stride; other layouts are rejected
+    # in BwOp.not_supported_reasons. has_bias is part of the compile key.
+    has_bias = attn_bias is not None
+    if has_bias and not _is_gfx950:
+        # Off gfx950 the kernels recompute P without the bias, corrupting dQ/dK/dV
+        # rather than just omitting db. BwOp declines it; this backstops direct callers.
+        raise NotImplementedError(
+            "mslk_flydsl::fmha_bwd does not support attn_bias on "
+            f"{gpu_arch}; the tensor-bias backward is implemented for gfx950 only."
+        )
+    _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
+    _bias_arg = attn_bias if has_bias else _dummy_bias
+    if attn_bias is not None:
+        bias_stride_b = attn_bias.stride(0)
+        bias_stride_h = attn_bias.stride(1)
+        bias_stride_q = attn_bias.stride(2)
+    else:
+        bias_stride_b = bias_stride_h = bias_stride_q = 0
+
+    # Contiguous [B, H, M, N] f32 plus a trailing sink for masked-off tail lanes;
+    # f32 because the kernel produces dS in f32, cast back once below.
+    emit_dbias = has_bias and needs_dbias
+    if emit_dbias:
+        dbias_sink = B * H * M * N
+        dBias_out = torch.zeros(dbias_sink + 1, device=device, dtype=torch.float32)
+    else:
+        dbias_sink = 0
+        dBias_out = torch.zeros(1, device=device, dtype=torch.float32)
+
     # gfx950 production path (mslk.attention.flydsl.fmha_bwd_mfma_gfx950),
     # replacing the older fmha_bwd_mfma.py dqdkdv kernel on this arch (gfx942
     # is untouched below -- this kernel hard-asserts gfx950). The kernel
@@ -894,6 +969,12 @@ def _flydsl_bwd(
             _seqstart_q_arg,
             _seqstart_k_arg,
             total_m,
+            _bias_arg,
+            bias_stride_b,
+            bias_stride_h,
+            bias_stride_q,
+            dBias_out,
+            dbias_sink,
             stream,
         )
         gfx950_key = (
@@ -906,6 +987,8 @@ def _flydsl_bwd(
             causal,
             heads_per_kv,
             varlen,
+            has_bias,
+            emit_dbias,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -921,6 +1004,8 @@ def _flydsl_bwd(
                 gpu_arch=gpu_arch,
                 deterministic=False,
                 ck_scope_dvdk=True,
+                has_bias=has_bias,
+                emit_dbias=emit_dbias,
             )
             # flyc.compile executes the kernel once (JIT warm run) -- dQ (and
             # dV/dK, always atomic-add under ck_scope_dvdk's per-query-head
@@ -951,6 +1036,12 @@ def _flydsl_bwd(
                 _seqstart_q_arg,
                 _seqstart_k_arg,
                 total_m,
+                _bias_arg,
+                bias_stride_b,
+                bias_stride_h,
+                bias_stride_q,
+                torch.zeros_like(dBias_out),
+                dbias_sink,
                 stream,
             )
             compiled_gfx950 = flyc.compile(launch_gfx950, *args_compile)
@@ -994,7 +1085,13 @@ def _flydsl_bwd(
             .sum(3)
             .to(dtype)
         )
-        return dq, dk, dv
+        # Drop the trailing sink element before reshaping; it absorbed the
+        # stores from masked-off tail lanes and is not part of the gradient.
+        if emit_dbias:
+            db = dBias_out[:-1].view(B, H, M, N).to(dtype)
+        else:
+            db = dQ_out.new_empty((0,))
+        return dq, dk, dv, db
 
     # Fused (dqdkdv) is the primary path -- measured (A3_ck_flyDSL_compare.md
     # SS7.18) to beat the split dvdk+dq path by ~2x-13x on BOTH gfx950 and
@@ -1256,7 +1353,13 @@ def _flydsl_bwd(
     dq = dQ_out.view(out_b, out_m, H, D).to(dtype)
     dk = dK_out.view(out_b, out_n, H_kv, D).to(dtype)
     dv = dV_out.view(out_b, out_n, H_kv, D).to(dtype)
-    return dq, dk, dv
+    # Drop the trailing sink element before reshaping; it absorbed the stores
+    # from masked-off tail lanes and is not part of the gradient.
+    if emit_dbias:
+        db = dBias_out[:-1].view(B, H, M, N).to(dtype)
+    else:
+        db = dQ_out.new_empty((0,))
+    return dq, dk, dv, db
 
 
 @torch.library.register_fake("mslk_flydsl::fmha_bwd")
@@ -1271,11 +1374,21 @@ def _flydsl_bwd_abstract(
     causal: bool,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    attn_bias: Optional[torch.Tensor] = None,
+    needs_dbias: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # db is empty (not None) when no bias gradient was requested: the schema's
+    # return arity is fixed, so `apply` keys off numel() rather than None.
+    db = (
+        torch.empty_like(attn_bias)
+        if (needs_dbias and attn_bias is not None)
+        else query.new_empty((0,))
+    )
     return (
         torch.empty_like(query),
         torch.empty_like(key),
         torch.empty_like(value),
+        db,
     )
 
 
@@ -1317,6 +1430,9 @@ class BwOp(AttentionBwOpBase):
     # per-shape-conditional, since AttentionBwOpBase.not_supported_reasons()
     # checks this BEFORE the op knows which internal path a given D will take.
     IS_DETERMINISTIC = False
+    # db is emitted by the gfx950 fused kernel as the unscaled dS; broadcast
+    # bias is rejected in not_supported_reasons, so no reduction is involved.
+    SUPPORTS_ATTN_BIAS_GRAD = True
     VARLEN_LSE_PACKED = (
         True  # matches ck.BwOp's convention (see fmha_bwd_mfma.py's _lse_row)
     )
@@ -1333,6 +1449,7 @@ class BwOp(AttentionBwOpBase):
     # semantics) -- separately scoped, not implemented.
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
+        torch.Tensor,
         LowerTriangularMask,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
@@ -1364,6 +1481,8 @@ class BwOp(AttentionBwOpBase):
             reasons.append(
                 "query head count must be a multiple of the KV head count (GQA)"
             )
+        if isinstance(d.attn_bias, torch.Tensor):
+            reasons.extend(_tensor_bias_bwd_reasons(d))
         return reasons
 
     @classmethod
@@ -1382,7 +1501,9 @@ class BwOp(AttentionBwOpBase):
             # Mirrors ck.py's _get_seqlen_info.
             seqstart_q = inp.attn_bias.q_seqinfo.seqstart.to(inp.query.device)
             seqstart_k = inp.attn_bias.k_seqinfo.seqstart.to(inp.query.device)
-        dq, dk, dv = cls.OPERATOR(
+        bias_t = inp.attn_bias if isinstance(inp.attn_bias, torch.Tensor) else None
+        needs_dbias = bias_t is not None and bias_t.requires_grad
+        dq, dk, dv, db = cls.OPERATOR(
             inp.query,
             inp.key,
             inp.value,
@@ -1393,6 +1514,8 @@ class BwOp(AttentionBwOpBase):
             causal,
             seqstart_q,
             seqstart_k,
+            bias_t,
+            needs_dbias,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see
@@ -1423,4 +1546,6 @@ class BwOp(AttentionBwOpBase):
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
             dk = (dk / heads_per_kv).expand(inp.key.shape)
             dv = (dv / heads_per_kv).expand(inp.value.shape)
-        return Gradients(dq=dq, dk=dk, dv=dv)
+        # The op's return arity is fixed, so an unwanted db comes back empty
+        # rather than as None -- mirror ck.BwOp and hand back None in that case.
+        return Gradients(dq=dq, dk=dk, dv=dv, db=db if needs_dbias else None)
