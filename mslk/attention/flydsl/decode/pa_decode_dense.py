@@ -72,8 +72,26 @@ def auto_split_k_coop(B: int, G: int, H_q: int, KV_MAX: int) -> int:
     return max(1, sk)
 
 
+# One CTA is one warp here, so split_k multiplies the warp count directly.
+# Above 256 the combine pass dominates: it stages per-partition stats in LDS and
+# its accumulation loop is unrolled over partitions, so cost grows linearly while
+# the extra parallelism has already saturated. Measured on MI350X at B=1, split
+# 512 was slower than 256 on every shape tried (ctx 32k..512k, D 64/128).
+_MAX_SPLIT_K_HP = 256
+
+# Tokens a split must own for its share of the combine pass to be worth it. The
+# measured knee sits between 256 and 2000 tokens/split and rises with context;
+# 256 puts the heuristic within ~9% of the per-shape optimum across that range.
+_MIN_CHUNK_TOKENS_HP = 256
+
+
 def auto_split_k_hp(B: int, G: int, H_q: int, H_kv: int, KV_MAX: int) -> int:
-    """split_k for the head-packed gfx950 kernel: ~8 waves counted in warps (B*G*H_kv), cap 64."""
+    """split_k for the head-packed gfx950 kernel: ~8 waves counted in warps (B*G*H_kv).
+
+    Capped by `_MAX_SPLIT_K_HP` and by the requirement that each split own at
+    least `_MIN_CHUNK_TOKENS_HP` tokens. Always returns a power of two so the
+    number of compiled (kernel, reduce) variants stays small.
+    """
     n_cus = _get_cu_count()
     target_warps = n_cus * 8
     base_warps = B * G * H_kv
@@ -81,10 +99,13 @@ def auto_split_k_hp(B: int, G: int, H_q: int, H_kv: int, KV_MAX: int) -> int:
     sk = 1
     while sk < needed:
         sk *= 2
-    MIN_CHUNK_TOKENS = 64
-    max_sk = max(1, KV_MAX // MIN_CHUNK_TOKENS)
-    sk = min(sk, max_sk, 64)
-    return max(1, sk)
+    max_sk = max(1, KV_MAX // _MIN_CHUNK_TOKENS_HP)
+    sk = min(sk, max_sk, _MAX_SPLIT_K_HP)
+    # min() can land off a power of two; round back down.
+    p = 1
+    while p * 2 <= sk:
+        p *= 2
+    return max(1, p)
 
 
 # ── Host launcher ─────────────────────────────────────────────────────────────
@@ -118,6 +139,112 @@ def pa_decode_launch(
     )
 
 
+def query_group_seqlen(seqlen_kv: int, seqlen_q: int, groups: int, group: int) -> int:
+    """KV length to pass for one query group, preserving bottom-right causality.
+
+    In the full block, query token ``i`` attends to ``[0, L - Sq + i + 1)``.
+    Group ``g`` holds tokens ``g*S .. g*S+S-1`` where ``S = Sq/groups``, and is
+    launched as its own block of ``S`` tokens. Inside that launch, token ``j``
+    attends to ``[0, L_g - S + j + 1)``. Setting
+
+        L_g = L - (groups - 1 - g) * S
+
+    makes those identical, since ``L_g - S + j + 1 == L - Sq + (g*S + j) + 1``.
+    The last group therefore sees the full context and earlier groups a
+    correspondingly shorter prefix -- no masking change is needed in the kernel.
+    """
+    span = seqlen_q // groups
+    return seqlen_kv - (groups - 1 - group) * span
+
+
+def pa_decode_paged_launch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seqlen_k: Optional[torch.Tensor],
+    softmax_scale: float,
+    *,
+    page_size: int,
+    max_seqlen_kv: int,
+    split_k: int = 0,
+    output_dtype: Optional[torch.dtype] = None,
+    query_groups: int = 1,
+) -> torch.Tensor:
+    """Paged-KV head-packed decode (short query blocks).
+
+    The head-packed gfx950 kernel maps the MFMA M-axis to (query-token, head)
+    pairs, so a decode shape fills the matrix core -- unlike the dualwave prefill
+    kernel, whose M-axis is query rows and which therefore runs at 1/32 MFMA
+    utilisation at Sq=1. Causal masking is applied per query token inside the
+    kernel (bottom-right alignment).
+
+    Shapes:
+      q            [B, Sq, G, H_q, D]  (Sq bounded by the M-tile budget; see
+                   MAX_M_TILES_BY_HEAD_DIM in pa_decode_gfx950)
+      k/v_cache    [num_pages, page_size, H_kv, D]   (MSLK "linear" layout)
+      block_table  [B, max_pages_per_seq] int32
+      seqlen_k     [B] int32, or None for "all of max_seqlen_kv"
+
+    ``max_seqlen_kv`` is required: deriving it from ``seqlen_k`` would be a
+    device->host sync and is illegal under CUDA-graph capture.
+
+    ``query_groups`` > 1 covers the query block in several shallower passes
+    instead of one deep one. Each M-tile adds loop-carried accumulator, so depth
+    costs occupancy (measured 9 waves/SIMD at one tile down to 2 at eight) and at
+    D=128 spills past 6 tiles. Splitting into G passes uses ``Sq/G`` tokens each
+    -- ``G`` times the KV traffic, but shallower tiles. Measured 1.5x-2.0x for
+    G=2 where a single pass would spill. See `query_group_seqlen` for why this is exact.
+
+    Raises ValueError for configurations the kernel cannot serve (GQA ratio > 16,
+    D % 32, page_size % 32, non-gfx950) -- there is no generic paged fallback, so
+    callers must gate before calling.
+    """
+    from .pa_decode_gfx950 import pa_decode_gfx950_launch
+
+    Sq = q.shape[1]
+    if query_groups <= 1 or Sq % query_groups != 0:
+        # Unchanged path. Kept as an early return so grouping cannot perturb the
+        # shapes that do not use it.
+        return pa_decode_gfx950_launch(
+            q,
+            k_cache,
+            v_cache,
+            seqlen_k,
+            softmax_scale,
+            split_k,
+            output_dtype,
+            block_table=block_table,
+            page_size=page_size,
+            kv_max=max_seqlen_kv,
+        )
+
+    span = Sq // query_groups
+    parts = []
+    for g in range(query_groups):
+        kv_g = query_group_seqlen(max_seqlen_kv, Sq, query_groups, g)
+        # `.contiguous()` is load-bearing, not hygiene. The kernel's non-split
+        # epilogue addresses the output with Q's strides, so it requires the two
+        # to share a layout. A slice of the query block keeps the parent's
+        # stride(0) (Sq*...) while the freshly allocated output has span*...,
+        # and the mismatch silently corrupts every batch above the first.
+        parts.append(
+            pa_decode_gfx950_launch(
+                q[:, g * span : (g + 1) * span].contiguous(),
+                k_cache,
+                v_cache,
+                None if seqlen_k is None else seqlen_k - (Sq - (g + 1) * span),
+                softmax_scale,
+                split_k,
+                output_dtype,
+                block_table=block_table,
+                page_size=page_size,
+                kv_max=kv_g,
+            )
+        )
+    return torch.cat(parts, dim=1)
+
+
 # ── AOT interface ─────────────────────────────────────────────────────────────
 
 
@@ -126,7 +253,14 @@ AOT_ARCHS: List[str] = ["gfx942", "gfx950"]
 # KV is f16/bf16 only; split-K path writes f32 partials, so out="f32" for sk>1.
 _HEAD_SIZES = (64, 128, 256)
 _KV_DTYPES = ("f16", "bf16")
-_SPLIT_KS = (1, 2, 4, 8, 16, 32, 64)
+_SPLIT_KS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+# Paged decode is reached only from flydsl_flash_attn_func, whose native paged
+# path is fixed at these (see _PAGED_PAGE_SIZE in flash_attn_interface.py).
+_PAGED_HEAD_SIZES = (64, 128)
+_PAGED_PAGE_SIZE = 64
+# The head-packed gfx950 kernel compiles the GQA ratio in. Cover the common
+# power-of-two ratios at a single query token; anything else JITs on first use.
+_GFX950_AOT_GQA_RATIOS = (1, 2, 4, 8, 16)
 
 AOT_CONFIGS: List[Dict[str, Any]] = [
     {
@@ -169,10 +303,25 @@ def compile_aot_config(config: Dict[str, Any], arch: str) -> None:
             split_k=sk,
             arch=arch,
         )
-        compile_pa_decode_gfx950(
-            head_size=hs,
-            kv_dtype_str=kv,
-            output_dtype_str=od,
-            split_k=sk,
-            arch=arch,
-        )
+        for ratio in _GFX950_AOT_GQA_RATIOS:
+            compile_pa_decode_gfx950(
+                head_size=hs,
+                kv_dtype_str=kv,
+                output_dtype_str=od,
+                split_k=sk,
+                arch=arch,
+                gqa_ratio=ratio,
+            )
+            # Paged variant (block-table KV), used by the flydsl_flash_attn_func
+            # paged decode fast path. Only D=64/128 reach it -- 256 is dense-only.
+            if hs in _PAGED_HEAD_SIZES:
+                compile_pa_decode_gfx950(
+                    head_size=hs,
+                    kv_dtype_str=kv,
+                    output_dtype_str=od,
+                    split_k=sk,
+                    arch=arch,
+                    paged=True,
+                    page_size=_PAGED_PAGE_SIZE,
+                    gqa_ratio=ratio,
+                )
