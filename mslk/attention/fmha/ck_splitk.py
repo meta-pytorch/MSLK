@@ -22,7 +22,7 @@ class FwOp(AttentionFwOpBase):
         torch.half,
         torch.bfloat16,
         torch.float,
-    }  # Those are dtypes of Q. In the quantized case K/V has dtype int32
+    }
     SUPPORTED_MAX_K = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
@@ -37,8 +37,6 @@ class FwOp(AttentionFwOpBase):
     BLOCK_M = 16
     BLOCK_N = 64
 
-    NUM_GROUPS = 1  # Default quantization is row-wise
-
     @classmethod
     def shape_not_supported_reasons(
         cls, Mq: int, Mkv: int, K: int, Kv: int
@@ -52,9 +50,8 @@ class FwOp(AttentionFwOpBase):
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(FwOp, cls).not_supported_reasons(d)
         check_lastdim_alignment_stride1(reasons, "query", d.query, 8)
-        if d.key.dtype != torch.int32:
-            check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
-            check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
+        check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
+        check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
         if cls.OPERATOR is None:
             reasons.append("triton is not available")
         if d.device.type == "cuda":
