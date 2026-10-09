@@ -99,6 +99,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     gpu_arch: str = "gfx950",
     deterministic: bool = False,
     ck_scope_dvdk: bool = False,
+    window_left: int = -1,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -1496,6 +1497,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             if const_expr(causal):
                                                 valid_mn = valid_mn & (
                                                     n_row_abs <= m_row_abs
+                                                )
+                                            if const_expr(window_left >= 0):
+                                                # Keep kv > q - window_size
+                                                # (xformers convention).
+                                                valid_mn = valid_mn & (
+                                                    n_row_abs + window_left > m_row_abs
                                                 )
                                             neg_log2e_lse = fx.Float32(
                                                 arith.mulf(

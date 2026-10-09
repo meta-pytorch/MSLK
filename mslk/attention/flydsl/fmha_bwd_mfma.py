@@ -113,6 +113,7 @@ def compile_fmha_bwd_dvdk_mfma(
     causal: bool = False,
     heads_per_kv: int = 1,
     varlen: bool = False,
+    window_left: int = -1,
 ):
     """Fused dV + dK backward kernel with MFMA.
 
@@ -587,6 +588,10 @@ def compile_fmha_bwd_dvdk_mfma(
                         valid_mn = m_valid & n_ok
                         if const_expr(causal):
                             valid_mn = valid_mn & (n_row_abs <= m_row_abs)
+                        if const_expr(window_left >= 0):
+                            # Sliding window: keep kv > q - window_size, the
+                            # xformers convention the forward already uses.
+                            valid_mn = valid_mn & (n_row_abs + window_left > m_row_abs)
                         neg_log2e_lse = fx.Float32(
                             arith.mulf(
                                 _raw(lse_val), _raw(fx.Float32(-_LOG2E)), fastmath=fm
@@ -844,6 +849,7 @@ def compile_fmha_bwd_dq_mfma(
     causal: bool = False,
     heads_per_kv: int = 1,
     varlen: bool = False,
+    window_left: int = -1,
 ):
     """Standalone dQ backward kernel with MFMA. Grid over M-tiles, loop over N-tiles.
 
@@ -1291,6 +1297,10 @@ def compile_fmha_bwd_dq_mfma(
                     valid_mn = m_valids[r] & n_ok
                     if const_expr(causal):
                         valid_mn = valid_mn & (n_row_abs <= m_row_abss[r])
+                    if const_expr(window_left >= 0):
+                        # Sliding window: keep kv > q - window_size, the
+                        # xformers convention the forward already uses.
+                        valid_mn = valid_mn & (n_row_abs + window_left > m_row_abss[r])
                     p_val = _softmax_p(
                         s_val, neg_log2e_lse_vals[r], log2e_scale_cst, valid_mn, fm
                     )
@@ -1441,6 +1451,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
     gpu_arch: str = "gfx950",
     M_SPLIT: int = 1,
     BLOCK_SIZE: int = 256,
+    window_left: int = -1,
 ):
     """Fused dQ + dV + dK backward kernel in one N-tile-gridded pass.
 
@@ -2136,6 +2147,12 @@ def compile_fmha_bwd_dqdkdv_mfma(
                             valid_mn = m_valid & n_ok
                             if const_expr(causal):
                                 valid_mn = valid_mn & (n_row_abs <= m_row_abs)
+                            if const_expr(window_left >= 0):
+                                # Sliding window: keep kv > q - window_size, the
+                                # xformers convention the forward already uses.
+                                valid_mn = valid_mn & (
+                                    n_row_abs + window_left > m_row_abs
+                                )
                             neg_log2e_lse = fx.Float32(
                                 arith.mulf(
                                     _raw(lse_val),
