@@ -810,6 +810,7 @@ _fwd_kernel_splitK_autotune: Dict[int, triton.runtime.Autotuner] = {}
 if sys.version_info >= (3, 9):
     # unroll_varargs requires Python 3.9+
     for num_groups in [1, 2, 4, 8]:
+        # pyrefly: ignore [unsupported-operation]
         _fwd_kernel_splitK_autotune[num_groups] = autotune_kernel(
             _get_splitk_kernel(num_groups)
         )
