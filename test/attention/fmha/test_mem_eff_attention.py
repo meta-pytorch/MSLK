@@ -24,7 +24,7 @@ except ImportError:
     pass
 
 from mslk.attention import fmha
-from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS
+from mslk.attention.fmha import ALL_BW_OPS, ALL_FW_OPS, dispatch as fmha_dispatch
 from mslk.attention.fmha.attn_bias_utils import pack_kv_cache
 from mslk.attention.fmha.common import AttentionFwOpBase, pack_fp8_tensorwise_per_head
 from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list, _usage_seen
@@ -2055,7 +2055,12 @@ def paged_attention_run_inner(
         (fmha.flash3.FwOp, fmha.flash3.BwOp),
     ],
 )
-def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
+def test_memeff_compile(
+    bias_t,
+    create_bias_inside_compiled: bool,
+    op,
+    monkeypatch,
+) -> None:
     torch.manual_seed(0)
     if op is not None and not op[0].is_available():
         if UNSUPPORTED_OP_PASSES:
@@ -2101,6 +2106,15 @@ def test_memeff_compile(bias_t, create_bias_inside_compiled: bool, op) -> None:
     out_ref.backward(grad)
     dq_ref, dk_ref, dv_ref = q.grad, k.grad, v.grad
     q.grad, k.grad, v.grad = None, None, None
+
+    if op is None:
+        # Exercise the first auto-dispatch from inside Dynamo. Without the
+        # compile guard, dispatch usage reporting traces Python stack
+        # introspection and breaks full-graph compilation.
+        monkeypatch.setattr(fmha_dispatch, "Sample", object())
+        monkeypatch.setattr(fmha_dispatch, "ScubaData", object())
+        monkeypatch.setattr(fmha_dispatch, "_usage_seen", set())
+        monkeypatch.setattr(fmha_dispatch, "justknobs_check", lambda _: True)
 
     # Compiled version
     with unittest.mock.patch.dict(_usage_seen, clear=True):
