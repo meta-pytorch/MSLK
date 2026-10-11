@@ -151,6 +151,8 @@ __configure_mslk_test_rocm () {
   export ignored_tests=(
     ./attention/*_test.py
     ./comm/*.py
+    # Requires an environment without FlyDSL, which CI always installs
+    ./gemm/bf16_grouped_fallback_test.py
     ./moe/*.py
     ./quantize/fp8_quantize_test.py
   )
