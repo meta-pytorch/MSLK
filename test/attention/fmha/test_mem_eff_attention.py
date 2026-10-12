@@ -1181,6 +1181,33 @@ def test_flydsl_splitk_decoder(
     )
 
 
+@pytest.mark.parametrize(
+    "op",
+    [fmha.ck_splitk.FwOp, fmha.flydsl_splitk.FwOp],
+    ids=["ck_splitk", "flydsl_splitk"],
+)
+def test_splitk_decoder_declines_int32_kv(op) -> None:
+    """Neither split-K decode backend implements an int32-packed quantized KV cache.
+
+    Only the Triton decoder does; the CK and FlyDSL kernels bind the K/V accessor
+    to the query's scalar type, so an int32 cache aborts inside the accessor. The
+    op must decline these inputs, since nothing upstream of it will: ``Inputs``
+    validation admits int32 K/V alongside a half query, and the base dtype check
+    inspects the query only. The last-dim alignment check is what rejects them.
+    """
+    d = 128
+    q = torch.randn(1, 8, 16, d, dtype=torch.float16)
+    # Quantized layout: int4 values packed 8 per int32, preceded by NUM_GROUPS
+    # fp16 scale/shift words, so the last dim is never a multiple of 8.
+    kv_shape = (1, 8 * 32, 16, d // 8 + 1)
+    k = torch.zeros(kv_shape, dtype=torch.int32)
+    v = torch.zeros(kv_shape, dtype=torch.int32)
+
+    reasons = op.not_supported_reasons(fmha.Inputs(q, k, v))
+    assert any(r.startswith("key") for r in reasons), reasons
+    assert any(r.startswith("value") for r in reasons), reasons
+
+
 @rocm_only
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("n_heads", [1, 16])
