@@ -466,9 +466,10 @@ def _sub_score_pair(v_s, row_max, fm_fast):
         lo_sub.append(_fsub(s_lo[r], row_max, fm_fast))
     for r in range_constexpr(16):
         hi_sub.append(_fsub(s_hi[r], row_max, fm_fast))
-    return Vec.from_elements(lo_sub, fx.Float32).ir_value(), Vec.from_elements(
-        hi_sub, fx.Float32
-    ).ir_value()
+    return (
+        Vec.from_elements(lo_sub, fx.Float32).ir_value(),
+        Vec.from_elements(hi_sub, fx.Float32).ir_value(),
+    )
 
 
 def _exp2_score_slice(v_s, start, length):
@@ -885,6 +886,33 @@ def _vec_v_src_elem(traits, d, wave_id_uni, lane_in_warp, kv_head_idx):
     )
 
 
+# CDNA4 (gfx950) can move global -> LDS with asynccnt-tracked copies instead of
+# the vmcnt-tracked `buffer_load ... lds`. Same operands, different completion
+# counter, so the swap is mechanical; opt-in until it is proven on this kernel.
+ASYNC_LDS = os.getenv("FLYDSL_FLASH_ATTN_ASYNC_LDS", "0") == "1"
+# Split-K combine: O-partial loads issued per chunk before being consumed.
+COMBINE_PREFETCH = int(os.getenv("FLYDSL_COMBINE_PREFETCH", "8"))
+
+
+def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
+    """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
+    if ASYNC_LDS:
+        return rocdl.raw_ptr_buffer_load_async_lds(
+            rsrc, lds_ptr, size, voffset, soffset, offset, aux
+        )
+    return rocdl.raw_ptr_buffer_load_lds(
+        rsrc, lds_ptr, size, voffset, soffset, offset, aux
+    )
+
+
+def wait_lds_copies(count=0):
+    """Wait for outstanding global->LDS copies on the right counter."""
+    if ASYNC_LDS:
+        rocdl.s_wait_asynccnt(count)
+    else:
+        rocdl.s_waitcnt(count)
+
+
 def _paged_bt_byte_offset(tile_idx, split_t0):
     """Byte offset of `tile_idx`'s page-id entry in the LDS block-table cache."""
     return fx.Int32((tile_idx - split_t0) * fx.Index(4))
@@ -893,6 +921,101 @@ def _paged_bt_byte_offset(tile_idx, split_t0):
 def _q_pack_col(traits, ks, lane_div_32):
     """K-dimension column for Q pack at MFMA k-step `ks` for this lane."""
     return ks * traits.K_STEP_QK + lane_div_32 * traits.MFMA_LANE_K
+
+
+def _is_pow2(n):
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def combine_chunk(head_dim):
+    """Head-dim values each lane owns in the split-K combine.
+
+    Four normally; eight when that yields at most 16 lanes per row, so a 64-lane
+    wave still holds four split groups. Groups are what make the combine cheap
+    -- its cost is the per-lane walk over splits -- and at HEAD_DIM 128 the
+    4-wide slice needs 32 lanes and leaves only two, which is why that head dim
+    saw the combine blow up an octave earlier than HEAD_DIM 64 (30.9 us at 192
+    splits against 6.7 us).
+
+    Always a multiple of four: the loads and stores move four values at a time.
+    """
+    if head_dim % 8 == 0 and head_dim // 8 <= 16 and _is_pow2(head_dim // 8):
+        return 8
+    return 4
+
+
+def combine_lanes_per_row(head_dim):
+    """Lanes covering one row's head dim."""
+    return head_dim // combine_chunk(head_dim)
+
+
+def combine_split_groups(head_dim):
+    """Split groups sharing a row's wave, or 1 when the head dim cannot.
+
+    Grouping needs the lanes-per-row to be a power of two dividing the wave, so
+    that groups are contiguous lane ranges and the merge is an XOR butterfly.
+    Head dims like 96 give 24 lanes and get the ungrouped layout instead --
+    correct, just without the split-dimension parallelism.
+    """
+    lanes = combine_lanes_per_row(head_dim)
+    return 64 // lanes if (_is_pow2(lanes) and lanes <= 64) else 1
+
+
+def combine_rows_per_block(head_dim, block_threads):
+    """Output rows a combine block covers."""
+    if combine_split_groups(head_dim) > 1:
+        return max(1, block_threads // 64)  # a row owns a whole wave
+    return max(1, block_threads // combine_lanes_per_row(head_dim))
+
+
+def _q_pack_group(traits):
+    """``Q_PACK_GROUP`` if this traits type has it, else 0 (not stride-packed).
+
+    The split-K combine helper is shared by the generic kernel
+    (``FlashAttnGenericTraits``) and the dualwave-SWP one
+    (``DualwaveSwpTraits``); only the former ever stride-packs, and only it
+    carries the field.
+    """
+    return getattr(traits, "Q_PACK_GROUP", 0)
+
+
+def _qo_head_stride(traits):
+    """Element distance between two KV heads in the caller's Q/O buffer.
+
+    Packed-by-stride reads the group's rows HEAD_DIM apart, so the next KV head
+    starts Q_PACK_GROUP rows further on. Unpacked layouts keep one head per row.
+    """
+    if _q_pack_group(traits) > 0:
+        return traits.HEAD_DIM * _q_pack_group(traits)
+    return traits.HEAD_DIM
+
+
+def _qo_row_offset(traits, token_idx, stride_token_q):
+    """Element offset of M row ``token_idx`` in the caller's Q/O buffer.
+
+    Unpacked, a row is a whole query token: one stride.
+
+    Packed-by-stride it is a (group member, token) pair laid out head-major as
+    ``row = g * Q_PACK_QLEN + t``, and the two move along different axes of the
+    caller's [.., q_len, H_q, D] buffer -- g by HEAD_DIM, t by every query head.
+    That is not affine in the row index, so it takes two terms; both divisors
+    are compile-time constants, and Q_PACK_QLEN is a power of two on the shapes
+    that reach here, so the divide and modulo fold into shifts.
+
+    The per-batch span is unchanged either way: rows * stride_token_q ==
+    Q_PACK_QLEN * NUM_HEADS_Q * Q_PACK_GROUP * HEAD_DIM, exactly the query heads
+    one batch item holds. Only how that span splits across the row and head axes
+    differs, so nothing outside these offsets needs to know.
+    """
+    group = _q_pack_group(traits)
+    if group <= 0:
+        return token_idx * stride_token_q
+    qlen = max(getattr(traits, "Q_PACK_QLEN", 0), 1)
+    if qlen == 1:  # degenerate: the row *is* the group member
+        return token_idx * fx.Index(traits.HEAD_DIM)
+    return (token_idx // fx.Index(qlen)) * fx.Index(traits.HEAD_DIM) + (
+        token_idx % fx.Index(qlen)
+    ) * fx.Index(group * stride_token_q)
 
 
 def _q_pack_global_idx(traits, q_row_in_block, ks, lane_div_32, stride_q_n_v):
@@ -1154,7 +1277,26 @@ class FlashAttnGenericTraits:
     # Top-left causal (kv_col <= q_row, delta=0) vs default bottom-right
     # (kv_col <= q_row + seqlen_kv - seqlen_q). Only differs for cross-length.
     CAUSAL_TOP_LEFT: bool
+    # GQA query-head packing: when > 0, the M axis holds (query head, token)
+    # pairs head-major, i.e. row = h * Q_PACK_QLEN + t, and this is the token
+    # count. Lets one workgroup own a KV head and serve the whole GQA group from
+    # a single KV read instead of re-streaming it once per query head. The
+    # causal bound then depends on t = row % Q_PACK_QLEN, not on the row index.
+    Q_PACK_QLEN: int
+    # GQA packing without materialising the packed Q/O. When > 0 this is the GQA
+    # group size and the M axis is read straight out of the caller's
+    # [B, q_len, H_q, D] buffer: group members are HEAD_DIM apart and a KV head
+    # is Q_PACK_GROUP * HEAD_DIM apart, so the pack is a stride change rather
+    # than a permute + copy. For q_len > 1 a row encodes (group, token); see
+    # _qo_row_offset.
+    Q_PACK_GROUP: int
     VARLEN: bool
+    # Per-request KV length read straight from CuSeqKv[b] (the caller's
+    # seqlen_k, not a prefix sum) while Q/O keep the dense [B, Sq, H, D]
+    # addressing. Without it a request is masked to the batch maximum and a short
+    # one attends to stale cache. Paged KV takes its base from the block table,
+    # so the length is all that is needed and no host-side scan has to run.
+    KV_LENS: bool
     CROSS_SEQLEN: bool
     # Gappy KV: per-seq KV base comes from an absolute KvSeqStart[b] (non-paged) or
     # a logical start offset (paged), instead of the cumulative CuSeqKv layout.
@@ -1249,6 +1391,9 @@ class FlashAttnGenericTraits:
     @property
     def cache_tag(self):
         return (
+            # Selects buffer_load..lds vs its asynccnt-tracked variant; changes
+            # emitted code, so it must key the compiled-kernel cache.
+            ASYNC_LDS,
             self.HAS_BIAS,
             self.HAS_DROPOUT,
             self.WINDOW_LEFT,
@@ -1260,6 +1405,9 @@ class FlashAttnGenericTraits:
             self.DTYPE_STR,
             self.CAUSAL,
             self.CAUSAL_TOP_LEFT,
+            self.Q_PACK_QLEN,
+            self.Q_PACK_GROUP,
+            self.KV_LENS,
             self.VARLEN,
             self.CROSS_SEQLEN,
             self.GAPPY_KV,
@@ -1366,6 +1514,9 @@ def _make_flash_attn_generic_traits(
     window_left=-1,
     has_bias=False,
     has_dropout=False,
+    q_pack_qlen=0,
+    q_pack_group=0,
+    kv_lens=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1545,7 +1696,10 @@ def _make_flash_attn_generic_traits(
         DTYPE_STR=dtype_str,
         CAUSAL=bool(causal),
         CAUSAL_TOP_LEFT=bool(causal_top_left),
+        Q_PACK_QLEN=int(q_pack_qlen or 0),
+        Q_PACK_GROUP=int(q_pack_group or 0),
         VARLEN=bool(varlen),
+        KV_LENS=bool(kv_lens),
         CROSS_SEQLEN=bool(cross_seqlen),
         GAPPY_KV=bool(gappy_kv),
         NUM_KV_SPLITS=int(num_kv_splits),
@@ -1713,6 +1867,9 @@ class DualwaveSwpTraits:
     @property
     def cache_tag(self):
         return (
+            # Selects buffer_load..lds vs its asynccnt-tracked variant; changes
+            # emitted code, so it must key the compiled-kernel cache.
+            ASYNC_LDS,
             self.RETURN_LSE,
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
@@ -1986,6 +2143,9 @@ class DualwaveSwpFp8Traits:
     @property
     def cache_tag(self):
         return (
+            # Selects buffer_load..lds vs its asynccnt-tracked variant; changes
+            # emitted code, so it must key the compiled-kernel cache.
+            ASYNC_LDS,
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
             self.HEAD_DIM,
@@ -2357,7 +2517,16 @@ class GenericFlashAttnContext:
             self.kv_tok_base = self.batch_idx * self.seq_len_kv_v
             self.kv_seq_start = fx.Index(0)
             self.seqlen_q_b = self.seq_len_v
-            self.seqlen_kv_b = self.seq_len_kv_v
+            if const_expr(traits.KV_LENS):
+                # Only the KV length is per-request; Q/O addressing stays dense.
+                cuk_div = fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(CuSeqKv), fx.make_layout(1, 1)
+                )
+                self.seqlen_kv_b = _cu_load(
+                    cuk_div, self.batch_idx, self.load_atom_32, self.v1i32_type
+                )
+            else:
+                self.seqlen_kv_b = self.seq_len_kv_v
 
     def init_kv_batch_pointers(self):
         # Dense/varlen fold batch into raw K/V pointers; paged adds page_id per tile.
@@ -2450,9 +2619,20 @@ class GenericFlashAttnContext:
             # diagonal is kv_col <= q_row regardless of the length difference.
             if const_expr(traits.CAUSAL_TOP_LEFT):
                 self.delta_i32 = fx.Int32(0)
+            elif const_expr(traits.Q_PACK_QLEN > 0):
+                # Packed rows: the query length is the token count, not the
+                # packed row count (which is token count x GQA group size).
+                self.delta_i32 = fx.Int32(self.seqlen_kv_b) - fx.Int32(
+                    traits.Q_PACK_QLEN
+                )
             else:
                 self.delta_i32 = fx.Int32(self.seqlen_kv_b) - fx.Int32(self.seqlen_q_b)
-            self.causal_end_raw_i32 = fx.Int32(q_end) + self.delta_i32
+            if const_expr(traits.Q_PACK_QLEN > 0):
+                # Any tile can hold rows with t = 0..QLEN-1, so the tile-level
+                # bound is the whole range; the per-row select below is exact.
+                self.causal_end_raw_i32 = fx.Int32(self.seqlen_kv_b)
+            else:
+                self.causal_end_raw_i32 = fx.Int32(q_end) + self.delta_i32
             causal_end_i32 = fx.Int32(
                 (self.causal_end_raw_i32 > fx.Int32(0)).select(
                     self.causal_end_raw_i32, fx.Int32(0)
@@ -2470,14 +2650,18 @@ class GenericFlashAttnContext:
         # so start the KV loop past them. Keep kv_col > q_row + delta - WINDOW_LEFT;
         # the first survivable column across the tile is at q_start (min q row), so
         # skip whole BLOCK_N_OUT tiles below it. Window implies causal (delta set).
+        # Packed rows carry query position t = row % Q_PACK_QLEN, and any tile can
+        # hold t = 0, so the lowest q position is 0 rather than q_start.
         self.kv_lower = fx.Index(0)
         if const_expr(traits.WINDOW_LEFT >= 0 and traits.CAUSAL):
             step_w = fx.Index(traits.BLOCK_N_OUT)
+            q_lo_i32 = (
+                fx.Int32(0)
+                if const_expr(traits.Q_PACK_QLEN > 0)
+                else fx.Int32(self.q_start)
+            )
             first_col_i32 = (
-                fx.Int32(self.q_start)
-                + self.delta_i32
-                - fx.Int32(traits.WINDOW_LEFT)
-                + fx.Int32(1)
+                q_lo_i32 + self.delta_i32 - fx.Int32(traits.WINDOW_LEFT) + fx.Int32(1)
             )
             first_col_i32 = (first_col_i32 > fx.Int32(0)).select(
                 first_col_i32, fx.Int32(0)
@@ -2509,9 +2693,20 @@ class GenericFlashAttnContext:
 
     def global_idx_q(self, token_idx, col):
         traits = self.traits
-        return (
-            token_idx * traits.STRIDE_TOKEN_Q + self.q_head_idx * traits.HEAD_DIM + col
+        idx = (
+            _qo_row_offset(traits, token_idx, traits.STRIDE_TOKEN_Q)
+            + self.q_head_idx * _qo_head_stride(traits)
+            + col
         )
+        if const_expr(_q_pack_group(traits) > 0):
+            # Unpacked, a padding row past seqlen_q_b lands beyond the per-batch
+            # Q/O resource and the hardware drops it. Stride-packed rows sit
+            # HEAD_DIM apart, so padding rows alias the next KV heads' rows and
+            # would overwrite their output. Send them to the resource end instead.
+            idx = (token_idx < self.seqlen_q_b).select(
+                idx, self.seqlen_q_b * fx.Index(traits.STRIDE_TOKEN_Q)
+            )
+        return idx
 
     def global_idx_kv(self, token_idx, col):
         traits = self.traits
@@ -3032,7 +3227,7 @@ class GenericKvGmemToLdsLoader:
                 + dcol * fx.Index(8)
             )
             voff = fx.Int32(voff_e * fx.Index(2))
-            rocdl.raw_ptr_buffer_load_lds(
+            _buffer_load_to_lds(
                 rsrc,
                 lds_ptr,
                 self._v_dma_sz,
@@ -3106,7 +3301,7 @@ class GenericKvGmemToLdsLoader:
                 + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
                 + col_byte
             )
-            rocdl.raw_ptr_buffer_load_lds(
+            _buffer_load_to_lds(
                 rsrc,
                 lds_ptr,
                 self._dma_size,
@@ -3146,7 +3341,7 @@ class GenericKvGmemToLdsLoader:
                     + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
                     + col_byte
                 )
-                rocdl.raw_ptr_buffer_load_lds(
+                _buffer_load_to_lds(
                     self.k_rsrc,
                     lds_ptr,
                     self._dma_size,
@@ -3479,8 +3674,16 @@ class GenericSoftmaxHelper:
         if const_expr(traits.CAUSAL):
             # tile_needs_mask lets below-diagonal tiles skip the 32 selects; the
             # scf.if carries the 32 scores as explicit state (a list can't cross it).
-            q_start_i32 = fx.Int32(ctx.q_start) + ctx.delta_i32
-            q_mask_limit_i32 = ctx.q_row_i32 + ctx.delta_i32
+            if const_expr(traits.Q_PACK_QLEN > 0):
+                # row = h * QLEN + t (head-major), so the causal position is
+                # t = row % QLEN. The tile's lowest possible bound is t = 0.
+                q_start_i32 = ctx.delta_i32
+                q_mask_limit_i32 = (
+                    ctx.q_row_i32 % fx.Int32(traits.Q_PACK_QLEN)
+                ) + ctx.delta_i32
+            else:
+                q_start_i32 = fx.Int32(ctx.q_start) + ctx.delta_i32
+                q_mask_limit_i32 = ctx.q_row_i32 + ctx.delta_i32
             max_kv_col_i32 = kv_start_i32 + fx.Int32(traits.BLOCK_N - 1)
             tile_needs_mask = max_kv_col_i32 > q_start_i32
             # Top-left (delta=0) with q>k: the diagonal admits padding columns
@@ -3496,7 +3699,11 @@ class GenericSoftmaxHelper:
             has_window = const_expr(traits.WINDOW_LEFT >= 0)
             if has_window:
                 window_left_i32 = fx.Int32(traits.WINDOW_LEFT)
-                q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
+                if const_expr(traits.Q_PACK_QLEN > 0):
+                    # Highest packed query position is QLEN - 1 in every tile.
+                    q_end_i32 = fx.Int32(traits.Q_PACK_QLEN) + ctx.delta_i32
+                else:
+                    q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
                 window_lo_edge_i32 = q_end_i32 - window_left_i32
                 tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
             col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
@@ -6205,7 +6412,9 @@ class DualwaveSplitKCombineContext:
         self.elem_dtype = dtype_to_elem_type(self.traits.DTYPE_STR)
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
-        self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
+        self.c_zero_v4f32 = Vec.filled(
+            combine_chunk(self.traits.HEAD_DIM), 0.0, fx.Float32
+        )
 
     def init_runtime_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
@@ -6213,11 +6422,35 @@ class DualwaveSplitKCombineContext:
         self.batch_size_v = fx.Index(self.batch_size)
 
     def init_thread_mapping(self, combine_rows_per_block, combine_lanes_per_row):
+        """One output row per wave, with the splits spread across the wave.
+
+        A lane owns combine_chunk(HEAD_DIM) head-dim values, so a row only
+        needs combine_lanes_per_row lanes.
+        Giving the row a whole wave leaves 64 / lanes_per_row "split groups" to
+        divide the split dimension between, which is the only axis with any work
+        left: every lane used to walk all NUM_KV_SPLITS partials itself, and that
+        walk is what the combine spends its time on -- block size makes no
+        difference to it (measured flat across block sizes), and neither does
+        CU count. The groups are contiguous lane ranges, so the cross-group merge
+        is an in-wave butterfly with no LDS and no barrier.
+        """
         traits = self.traits
         self.tid = fx.Index(gpu.thread_idx.x)
         self.blk = fx.Index(gpu.block_idx.x)
-        self.row = self.blk * combine_rows_per_block + self.tid // combine_lanes_per_row
-        self.col = (self.tid % combine_lanes_per_row) * 4
+        self.lane = self.tid % fx.Index(64)
+        if combine_split_groups(traits.HEAD_DIM) > 1:
+            self.sgrp = self.lane // fx.Index(combine_lanes_per_row)
+            self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(64)
+        else:
+            # No split parallelism available for this head dim; every lane walks
+            # all splits, as before, and rows pack by lanes_per_row.
+            self.sgrp = fx.Index(0)
+            self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(
+                combine_lanes_per_row
+            )
+        self.col = (self.tid % fx.Index(combine_lanes_per_row)) * fx.Index(
+            combine_chunk(traits.HEAD_DIM)
+        )
         heads_per_batch = self.seq_len_v * traits.NUM_HEADS_Q
         self.batch_idx = self.row // heads_per_batch
         rem = self.row % heads_per_batch
@@ -6255,6 +6488,35 @@ class DualwaveSplitKCombineContext:
             num_records_bytes=as_mlir_value(fx.Int64(per_batch_elems * fx.Index(2))),
         )
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
+        self.init_split_resources()
+
+    def init_split_resources(self):
+        """One buffer descriptor per workspace region, spanning every split.
+
+        Building a descriptor per split put a 4-SGPR setup between consecutive
+        loads, so the splits' loads could not be in flight together and the
+        combine paid a full memory latency per split (~0.47 us each, linear in
+        split count). The regions are contiguous in the split index, so a single
+        descriptor plus an element offset addresses all of them.
+        """
+        traits = self.traits
+        z_total = self.batch_size_v * traits.NUM_KV_SPLITS
+        ml_bytes = z_total * self.ws_ml_per_split_bytes
+        self.opart_rsrc_all = self.workspace_resource(
+            fx.Index(0), self.ws_mrow_abs_bytes
+        )
+        self.mrow_rsrc_all = self.workspace_resource(self.ws_mrow_abs_bytes, ml_bytes)
+        self.lrow_rsrc_all = self.workspace_resource(self.ws_lrow_abs_bytes, ml_bytes)
+
+    def opart_index(self, split_z):
+        return (
+            split_z * self.ws_opart_per_split_elems
+            + self.local_o_base
+            + (self.col // 2)
+        )
+
+    def ml_index(self, split_z):
+        return split_z * self.ws_ml_per_split_elems + self.local_ml_idx
 
     def workspace_resource(self, byte_offset, nrec_bytes):
         return _make_ws_rsrc(self.ws_base_i64, byte_offset, nrec_bytes)
@@ -6262,116 +6524,242 @@ class DualwaveSplitKCombineContext:
     def split_z(self, split_i):
         return self.batch_idx * self.traits.NUM_KV_SPLITS + split_i
 
-    def opart_resource(self, split_z):
-        return self.workspace_resource(
-            split_z * self.ws_opart_per_split_bytes, self.ws_opart_per_split_bytes
-        )
-
-    def mrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_mrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
-
-    def lrow_resource(self, split_z):
-        return self.workspace_resource(
-            self.ws_lrow_abs_bytes + split_z * self.ws_ml_per_split_bytes,
-            self.ws_ml_per_split_bytes,
-        )
-
 
 class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
     def __init__(self, ctx):
         super().__init__(ctx)
 
-    def load_ml_rows(self):
-        m_s = []
-        l_s = []
-        for i in range_constexpr(self.traits.NUM_KV_SPLITS):
-            split_z_i = self.split_z(i)
-            m_f32 = buffer_ops.buffer_load(
-                self.mrow_resource(split_z_i),
-                as_mlir_value(fx.Int32(self.local_ml_idx)),
-                vec_width=1,
-                dtype=T.f32,
-            )
-            l_f32 = buffer_ops.buffer_load(
-                self.lrow_resource(split_z_i),
-                as_mlir_value(fx.Int32(self.local_ml_idx)),
-                vec_width=1,
-                dtype=T.f32,
-            )
-            m_s.append(m_f32)
-            l_s.append(l_f32)
-        return m_s, l_s
+    # Stands in for -inf on a split this lane does not own. A real -inf would
+    # make an all-empty group's merge compute (-inf) - (-inf) = NaN and poison
+    # every group it is then merged with; a large finite sentinel yields
+    # exp2(0) * 0 == 0 instead, and can never win the max against real data.
+    _M_EMPTY = -3.0e38
 
-    def reduce_m_max(self, m_s):
-        m_max = m_s[0]
-        for i in range_constexpr(self.traits.NUM_KV_SPLITS - 1):
-            m_max = _fmax(m_max, m_s[i + 1], self.fm_fast)
+    def load_ml(self, split_i):
+        """Load one split's (max, sum) statistics, masked to the valid range.
+
+        NUM_KV_SPLITS need not divide evenly among the split groups, so the
+        trailing lanes address a split that does not exist. The index is clamped
+        to keep the read inside the workspace and the values are neutralised.
+        """
+        n = self.traits.NUM_KV_SPLITS
+        valid = fx.Int32(split_i) < fx.Int32(n)
+        safe_i = valid.select(fx.Int32(split_i), fx.Int32(n - 1))
+        ml_idx_i = self.ml_index(self.split_z(fx.Index(safe_i)))
+        m_f32 = buffer_ops.buffer_load(
+            self.mrow_rsrc_all,
+            as_mlir_value(fx.Int32(ml_idx_i)),
+            vec_width=1,
+            dtype=T.f32,
+        )
+        l_f32 = buffer_ops.buffer_load(
+            self.lrow_rsrc_all,
+            as_mlir_value(fx.Int32(ml_idx_i)),
+            vec_width=1,
+            dtype=T.f32,
+        )
+        m_out = valid.select(
+            fx.Float32(m_f32), fx.Float32(arith.constant(self._M_EMPTY, type=T.f32))
+        )
+        l_out = valid.select(fx.Float32(l_f32), self.c_zero_f)
+        return as_mlir_value(m_out), as_mlir_value(l_out)
+
+    def reduce_m_max(self):
+        """Running max over the splits, holding one value rather than all of them.
+
+        Materialising every split's m and l up front and keeping them live
+        across the accumulation costs 2 * NUM_KV_SPLITS registers, which spills
+        hard once the split count passes ~96: the combine went 6.8 us at 63
+        splits to 131 us at 256, superlinearly, while the attention kernel it
+        feeds kept getting faster (16.4 -> 9.5 us over the same range). Streaming
+        the max and re-reading m/l during the accumulation keeps the live set
+        O(chunk) instead, at the cost of one extra 4-byte read per split.
+        """
+        base, cnt = self.local_split_indices()
+        step = self.split_groups()
+        m_max = None
+        for k in range_constexpr(cnt):
+            m_i, _ = self.load_ml(base + fx.Index(k * step))
+            m_max = m_i if m_max is None else _fmax(m_max, m_i, self.fm_fast)
         return m_max
 
     def init_accumulators(self):
         return as_mlir_value(self.c_zero_v4f32), as_mlir_value(self.c_zero_f)
 
-    def accumulate_split(self, acc, den, split_i, m_i, l_i, m_max):
-        orsrc_i = self.opart_resource(self.split_z(split_i))
-        local_o_idx_i = self.local_o_base + self.col // 2
+    def load_opart(self, split_i):
+        """Issue one split's O-partial load, unconditionally.
 
-        @flyc.jit
-        def _accum_split(acc, den):
-            if fx.Float32(l_i) > fx.Float32(0.0):
-                w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_i, m_max, self.fm_fast)))
-                wl = _fmul(w, l_i, self.fm_fast)
-                den = _fadd(den, wl, self.fm_fast)
-                o2_raw = buffer_ops.buffer_load(
-                    orsrc_i,
-                    as_mlir_value(fx.Int32(local_o_idx_i)),
-                    vec_width=2,
-                    dtype=T.i32,
-                )
-                o2_i32 = ir.Value(o2_raw)
-                o4 = Vec(o2_i32, (2,), fx.Int32).bitcast(self.elem_dtype).to(fx.Float32)
-                w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(4)
-                acc = _fadd(acc, _fmul(w4, o4, self.fm_fast), self.fm_fast)
-            return acc, den
+        Kept out of any scf.if so consecutive splits' loads can be in flight at
+        once. The guard that used to wrap this made every split pay a full
+        memory latency in sequence: 63 splits x ~476 ns was 30 us, more than the
+        attention kernel itself on a low-concurrency decode.
+        """
+        n = self.traits.NUM_KV_SPLITS
+        safe_i = (fx.Int32(split_i) < fx.Int32(n)).select(
+            fx.Int32(split_i), fx.Int32(n - 1)
+        )
+        o2_raw = buffer_ops.buffer_load(
+            self.opart_rsrc_all,
+            as_mlir_value(fx.Int32(self.opart_index(self.split_z(fx.Index(safe_i))))),
+            vec_width=self.chunk() // 2,
+            dtype=T.i32,
+        )
+        return (
+            Vec(ir.Value(o2_raw), (self.chunk() // 2,), fx.Int32)
+            .bitcast(self.elem_dtype)
+            .to(fx.Float32)
+        )
 
-        return _accum_split(acc, den)
+    def accumulate_loaded(self, acc, den, m_i, l_i, m_max, o4):
+        """Branchless merge of one already-loaded split partial.
 
-    def accumulate_splits(self, m_s, l_s, m_max):
+        An unused split has l <= 0 and its workspace slot is uninitialised, so
+        the weight is forced to zero *and* the operand is zeroed -- otherwise a
+        garbage NaN would survive the multiply.
+        """
+        live = fx.Float32(l_i) > self.c_zero_f
+        w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_i, m_max, self.fm_fast)))
+        wl = live.select(fx.Float32(_fmul(w, l_i, self.fm_fast)), self.c_zero_f)
+        den = _fadd(den, wl, self.fm_fast)
+        n = self.chunk()
+        zero4 = Vec.from_elements([self.c_zero_f], fx.Float32).broadcast_to(n)
+        o4 = Vec(live.select(o4, zero4), (n,), fx.Float32)
+        w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(n)
+        acc = _fadd(acc, _fmul(w4, o4, self.fm_fast), self.fm_fast)
+        return acc, den
+
+    def chunk(self):
+        """Head-dim values this lane owns."""
+        return combine_chunk(self.traits.HEAD_DIM)
+
+    def split_groups(self):
+        """Number of split groups sharing one row's wave (1 = ungrouped)."""
+        return combine_split_groups(self.traits.HEAD_DIM)
+
+    def local_split_indices(self):
+        """This lane's share of the split dimension, as (base, count).
+
+        Group g takes splits g, g + G, g + 2G, ... so consecutive lanes read
+        consecutive partials and the loads stay coalesced.
+        """
+        return (
+            self.sgrp,
+            (self.traits.NUM_KV_SPLITS + self.split_groups() - 1)
+            // self.split_groups(),
+        )
+
+    def _shuffle_f32(self, val, xor_lanes):
+        """Value held by the lane `xor_lanes` away, within the wave."""
+        tgt = (self.lane ^ fx.Index(xor_lanes)) * fx.Index(4)
+        got = rocdl.ds_bpermute(
+            T.i32,
+            as_mlir_value(fx.Int32(tgt)),
+            arith.bitcast(T.i32, as_mlir_value(val)),
+        )
+        return arith.bitcast(T.f32, got)
+
+    def merge_split_groups(self, m_max, den, acc):
+        """Butterfly-merge the per-group (max, sum, numerator) across the wave.
+
+        Each group weighted its numerator by its own local max, so the merge is
+        a log-sum-exp combine rather than a plain sum. After the last step every
+        lane in the group holds the full result; only group 0 stores.
+        """
+        # Partners are the lanes holding the same head-dim slice in the next
+        # split group, i.e. lanes_per_row apart -- not HEAD_DIM // 4, which only
+        # coincides with it while the lane slice is 4 values wide.
+        if self.split_groups() <= 1:
+            return m_max, den, acc
+        stride = combine_lanes_per_row(self.traits.HEAD_DIM)
+        while stride < 64:
+            m_p = self._shuffle_f32(m_max, stride)
+            m_new = _fmax(m_max, m_p, self.fm_fast)
+            w = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_max, m_new, self.fm_fast)))
+            w_p = rocdl.exp2(T.f32, as_mlir_value(_fsub(m_p, m_new, self.fm_fast)))
+            den_p = self._shuffle_f32(den, stride)
+            den = _fadd(
+                _fmul(den, w, self.fm_fast),
+                _fmul(den_p, w_p, self.fm_fast),
+                self.fm_fast,
+            )
+            acc_p = Vec.from_elements(
+                [
+                    fx.Float32(self._shuffle_f32(acc[j], stride))
+                    for j in range_constexpr(self.chunk())
+                ],
+                fx.Float32,
+            )
+            w4 = Vec.from_elements([fx.Float32(w)], fx.Float32).broadcast_to(
+                self.chunk()
+            )
+            wp4 = Vec.from_elements([fx.Float32(w_p)], fx.Float32).broadcast_to(
+                self.chunk()
+            )
+            acc = _fadd(
+                _fmul(acc, w4, self.fm_fast),
+                _fmul(acc_p, wp4, self.fm_fast),
+                self.fm_fast,
+            )
+            m_max = m_new
+            stride *= 2
+        return m_max, den, acc
+
+    def accumulate_splits(self, m_max):
+        """Merge every split, batching loads so they overlap.
+
+        Loads for a chunk are issued together, then consumed; the accumulator
+        chain stays serial but no longer serialises the memory traffic. Chunk
+        size trades registers for loads in flight.
+        """
         acc, den = self.init_accumulators()
-        for i in range_constexpr(self.traits.NUM_KV_SPLITS):
-            acc, den = self.accumulate_split(acc, den, i, m_s[i], l_s[i], m_max)
+        first, cnt = self.local_split_indices()
+        step = self.split_groups()
+        chunk = COMBINE_PREFETCH if COMBINE_PREFETCH > 0 else cnt
+        for base in range_constexpr((cnt + chunk - 1) // chunk):
+            ks = [base * chunk + j for j in range(chunk) if base * chunk + j < cnt]
+            idxs = [first + fx.Index(k * step) for k in ks]
+            mls = [self.load_ml(i) for i in idxs]
+            o4s = [self.load_opart(i) for i in idxs]
+            for (m_i, l_i), o4 in zip(mls, o4s):
+                acc, den = self.accumulate_loaded(acc, den, m_i, l_i, m_max, o4)
         return acc, den
 
     def pack_output(self, acc, den):
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
-        inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
-        out4 = Vec(_fmul(acc, inv4, self.fm_fast), (4,), fx.Float32)
+        n = self.chunk()
+        inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(n)
+        out4 = Vec(_fmul(acc, inv4, self.fm_fast), (n,), fx.Float32)
         if const_expr(self.traits.DTYPE_STR == "bf16"):
-            lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
-            hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
+            words = [
+                fx.Int32(rocdl.cvt_pk_bf16_f32(out4[2 * i], out4[2 * i + 1]))
+                for i in range_constexpr(n // 2)
+            ]
         else:
-            o_f16 = []
-            for i in range_constexpr(4):
-                o_f16.append(fx.Float32(out4[i]).to(self.elem_dtype))
+            o_f16 = [
+                fx.Float32(out4[i]).to(self.elem_dtype) for i in range_constexpr(n)
+            ]
             pack = Vec.from_elements(o_f16, self.elem_dtype).bitcast(fx.Int32)
-            lo, hi = as_mlir_value(pack[0]), as_mlir_value(pack[1])
-        return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
+            words = [fx.Int32(as_mlir_value(pack[i])) for i in range_constexpr(n // 2)]
+        return Vec.from_elements(words, fx.Int32)
 
     def store_output(self, o_pack):
         o_global = (
-            self.seq_idx * self.stride_q_n_v
-            + self.q_head_idx * self.traits.HEAD_DIM
+            _qo_row_offset(self.traits, self.seq_idx, self.stride_q_n_v)
+            + self.q_head_idx * fx.Index(_qo_head_stride(self.traits))
             + self.col
         )
-        buffer_ops.buffer_store(
-            o_pack.ir_value(),
-            self.o_rsrc,
-            as_mlir_value(fx.Int32(o_global * fx.Index(2))),
-            offset_is_bytes=True,
-        )
+        # Mirror the load: 2 i32 (4 values, 8 bytes) at a time.
+        for w in range_constexpr(self.chunk() // 4):
+            pair = Vec.from_elements(
+                [fx.Int32(o_pack[2 * w]), fx.Int32(o_pack[2 * w + 1])], fx.Int32
+            )
+            buffer_ops.buffer_store(
+                pair.ir_value(),
+                self.o_rsrc,
+                as_mlir_value(fx.Int32((o_global + fx.Index(4 * w)) * fx.Index(2))),
+                offset_is_bytes=True,
+            )
 
     def store_lse(self, m_max, den):
         """Single-writer-per-row fp32 LSE store for the split-K combine pass."""
