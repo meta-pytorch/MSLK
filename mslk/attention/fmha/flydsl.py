@@ -49,13 +49,11 @@ negative-path test in `test_backward.py`):
 - Tensor-bias / ALiBi (`LowerTriangularMaskWithTensorBias` and similar): no
   MSLK caller found for this backward op. Rejected the same way, via
   `SUPPORTED_ATTN_BIAS_TYPES` omission.
-- Bottom-right / local-window varlen (`BlockDiagonalCausalFromBottomRightMask`
-  and other non-top-left alignment variants): only top-left causal alignment
-  (`LowerTriangularMask`, `BlockDiagonalCausalMask`) is implemented;
-  bottom-right/local-window semantics are separately scoped and not
-  implemented. Rejected the same way, via `SUPPORTED_ATTN_BIAS_TYPES`
-  omission. Revisit if a caller needs bottom-right or local-window varlen
-  causal masking specifically.
+- Bottom-right varlen (`BlockDiagonalCausalFromBottomRightMask` and other
+  bottom-right alignment variants): only top-left causal alignment, including
+  `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
+  way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
+  bottom-right causal masking specifically.
 """
 
 import math
@@ -779,6 +777,7 @@ def _flydsl_bwd(
     seqstart_k: Optional[torch.Tensor] = None,
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
+    window_left: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
@@ -992,6 +991,7 @@ def _flydsl_bwd(
             varlen,
             has_bias,
             emit_dbias,
+            window_left,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1004,6 +1004,7 @@ def _flydsl_bwd(
                 causal=causal,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
+                window_left=window_left,
                 gpu_arch=gpu_arch,
                 deterministic=False,
                 ck_scope_dvdk=True,
@@ -1174,6 +1175,7 @@ def _flydsl_bwd(
             causal,
             heads_per_kv,
             varlen,
+            window_left,
             USE_TRLOAD_DQDKDV,
             M_SPLIT_DQDKDV,
         )
@@ -1191,6 +1193,7 @@ def _flydsl_bwd(
                 causal=causal,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
+                window_left=window_left,
             )
             # flyc.compile executes the kernel once (JIT warm run) as part of
             # compilation -- unlike the old dvdk/dq split path (plain stores,
@@ -1272,6 +1275,7 @@ def _flydsl_bwd(
             causal,
             heads_per_kv,
             varlen,
+            window_left,
         )
         compiled_dvdk = _dvdk_kernel_cache.get(dvdk_key)
         if compiled_dvdk is None:
@@ -1286,6 +1290,7 @@ def _flydsl_bwd(
                 causal=causal,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
+                window_left=window_left,
             )
             compiled_dvdk = flyc.compile(launch_dvdk, *args_dvdk)
             _dvdk_kernel_cache[dvdk_key] = compiled_dvdk
@@ -1327,6 +1332,7 @@ def _flydsl_bwd(
             causal,
             heads_per_kv,
             varlen,
+            window_left,
         )
         compiled_dq = _dq_kernel_cache.get(dq_key)
         if compiled_dq is None:
@@ -1340,6 +1346,7 @@ def _flydsl_bwd(
                 causal=causal,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
+                window_left=window_left,
             )
             compiled_dq = flyc.compile(launch_dq, *args_dq)
             _dq_kernel_cache[dq_key] = compiled_dq
@@ -1379,6 +1386,7 @@ def _flydsl_bwd_abstract(
     seqstart_k: Optional[torch.Tensor] = None,
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
+    window_left: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # db is empty (not None) when no bias gradient was requested: the schema's
     # return arity is fixed, so `apply` keys off numel() rather than None.
@@ -1453,13 +1461,17 @@ class BwOp(AttentionBwOpBase):
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
     # causal block-diagonal variants (e.g.
     # `BlockDiagonalCausalFromBottomRightMask`, different alignment
-    # semantics) -- separately scoped, not implemented.
+    # semantics) -- separately scoped, not implemented. Top-left local
+    # attention adds its lower window edge to this existing causal geometry.
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,
         LowerTriangularMask,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
+        # Top-left causal + sliding window. The bottom-right local types stay
+        # out: they need bottom-right causal, which this kernel lacks.
+        BlockDiagonalCausalLocalAttentionMask,
     )
     _TEST_K: List[int] = [32, 64, 96, 128, 256]
     NAME = "flydslB"
@@ -1534,6 +1546,13 @@ class BwOp(AttentionBwOpBase):
             else None
         )
         needs_dbias = bias_t is not None and bias_t.requires_grad
+        # BlockDiagonalCausalLocalAttentionMask subclasses BlockDiagonalCausalMask,
+        # so `causal` and the seqstarts above are already set for it.
+        window_left = (
+            int(inp.attn_bias._window_size)
+            if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
+            else -1
+        )
         dq, dk, dv, db = cls.OPERATOR(
             inp.query,
             inp.key,
@@ -1547,6 +1566,7 @@ class BwOp(AttentionBwOpBase):
             seqstart_k,
             bias_t,
             needs_dbias,
+            window_left,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see
