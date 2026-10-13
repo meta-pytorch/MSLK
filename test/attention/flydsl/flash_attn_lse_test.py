@@ -229,7 +229,7 @@ def test_cross_seqlen_causal_fully_masked_rows_are_negative_infinity() -> None:
     )
 
 
-@pytest.mark.parametrize("num_kv_splits", [1, 4])
+@pytest.mark.parametrize("num_kv_splits", [1, 4, 63, 64, 65, 128, 256])
 def test_splitk_lse(num_kv_splits: int) -> None:
     batch, seq_len, num_heads, head_dim = 1, 512, 8, 128
     torch.manual_seed(2)
@@ -262,6 +262,134 @@ def test_splitk_lse(num_kv_splits: int) -> None:
         torch.bfloat16,
         f"splitk={num_kv_splits}",
     )
+
+
+def _reference_splitk_reduce(
+    partial_out: torch.Tensor,
+    partial_max: torch.Tensor,
+    partial_sum: torch.Tensor,
+) -> torch.Tensor:
+    finite_max = torch.where(
+        torch.isfinite(partial_max),
+        partial_max,
+        torch.full_like(partial_max, -3.0e38),
+    )
+    global_max = finite_max.amax(dim=2, keepdim=True)
+    weights = torch.where(
+        torch.isfinite(partial_max),
+        torch.exp(partial_max - global_max),
+        torch.zeros_like(partial_max),
+    )
+    denominator = (weights * partial_sum).sum(dim=2)
+    numerator = (weights.unsqueeze(-1) * partial_out).sum(dim=2)
+    return numerator / denominator.clamp_min(1.0).unsqueeze(-1)
+
+
+@pytest.mark.parametrize(
+    "max_parts,head_dim",
+    [
+        (1, 64),
+        (63, 128),
+        (64, 256),
+        (65, 64),
+        (127, 128),
+        (128, 256),
+        (129, 64),
+        (256, 128),
+    ],
+)
+def test_splitk_reduce_matches_reference(max_parts: int, head_dim: int) -> None:
+    from mslk.attention.flydsl.decode.pa_decode_reduce import pa_decode_reduce
+
+    generator = torch.Generator(device=DEVICE).manual_seed(max_parts + head_dim)
+    shape = (2, 2, max_parts, 3)
+    partial_max = torch.randn(shape, generator=generator, device=DEVICE) * 3.0
+    partial_sum = torch.rand(shape, generator=generator, device=DEVICE) + 0.125
+    partial_out = torch.randn(
+        *shape,
+        head_dim,
+        generator=generator,
+        device=DEVICE,
+    )
+    output = torch.empty(2, 2, 3, head_dim, dtype=torch.float32, device=DEVICE)
+
+    expected = _reference_splitk_reduce(partial_out, partial_max, partial_sum)
+    pa_decode_reduce(partial_out, partial_max, partial_sum, output)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("max_parts", [1, 64, 65, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_splitk_reduce_empty_request_is_zero(
+    max_parts: int,
+    head_dim: int,
+) -> None:
+    from mslk.attention.flydsl.decode.pa_decode_reduce import pa_decode_reduce
+
+    partial_out = torch.zeros(1, 1, max_parts, 2, head_dim, device=DEVICE)
+    partial_max = torch.full(
+        (1, 1, max_parts, 2),
+        float("-inf"),
+        device=DEVICE,
+    )
+    partial_sum = torch.zeros_like(partial_max)
+    output = torch.full(
+        (1, 1, 2, head_dim),
+        float("nan"),
+        device=DEVICE,
+    )
+
+    pa_decode_reduce(partial_out, partial_max, partial_sum, output)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output, torch.zeros_like(output))
+
+
+def test_splitk_reduce_ignores_all_masked_partitions() -> None:
+    from mslk.attention.flydsl.decode.pa_decode_reduce import pa_decode_reduce
+
+    max_parts, head_dim = 65, 128
+    partial_out = torch.zeros(1, 1, max_parts, 1, head_dim, device=DEVICE)
+    partial_max = torch.full(
+        (1, 1, max_parts, 1),
+        float("-inf"),
+        device=DEVICE,
+    )
+    partial_sum = torch.zeros_like(partial_max)
+    partial_out[:, :, 0, :, :] = 7.0
+    partial_max[:, :, 0, :] = 2.0
+    partial_sum[:, :, 0, :] = 1.0
+    output = torch.empty(1, 1, 1, head_dim, device=DEVICE)
+
+    pa_decode_reduce(partial_out, partial_max, partial_sum, output)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, torch.full_like(output, 7.0))
+
+
+@pytest.mark.parametrize("max_parts", [64, 65])
+def test_splitk_reduce_preserves_extreme_finite_max(max_parts: int) -> None:
+    from mslk.attention.flydsl.decode.pa_decode_reduce import pa_decode_reduce
+
+    partial_out = torch.zeros(1, 1, max_parts, 1, 64, device=DEVICE)
+    partial_max = torch.full(
+        (1, 1, max_parts, 1),
+        float("-inf"),
+        device=DEVICE,
+    )
+    partial_sum = torch.zeros_like(partial_max)
+    partial_out[:, :, 0, :, :] = 11.0
+    partial_max[:, :, 0, :] = -3.2e38
+    partial_sum[:, :, 0, :] = 1.0
+    output = torch.empty(1, 1, 1, 64, device=DEVICE)
+
+    pa_decode_reduce(partial_out, partial_max, partial_sum, output)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, torch.full_like(output, 11.0))
 
 
 def test_varlen_lse() -> None:
