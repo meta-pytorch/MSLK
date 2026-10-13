@@ -29,6 +29,9 @@ from .flash_attn_utils import (
     _stagger_extra_barrier_if_one,
     _stagger_extra_barrier_if_zero,
     _waitcnt_vm_n,
+    combine_lanes_per_row,
+    COMBINE_PREFETCH,
+    combine_rows_per_block,
     dualwave_splitk_workspace_elems,  # noqa: F401
     DualwaveFp8GemmHelper,
     DualwaveFp8KernelContext,
@@ -39,6 +42,7 @@ from .flash_attn_utils import (
     DualwaveFp8StoreHelper,
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
+    scf_if_dispatch,
 )
 
 
@@ -120,7 +124,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
-    _dualwave_swp_fp8_cache_tag = traits.cache_tag
+    _dualwave_swp_fp8_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
 
     @fx.struct
@@ -681,10 +685,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
             output_store.store_empty_split()
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
-    # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
+    # Spare wave lanes split the K reductions and merge them before one group stores.
     COMBINE_BLOCK = 256
-    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
-    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+    COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
+    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_splitk_combine_kernel(
@@ -700,15 +704,30 @@ def build_flash_attn_dualwave_swp_fp8_module(
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
+        total_rows = (
+            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
+        )
+        ctx.row_in_bounds = ctx.row < total_rows
+        ctx.row = ctx.row_in_bounds.select(ctx.row, fx.Index(0))
+        heads_per_batch = ctx.seq_len_v * traits.NUM_HEADS_Q
+        ctx.batch_idx = ctx.row // heads_per_batch
+        rem = ctx.row % heads_per_batch
+        ctx.q_head_idx = rem // ctx.seq_len_v
+        ctx.seq_idx = rem % ctx.seq_len_v
         ctx.init_workspace()
         ctx.init_descriptors()
 
         combine = DualwaveSplitKCombineHelper(ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        m_max = combine.reduce_m_max()
+        m_max = combine.merge_m_max(m_max)
+        acc, den = combine.accumulate_splits(m_max)
+        den, acc = combine.merge_split_groups(den, acc)
         o_pack = combine.pack_output(acc, den)
-        combine.store_output(o_pack)
+
+        def _store():
+            combine.store_output(o_pack)
+
+        scf_if_dispatch(ctx.row_in_bounds & (ctx.sgrp == fx.Index(0)), _store)
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
@@ -777,10 +796,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
         )
         if const_expr(SPLITK):
             combine_rows = bs_idx * NUM_HEADS_Q * sl_idx
+            combine_blocks = (
+                combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK - 1)
+            ) // fx.Index(COMBINE_ROWS_PER_BLOCK)
             flash_attn_splitk_combine_kernel(
                 O, DebugCounts, batch_size, seq_len, stride_q_n
             ).launch(
-                grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
+                grid=(combine_blocks, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
             )

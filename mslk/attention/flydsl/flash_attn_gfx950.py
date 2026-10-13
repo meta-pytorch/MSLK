@@ -43,6 +43,9 @@ from .flash_attn_utils import (
     _v_pair_to_vec32,
     _v_vec32_to_pair,
     _waitcnt_vm_n,
+    combine_lanes_per_row,
+    COMBINE_PREFETCH,
+    combine_rows_per_block,
     DualwaveGemmHelper,
     DualwaveKernelContext,
     DualwaveKvGmemToLdsLoader,
@@ -53,6 +56,7 @@ from .flash_attn_utils import (
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     DualwaveStoreHelper,
+    scf_if_dispatch,
 )
 
 
@@ -137,7 +141,7 @@ def build_flash_attn_dualwave_swp_module(
         return_lse=return_lse,
     )
     traits.BLOCK_N_OUT // traits.BLOCK_N
-    _dualwave_swp_cache_tag = traits.cache_tag
+    _dualwave_swp_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
     # Shared-memory layout: one 16B-aligned K/V region (K0/V0/K1/V1).
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
@@ -771,10 +775,12 @@ def build_flash_attn_dualwave_swp_module(
         if const_expr(traits.SPLITK):
             output_store.store_empty_split()
 
-    # Combine kernel computes weighted split-K O, with one wave row covering four cols per lane.
+    # Combine kernel computes weighted split-K O; layout in combine_rows_per_block.
     COMBINE_BLOCK = 256
-    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
-    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+    COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
+    # One row per wave; the spare lanes divide the split dimension (see
+    # DualwaveSplitKCombineContext.init_thread_mapping).
+    COMBINE_ROWS_PER_BLOCK = combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK)
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_splitk_combine_kernel(
@@ -791,17 +797,33 @@ def build_flash_attn_dualwave_swp_module(
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
         ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
+        total_rows = (
+            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
+        )
+        ctx.row_in_bounds = ctx.row < total_rows
+        ctx.row = ctx.row_in_bounds.select(ctx.row, fx.Index(0))
+        heads_per_batch = ctx.seq_len_v * traits.NUM_HEADS_Q
+        ctx.batch_idx = ctx.row // heads_per_batch
+        rem = ctx.row % heads_per_batch
+        ctx.q_head_idx = rem // ctx.seq_len_v
+        ctx.seq_idx = rem % ctx.seq_len_v
         ctx.init_workspace()
         ctx.init_descriptors()
 
         combine = DualwaveSplitKCombineHelper(ctx)
-        m_s, l_s = combine.load_ml_rows()
-        m_max = combine.reduce_m_max(m_s)
-        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        m_max = combine.reduce_m_max()
+        m_max = combine.merge_m_max(m_max)
+        acc, den = combine.accumulate_splits(m_max)
+        den, acc = combine.merge_split_groups(den, acc)
         o_pack = combine.pack_output(acc, den)
-        combine.store_output(o_pack)
-        if const_expr(traits.RETURN_LSE):
-            combine.store_lse(m_max, den)
+
+        # Every split group holds the merged result; one of them stores it.
+        def _store():
+            combine.store_output(o_pack)
+            if const_expr(traits.RETURN_LSE):
+                combine.store_lse(m_max, den)
+
+        scf_if_dispatch(ctx.row_in_bounds & (ctx.sgrp == fx.Index(0)), _store)
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
@@ -870,10 +892,13 @@ def build_flash_attn_dualwave_swp_module(
         )
         if const_expr(traits.SPLITK):
             combine_rows = bs_idx * traits.NUM_HEADS_Q * sl_idx
+            combine_blocks = (
+                combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK - 1)
+            ) // fx.Index(COMBINE_ROWS_PER_BLOCK)
             flash_attn_splitk_combine_kernel(
                 O, DebugCounts, LSE, batch_size, seq_len, stride_q_n
             ).launch(
-                grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
+                grid=(combine_blocks, 1, 1),
                 block=(COMBINE_BLOCK, 1, 1),
                 stream=stream,
             )

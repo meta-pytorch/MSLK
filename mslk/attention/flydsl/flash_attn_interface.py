@@ -55,6 +55,21 @@ _VARLEN_LIGHT_MAX_SEQ = 256
 _DENSE_LIGHT_CU_FALLBACK = 256
 _DENSE_DUALWAVE_MIN_SEQ = 256
 _DENSE_DUALWAVE_LARGE_BATCH = 8
+_RAW_BUFFER_MAX_BYTES = (1 << 32) - 1
+
+
+def _validate_splitk_workspace_descriptor(
+    num_heads: int, seq_len: int, head_dim: int, num_splits: int
+) -> None:
+    opart_batch_bytes = num_heads * seq_len * (head_dim // 2) * num_splits * 4
+    if opart_batch_bytes > _RAW_BUFFER_MAX_BYTES:
+        raise ValueError(
+            "flydsl_flash_attn_func: split-K O-partial workspace per batch "
+            f"({opart_batch_bytes} bytes) exceeds the raw-buffer descriptor limit "
+            f"({_RAW_BUFFER_MAX_BYTES} bytes)"
+        )
+
+
 _DENSE_DUALWAVE_MIN_SEQ_LARGE_BATCH = 192
 _DENSE_M256_MIN_TOKENS = 4096
 
@@ -593,6 +608,8 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
             f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
         )
+    if splitk:
+        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
@@ -1078,6 +1095,7 @@ def flydsl_flash_attn_func(
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=D
         )
+        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # ── build (cached) ──────────────────────────────────────────────────────
     debug_lazy = debug_counts is not None
@@ -1239,6 +1257,7 @@ def flydsl_flash_attn_func(
                     if _gen_splits > 1:
                         generic_splitk = True
                         num_kv_splits = _gen_splits
+                        _validate_splitk_workspace_descriptor(H, Sq, D, _gen_splits)
                         # BLOCK_M=64 short-q tile; N128 only for causal D128, else
                         # N32 (matches the generic builder's own path selection).
                         _sk_tag = "N128" if (causal and D == 128) else "N32"
