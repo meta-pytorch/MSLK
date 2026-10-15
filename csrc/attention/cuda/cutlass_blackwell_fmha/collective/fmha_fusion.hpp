@@ -308,7 +308,9 @@ struct CausalMask : NoMask {
     if constexpr (IsQBegin) {
       return std::min(trip_count, int(ceil_div(size<0>(tile_shape), size<1>(tile_shape))));
     } else {
-      const int offset_tile_q = (get<1>(problem_size) - get<0>(problem_size)) % get<1>(tile_shape);
+      // Non-negative remainder: the offset is negative when seqlen_q > seqlen_k.
+      const int tile_n = get<1>(tile_shape);
+      const int offset_tile_q = ((get<1>(problem_size) - get<0>(problem_size)) % tile_n + tile_n) % tile_n;
       return std::min(trip_count, int(ceil_div(get<0>(tile_shape) + offset_tile_q, get<1>(tile_shape))));
     }
   }
