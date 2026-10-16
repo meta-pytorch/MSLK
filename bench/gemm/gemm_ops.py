@@ -46,7 +46,7 @@ from mslk.quantize.triton.fp8_quantize import (
     quantize_fp8_row,
     quantize_fp8_tensor,
 )
-from mslk.utils.device import is_cuda, is_gfx942, is_gfx950, is_rocm
+from mslk.utils.device import gfx_arch_in, is_cuda, is_gfx942, is_gfx950, is_rocm
 
 try:
     from tinygemm.utils import group_quantize_tensor
@@ -105,6 +105,7 @@ class Accelerator(Enum):
     NVIDIA_SM103 = auto()
     AMD_GFX942 = auto()
     AMD_GFX950 = auto()
+    AMD_GFX1250 = auto()
 
 
 class GemmType(Enum):
@@ -130,6 +131,8 @@ def get_current_accelerator() -> Accelerator | None:
             return Accelerator.AMD_GFX950
         if is_gfx942():
             return Accelerator.AMD_GFX942
+        if gfx_arch_in(("gfx1250",)):
+            return Accelerator.AMD_GFX1250
     elif is_cuda():
         major, minor = torch.cuda.get_device_capability()
         if major == 9 and minor == 0:
@@ -1146,7 +1149,11 @@ class FP8RowwiseGrouped2D3D(FP8RowwiseGrouped):
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
+        return {
+            Accelerator.AMD_GFX942,
+            Accelerator.AMD_GFX950,
+            Accelerator.AMD_GFX1250,
+        }
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:

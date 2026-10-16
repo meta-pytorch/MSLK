@@ -6,11 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 #undef __HIP_NO_HALF_CONVERSIONS__
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <ATen/cuda/CUDAContext.h>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include <ATen/core/Tensor.h>
 #include <c10/hip/HIPStream.h>
@@ -47,6 +51,99 @@ enum GroupedGemmInputType {
   // M dynamic (MoE style)
   _2D3D
 };
+
+#if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
+bool isGfx1250() {
+  const std::string arch =
+      at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  return arch.starts_with("gfx1250");
+}
+
+at::Tensor dequantizeRows(
+    const at::Tensor& quantized,
+    const at::Tensor& scale) {
+  return quantized.to(at::kFloat) *
+      scale.to(at::kFloat).reshape({-1}).unsqueeze(-1);
+}
+
+std::vector<int64_t> copyOffsetsToHost(const at::Tensor& offsets) {
+  TORCH_CHECK(
+      at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None,
+      "The MI450 ATen grouped GEMM fallback does not support CUDA graph "
+      "capture when offsets are required.");
+  const auto cpuOffsets = offsets.to(at::kCPU).contiguous();
+  const auto* data = cpuOffsets.data_ptr<int32_t>();
+  return {data, data + cpuOffsets.numel()};
+}
+
+void scaledMmOut(
+    const at::Tensor& xq,
+    const at::Tensor& wq,
+    const at::Tensor& xScale,
+    const at::Tensor& wScale,
+    at::Tensor out) {
+  const auto x = dequantizeRows(xq, xScale);
+  const auto w = dequantizeRows(wq, wScale);
+  out.copy_(at::matmul(x, w.transpose(-2, -1)).to(out.scalar_type()));
+}
+
+at::Tensor f8f8bf16RowwiseGroupedMmMi45x(
+    const at::Tensor& XQ,
+    const at::Tensor& WQ,
+    const at::Tensor& xScale,
+    const at::Tensor& wScale,
+    const std::optional<at::Tensor>& offsets,
+    at::Tensor& out,
+    GroupedGemmInputType inputType,
+    int64_t groupCount) {
+  TORCH_WARN_ONCE(
+      "FP8 rowwise grouped GEMM is using the ATen correctness fallback on MI450");
+  if (inputType == GroupedGemmInputType::_3D3D) {
+    for (int64_t group = 0; group < groupCount; ++group) {
+      scaledMmOut(
+          XQ.select(0, group),
+          WQ.select(0, group),
+          xScale.select(0, group),
+          wScale.select(0, group),
+          out.select(0, group));
+    }
+    return out;
+  }
+
+  const auto ends = copyOffsetsToHost(offsets.value());
+  int64_t start = 0;
+  for (int64_t group = 0; group < groupCount; ++group) {
+    const int64_t end = ends[group];
+    if (end == start) {
+      continue;
+    }
+    if (inputType == GroupedGemmInputType::_2D3D) {
+      scaledMmOut(
+          XQ.slice(0, start, end),
+          WQ.select(0, group),
+          xScale.reshape({-1}).slice(0, start, end),
+          wScale.select(0, group),
+          out.slice(0, start, end));
+    } else if (inputType == GroupedGemmInputType::_3D2D) {
+      scaledMmOut(
+          XQ.select(0, group),
+          WQ.slice(0, start, end),
+          xScale.select(0, group),
+          wScale.reshape({-1}).slice(0, start, end),
+          out.slice(1, start, end));
+    } else {
+      scaledMmOut(
+          XQ.slice(1, start, end),
+          WQ.slice(1, start, end),
+          xScale.reshape({groupCount, -1}).select(0, group),
+          wScale.reshape({groupCount, -1}).select(0, group),
+          out.select(0, group));
+    }
+    start = end;
+  }
+  return out;
+}
+#endif
 
 // Define useful types that are needed for various kernels.
 using KernelArguments =
@@ -856,6 +953,13 @@ at::Tensor f8f8bf16_rowwise_grouped_mm(
   if (out.numel() == 0) {
     return out;
   }
+
+#if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
+  if (isGfx1250()) {
+    return f8f8bf16RowwiseGroupedMmMi45x(
+        XQ, WQ, x_scale, w_scale, offsets, out, *inputType, G);
+  }
+#endif
 
   at::Tensor kernel_args = at::empty(
       {static_cast<long>(G * sizeof(KernelArguments))},

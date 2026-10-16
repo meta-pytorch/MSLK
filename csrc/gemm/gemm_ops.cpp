@@ -167,6 +167,9 @@ TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
   m.impl("f8f8f16_rowwise", f8f8f16_rowwise);
   m.impl("f8f8bf16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
   m.impl("f8f8f16_rowwise_preshuffle", f8f8bf16_rowwise_preshuffle);
+#ifdef MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK
+  m.impl("f8f8bf16_rowwise_grouped_mm", f8f8bf16_rowwise_grouped_mm);
+#endif
   // Deliberately unregistered: a Python torch.library.impl owns the CUDA key
   // for each of these on ROCm, and a C++ registration here would leave that
   // binding overriding this one rather than being the only implementation.

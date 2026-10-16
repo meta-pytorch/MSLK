@@ -31,6 +31,7 @@ import torch._utils_internal  # noqa: E402
 torch._utils_internal.REQUIRES_SET_PYTHON_MODULE = False
 
 import torch  # noqa: E402
+from mslk.utils.device import gfx_arch_in  # noqa: E402
 
 from . import _meta  # noqa: F401, E402
 
@@ -353,6 +354,8 @@ if torch.version.hip is not None:
             "matmul_f8f8bf16_rowwise_grouped_mm_preshuffle",
         ),
     ):
+        if gfx_arch_in(("gfx1250",)) and _op == "f8f8bf16_rowwise_grouped_mm":
+            continue
         if not hasattr(torch.ops.mslk, _op):
             continue  # schema absent, as in a python-only build
         try:
