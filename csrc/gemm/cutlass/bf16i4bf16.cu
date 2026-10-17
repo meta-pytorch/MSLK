@@ -63,6 +63,18 @@ at::Tensor _bf16i4bf16(
   using QuantType = cutlass::int4b_t;
   constexpr int TileShapeK = 128 * 8 / cute::sizeof_bits<MmaType>::value;
 
+  // Scales change between K tiles, so each group must cover whole tiles
+  // unless one group spans the entire row.
+  TORCH_CHECK(
+      group_size > 0 && (group_size == K || group_size % TileShapeK == 0),
+      "INT4 group size must equal K (",
+      K,
+      ") or be a positive multiple of ",
+      TileShapeK,
+      "; got ",
+      group_size,
+      ".");
+
   // A Matrix configuration.
   using ElementA = MmaType;
   using LayoutA = cutlass::layout::RowMajor;
