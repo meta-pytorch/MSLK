@@ -83,6 +83,9 @@ def build_flash_attn_func_module_primary(
     has_dropout=False,
     gappy_kv=False,
     num_kv_splits=1,
+    q_pack_qlen=0,
+    q_pack_group=0,
+    kv_lens=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -264,6 +267,9 @@ def build_flash_attn_func_module_primary(
         has_dropout=has_dropout,
         gappy_kv=gappy_kv,
         num_kv_splits=num_kv_splits,
+        q_pack_qlen=q_pack_qlen,
+        q_pack_group=q_pack_group,
+        kv_lens=kv_lens,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -730,6 +736,8 @@ def build_flash_attn_func_module_primary(
         den, acc = combine.merge_split_groups(den, acc)
         o_pack = combine.pack_output(acc, den)
         # Every group ends up with the merged result; one of them stores it.
+        # seq_len is the exact packed-row count, so row_in_bounds also excludes
+        # every ceil-div padding row before stride-packed output addressing.
         _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
 
         def _store_in_bounds():
