@@ -6,9 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 #undef __HIP_NO_HALF_CONVERSIONS__
+#if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <limits>
