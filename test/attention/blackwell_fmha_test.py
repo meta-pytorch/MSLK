@@ -1774,3 +1774,215 @@ class CutlassBlackwellFMHATest(unittest.TestCase):
             )
         else:
             os.environ.pop("PYTORCH_NO_CUDA_MEMORY_CACHING")
+
+    def _bottom_right_attention_ref(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        window_left: int,
+        upcast: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Bottom-right causal (optionally local) attention in which a query row
+        with no visible keys gives output 0 and LSE -inf, with finite gradients.
+        """
+        dtype = q.dtype
+        if upcast:
+            q, k, v = q.float(), k.float(), v.float()
+        seqlen_q, seqlen_k = q.shape[1], k.shape[1]
+        k = k.repeat_interleave(q.shape[2] // k.shape[2], dim=2)
+        v = v.repeat_interleave(q.shape[2] // v.shape[2], dim=2)
+        scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(q.shape[-1]), k)
+        row = torch.arange(seqlen_q, device=q.device)[:, None] + seqlen_k - seqlen_q
+        col = torch.arange(seqlen_k, device=q.device)[None, :]
+        visible = col <= row
+        if window_left >= 0:
+            visible &= col >= row - window_left
+        empty = ~visible.any(-1, keepdim=True)
+        scores = scores.masked_fill(~visible, float("-inf")).masked_fill(empty, 0.0)
+        lse = torch.logsumexp(scores.float(), dim=-1).masked_fill(
+            empty.squeeze(-1), float("-inf")
+        )
+        p = torch.softmax(scores, dim=-1).masked_fill(empty, 0.0)
+        out = torch.einsum("bhts,bshd->bthd", p, v)
+        return out.to(dtype), lse
+
+    def _check_fully_masked_rows(
+        self,
+        empty_rows: torch.Tensor,
+        test: tuple[torch.Tensor, ...],
+        ref: tuple[torch.Tensor, ...],
+        pt: tuple[torch.Tensor, ...],
+    ) -> None:
+        """
+        Each of test/ref/pt is (out, lse, dq, dk, dv) with out as
+        (B, M, H, D) and lse as (B, H, M); empty_rows is a bool mask over M.
+        """
+        out, lse, dq, dk, dv = test
+        self.assertTrue(torch.all(out[:, empty_rows] == 0).item())
+        self.assertTrue(torch.all(lse[..., empty_rows] == float("-inf")).item())
+        for name, t in zip(
+            ("out", "lse", "dq", "dk", "dv"),
+            (out, lse[..., ~empty_rows], dq, dk, dv),
+        ):
+            self.assertFalse(t.isnan().any().item(), f"NaN in {name}")
+
+        lse_diff = (lse - ref[1])[..., ~empty_rows].abs().max().item()
+        self.assertLessEqual(lse_diff, 1e-2)
+        for i in (0, 2, 3, 4):
+            self._allclose(test[i], ref[i], pt[i])
+
+    @skip_cuda_lt_sm100
+    @skip_rocm
+    @parameterized.expand(
+        [
+            (seqlen_q, seqlen_k, window_left, head_dim, deterministic)
+            for seqlen_q, seqlen_k in [
+                (200, 100),  # Some rows of a Q tile have no visible keys
+                (1000, 900),  # Offset is not a multiple of the KV tile size
+                (640, 128),  # Q tiles in which no row has a visible key
+            ]
+            for window_left in [-1, 64]
+            for head_dim in [64, 128]
+            for deterministic in [False, True]
+        ]
+    )
+    def test_fully_masked_rows(
+        self,
+        seqlen_q: int,
+        seqlen_k: int,
+        window_left: int,
+        head_dim: int,
+        deterministic: bool,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """
+        Bottom-right causal/local attention with seqlen_q > seqlen_k leaves the
+        first seqlen_q - seqlen_k rows with no visible keys.
+        """
+        device = torch.accelerator.current_accelerator()
+        assert device is not None
+        torch.manual_seed(SEED)
+
+        q, k, v = (
+            t.detach()
+            for t in self._generate_qkv(
+                2, seqlen_q, seqlen_k, 4, 2, head_dim, device, dtype
+            )
+        )
+        dout = torch.randn_like(q)
+        window_right = 0 if window_left >= 0 else -1
+
+        out, lse = _cutlass_blackwell_fmha_forward(
+            q,
+            k,
+            v,
+            causal=True,
+            window_left=window_left,
+            window_right=window_right,
+            bottom_right=True,
+        )
+        dq, dk, dv = fmha_interface._cutlass_blackwell_fmha_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            causal=True,
+            window_left=window_left,
+            window_right=window_right,
+            bottom_right=True,
+            deterministic=deterministic,
+        )
+
+        def ref(upcast: bool) -> tuple[torch.Tensor, ...]:
+            q_ref, k_ref, v_ref = (t.clone().requires_grad_() for t in (q, k, v))
+            out_ref, lse_ref = self._bottom_right_attention_ref(
+                q_ref, k_ref, v_ref, window_left, upcast
+            )
+            grads = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout)
+            return out_ref, lse_ref, *grads
+
+        empty_rows = torch.arange(seqlen_q, device=device) < seqlen_q - seqlen_k
+        self._check_fully_masked_rows(
+            empty_rows, (out, lse, dq, dk, dv), ref(upcast=True), ref(upcast=False)
+        )
+
+    @skip_cuda_lt_sm100
+    @skip_rocm
+    @parameterized.expand([(-1,), (64,)])
+    def test_fully_masked_rows_varlen(
+        self, window_left: int, dtype: torch.dtype = torch.bfloat16
+    ) -> None:
+        """
+        Varlen version of test_fully_masked_rows: only some sequences have
+        seqlen_q > seqlen_k, and the last one has a Q tile with no visible keys.
+        """
+        device = torch.accelerator.current_accelerator()
+        assert device is not None
+        torch.manual_seed(SEED)
+
+        seqlens_q = [4, 64, 300]
+        seqlens_k = [1, 128, 40]
+        cu_seqlens_q = [0, *torch.tensor(seqlens_q).cumsum(0).tolist()]
+        cu_seqlens_k = [0, *torch.tensor(seqlens_k).cumsum(0).tolist()]
+        q_heads, kv_heads, head_dim = 4, 2, 128
+        q = torch.randn(cu_seqlens_q[-1], q_heads, head_dim, device=device, dtype=dtype)
+        k, v = (
+            torch.randn(
+                cu_seqlens_k[-1], kv_heads, head_dim, device=device, dtype=dtype
+            )
+            for _ in range(2)
+        )
+        dout = torch.randn_like(q)
+        window_right = 0 if window_left >= 0 else -1
+        varlen_args = {
+            "cu_seqlens_q": torch.tensor(
+                cu_seqlens_q, device=device, dtype=torch.int32
+            ),
+            "cu_seqlens_k": torch.tensor(
+                cu_seqlens_k, device=device, dtype=torch.int32
+            ),
+            "max_seq_len_q": max(seqlens_q),
+            "max_seq_len_k": max(seqlens_k),
+            "causal": True,
+            "window_left": window_left,
+            "window_right": window_right,
+            "bottom_right": True,
+        }
+
+        out, lse = _cutlass_blackwell_fmha_forward(q, k, v, **varlen_args)
+        dq, dk, dv = fmha_interface._cutlass_blackwell_fmha_backward(
+            dout, q, k, v, out, lse, **varlen_args
+        )
+
+        def ref(upcast: bool) -> tuple[torch.Tensor, ...]:
+            q_ref, k_ref, v_ref = (t.clone().requires_grad_() for t in (q, k, v))
+            outs, lses = [], []
+            for i in range(len(seqlens_q)):
+                q_i = q_ref[None, cu_seqlens_q[i] : cu_seqlens_q[i + 1]]
+                k_i = k_ref[None, cu_seqlens_k[i] : cu_seqlens_k[i + 1]]
+                v_i = v_ref[None, cu_seqlens_k[i] : cu_seqlens_k[i + 1]]
+                out_i, lse_i = self._bottom_right_attention_ref(
+                    q_i, k_i, v_i, window_left, upcast
+                )
+                outs.append(out_i)
+                lses.append(lse_i)
+            out_ref = torch.cat(outs, dim=1)
+            grads = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout[None])
+            return out_ref, torch.cat(lses, dim=-1), *grads
+
+        empty_rows = torch.cat(
+            [
+                torch.arange(sq, device=device) < sq - sk
+                for sq, sk in zip(seqlens_q, seqlens_k)
+            ]
+        )
+        self._check_fully_masked_rows(
+            empty_rows,
+            (out[None], lse, dq, dk, dv),
+            ref(upcast=True),
+            ref(upcast=False),
+        )
