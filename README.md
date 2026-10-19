@@ -20,6 +20,23 @@ pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu13
 pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm7.1/ --extra-index-url https://pypi.org/simple
 ```
 
+### Optional: aiter on ROCm
+
+On ROCm, MSLK can serve some ops from [aiter](https://github.com/ROCm/aiter)
+kernels where they are faster. aiter is optional: without it, every op uses
+MSLK's own kernels. MSLK is tested against one aiter build, which aiter
+publishes outside PyPI, so add its download location when installing the
+`aiter` extra:
+
+```bash
+pip install --pre "mslk[aiter]" --index-url https://download.pytorch.org/whl/nightly/rocm7.1/ --extra-index-url https://pypi.org/simple \
+  --find-links https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/
+```
+
+aiter compiles its kernels on first use, so the machine needs a ROCm installation
+with `hipcc`; the first `import aiter` takes some seconds while it builds its core
+module.
+
 ## Release Compatibility Table
 
 MSLK is released in accordance to the PyTorch release schedule, and each

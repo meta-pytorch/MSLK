@@ -22,7 +22,11 @@ on:
       - 'ci/scripts/mslk_external_repos.bash'
       - 'ci/scripts/utils_rocm.bash'
       - 'ci/scripts/utils_flydsl.bash'
+      - 'ci/scripts/utils_aiter.bash'
       - 'setup.py'
+      # Pinned FlyDSL and aiter versions
+      - 'ci/flydsl_version.txt'
+      - 'mslk/aiter/**'
       # CMake ROCm/HIP configuration
       - 'cmake/Hip.cmake'
       - 'cmake/RocmSetup.cmake'
