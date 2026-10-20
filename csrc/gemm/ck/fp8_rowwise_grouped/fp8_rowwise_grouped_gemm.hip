@@ -8,8 +8,8 @@
 #undef __HIP_NO_HALF_CONVERSIONS__
 #if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #endif
 #include <cmath>
 #include <cstdlib>
@@ -70,7 +70,8 @@ at::Tensor dequantizeRows(
 
 std::vector<int64_t> copyOffsetsToHost(const at::Tensor& offsets) {
   TORCH_CHECK(
-      at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None,
+      c10::cuda::currentStreamCaptureStatusMayInitCtx() ==
+          c10::cuda::CaptureStatus::None,
       "The MI450 ATen grouped GEMM fallback does not support CUDA graph "
       "capture when offsets are required.");
   const auto cpuOffsets = offsets.to(at::kCPU).contiguous();
