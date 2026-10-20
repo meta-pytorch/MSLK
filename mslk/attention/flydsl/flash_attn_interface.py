@@ -560,33 +560,133 @@ def _validate_paged_metadata(
         )
 
 
+# Paged split-K sizing. `_num_kv_splits_heuristic` (CK's) stops as soon as the
+# workgroup count covers the CUs once, because it assumes a workgroup that has
+# started is a workgroup making progress. That does not hold for the paged light
+# kernel: each workgroup walks its KV range as a serial chain of dependent loads
+# at roughly one memory latency per BLOCK_N_OUT tile, so a full GPU can still be
+# idle-stalled. Size by chain length instead, then bound the workgroup count so
+# the fp32 workspace and combine pass stay cheap.
+_PAGED_BLOCK_N_OUT = 64  # generic paged builds with path_tag="N32"
+# Target KV tiles per workgroup. Measured on MI350X (gfx950, bf16) across the
+# supported head dims: the curve is flat between 8 and 32 tiles over a wide
+# range of request counts and query lengths before combine overhead takes over
+# past ~64.
+_PAGED_TARGET_CHAIN = int(os.getenv("FLYDSL_PAGED_TARGET_CHAIN", "8"))
+_PAGED_MAX_SPLITS = int(os.getenv("FLYDSL_PAGED_MAX_SPLITS", "64"))
+# A base grid this small cannot fill the device even at MAX_SPLITS, so it is
+# allowed twice the cap. Measured at r=1 (4 base blocks after GQA packing):
+# 128 splits beats 64 by 27% at ctx=512000 and 3% at ctx=128000, while at
+# ctx=32000 the chain is already short enough that the split cost dominates.
+_PAGED_STARVED_BLOCKS = int(os.getenv("FLYDSL_PAGED_STARVED_BLOCKS", "8"))
+# Ceiling on total workgroups (blocks * splits). Past this the combine pass and
+# scheduling cost outweigh the shorter chain; measured knee at r=64 on MI350X.
+_PAGED_MAX_WG = int(os.getenv("FLYDSL_PAGED_MAX_WG", "8192"))
+# The fp32 split-K workspace is B*splits*H*Sq*(D/2+2) elements; cap it so a
+# large-batch speculative-decode call cannot quietly allocate gigabytes.
+_PAGED_WS_BUDGET_MB = int(os.getenv("FLYDSL_PAGED_WS_BUDGET_MB", "512"))
+# Debug/tuning override: force an exact split count (0 = use the heuristic).
+_PAGED_FORCE_SPLITS = int(os.getenv("FLYDSL_PAGED_FORCE_SPLITS", "0"))
+
+
 def _paged_num_kv_splits(
-    batch_size: int,
-    num_heads: int,
-    seq_len: int,
-    head_dim: int,
-    max_kv_len: int,
-    page_size: int,
-    device: torch.device,
+    num_batches: int, num_heads: int, seqlen_q: int, seqlen_kv: int, head_dim: int
 ) -> int:
-    """Choose a bounded split count for the generic paged kernel."""
-    if seq_len < 384 or head_dim not in (64, 128):
-        return 1
-    max_pages = max(1, (max_kv_len + page_size - 1) // page_size)
-    return max(
-        1,
-        min(
-            max_pages,
-            _num_kv_splits_heuristic(
-                batch_size,
-                num_heads,
-                seq_len,
-                head_dim,
-                _dense_light_cu(device),
-                max_splits=8,
-            ),
-        ),
-    )
+    """KV splits for the generic paged (light) kernel.
+
+    Sized by chain length, not by workgroup count. The KV loop is a serial chain
+    of dependent loads costing roughly one memory latency per BLOCK_N_OUT tile,
+    so a grid that already covers every CU can still be latency-stalled -- at
+    r=64 (2048 workgroups, 8 per CU) splitting 32 ways is still worth 22%.
+    Pick the smallest split count that brings the chain to _PAGED_TARGET_CHAIN
+    tiles, then clamp to the workspace budget.
+    """
+    if _PAGED_FORCE_SPLITS > 0:
+        return _PAGED_FORCE_SPLITS
+
+    def ceildiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    kv_tiles = ceildiv(max(seqlen_kv, 1), _PAGED_BLOCK_N_OUT)
+    if kv_tiles <= _PAGED_TARGET_CHAIN:
+        return 1  # chain is already short; splitting only adds a combine pass
+
+    blocks = num_batches * num_heads * ceildiv(max(seqlen_q, 1), 64)
+    starved = blocks < _PAGED_STARVED_BLOCKS
+    cap = _PAGED_MAX_SPLITS * (2 if starved else 1)
+    # A starved grid (r=1 leaves 4 workgroups before splitting) is short of
+    # latency hiding, not of work, so it pays to halve the chain and take the
+    # extra combine passes: measured 20.8 -> 18.2 us at r=1/ctx=32000. The same
+    # target costs 13% at r=4 and 4% at r=16, where the base grid already has
+    # enough in flight, so it stays keyed to the starvation test.
+    chain = max(1, _PAGED_TARGET_CHAIN // 2 if starved else _PAGED_TARGET_CHAIN)
+    want = min(ceildiv(kv_tiles, chain), cap)
+
+    # Don't let the grid blow past the workgroup ceiling: with a large base grid
+    # (high concurrency) the extra splits stop buying latency hiding and the
+    # combine pass starts to dominate.
+    by_grid = max(1, _PAGED_MAX_WG // max(blocks, 1))
+
+    # rows = B*splits*H*Sq; elems = rows*(D//2) + 2*rows  (see
+    # dualwave_splitk_workspace_elems). Solve for the largest affordable split.
+    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
+    budget_elems = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4
+    affordable = max(1, budget_elems // max(per_split_elems, 1))
+    limit = max(1, min(cap, by_grid, affordable, kv_tiles))
+    splits = max(1, min(want, limit))
+    # NUM_KV_SPLITS is compiled in, and the raw count moves with every ~512
+    # tokens of context, so a growing decode would JIT a new kernel pair each
+    # time. Powers of two keep it to a handful: round the target up, then back
+    # down under every cap.
+    pow2 = 1 << (max(want, 1) - 1).bit_length()
+    while pow2 > limit:
+        pow2 //= 2
+    # Each split's pages must fit the block-table LDS window; never round down
+    # past that, or a shape that ran would start raising.
+    pages = ceildiv(max(seqlen_kv, 1), _PAGED_PAGE_SIZE)
+    if ceildiv(pages, pow2) > _PAGED_BT_LDS_SIZE:
+        return splits
+    return pow2
+
+
+# Windowed paged split-K sizing. A window bounds the KV walk to a short range,
+# so chain length stops being the constraint and the fixed per-split cost
+# dominates; size by grid instead, aiming for about _PAGED_WINDOW_TARGET_WG
+# workgroups in total.
+_PAGED_WINDOW_TARGET_WG = 1024
+_PAGED_WINDOW_MIN_SPLITS = 2
+_PAGED_WINDOW_MAX_SPLITS = 32
+
+
+def _paged_window_num_kv_splits(
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    reach: int,
+    head_dim: int,
+    max_kv_pages: int,
+) -> int:
+    """KV splits for a windowed paged call that can see `reach` keys."""
+    if _PAGED_FORCE_SPLITS > 0:
+        return _PAGED_FORCE_SPLITS
+    kv_tiles = -(-max(reach, 1) // _PAGED_BLOCK_N_OUT)
+    units = num_batches * num_heads * -(-max(seqlen_q, 1) // 64)
+    per_split_elems = num_batches * num_heads * max(seqlen_q, 1) * (head_dim // 2 + 2)
+    affordable = _PAGED_WS_BUDGET_MB * 1024 * 1024 // 4 // max(per_split_elems, 1)
+    splits = max(_PAGED_WINDOW_TARGET_WG // max(units, 1), _PAGED_WINDOW_MIN_SPLITS)
+    splits = max(1, min(splits, _PAGED_WINDOW_MAX_SPLITS, kv_tiles, affordable))
+    splits = 1 << (splits.bit_length() - 1)
+
+    # The generic paged kernel stages at most `_PAGED_BT_LDS_SIZE` block-table
+    # entries per split. Raise the split count only when that count still fits
+    # the workspace budget; otherwise the common LDS-window validation below
+    # rejects the unsupported shape before allocating a split-K workspace.
+    minimum = (max_kv_pages + _PAGED_BT_LDS_SIZE - 1) // _PAGED_BT_LDS_SIZE
+    minimum_pow2 = 1 << (max(minimum, 1) - 1).bit_length()
+    allowed = max(1, min(_PAGED_WINDOW_MAX_SPLITS, kv_tiles, affordable))
+    if minimum_pow2 <= allowed:
+        splits = max(splits, minimum_pow2)
+    return splits
 
 
 def _flydsl_flash_attn_paged(
@@ -615,13 +715,17 @@ def _flydsl_flash_attn_paged(
     dualwave_swp_setprio: bool,
     dualwave_swp_enable_stagger: bool,
     stream,
+    # Sliding window, forwarded to the generic (light) paged kernel. Keyword
+    # with a default so the positional call sites above stay valid.
+    window_left: int = -1,
 ) -> torch.Tensor:
     """Native paged-KV attention on the gfx950 dualwave kernel.
 
     Supported config ONLY (anything else raises): linear/vectorized cache layout
     [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
     seqlen_k), causal, D=64/128, dtype bf16/f16.
-    - Dense 4D Q ``[B, Sq, H, D]``: split-K (num_kv_splits>1) supported (seq_len>=384).
+    - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. ``num_kv_splits=0``
+      selects a count from occupancy; ``1`` disables; ``>1`` forces.
     - Varlen packed Q ``[total_q, H, D]`` (cu_seqlens_q given): paged K/V looked up
       per kv-tile via block_table; split-K not supported (matches dense varlen).
     """
@@ -666,10 +770,6 @@ def _flydsl_flash_attn_paged(
         if max_seqlen_q is None:
             raise ValueError(
                 "flydsl_flash_attn_func: varlen paged KV requires max_seqlen_q"
-            )
-        if num_kv_splits > 1:
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: varlen paged KV does not support split-K"
             )
         if q.dim() != 3:
             raise ValueError(
@@ -727,6 +827,7 @@ def _flydsl_flash_attn_paged(
     # below would otherwise decline every caller that leaves it unset).
     if num_kv_heads is None:
         num_kv_heads = int(k.shape[1] if vectorized else k.shape[2])
+    _paged_window = window_left >= 0
     _gqa_packed = False
     _gqa_group = 0
     _gqa_qlen = 0
@@ -747,6 +848,7 @@ def _flydsl_flash_attn_paged(
         and H > num_kv_heads
         and H % num_kv_heads == 0
         and (Sq == 1 or causal)
+        and (causal or not _paged_window)
     ):
         _gqa_group = H // num_kv_heads
         _gqa_qlen = Sq
@@ -805,7 +907,8 @@ def _flydsl_flash_attn_paged(
         k_head_dim = int(k.shape[2]) * int(k.shape[4])  # (D/kVS) * kVS
         if int(k.shape[4]) != kvs:
             raise ValueError(
-                f"flydsl_flash_attn_func: vectorized K last dim ({k.shape[4]}) must equal kVS={kvs}"
+                "flydsl_flash_attn_func: vectorized K last dim "
+                f"({k.shape[4]}) must equal kVS={kvs}"
             )
     else:
         page_size = int(k.shape[1])
@@ -834,9 +937,10 @@ def _flydsl_flash_attn_paged(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
 
-    # Split-K (paged, dense only): split the KV dimension across grid_z = B*num_kv_splits
-    # workgroups + a combine pass. Fills the GPU for low-occupancy shapes (small B / few
-    # heads), where single-split paged underutilizes the device.
+    # Split-K (paged, dense only): split the KV dimension across
+    # grid_z = B*num_kv_splits workgroups + a combine pass. Fills the GPU for
+    # low-occupancy shapes (small B / few heads), where single-split paged
+    # underutilizes the device.
     # ── route + split-K sizing ──────────────────────────────────────────────
     # Two paged kernels: the generic "light" one and the gfx950 dualwave one. The
     # dualwave paged softmax overflows for f16 (narrow exponent) and on the causal
@@ -865,35 +969,54 @@ def _flydsl_flash_attn_paged(
     _arch = _gpu_arch(q.device)
     _gappy = kv_seqstart is not None
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
-    _paged_light_ok = _gappy or (
-        _splitk_dtype_ok
-        and (
-            # Dualwave takes per-request KV lengths only via its varlen
-            # variant, which has no split-K.
-            (_dense_kv_lens and requested_num_kv_splits > 1)
-            or dtype_str == "f16"
-            or causal
-            or not _arch.startswith("gfx950")
-            or Sq <= _VARLEN_LIGHT_MAX_SEQ
+    _paged_light_ok = (
+        _gappy
+        or _paged_window
+        or (
+            _splitk_dtype_ok
+            and (
+                # Dualwave takes per-request KV lengths only via its varlen
+                # variant, which has no split-K.
+                (_dense_kv_lens and requested_num_kv_splits > 1)
+                or dtype_str == "f16"
+                or causal
+                or not _arch.startswith("gfx950")
+                or Sq <= _VARLEN_LIGHT_MAX_SEQ
+            )
         )
     )
 
-    if varlen:
-        # The split-K combine kernel addresses a dense [B, H, Sq] output.
-        # Packed varlen Q has only sum(q_seqlens) rows, so automatic splitting
-        # would give the combine pass the wrong row mapping and allocation size.
+    if varlen and not _varlen_uniform_q and requested_num_kv_splits > 1:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: paged split-K requires uniform varlen Q"
+        )
+    if varlen and not _varlen_uniform_q:
         num_kv_splits = 1
     elif _paged_light_ok and requested_num_kv_splits == 0:
-        num_kv_splits = _paged_num_kv_splits(B, H, Sq, D, skv, page_size, q.device)
+        if _paged_window:
+            q_len = _gqa_qlen if _gqa_packed else Sq
+            reach = min(skv, int(window_left) + q_len)
+            pages = (skv + page_size - 1) // page_size
+            num_kv_splits = _paged_window_num_kv_splits(B, H, q_len, reach, D, pages)
+        else:
+            num_kv_splits = _paged_num_kv_splits(B, H, Sq, skv, D)
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1
     else:
         num_kv_splits = requested_num_kv_splits
     splitk = num_kv_splits > 1
-    if splitk and (D not in (64, 128) or dtype_str not in ("bf16", "f16") or Sq < 384):
+    if splitk and not _splitk_dtype_ok:
         raise ValueError(
-            f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
-            f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
+            f"flydsl_flash_attn_func: paged split-K requires D=64/128, dtype "
+            f"bf16/f16; got D={D}, dtype={dtype_str}"
+        )
+    # The dualwave split-K route needs enough Q rows to amortise its pipeline; the
+    # generic light route has no such floor, and short-q is exactly where splitting
+    # pays. Keep the old requirement only for the route it was written for.
+    if splitk and not _paged_light_ok and Sq < 384:
+        raise ValueError(
+            f"flydsl_flash_attn_func: dualwave paged split-K requires seq_len>=384; "
+            f"got seq_len={Sq}"
         )
     if splitk:
         _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
@@ -901,6 +1024,21 @@ def _flydsl_flash_attn_paged(
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
     max_kv_pages = (skv + page_size - 1) // page_size
+    # Split-K (paged, dense only): split the KV dimension across
+    # grid_z = B*num_kv_splits workgroups + a combine pass. Fills the GPU for
+    # low-occupancy shapes (small B / few heads), where single-split paged
+    # underutilizes the device.
+    #
+    # `_paged_num_kv_splits` above has already sized this for the paged routes it
+    # covers, by KV-chain length rather than occupancy -- a grid that fills every
+    # CU can still be latency-stalled, which occupancy cannot see. Only resolve
+    # the `0` sentinel for what it left alone; never overwrite a count it chose,
+    # which moves shapes off the light kernel onto dualwave, where non-tile-
+    # aligned seqlen_k mis-masks (1e-2, above bf16 eps).
+    if num_kv_splits == 0:
+        num_kv_splits = 1
+
+    splitk = num_kv_splits > 1
     max_pages_per_split = (max_kv_pages + int(num_kv_splits) - 1) // int(num_kv_splits)
     if max_pages_per_split > _PAGED_BT_LDS_SIZE:
         max_supported_kv = _PAGED_BT_LDS_SIZE * int(num_kv_splits) * page_size
@@ -967,6 +1105,7 @@ def _flydsl_flash_attn_paged(
                     q_pack_group=_gqa_group if _gqa_stride_packed else 0,
                     kv_lens=_dense_kv_lens,
                     block_m=128 if (_gqa_packed and Sq > 64) else 0,
+                    window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                 )
             else:
@@ -1097,8 +1236,14 @@ def _build_paged_light(
     q_pack_group: int = 0,
     kv_lens: bool = False,
     block_m: int = 0,
+    window_left: int = -1,
 ):
-    """Build a lightweight paged-varlen launcher for short attention."""
+    """Build a lightweight paged-varlen launcher for short attention.
+
+    ``num_kv_splits > 1`` partitions the KV loop across grid.y. Decode-shaped
+    paged calls (q_len 1-16) otherwise walk the whole context in one workgroup,
+    which is latency-bound end to end; splitting shortens that serial chain.
+    """
     from .flash_attn_generic import build_flash_attn_func_module
 
     return build_flash_attn_func_module(
@@ -1114,6 +1259,9 @@ def _build_paged_light(
         block_m=block_m or _PAGED_LIGHT_BLOCK_M,
         flat_work_group_size=(block_m or _PAGED_LIGHT_BLOCK_M) * 2,
         path_tag="N32",
+        # N32 is the only path carrying the window mask, and it is already what
+        # this builder selects -- so the window costs no path change here.
+        window_left=window_left,
         waves_per_eu=waves_per_eu,
         daz=daz,
         gappy_kv=gappy_kv,
@@ -1269,11 +1417,31 @@ def flydsl_flash_attn_func(
     # LSE; the dualwave native-paged path does not. The precise check lives in
     # _flydsl_flash_attn_paged where the light-vs-dualwave decision is made.
     if window_left >= 0:
-        # Window lives in apply_kv_mask (dense + generic varlen); fp8/paged lack it.
-        if dtype_str == "fp8" or paged_kv:
+        # Window lives in apply_kv_mask, which is the generic kernel's N32 mask
+        # path. Dense/varlen and paged both reach it -- paged light already
+        # builds with path_tag="N32" -- so the window is expressible there. fp8
+        # has no mask path at all.
+        #
+        # The *native* paged kernels (dualwave, pa_decode_gfx950) do their own
+        # masking and have no window, so they must not take a windowed shape:
+        # they would silently drop the window and return a full-context answer.
+        # `_paged_window` in the paged helper forces the light route and declines
+        # fast paths for exactly that reason.
+        if dtype_str == "fp8":
             raise NotImplementedError(
                 "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
-                "supported for fp8 or paged KV"
+                "supported for fp8"
+            )
+        if paged_kv and not causal:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: sliding-window paged KV requires causal=True"
+            )
+        if paged_kv and kv_seqstart is not None:
+            # Gappy paged builds a different KV index space; the window bound is
+            # expressed in flat KV columns and would not line up.
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
+                "supported for gappy paged KV (kv_seqstart)"
             )
     if sm_scale is not None:
         # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
@@ -1324,9 +1492,17 @@ def flydsl_flash_attn_func(
             dualwave_swp_setprio=dualwave_swp_setprio,
             dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
             stream=stream,
+            window_left=window_left,
         )
 
     varlen = cu_seqlens_q is not None
+
+    # `0` (auto) only selects a split count on the dense paged path, which has
+    # already returned above. Everything from here on is non-paged, where the
+    # existing per-shape `generic_splitk` selection is the auto mechanism, so
+    # collapse the sentinel to the historical default before anything reads it.
+    if num_kv_splits == 0:
+        num_kv_splits = 1
 
     if dtype_str == "fp8":
         if varlen:

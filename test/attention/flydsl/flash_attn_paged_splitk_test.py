@@ -857,3 +857,188 @@ def test_materialized_gqa_pack_and_unpack_stay_on_explicit_stream(monkeypatch, v
     assert got.data_ptr() == out.data_ptr()
     torch.testing.assert_close(got, expected, atol=0, rtol=0)
     producer_stream.synchronize()
+
+
+def test_chain_sized_splits_are_bounded():
+    short = fai._PAGED_TARGET_CHAIN * fai._PAGED_BLOCK_N_OUT
+    assert fai._paged_num_kv_splits(1, HKV, 8, short, 128) == 1
+    assert fai._paged_num_kv_splits(1, HKV, 8, 32768, 128) > 1
+
+    for ctx in range(1024, 131072, 512):
+        splits = fai._paged_num_kv_splits(4, HKV, 32, ctx, 128)
+        assert splits & (splits - 1) == 0
+        assert splits <= fai._PAGED_MAX_SPLITS
+
+
+def test_chain_sized_splits_respect_workspace(monkeypatch):
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
+    batch, seqlen_q, head_dim = 4, 16, 128
+    splits = fai._paged_num_kv_splits(batch, H, seqlen_q, 131072, head_dim)
+    elems = splits * batch * H * seqlen_q * (head_dim // 2 + 2)
+    assert splits == 1 or elems * 4 <= 1024 * 1024
+
+
+def test_window_sized_splits_respect_workspace_after_lds_floor(monkeypatch):
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 1)
+    batch, heads, seqlen_q, head_dim = 4, 8, 64, 128
+    max_kv_pages = 2 * fai._PAGED_BT_LDS_SIZE
+    splits = fai._paged_window_num_kv_splits(
+        batch, heads, seqlen_q, 255, head_dim, max_kv_pages
+    )
+    elems = splits * batch * heads * seqlen_q * (head_dim // 2 + 2)
+
+    assert splits == 1
+    assert elems * 4 <= 1024 * 1024
+    assert (max_kv_pages + splits - 1) // splits > fai._PAGED_BT_LDS_SIZE
+
+
+def test_window_sized_splits_do_not_exceed_tile_or_configured_caps(monkeypatch):
+    monkeypatch.setattr(fai, "_PAGED_WS_BUDGET_MB", 512)
+    monkeypatch.setattr(fai, "_PAGED_WINDOW_MAX_SPLITS", 4)
+    max_kv_pages = 8 * fai._PAGED_BT_LDS_SIZE
+
+    by_configured_cap = fai._paged_window_num_kv_splits(1, 1, 1, 4096, 64, max_kv_pages)
+    by_tile_cap = fai._paged_window_num_kv_splits(
+        1, 1, 1, fai._PAGED_BLOCK_N_OUT, 64, max_kv_pages
+    )
+
+    assert by_configured_cap <= 4
+    assert by_tile_cap == 1
+
+
+def _paged_window_reference(q, k, v, ctx, window):
+    _, seqlen_q, num_heads, head_dim = q.shape
+    flat_k = k.reshape(-1, HKV, head_dim).float()[:ctx]
+    flat_v = v.reshape(-1, HKV, head_dim).float()[:ctx]
+    columns = torch.arange(ctx, device=q.device)
+    output = torch.empty(seqlen_q, num_heads, head_dim, device=q.device)
+    for head in range(num_heads):
+        kv_head = head // (num_heads // HKV)
+        for row in range(seqlen_q):
+            query_position = ctx - seqlen_q + row
+            scores = (q[0, row, head].float() @ flat_k[:, kv_head].T) / math.sqrt(
+                head_dim
+            )
+            keep = (columns <= query_position) & (columns > query_position - window)
+            output[row, head] = (
+                scores.masked_fill(~keep, -math.inf).softmax(-1) @ flat_v[:, kv_head]
+            )
+    return output
+
+
+@pytest.mark.parametrize("num_kv_splits", [1, 4, 0])
+@pytest.mark.parametrize("seqlen_q", [1, 16, 64])
+def test_paged_window_matches_reference(num_kv_splits, seqlen_q):
+    ctx, window, head_dim = 2048, 255, 64
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, ctx, head_dim)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=num_kv_splits,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    reference = _paged_window_reference(q, k, v, ctx, window)
+    torch.testing.assert_close(got[0].float(), reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_paged_window_rejects_noncausal(monkeypatch, seqlen_q):
+    monkeypatch.setattr(
+        fai,
+        "_build_paged_light",
+        lambda **_kwargs: pytest.fail("non-causal window reached kernel construction"),
+    )
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, 2048, 64)
+
+    with pytest.raises(NotImplementedError, match="paged KV requires causal=True"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=False,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            max_seqlen_kv=2048,
+            window_left=255,
+        )
+
+
+def test_paged_window_reaches_light_builder(monkeypatch):
+    seen = []
+    real = fai._build_paged_light
+    monkeypatch.setattr(
+        fai,
+        "_build_paged_light",
+        lambda **kwargs: (seen.append(kwargs), real(**kwargs))[1],
+    )
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=2048,
+        window_left=255,
+    )
+    assert seen[-1]["window_left"] == 255
+    assert seen[-1]["q_pack_qlen"] == 4
+
+
+def test_paged_window_sizes_from_logical_gqa_query_length(monkeypatch):
+    seen = []
+    real_sizer = fai._paged_window_num_kv_splits
+
+    def capture_sizer(*args):
+        seen.append(args)
+        return real_sizer(*args)
+
+    monkeypatch.setattr(fai, "_paged_window_num_kv_splits", capture_sizer)
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=0,
+        max_seqlen_kv=2048,
+        window_left=255,
+    )
+
+    assert seen[-1][2] == 4
+
+
+def test_paged_window_rejects_gappy_kv():
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 4, 2048, 64)
+    with pytest.raises(NotImplementedError, match="gappy"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_seqstart=torch.zeros(2, device="cuda", dtype=torch.int32),
+            kv_cache_layout="linear",
+            num_kv_splits=1,
+            max_seqlen_kv=2048,
+            window_left=255,
+        )
