@@ -42,6 +42,13 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 # Inlined (not imported from kernels.kernels_common / kernels.common.kernels_common):
 # that module's path has moved across FlyDSL checkouts on different nodes, so this
 # kernel is kept self-contained rather than depending on FlyDSL's internal layout.
+# Causal alignment, mirroring CK's _CustomMaskType. Top-left pins the diagonal
+# to row/col 0; bottom-right pins it to the END of both sequences.
+CAUSAL_NONE = 0
+CAUSAL_TOP_LEFT = 1
+CAUSAL_BOTTOM_RIGHT = 2
+
+
 def dtype_to_elem_type(dtype_str: str):
     """Map a dtype string to its FlyDSL numeric type ('f32', 'f16', 'bf16', 'fp8')."""
     if dtype_str == "f32":
@@ -110,7 +117,7 @@ def compile_fmha_bwd_dvdk_mfma(
     use_trload: bool = False,
     use_pipeline: bool = False,
     gpu_arch: str = "gfx950",
-    causal: bool = False,
+    causal_mode: int = CAUSAL_NONE,
     heads_per_kv: int = 1,
     varlen: bool = False,
     window_left: int = -1,
@@ -586,8 +593,14 @@ def compile_fmha_bwd_dvdk_mfma(
                         s_val = Vec(s_acc)[r]
                         dp_val = Vec(dp_acc)[r]
                         valid_mn = m_valid & n_ok
-                        if const_expr(causal):
+                        if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                             valid_mn = valid_mn & (n_row_abs <= m_row_abs)
+                        if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
+                            # Diagonal pinned to the end of both sequences;
+                            # additive form avoids an unsigned index wrap.
+                            valid_mn = valid_mn & (
+                                n_row_abs + this_seqlen_q <= m_row_abs + this_seqlen_k
+                            )
                         if const_expr(window_left >= 0):
                             # Sliding window: keep kv > q - window_size, the
                             # xformers convention the forward already uses.
@@ -846,7 +859,7 @@ def compile_fmha_bwd_dq_mfma(
     scale: float = None,
     use_pipeline: bool = False,
     gpu_arch: str = "gfx950",
-    causal: bool = False,
+    causal_mode: int = CAUSAL_NONE,
     heads_per_kv: int = 1,
     varlen: bool = False,
     window_left: int = -1,
@@ -1163,7 +1176,9 @@ def compile_fmha_bwd_dq_mfma(
         # cutting both wasted MFMA and redundant per-N-tile K/V HBM reloads roughly
         # in half for causal shapes -- same magnitude win as compile_fmha_bwd_dqdkdv_mfma's
         # original causal skip-ahead finding.
-        if const_expr(causal):
+        # Top-left only: bottom-right shifts the diagonal down, so this
+        # bound would skip live tiles. Full range there, correctness first.
+        if const_expr(causal_mode == CAUSAL_TOP_LEFT):
             n_tile_end_raw = (m_start + fx.Index(BLOCK_M) - fx.Index(1)) // fx.Index(
                 BLOCK_N
             ) + fx.Index(1)
@@ -1295,8 +1310,14 @@ def compile_fmha_bwd_dq_mfma(
                     s_val = Vec(s_acc)[r]
                     dp_val = Vec(dp_acc)[r]
                     valid_mn = m_valids[r] & n_ok
-                    if const_expr(causal):
+                    if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                         valid_mn = valid_mn & (n_row_abs <= m_row_abss[r])
+                    if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
+                        # Diagonal pinned to the end of both sequences;
+                        # additive form avoids an unsigned index wrap.
+                        valid_mn = valid_mn & (
+                            n_row_abs + this_seqlen_q <= m_row_abss[r] + this_seqlen_k
+                        )
                     if const_expr(window_left >= 0):
                         # Sliding window: keep kv > q - window_size, the
                         # xformers convention the forward already uses.
@@ -1445,7 +1466,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
     use_pipeline: bool = True,
     use_lds_reduce: bool = False,
     use_trload: bool = False,
-    causal: bool = False,
+    causal_mode: int = CAUSAL_NONE,
     heads_per_kv: int = 1,
     varlen: bool = False,
     gpu_arch: str = "gfx950",
@@ -1987,7 +2008,9 @@ def compile_fmha_bwd_dqdkdv_mfma(
             # Starting the M-loop there skips fully-masked M-tiles, roughly
             # halving both wasted MFMA work and redundant Q/dO HBM reloads.
             m_tile_start_full = (
-                (n_tile * BLOCK_N) // BLOCK_M if const_expr(causal) else fx.Index(0)
+                (n_tile * BLOCK_N) // BLOCK_M
+                if const_expr(causal_mode == CAUSAL_TOP_LEFT)
+                else fx.Index(0)
             )
 
             # M_SPLIT>1: divide this N-tile's (post-causal-skip-ahead) M range
@@ -2145,8 +2168,15 @@ def compile_fmha_bwd_dqdkdv_mfma(
                             s_val = Vec(s_acc)[r]
                             dp_val = Vec(dp_acc)[r]
                             valid_mn = m_valid & n_ok
-                            if const_expr(causal):
+                            if const_expr(causal_mode == CAUSAL_TOP_LEFT):
                                 valid_mn = valid_mn & (n_row_abs <= m_row_abs)
+                            if const_expr(causal_mode == CAUSAL_BOTTOM_RIGHT):
+                                # Diagonal pinned to the end of both sequences;
+                                # additive form avoids an unsigned index wrap.
+                                valid_mn = valid_mn & (
+                                    n_row_abs + this_seqlen_q
+                                    <= m_row_abs + this_seqlen_k
+                                )
                             if const_expr(window_left >= 0):
                                 # Sliding window: keep kv > q - window_size, the
                                 # xformers convention the forward already uses.

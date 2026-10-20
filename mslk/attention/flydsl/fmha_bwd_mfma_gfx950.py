@@ -22,6 +22,9 @@ from mslk.attention.flydsl.fmha_bwd_mfma import (
     _grad_ds_unscaled,
     _LOG2E,
     _softmax_p,
+    CAUSAL_BOTTOM_RIGHT,
+    CAUSAL_NONE,
+    CAUSAL_TOP_LEFT,
     dtype_to_elem_type,
     WARP_SIZE,
 )
@@ -93,7 +96,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     use_pipeline: bool = True,  # unused, kept for API compat
     use_lds_reduce: bool = False,
     use_trload: bool | None = None,
-    causal: bool = False,
+    causal_mode: int = CAUSAL_NONE,
     heads_per_kv: int = 1,
     varlen: bool = False,
     gpu_arch: str = "gfx950",
@@ -1177,7 +1180,9 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             # the full Q/dO range from HBM once per M-tile it visits; skipping
             # unneeded M-tiles directly cuts that HBM traffic, not just compute.
             m_tile_start_full = (
-                (n_tile * BLOCK_N) // BLOCK_M if const_expr(causal) else fx.Index(0)
+                (n_tile * BLOCK_N) // BLOCK_M
+                if const_expr(causal_mode == CAUSAL_TOP_LEFT)
+                else fx.Index(0)
             )
 
             m_tile_start = m_tile_start_full
@@ -1552,9 +1557,20 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                     [b_elem], elem_dtype
                                                 ).to(fx.Float32)[0]
                                             valid_mn = bias_load_valid
-                                            if const_expr(causal):
+                                            if const_expr(
+                                                causal_mode == CAUSAL_TOP_LEFT
+                                            ):
                                                 valid_mn = valid_mn & (
                                                     n_row_abs <= m_row_abs
+                                                )
+                                            if const_expr(
+                                                causal_mode == CAUSAL_BOTTOM_RIGHT
+                                            ):
+                                                # Diagonal pinned to the end of
+                                                # both sequences; no unsigned wrap.
+                                                valid_mn = valid_mn & (
+                                                    n_row_abs + this_seqlen_q
+                                                    <= m_row_abs + this_seqlen_k
                                                 )
                                             if const_expr(window_left >= 0):
                                                 # Keep kv > q - window_size

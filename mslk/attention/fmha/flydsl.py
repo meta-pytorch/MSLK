@@ -111,6 +111,24 @@ _WINDOW_BIAS_TYPES = (
     BlockDiagonalCausalLocalAttentionFromBottomRightMask,
 )
 
+# Causal tri-state mirroring ck.py's _CustomMaskType and fmha_bwd_mfma.py's
+# CAUSAL_* constants. Duplicated: importing it would pull FlyDSL in eagerly.
+CAUSAL_NONE = 0
+CAUSAL_TOP_LEFT = 1
+CAUSAL_BOTTOM_RIGHT = 2
+
+# Disjoint by construction: BlockDiagonalCausalFromBottomRightMask derives
+# from BlockDiagonalMask, and LowerTriangularFromBottomRightMask from AttentionBias.
+_TOP_LEFT_CAUSAL_TYPES = (
+    LowerTriangularMask,
+    LowerTriangularMaskWithTensorBias,
+    BlockDiagonalCausalMask,
+)
+_BOTTOM_RIGHT_CAUSAL_TYPES = (
+    LowerTriangularFromBottomRightMask,
+    BlockDiagonalCausalFromBottomRightMask,
+)
+
 # Varlen-local (windowed) top-left type; drives causal_top_left.
 _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
@@ -772,7 +790,7 @@ def _flydsl_bwd(
     lse: torch.Tensor,
     grad: torch.Tensor,
     scale: float,
-    causal: bool,
+    causal_mode: int,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
     attn_bias: Optional[torch.Tensor] = None,
@@ -986,7 +1004,7 @@ def _flydsl_bwd(
             BLOCK_N_CK,
             scale,
             gpu_arch,
-            causal,
+            causal_mode,
             heads_per_kv,
             varlen,
             has_bias,
@@ -1001,7 +1019,7 @@ def _flydsl_bwd(
                 BLOCK_M=BLOCK_M_CK,
                 BLOCK_N=BLOCK_N_CK,
                 scale=scale,
-                causal=causal,
+                causal_mode=causal_mode,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
                 window_left=window_left,
@@ -1134,7 +1152,15 @@ def _flydsl_bwd(
             BLOCK_N_DQDKDV = 64 if D == 256 else 128
             USE_TRLOAD_DQDKDV = True
             M_SPLIT_DQDKDV = _gqa_m_split_gfx950(
-                B, H, H_kv, D, M, N, causal, BLOCK_M_DQDKDV, BLOCK_N_DQDKDV
+                B,
+                H,
+                H_kv,
+                D,
+                M,
+                N,
+                causal_mode != CAUSAL_NONE,
+                BLOCK_M_DQDKDV,
+                BLOCK_N_DQDKDV,
             )
         else:
             BLOCK_M_DQDKDV = 32 if D >= 128 else 64
@@ -1172,7 +1198,7 @@ def _flydsl_bwd(
             BLOCK_N_DQDKDV,
             scale,
             gpu_arch,
-            causal,
+            causal_mode,
             heads_per_kv,
             varlen,
             window_left,
@@ -1190,7 +1216,7 @@ def _flydsl_bwd(
                 use_trload=USE_TRLOAD_DQDKDV,
                 M_SPLIT=M_SPLIT_DQDKDV,
                 gpu_arch=gpu_arch,
-                causal=causal,
+                causal_mode=causal_mode,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
                 window_left=window_left,
@@ -1272,7 +1298,7 @@ def _flydsl_bwd(
             BLOCK_N_DVDK,
             scale,
             gpu_arch,
-            causal,
+            causal_mode,
             heads_per_kv,
             varlen,
             window_left,
@@ -1287,7 +1313,7 @@ def _flydsl_bwd(
                 scale=scale,
                 use_pipeline=True,
                 gpu_arch=gpu_arch,
-                causal=causal,
+                causal_mode=causal_mode,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
                 window_left=window_left,
@@ -1329,7 +1355,7 @@ def _flydsl_bwd(
             BLOCK_N_DQ,
             scale,
             gpu_arch,
-            causal,
+            causal_mode,
             heads_per_kv,
             varlen,
             window_left,
@@ -1343,7 +1369,7 @@ def _flydsl_bwd(
                 BLOCK_N=BLOCK_N_DQ,
                 scale=scale,
                 gpu_arch=gpu_arch,
-                causal=causal,
+                causal_mode=causal_mode,
                 heads_per_kv=heads_per_kv,
                 varlen=varlen,
                 window_left=window_left,
@@ -1381,7 +1407,7 @@ def _flydsl_bwd_abstract(
     lse: torch.Tensor,
     grad: torch.Tensor,
     scale: float,
-    causal: bool,
+    causal_mode: int,
     seqstart_q: Optional[torch.Tensor] = None,
     seqstart_k: Optional[torch.Tensor] = None,
     attn_bias: Optional[torch.Tensor] = None,
@@ -1459,19 +1485,19 @@ class BwOp(AttentionBwOpBase):
     # (never seqstart-global), which already implements per-block causal
     # masking correctly given per-batch tiling -- confirmed via
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
-    # causal block-diagonal variants (e.g.
-    # `BlockDiagonalCausalFromBottomRightMask`, different alignment
-    # semantics) -- separately scoped, not implemented. Top-left local
-    # attention adds its lower window edge to this existing causal geometry.
+    # Bottom-right is the tri-state's second mode. The bottom-right LOCAL
+    # types stay out: the window term still uses the top-left diagonal.
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,
         LowerTriangularMask,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
-        # Top-left causal + sliding window. The bottom-right local types stay
-        # out: they need bottom-right causal, which this kernel lacks.
+        # Top-left causal + sliding window.
         BlockDiagonalCausalLocalAttentionMask,
+        # Bottom-right alignment, dense and per-block.
+        LowerTriangularFromBottomRightMask,
+        BlockDiagonalCausalFromBottomRightMask,
     )
     _TEST_K: List[int] = [32, 64, 96, 128, 256]
     NAME = "flydslB"
@@ -1525,14 +1551,14 @@ class BwOp(AttentionBwOpBase):
         # under CausalFromTopLeft. BlockDiagonalCausalMask subclasses
         # BlockDiagonalMask, so the isinstance check below (seqstart
         # extraction) already covers it.
-        causal = isinstance(
-            inp.attn_bias,
-            (
-                LowerTriangularMask,
-                LowerTriangularMaskWithTensorBias,
-                BlockDiagonalCausalMask,
-            ),
-        )
+        # Tri-state mirroring ck.py's _CustomMaskType. The two tuples are
+        # disjoint: neither bottom-right type subclasses a top-left one.
+        if isinstance(inp.attn_bias, _BOTTOM_RIGHT_CAUSAL_TYPES):
+            causal_mode = CAUSAL_BOTTOM_RIGHT
+        elif isinstance(inp.attn_bias, _TOP_LEFT_CAUSAL_TYPES):
+            causal_mode = CAUSAL_TOP_LEFT
+        else:
+            causal_mode = CAUSAL_NONE
         seqstart_q = seqstart_k = None
         if isinstance(inp.attn_bias, BlockDiagonalMask):
             # Mirrors ck.py's _get_seqlen_info.
@@ -1561,7 +1587,7 @@ class BwOp(AttentionBwOpBase):
             ctx.lse,
             grad,
             inp.scale_float,
-            causal,
+            causal_mode,
             seqstart_q,
             seqstart_k,
             bias_t,
