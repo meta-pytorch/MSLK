@@ -689,6 +689,122 @@ def _paged_window_num_kv_splits(
     return splits
 
 
+# Streaming tile of the head-packed decode kernel
+# (TILE_N in decode/pa_decode_gfx950.py).
+# A page must be a whole number of tiles so a tile never straddles two pages.
+_PAGED_DECODE_TILE_N = 32
+
+# Kill-switch for routing paged Sq=1 decode to the head-packed decode kernel
+# (`decode/pa_decode_gfx950.py`). Set to fall back to the dualwave paged path,
+# for A/B measurement and for bisecting regressions.
+_DISABLE_PAGED_DECODE_HP: bool = (
+    os.environ.get("MSLK_DISABLE_PAGED_DECODE_HP", "0") != "0"
+)
+
+# The head-packed decode kernel maps the MFMA M-axis to (query-token, head) pairs,
+# so it needs `ratio` to divide MFMA_M and `ratio * Sq` to fit the M-tile budget.
+# Mirrors MFMA_M / MAX_M_TILES_BY_HEAD_DIM in decode/pa_decode_gfx950.py.
+_HP_MFMA_M = 16
+
+# One CTA is one wave here, so CTA count is the wave count. Below this the kernel
+# cannot hide memory latency: more M-tiles cost occupancy (9 waves/SIMD at 1 tile
+# down to 2 at 8), and with too few CTAs there is nothing else resident to cover
+# the stall. Measured on a deeply-tiled block: 1.0 CTA/CU ran 0.74x the path it
+# replaced, while every shape at >= 4.0 CTA/CU won (1.27x-3.23x).
+_HP_MIN_CTAS_PER_CU = 2
+
+# Tile count at which the occupancy cost becomes worth guarding. Measured
+# waves/SIMD at the smaller head dim: 9 at one tile, 6 at two, then 4 and below.
+# Shallow tiling keeps enough waves resident to hide latency on its own, and
+# short query blocks were measured winning even at a single request (1.45x), so
+# the floor must not reject them.
+_HP_FLOOR_MIN_TILES = 3
+
+# Query groups to use when one pass would exceed the register budget. Measured
+# where a single pass would spill: G=2 is 1.92x-1.97x over single-pass, G=4 is
+# slower than G=2 in 9 of 10 shapes (the extra launches cost more than the
+# occupancy they buy), so there is no reason to go beyond 2.
+_HP_QUERY_GROUPS = 2
+
+# Kill-switch for query grouping, mirroring MSLK_DISABLE_PAGED_DECODE_HP. With
+# this set, shapes that only fit via grouping decline to the dualwave path as
+# they did before.
+_DISABLE_PAGED_QGROUPS: bool = os.environ.get("MSLK_DISABLE_PAGED_QGROUPS", "0") != "0"
+
+
+def _hp_decode_ok(
+    num_heads: int,
+    num_kv_heads: int,
+    seqlen_q: int,
+    head_dim: int,
+    num_batches: int,
+    max_kv_pages: int,
+    device,
+) -> int:
+    """How should this shape run on the head-packed decode kernel?
+
+    Returns the number of query groups to split the block into, or 0 to decline.
+    1 is the ordinary single pass.
+
+    Three derived gates -- no tuned table:
+
+    1. **Register budget.** `ratio * Sq` pairs must fit in `MFMA_M` slots across
+       at most `max_m_tiles(head_dim)` tiles, the measured point before the
+       compiler spills.
+    2. **Query grouping.** A block too deep for that budget can instead be run as
+       `_HP_QUERY_GROUPS` shallower passes (see `query_group_seqlen`). Costs one
+       extra KV pass per group but avoids the spill, measured 1.5x-2.0x where a
+       single pass would spill. Only used to rescue a shape the budget would
+       reject: where single-pass already fits, it was inside run-to-run noise
+       (1.03x-1.28x) and is not worth the extra traffic.
+    3. **Parallelism floor.** The resulting CTA count must reach
+       `_HP_MIN_CTAS_PER_CU * CUs`. More tiles buy fewer KV passes but cost
+       occupancy, and that trade only pays when enough CTAs are resident.
+    """
+    from .decode.pa_decode_dense import auto_split_k_hp
+    from .decode.pa_decode_gfx950 import max_m_tiles
+
+    if _DISABLE_PAGED_QGROUPS:
+        groups_allowed = 1
+    else:
+        groups_allowed = _HP_QUERY_GROUPS
+
+    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        return 0
+    ratio = num_heads // num_kv_heads
+    if not (1 <= ratio <= _HP_MFMA_M) or _HP_MFMA_M % ratio != 0:
+        return 0
+    t_pack = _HP_MFMA_M // ratio  # query tokens per M-tile
+    budget = t_pack * max_m_tiles(head_dim)
+
+    groups = 1
+    if seqlen_q > budget:
+        # Too deep for one pass: can grouping bring it under the budget?
+        if (
+            groups_allowed > 1
+            and seqlen_q % groups_allowed == 0
+            and seqlen_q // groups_allowed <= budget
+        ):
+            groups = groups_allowed
+        else:
+            return 0
+    if seqlen_q < 1:
+        return 0
+
+    # Only deep tiling trades enough occupancy away to need the floor; shallow
+    # tiling still leaves 6+ waves/SIMD resident. Grouping makes each pass
+    # shallower, so the depth that matters is the per-group one.
+    tiles = -(-(seqlen_q // groups) // t_pack)
+    if tiles < _HP_FLOOR_MIN_TILES:
+        return groups
+    num_cu = _dense_light_cu(device)
+    split_k = auto_split_k_hp(
+        num_batches, 1, num_heads, num_kv_heads, max_kv_pages * _PAGED_PAGE_SIZE
+    )
+    ctas = num_batches * num_kv_heads * split_k
+    return groups if ctas >= _HP_MIN_CTAS_PER_CU * num_cu else 0
+
+
 def _flydsl_flash_attn_paged(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -748,10 +864,17 @@ def _flydsl_flash_attn_paged(
             raise ValueError(
                 f"flydsl_flash_attn_func: vectorized paged K/V must be 5D, got K{k.dim()}D V{v.dim()}D"
             )
-    elif k.dim() != 4:
-        raise ValueError(
-            f"flydsl_flash_attn_func: linear paged K/V must be 4D [NumBlocks,PageSize,Hkv,D], got {k.dim()}D"
-        )
+    else:
+        if k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                "flydsl_flash_attn_func: linear paged K/V must both be 4D "
+                f"[NumBlocks,PageSize,Hkv,D], got K{k.dim()}D V{v.dim()}D"
+            )
+        if k.shape != v.shape:
+            raise ValueError(
+                "flydsl_flash_attn_func: linear paged K/V must have matching "
+                f"shapes, got K{tuple(k.shape)} V{tuple(v.shape)}"
+            )
 
     varlen = cu_seqlens_q is not None
     # Dense paged callers hand us a per-request `seqlen_k` but the launch only
@@ -812,6 +935,13 @@ def _flydsl_flash_attn_paged(
             )
 
     # ── GQA head packing ────────────────────────────────────────────────────
+    if B == 0:
+        empty_out = torch.empty_like(q) if out is None else out
+        if return_lse:
+            empty_lse = torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
+            return empty_out, empty_lse
+        return empty_out
+
     # The grid is one workgroup per (request, QUERY head), so the group_size
     # query heads sharing a KV head each stream that head's entire KV range
     # independently. Measured on GQA 32x4: 7.3 TB/s of issued loads for
@@ -966,6 +1096,16 @@ def _flydsl_flash_attn_paged(
             "flydsl_flash_attn_func: max_seqlen_kv must be between 0 and "
             f"block-table capacity {block_table_capacity}; got {skv}"
         )
+    with torch.cuda.device(q.device.index):
+        with torch.cuda.stream(launch_stream):
+            block_table_2d_i32 = block_table.to(torch.int32).contiguous()
+            bounded_seqlen_k = None
+            if seqlen_k is not None:
+                bounded_seqlen_k, _ = _normalize_paged_lengths(
+                    seqlen_k,
+                    launch_kv_bound=skv,
+                    block_table_capacity=block_table_capacity,
+                )
     _arch = _gpu_arch(q.device)
     _gappy = kv_seqstart is not None
     _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
@@ -1024,6 +1164,49 @@ def _flydsl_flash_attn_paged(
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
     max_kv_pages = (skv + page_size - 1) // page_size
+
+    # The dualwave kernel maps the MFMA M-axis to query rows. The decode kernel
+    # instead packs (query-token, head) pairs onto M for short query blocks.
+    _hp_groups = 0
+    if (
+        not _DISABLE_PAGED_DECODE_HP
+        and not _paged_window
+        and (causal or Sq == 1)
+        # Generic GQA packing removes the same fan-out and takes precedence.
+        and not _gqa_packed
+        and not varlen
+        and kv_seqstart is None
+        and not return_lse
+        and not vectorized
+        and D in (64, 128)
+        and dtype_str in ("bf16", "f16")
+        and page_size % _PAGED_DECODE_TILE_N == 0
+        and _arch.startswith("gfx950")
+    ):
+        _hp_groups = _hp_decode_ok(H, num_kv_heads, Sq, D, B, max_kv_pages, q.device)
+    if _hp_groups:
+        from .decode.pa_decode_dense import pa_decode_paged_launch
+
+        with torch.cuda.device(q.device.index):
+            with torch.cuda.stream(launch_stream):
+                hp_out = pa_decode_paged_launch(
+                    q.view(B, Sq, 1, H, D),
+                    k,
+                    v,
+                    block_table_2d_i32,
+                    bounded_seqlen_k,
+                    float(sm_scale) if sm_scale is not None else float(D**-0.5),
+                    page_size=page_size,
+                    max_seqlen_kv=skv,
+                    split_k=(0 if requested_num_kv_splits == 0 else int(num_kv_splits)),
+                    output_dtype=q.dtype,
+                    query_groups=_hp_groups,
+                ).view(B, Sq, H, D)
+                if out is not None:
+                    out.copy_(hp_out)
+                    return out
+                return hp_out
+
     # Split-K (paged, dense only): split the KV dimension across
     # grid_z = B*num_kv_splits workgroups + a combine pass. Fills the GPU for
     # low-occupancy shapes (small B / few heads), where single-split paged
@@ -1058,14 +1241,7 @@ def _flydsl_flash_attn_paged(
     with torch.cuda.device(q.device.index):
         with torch.cuda.stream(launch_stream):
             # Flatten so the kernel's row-major index addresses the table correctly.
-            block_table_i32 = block_table.to(torch.int32).contiguous().reshape(-1)
-            bounded_seqlen_k = None
-            if seqlen_k is not None:
-                bounded_seqlen_k, _ = _normalize_paged_lengths(
-                    seqlen_k,
-                    launch_kv_bound=skv,
-                    block_table_capacity=block_table_capacity,
-                )
+            block_table_i32 = block_table_2d_i32.reshape(-1)
             bounded_cu_seqlens_kv = None
             bounded_kv_seqstart = None
             if cu_seqlens_kv is not None:
