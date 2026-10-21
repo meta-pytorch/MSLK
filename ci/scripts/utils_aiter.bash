@@ -51,26 +51,21 @@ install_aiter_pip () {
   # aiter is optional, and comes from a server outside PyPI, so failing to
   # install or import it does not fail the job: it continues without aiter, and
   # the tests of MSLK's aiter paths skip. The warning shows on the run summary.
-  local skip_note="continuing without aiter, so tests of MSLK's aiter paths will skip"
+  __continue_without_aiter () {
+    echo "::warning::$1; continuing without aiter, so tests of MSLK's aiter paths will skip."
+    # Leave no half-installed aiter behind; a no-op when none was installed.
+    # shellcheck disable=SC2086
+    conda run ${env_prefix} python -m pip uninstall -y amd-aiter
+  }
 
   # The pin must stay exact: these builds are versioned 0.1.1.dev1+g<sha>, which
   # sorts below older aiter builds in the same folder, so a looser requirement
-  # resolves to the wrong build.
-  echo "[INSTALL] Installing amd-aiter===${aiter_version} from ${AITER_WHEELS_URL} ..."
+  # resolves to the wrong build. (== is exact for a version with a local label.)
+  echo "[INSTALL] Installing amd-aiter==${aiter_version} from ${AITER_WHEELS_URL} ..."
   # shellcheck disable=SC2086
-  if ! (exec_with_retries 3 conda run --no-capture-output ${env_prefix} python -m pip install "amd-aiter===${aiter_version}" --find-links "${AITER_WHEELS_URL}"); then
-    echo "::warning::Could not install aiter ${aiter_version} from ${AITER_WHEELS_URL}; ${skip_note}."
-    return 0
-  fi
-
-  # The first import compiles aiter's core module with hipcc (once per
-  # installation), so this also checks that the environment can do that.
-  # shellcheck disable=SC2086
-  if ! (test_python_import_package "${env_name}" aiter); then
-    echo "::warning::aiter ${aiter_version} was installed but cannot be imported; uninstalling it and ${skip_note}."
-    # shellcheck disable=SC2086
-    conda run ${env_prefix} python -m pip uninstall -y amd-aiter
-    return 0
+  if ! (exec_with_retries 3 conda run --no-capture-output ${env_prefix} python -m pip install "amd-aiter==${aiter_version}" --find-links "${AITER_WHEELS_URL}"); then
+    __continue_without_aiter "Could not install aiter ${aiter_version} from ${AITER_WHEELS_URL}"
+    return
   fi
 
   # aiter pins FlyDSL exactly. If that is not ci/flydsl_version.txt, pip has
@@ -84,6 +79,14 @@ install_aiter_pip () {
     echo "[CHECK] aiter ${aiter_version} requires a different FlyDSL than ci/flydsl_version.txt (${flydsl_version}); pip installed flydsl ${installed_flydsl}."
     echo "[CHECK] Set ci/flydsl_version.txt to the FlyDSL version this aiter build requires."
     return 1
+  fi
+
+  # The first import compiles aiter's core module with hipcc (once per
+  # installation), so this also checks that the environment can do that.
+  # shellcheck disable=SC2086
+  if ! (test_python_import_package "${env_name}" aiter); then
+    __continue_without_aiter "aiter ${aiter_version} was installed but cannot be imported"
+    return
   fi
 
   echo "[CHECK] Printing out the aiter and flydsl versions ..."
