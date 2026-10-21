@@ -22,20 +22,25 @@ pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm
 
 ### Optional: aiter on ROCm
 
-On ROCm, MSLK can serve some ops from [aiter](https://github.com/ROCm/aiter)
-kernels where they are faster. aiter is optional: without it, every op uses
-MSLK's own kernels. MSLK is tested against one aiter build, which aiter
-publishes outside PyPI, so add its download location when installing the
-`aiter` extra:
+Installing [aiter](https://github.com/ROCm/aiter), AMD's kernel library,
+alongside MSLK on ROCm gives better performance on some ops: for the shapes
+where an aiter kernel is measurably faster than MSLK's own, MSLK serves those
+calls from aiter. The choice is made per op and per shape from tuning tables
+shipped with MSLK, and does not change any op's interface or results. aiter is
+optional: without it, every op uses MSLK's own kernels.
+
+MSLK is tested against one aiter build, which aiter publishes outside PyPI, so
+add its download location when installing the `aiter` extra:
 
 ```bash
 pip install --pre "mslk[aiter]" --index-url https://download.pytorch.org/whl/nightly/rocm7.1/ --extra-index-url https://pypi.org/simple \
   --find-links https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/
 ```
 
-aiter compiles its kernels on first use, so the machine needs a ROCm installation
-with `hipcc`; the first `import aiter` takes some seconds while it builds its core
-module.
+The machine needs a ROCm installation with `hipcc`: the first `import aiter`
+builds aiter's core module (once, taking some seconds). aiter kernels that MSLK
+does not ship precompiled in its bundled kernel cache are compiled the first
+time they are used, and cached.
 
 ## Release Compatibility Table
 

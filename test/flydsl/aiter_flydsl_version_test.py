@@ -16,8 +16,9 @@ pip does not enforce this when the two are installed one after the other: the
 later install replaces FlyDSL and only warns.
 
 Everything is read from installed package metadata, so this checks what was
-installed rather than the files in the repository. It skips without aiter, and
-where MSLK was not installed from a package with metadata.
+installed rather than the files in the repository. It skips without aiter. With
+aiter installed, MSLK must be found as a package too; it may be named other
+than ``mslk`` (CI builds e.g. ``mslk-rocm-nightly``).
 """
 
 import unittest
@@ -26,6 +27,21 @@ from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from packaging.version import Version
+
+
+def _mslk_distributions() -> list[str]:
+    """Names of the installed packages providing ``mslk``.
+
+    Looked up by the import name, since the package name varies with how MSLK
+    was built (``mslk``, ``mslk-rocm-nightly``, ...). Editable installs are not
+    always mapped to the import name, so packages named ``mslk*`` count too.
+    """
+    names = set(metadata.packages_distributions().get("mslk", []))
+    for dist in metadata.distributions():
+        name = dist.metadata["Name"] or ""
+        if name.lower().replace("_", "-").split("-")[0] == "mslk":
+            names.add(name)
+    return sorted(names)
 
 
 def _pinned_flydsl(dist: str) -> Optional["Version"]:
@@ -54,25 +70,29 @@ def _pinned_flydsl(dist: str) -> Optional["Version"]:
 
 class AiterFlyDSLVersionTest(unittest.TestCase):
     aiter_flydsl: "Version"
+    mslk_dists: list[str]
 
     def setUp(self) -> None:
-        for dist in ("amd-aiter", "mslk"):
-            try:
-                metadata.version(dist)
-            except metadata.PackageNotFoundError:
-                self.skipTest(f"{dist} is not installed as a package")
+        try:
+            metadata.version("amd-aiter")
+        except metadata.PackageNotFoundError:
+            self.skipTest("aiter is not installed")
+        self.mslk_dists = _mslk_distributions()
+        if not self.mslk_dists:
+            self.fail("aiter is installed, but no installed package provides mslk")
         pinned = _pinned_flydsl("amd-aiter")
         if pinned is None:
             self.fail("aiter declares no FlyDSL requirement")
         self.aiter_flydsl = pinned
 
     def test_mslk_pins_the_flydsl_aiter_requires(self) -> None:
-        self.assertEqual(
-            _pinned_flydsl("mslk"),
-            self.aiter_flydsl,
-            "ci/flydsl_version.txt must match the FlyDSL version required by the "
-            "aiter build pinned in mslk/aiter/aiter_version.txt",
-        )
+        for dist in self.mslk_dists:
+            self.assertEqual(
+                _pinned_flydsl(dist),
+                self.aiter_flydsl,
+                f"{dist}: ci/flydsl_version.txt must match the FlyDSL version "
+                "required by the aiter build pinned in mslk/aiter/aiter_version.txt",
+            )
 
     def test_installed_flydsl_is_the_one_aiter_requires(self) -> None:
         from packaging.version import Version

@@ -48,19 +48,43 @@ install_aiter_pip () {
   # shellcheck disable=SC2155
   local env_prefix=$(env_name_or_prefix "${env_name}")
 
+  # aiter is optional, and comes from a server outside PyPI, so failing to
+  # install or import it does not fail the job: it continues without aiter, and
+  # the tests of MSLK's aiter paths skip. The warning shows on the run summary.
+  local skip_note="continuing without aiter, so tests of MSLK's aiter paths will skip"
+
   # The pin must stay exact: these builds are versioned 0.1.1.dev1+g<sha>, which
   # sorts below older aiter builds in the same folder, so a looser requirement
-  # resolves to the wrong build. aiter also pins FlyDSL exactly; if that differs
-  # from ci/flydsl_version.txt, pip replaces the FlyDSL installed earlier, and
-  # the FlyDSL version test fails.
-  echo "[INSTALL] Installing amd-aiter==${aiter_version} from ${AITER_WHEELS_URL} ..."
+  # resolves to the wrong build.
+  echo "[INSTALL] Installing amd-aiter===${aiter_version} from ${AITER_WHEELS_URL} ..."
   # shellcheck disable=SC2086
-  (exec_with_retries 3 conda run --no-capture-output ${env_prefix} python -m pip install "amd-aiter==${aiter_version}" --find-links "${AITER_WHEELS_URL}") || return 1
+  if ! (exec_with_retries 3 conda run --no-capture-output ${env_prefix} python -m pip install "amd-aiter===${aiter_version}" --find-links "${AITER_WHEELS_URL}"); then
+    echo "::warning::Could not install aiter ${aiter_version} from ${AITER_WHEELS_URL}; ${skip_note}."
+    return 0
+  fi
 
   # The first import compiles aiter's core module with hipcc (once per
   # installation), so this also checks that the environment can do that.
   # shellcheck disable=SC2086
-  (test_python_import_package "${env_name}" aiter) || return 1
+  if ! (test_python_import_package "${env_name}" aiter); then
+    echo "::warning::aiter ${aiter_version} was installed but cannot be imported; uninstalling it and ${skip_note}."
+    # shellcheck disable=SC2086
+    conda run ${env_prefix} python -m pip uninstall -y amd-aiter
+    return 0
+  fi
+
+  # aiter pins FlyDSL exactly. If that is not ci/flydsl_version.txt, pip has
+  # just replaced the FlyDSL installed earlier. That is an error in this
+  # repository, not in the server, so fail now rather than in the tests.
+  # shellcheck disable=SC2155
+  local flydsl_version=$(tr -d '[:space:]' < "$( dirname -- "$BASH_SOURCE"; )/../flydsl_version.txt")
+  # shellcheck disable=SC2086,SC2155
+  local installed_flydsl=$(conda run ${env_prefix} python -c "from importlib.metadata import version; print(version('flydsl'))")
+  if [ "${installed_flydsl}" != "${flydsl_version}" ]; then
+    echo "[CHECK] aiter ${aiter_version} requires a different FlyDSL than ci/flydsl_version.txt (${flydsl_version}); pip installed flydsl ${installed_flydsl}."
+    echo "[CHECK] Set ci/flydsl_version.txt to the FlyDSL version this aiter build requires."
+    return 1
+  fi
 
   echo "[CHECK] Printing out the aiter and flydsl versions ..."
   # shellcheck disable=SC2086,SC2155
