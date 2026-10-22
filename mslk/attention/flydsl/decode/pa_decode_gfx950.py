@@ -241,6 +241,7 @@ def compile_pa_decode_gfx950(
             # query group whose shifted length went negative, attends to nothing
             # rather than walking stale block-table entries up to kv_max.
             t_full = arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0))
+            t_full = arith.select(t_full < kv_max, t_full, kv_max)
         else:
             t_full = arith.select(seq_len > fx.Int32(0), seq_len, kv_max)
         if const_expr(_SPLIT):

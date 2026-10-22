@@ -2533,6 +2533,12 @@ class GenericFlashAttnContext:
                 )
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v
+        if const_expr(traits.PAGED and not traits.GAPPY_KV):
+            # Clamp the caller's paged length to [0, seq_len_kv].
+            n = fx.Int32(self.seqlen_kv_b)
+            bound = fx.Int32(self.seq_len_kv_v)
+            n = (n > fx.Int32(0)).select(n, fx.Int32(0))
+            self.seqlen_kv_b = fx.Index((n < bound).select(n, bound))
 
     def init_kv_batch_pointers(self):
         # Dense/varlen fold batch into raw K/V pointers; paged adds page_id per tile.
@@ -4128,8 +4134,9 @@ class GenericStoreHelper:
 
         inv_l_rcp = rocdl.rcp(T.f32, l_final)
         # Fully-masked row has l_final == 0 -> rcp*0 = NaN; emit 0 instead (matches
-        # CK). Rows can be fully masked under causal or an all -inf bias row.
-        if const_expr(traits.CAUSAL or traits.HAS_BIAS):
+        # CK). Rows can be fully masked under causal, an all -inf bias row, or an
+        # empty paged request.
+        if const_expr(traits.CAUSAL or traits.HAS_BIAS or traits.PAGED):
             inv_l = (fx.Float32(l_final) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         else:
             inv_l = inv_l_rcp
@@ -6446,7 +6453,14 @@ class DualwaveSplitKCombineContext:
         self.lane = self.tid % fx.Index(64)
         if combine_split_groups(traits.HEAD_DIM) > 1:
             self.sgrp = self.lane // fx.Index(combine_lanes_per_row)
-            self.row = self.blk * combine_rows_per_block + self.tid // fx.Index(64)
+            # Wave-uniform row keeps the per-batch descriptors scalar (no waterfall).
+            wave = rocdl.readfirstlane(
+                T.i32,
+                arith.divsi(
+                    as_mlir_value(fx.Int32(self.tid)), as_mlir_value(fx.Int32(64))
+                ),
+            )
+            self.row = self.blk * combine_rows_per_block + fx.Index(wave)
         else:
             # No split parallelism available for this head dim; every lane walks
             # all splits, as before, and rows pack by lanes_per_row.

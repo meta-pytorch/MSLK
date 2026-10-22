@@ -60,9 +60,12 @@ def _run(q, k, v, block_table, seqlen_k, num_kv_splits):
     )
 
 
-def _run_single_pass(*args):
-    """Reference with the public split count pinned to one."""
-    return _run(*args, num_kv_splits=1)
+def _run_single_pass(monkeypatch, *args):
+    """Reference with auto-sizing pinned to one split (1 alone auto-sizes)."""
+    with monkeypatch.context() as m:
+        m.setattr(fai, "_paged_num_kv_splits", lambda *a, **kw: 1)
+        m.setattr(fai, "_paged_window_num_kv_splits", lambda *a, **kw: 1)
+        return _run(*args, num_kv_splits=1)
 
 
 def _windowed_reference(q, k, v, left, right, num_kv_heads):
@@ -164,6 +167,18 @@ def test_single_split_gqa_packed_matches_reference(ctx, Sq, D):
     torch.testing.assert_close(got[0].float(), ref[0], atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("num_kv_splits", [0, 1])
+def test_default_split_counts_are_auto_sized(monkeypatch, num_kv_splits):
+    """Both 0 and the historical default 1 reach the paged split sizing."""
+    seen = []
+    real = fai._paged_num_kv_splits
+    monkeypatch.setattr(
+        fai, "_paged_num_kv_splits", lambda *a: (seen.append(real(*a)), seen[-1])[1]
+    )
+    _run(*_paged_inputs(1, 1, 32768, 128), num_kv_splits)
+    assert len(seen) == 1 and seen[0] > 1
+
+
 def test_auto_split_stride_packed_gqa_matches_single_pass_and_reference(monkeypatch):
     batch, seqlen_q, ctx, head_dim = 1, 64, 4096, 64
     q, k, v, block_table, seqlen_k = _paged_inputs(batch, seqlen_q, ctx, head_dim)
@@ -196,7 +211,7 @@ def test_auto_split_stride_packed_gqa_matches_single_pass_and_reference(monkeypa
         num_kv_splits=0,
         out=out,
     )
-    single_pass = _run_single_pass(q, k, v, block_table, seqlen_k)
+    single_pass = _run_single_pass(monkeypatch, q, k, v, block_table, seqlen_k)
     reference = _paged_reference(q, k, v, block_table, seqlen_k, causal=True)
 
     assert len(auto_selection_calls) == 1
@@ -487,6 +502,68 @@ def test_explicit_max_seqlen_kv_bounds_each_request(causal, Sq):
     )
     bounded = torch.full_like(seqlen_k, bound)
     ref = _paged_reference(q, k, v, block_table, bounded, causal)
+    torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "route,Sq,varlen,causal",
+    [
+        ("generic", 4, False, True),
+        ("generic", 16, True, True),
+        ("generic", 1, False, False),
+        ("head_packed", 4, False, True),
+    ],
+)
+@pytest.mark.parametrize("num_kv_splits", [0, 1, 4])
+def test_int32_lengths_are_bounded_in_kernel(
+    monkeypatch, route, Sq, varlen, causal, num_kv_splits
+):
+    """Kernels clamp raw int32 lengths and write empty requests as 0, not NaN."""
+    if route == "head_packed":
+        calls = _count_hp_calls(monkeypatch)
+    else:
+        monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
+        calls = []
+        real = fai._build_paged_light
+        monkeypatch.setattr(
+            fai, "_build_paged_light", lambda **kw: (calls.append(kw), real(**kw))[1]
+        )
+    ctx, D = 512, 64
+    bound = ctx - PAGE
+    q, k, v, block_table, _ = _paged_inputs(4, Sq, ctx, D)
+    seqlen_k = torch.tensor([-1, 2**30, 0, 100], device="cuda", dtype=torch.int32)
+    bounded = torch.tensor([0, bound, 0, 100], device="cuda", dtype=torch.int32)
+    kw = dict(
+        causal=causal,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=num_kv_splits,
+        max_seqlen_kv=bound,
+    )
+    if varlen:
+        q_packed = q.reshape(-1, H, D)
+        cu_q = torch.arange(0, (4 + 1) * Sq, Sq, device="cuda", dtype=torch.int32)
+        cu_kv = torch.nn.functional.pad(seqlen_k.clamp(min=0).cumsum(0), (1, 0))
+        got = flydsl_flash_attn_func(
+            q_packed,
+            k,
+            v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv.to(torch.int32),
+            max_seqlen_q=Sq,
+            cross_seqlen=True,
+            **kw,
+        )
+        ref = _paged_varlen_reference(
+            q_packed, cu_q, k, v, block_table, bounded, causal=causal
+        )
+    else:
+        got = flydsl_flash_attn_func(q, k, v, **kw)
+        ref = _paged_reference(q, k, v, block_table, bounded, causal=causal)
+    assert len(calls) == 1
+    assert not got.isnan().any()
     torch.testing.assert_close(got.float(), ref, atol=2e-2, rtol=2e-2)
 
 
@@ -948,6 +1025,30 @@ def test_paged_window_matches_reference(num_kv_splits, seqlen_q):
     torch.testing.assert_close(got[0].float(), reference, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("window", [-1, 2047])
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_default_split_count_runs_past_one_block_table_window(window, seqlen_q):
+    """``num_kv_splits=1`` past one split's block-table window is auto-sized."""
+    ctx, head_dim = 262144, 64
+    assert ctx // PAGE > fai._PAGED_BT_LDS_SIZE
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, seqlen_q, ctx, head_dim)
+    got = flydsl_flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        num_kv_heads=HKV,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        kv_cache_layout="linear",
+        num_kv_splits=1,
+        max_seqlen_kv=ctx,
+        window_left=window,
+    )
+    reference = _paged_window_reference(q, k, v, ctx, ctx if window < 0 else window)
+    torch.testing.assert_close(got[0].float(), reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("seqlen_q", [1, 16])
 def test_paged_window_rejects_noncausal(monkeypatch, seqlen_q):
     monkeypatch.setattr(
@@ -1107,7 +1208,7 @@ def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
 
     args = _paged_inputs(2, 1, 32768, 64)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
-    ref = _run(*args, 1)
+    ref = _run_single_pass(monkeypatch, *args)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
     assert got.shape == ref.shape
@@ -1238,7 +1339,7 @@ def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
 
     args = _paged_inputs(2, Sq, 32768, D)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
-    ref = _run(*args, 1)
+    ref = _run_single_pass(monkeypatch, *args)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
     assert got.shape == ref.shape == (2, Sq, H, D)

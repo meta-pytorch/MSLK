@@ -487,9 +487,20 @@ _PAGED_GQA_PACK = os.getenv("FLYDSL_PAGED_GQA_PACK", "1") == "1"
 _PAGED_LIGHT_BLOCK_M = int(os.getenv("FLYDSL_PAGED_BLOCK_M", "64"))
 
 
+_UNIFORM_CU_SEQLENS: dict = {}
+
+
 def _uniform_cu_seqlens(count: int, step: int, device: str) -> torch.Tensor:
-    """Prefix sums for uniform sequence lengths on the current stream."""
-    return torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
+    """Cached prefix sums for uniform sequence lengths; not cached under capture."""
+    key = (count, step, device)
+    cached = _UNIFORM_CU_SEQLENS.get(key)
+    if cached is not None:
+        return cached
+    t = torch.arange(0, (count + 1) * step, step, dtype=torch.int32, device=device)
+    if not torch.cuda.is_current_stream_capturing():
+        torch.cuda.current_stream().synchronize()
+        _UNIFORM_CU_SEQLENS[key] = t
+    return t
 
 
 def _paged_kv_cumsum(seqlen_k: torch.Tensor) -> torch.Tensor:
@@ -497,6 +508,10 @@ def _paged_kv_cumsum(seqlen_k: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.pad(
         seqlen_k.to(torch.int32).cumsum(0, dtype=torch.int32), (1, 0)
     )
+
+
+def _is_i32_vector(t: torch.Tensor) -> bool:
+    return t.dtype == torch.int32 and t.is_contiguous()
 
 
 def _normalize_paged_lengths(
@@ -841,7 +856,7 @@ def _flydsl_flash_attn_paged(
     [NumBlocks, PageSize=64, NumKVHeads, HeadDim], vLLM lookup (block_table +
     seqlen_k), causal, D=64/128, dtype bf16/f16.
     - Dense 4D Q ``[B, Sq, H, D]``: split-K supported at any Sq. ``num_kv_splits=0``
-      selects a count from occupancy; ``1`` disables; ``>1`` forces.
+      and ``1`` auto-size the count; ``>1`` forces.
     - Varlen packed Q ``[total_q, H, D]`` (cu_seqlens_q given): paged K/V looked up
       per kv-tile via block_table; split-K not supported (matches dense varlen).
     """
@@ -1099,7 +1114,7 @@ def _flydsl_flash_attn_paged(
     with torch.cuda.device(q.device.index):
         with torch.cuda.stream(launch_stream):
             block_table_2d_i32 = block_table.to(torch.int32).contiguous()
-            bounded_seqlen_k = None
+            bounded_seqlen_k = seqlen_k
             if seqlen_k is not None:
                 bounded_seqlen_k, _ = _normalize_paged_lengths(
                     seqlen_k,
@@ -1125,6 +1140,10 @@ def _flydsl_flash_attn_paged(
             )
         )
     )
+    # 1 (the historical default) auto-sizes like 0 wherever split-K applies.
+    _auto_splits = requested_num_kv_splits == 0 or (
+        requested_num_kv_splits == 1 and _splitk_dtype_ok and not _gappy
+    )
 
     if varlen and not _varlen_uniform_q and requested_num_kv_splits > 1:
         raise NotImplementedError(
@@ -1132,7 +1151,7 @@ def _flydsl_flash_attn_paged(
         )
     if varlen and not _varlen_uniform_q:
         num_kv_splits = 1
-    elif _paged_light_ok and requested_num_kv_splits == 0:
+    elif _paged_light_ok and _auto_splits:
         if _paged_window:
             q_len = _gqa_qlen if _gqa_packed else Sq
             reach = min(skv, int(window_left) + q_len)
@@ -1198,7 +1217,7 @@ def _flydsl_flash_attn_paged(
                     float(sm_scale) if sm_scale is not None else float(D**-0.5),
                     page_size=page_size,
                     max_seqlen_kv=skv,
-                    split_k=(0 if requested_num_kv_splits == 0 else int(num_kv_splits)),
+                    split_k=(0 if _auto_splits else int(num_kv_splits)),
                     output_dtype=q.dtype,
                     query_groups=_hp_groups,
                 ).view(B, Sq, H, D)
@@ -1242,7 +1261,14 @@ def _flydsl_flash_attn_paged(
         with torch.cuda.stream(launch_stream):
             # Flatten so the kernel's row-major index addresses the table correctly.
             block_table_i32 = block_table_2d_i32.reshape(-1)
-            bounded_cu_seqlens_kv = None
+            _host_bounds = True
+            if _host_bounds and seqlen_k is not None and bounded_seqlen_k is seqlen_k:
+                bounded_seqlen_k, _ = _normalize_paged_lengths(
+                    seqlen_k,
+                    launch_kv_bound=skv,
+                    block_table_capacity=block_table_capacity,
+                )
+            bounded_cu_seqlens_kv = cu_seqlens_kv
             bounded_kv_seqstart = None
             if cu_seqlens_kv is not None:
                 bounded_cu_seqlens_kv, bounded_kv_seqstart = (
@@ -1330,7 +1356,7 @@ def _flydsl_flash_attn_paged(
                 kwargs["cu_seqlens_kv"] = bounded_cu_seqlens_kv
             if kv_seqstart is not None:
                 kwargs["kv_seqstart"] = bounded_kv_seqstart
-            if cross:
+            if cross or _paged_light_ok:
                 kwargs["seq_len_kv"] = skv
             lse = (
                 torch.empty((B, H, Sq), dtype=torch.float32, device=q.device)
@@ -1353,12 +1379,12 @@ def _flydsl_flash_attn_paged(
             exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
             if o_flat.data_ptr() != out.data_ptr():
                 out.copy_(o_flat.view_as(out))
-            if not varlen and bounded_seqlen_k is not None:
+            if _host_bounds and not varlen and bounded_seqlen_k is not None:
                 empty_kv = bounded_seqlen_k.eq(0)
                 out.masked_fill_(empty_kv.view(B, 1, 1, 1), 0)
                 if lse is not None:
                     lse.masked_fill_(empty_kv.view(B, 1, 1), -torch.inf)
-            elif varlen and bounded_cu_seqlens_kv is not None:
+            elif _host_bounds and varlen and bounded_cu_seqlens_kv is not None:
                 empty_kv = bounded_cu_seqlens_kv[1:].eq(bounded_cu_seqlens_kv[:-1])
                 q_lengths = output_cu_seqlens_q[1:] - output_cu_seqlens_q[:-1]
                 empty_q_rows = torch.repeat_interleave(
@@ -1542,8 +1568,8 @@ def flydsl_flash_attn_func(
         cross_seqlen: Whether seqlen_q and seqlen_kv differ. Required in varlen mode;
             dense mode infers it from ``q.shape[1] != k.shape[1]``.
         block_table / seqlen_k: vLLM-style 2D block table metadata.
-        num_kv_splits: For paged dense attention, 0 selects the split count
-            automatically; values >=1 request that exact count, and negative values
+        num_kv_splits: For paged dense attention, 0 and 1 select the split count
+            automatically; values >1 request that exact count, and negative values
             are invalid. Split-K requires gfx950, D=64/128, bf16/f16, and seq>=384.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
