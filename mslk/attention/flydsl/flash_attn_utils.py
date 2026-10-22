@@ -28,18 +28,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, vector
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    math as fmath,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, const_expr, gpu, math as fmath, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.utils.smem_allocator import SmemPtr
+from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
 
@@ -592,7 +585,7 @@ def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -607,7 +600,7 @@ def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -898,7 +891,7 @@ def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
     """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
     if ASYNC_LDS:
         return rocdl.raw_ptr_buffer_load_async_lds(
-            rsrc, lds_ptr, size, voffset, soffset, offset, aux
+            rsrc, lds_ptr, size, voffset, soffset, offset, aux=aux
         )
     return rocdl.raw_ptr_buffer_load_lds(
         rsrc, lds_ptr, size, voffset, soffset, offset, aux
@@ -3202,7 +3195,7 @@ class GenericKvGmemToLdsLoader:
         )
         self._v_dma_sz = fx.Int32(16)
         self._v_dma_z = fx.Int32(0)
-        self._v_dma_aux = fx.Int32(1)
+        self._v_dma_aux = 1
         self._v_dma_no = ctx.lane // fx.Index(8)
         self._v_dma_dloc = ctx.lane % fx.Index(8)
 
@@ -3261,7 +3254,7 @@ class GenericKvGmemToLdsLoader:
         self._dma_size = fx.Int32(self.DMA_BYTES)
         self._dma_soff = fx.Int32(0)
         self._dma_off = fx.Int32(0)
-        self._dma_aux = fx.Int32(1)
+        self._dma_aux = 1
         self.k_rsrc = buffer_ops.create_buffer_resource(
             ctx.K,
             max_size=False,
@@ -5891,18 +5884,21 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
 
     def _mfma_acc_fp8_wide(self, a_i32x8, b_i32x8, c_v16):
         # Wide fp8 QK: mfma_scale (32x32x64) with unit E8M0 scales, i32x8 operands.
+        # Operands: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b.
         return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
             self.v16f32_type,
-            as_mlir_value(a_i32x8),
-            as_mlir_value(b_i32x8),
-            as_mlir_value(c_v16),
-            0,
-            0,
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-        ).result
+            [
+                as_mlir_value(a_i32x8),
+                as_mlir_value(b_i32x8),
+                as_mlir_value(c_v16),
+                0,
+                0,
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+            ],
+        )
 
     def _mfma_acc_bf16(self, a_v8, b_v8, c_v16):
         return fly.mma_atom_call_ssa(
@@ -6830,11 +6826,12 @@ def _stagger_extra_barrier_if_one(stagger_i32):
 
 def _debug_atomic_inc_lazy_count(byte_offset, debug_counts_rsrc):
     rocdl.raw_buffer_atomic_fadd(
+        T.f32,
         as_mlir_value(fx.Float32(1.0)),
         debug_counts_rsrc,
         as_mlir_value(fx.Int32(byte_offset)),
         as_mlir_value(fx.Int32(0)),
-        as_mlir_value(fx.Int32(0)),
+        aux=ir.IntegerAttr.get(T.i32, 0),
     )
 
 

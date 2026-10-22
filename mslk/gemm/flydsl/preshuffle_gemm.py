@@ -12,6 +12,7 @@ Provides single and batched FP8 preshuffle GEMM via FlyDSL. Also registers
 as the ROCm implementation of the ``mslk`` rowwise FP8 ops on gfx950.
 """
 
+import weakref
 from dataclasses import dataclass
 from math import prod
 from typing import Optional
@@ -419,15 +420,28 @@ if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
     from mslk.flydsl.common import is_flydsl_available
 
     if is_flydsl_available():
-        _preshuffle_cache: dict = {}
+        # Keyed by the weight tensor itself, not its address: a freed weight's
+        # address is handed to the next allocation of the same size, which
+        # would otherwise be served the old weight's preshuffle. The version
+        # counter catches in-place updates, and an entry is dropped once its
+        # weight is collected so the cache does not pin the copies.
+        _preshuffle_cache: dict[int, tuple[weakref.ref, int, Tensor]] = {}
+
+        def _evict(ref: weakref.ref, key: int) -> None:
+            entry = _preshuffle_cache.get(key)
+            if entry is not None and entry[0] is ref:
+                del _preshuffle_cache[key]
 
         def _get_preshuffled(WQ: Tensor) -> Tensor:
-            key = WQ.data_ptr()
-            cached = _preshuffle_cache.get(key)
-            if cached is not None and cached.shape == WQ.shape:
-                return cached
+            key = id(WQ)
+            entry = _preshuffle_cache.get(key)
+            if entry is not None:
+                ref, version, shuf = entry
+                if ref() is WQ and version == WQ._version and shuf.shape == WQ.shape:
+                    return shuf
             shuf = flydsl_preshuffle(WQ)
-            _preshuffle_cache[key] = shuf
+            ref = weakref.ref(WQ, lambda r, k=key: _evict(r, k))
+            _preshuffle_cache[key] = (ref, WQ._version, shuf)
             return shuf
 
         def _flydsl_rowwise_impl(
