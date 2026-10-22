@@ -25,9 +25,8 @@ pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/rocm
 Installing [aiter](https://github.com/ROCm/aiter), AMD's kernel library,
 alongside MSLK on ROCm gives better performance on some ops: for the shapes
 where an aiter kernel is measurably faster than MSLK's own, MSLK serves those
-calls from aiter. The choice is made per op and per shape from tuning tables
-shipped with MSLK, and does not change any op's interface or results. aiter is
-optional: without it, every op uses MSLK's own kernels.
+calls from aiter. aiter is optional: without it, every op uses MSLK's own
+kernels.
 
 MSLK is tested against one aiter build, which aiter publishes outside PyPI, so
 add its download location when installing the `aiter` extra:
