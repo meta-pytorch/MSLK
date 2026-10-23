@@ -50,11 +50,13 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, math as math_dialect, memref as memref_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops
+from mslk.flydsl.kernels.common.kernels_common import default_f8_type
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import swizzle_xor16
 
 # MFMA geometry: one issue is a 32x32 output tile contracting 64 of K.
@@ -271,7 +273,7 @@ def compile_groupwise_wide_gemm(
         # One arena: the A buffers, then the B buffers. Both operands are
         # row-major over K with the same stride, so one indexing helper serves
         # both.
-        lds_a = SmemPtr(base_ptr, lds_off, T.f8, shape=(lds_bytes,)).get()
+        lds_a = SmemPtr(base_ptr, lds_off, default_f8_type(), shape=(lds_bytes,)).get()
 
         def a_buf(slot):
             return slot * fx.Index(lds_a_elems)
@@ -366,7 +368,7 @@ def compile_groupwise_wide_gemm(
                         fx.Int32(byte_off),
                         fx.Int32(0),
                         fx.Int32(0),
-                        fx.Int32(1),
+                        1,
                     ),
                     _SCOPE_DMA,
                 )
@@ -407,18 +409,21 @@ def compile_groupwise_wide_gemm(
             # The scale operands are the neutral exponent, so the instruction's
             # own block scaling is the identity and the FP32 scales are folded in
             # afterwards instead.
+            # Operands: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b.
             return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
                 v_acc_ty,
-                _raw(a_op),
-                _raw(b_op),
-                _raw(c_in),
-                0,
-                0,
-                0,
-                _raw(fx.Int32(NEUTRAL_E8M0)),
-                0,
-                _raw(fx.Int32(NEUTRAL_E8M0)),
-            ).result
+                [
+                    _raw(a_op),
+                    _raw(b_op),
+                    _raw(c_in),
+                    0,
+                    0,
+                    0,
+                    _raw(fx.Int32(NEUTRAL_E8M0)),
+                    0,
+                    _raw(fx.Int32(NEUTRAL_E8M0)),
+                ],
+            )
 
         zero_acc = Vector.from_elements(
             [fx.Float32(0.0) for _ in range_constexpr(ACC_REGS)], fx.Float32
