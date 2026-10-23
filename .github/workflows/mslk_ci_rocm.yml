@@ -22,7 +22,11 @@ on:
       - 'ci/scripts/mslk_external_repos.bash'
       - 'ci/scripts/utils_rocm.bash'
       - 'ci/scripts/utils_flydsl.bash'
+      - 'ci/scripts/utils_aiter.bash'
       - 'setup.py'
+      # Pinned FlyDSL and aiter versions
+      - 'ci/flydsl_version.txt'
+      - 'mslk/aiter/**'
       # CMake ROCm/HIP configuration
       - 'cmake/Hip.cmake'
       - 'cmake/RocmSetup.cmake'
@@ -46,8 +50,15 @@ on:
       - 'mslk/gemm/flydsl/**'
       # Arbitrates which backend serves each GEMM op on ROCm
       - 'mslk/gemm/__init__.py'
+      - 'mslk/gemm/_meta.py'
+      # aiter backends, their tuning tables and tuning scripts
+      - 'mslk/gemm/aiter/**'
+      - 'mslk/gemm/dispatch/**'
+      - 'test/aiter/**'
+      - 'bench/aiter/**'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
+      - 'test/gemm/dispatch_test.py'
       # AMD/ROCm Triton GEMM kernels
       - 'mslk/gemm/triton/**'
       # HIP source files (AMD GPU kernels)
