@@ -40,9 +40,8 @@ from .flash_attn_utils import (
     combine_lanes_per_row,
     COMBINE_PREFETCH,
     combine_rows_per_block,
-    DualwaveSplitKCombineContext,
-    DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
+    GenericFusedSplitKCombine,
     GenericGemmHelper,
     GenericKvGmemToLdsLoader,
     GenericKvLdsToVgprLoader,
@@ -50,6 +49,7 @@ from .flash_attn_utils import (
     GenericQLoader,
     GenericSoftmaxHelper,
     GenericStoreHelper,
+    run_splitk_combine,
     scf_if_dispatch,
     wait_lds_copies,
 )
@@ -86,6 +86,11 @@ def build_flash_attn_func_module_primary(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    paged_kv_dma=False,
+    paged_k_prefetch=False,
+    high_concurrency=False,
+    fused_combine=False,
+    paged_pid_regs=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -235,10 +240,8 @@ def build_flash_attn_func_module_primary(
         raise NotImplementedError(
             f"generic paged kernel supports linear/vectorized kv_cache_layout, got {kv_cache_layout!r}"
         )
-    if paged and _validate_enable_dma:
-        raise NotImplementedError(
-            "generic paged kernel requires the non-DMA path (build with path_tag='N32')"
-        )
+    if paged and _validate_enable_dma and _validate_path == "N128":
+        raise NotImplementedError("generic paged kernel builds with path_tag='N32'")
 
     traits = _make_flash_attn_generic_traits(
         num_heads,
@@ -270,8 +273,21 @@ def build_flash_attn_func_module_primary(
         q_pack_qlen=q_pack_qlen,
         q_pack_group=q_pack_group,
         kv_lens=kv_lens,
+        paged_kv_dma=paged_kv_dma,
+        paged_k_prefetch=paged_k_prefetch,
+        high_concurrency=high_concurrency,
+        fused_combine=fused_combine,
+        paged_pid_regs=paged_pid_regs,
     )
-    _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
+    # Threads per combine block; a block is the unit of CU assignment, so this
+    # sets how many workgroups the combine launches. One wave per block spreads
+    # a given thread count over the most CUs. Wider blocks do not win it back:
+    # the combine is latency-bound on its walk over the splits, so its cost
+    # keeps falling with workgroups in flight even once the grid covers the
+    # device, leaving no shape-dependent crossover to size this by. Read here
+    # so the cache key sees it.
+    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "64"))
+    _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH, COMBINE_BLOCK)
 
     def _extract_seq_len(args, kwargs):
         """Return the launch-time seq_len as int, or None if not statically known."""
@@ -344,6 +360,9 @@ def build_flash_attn_func_module_primary(
         q_loader = GenericQLoader(ctx)
         store_helper = GenericStoreHelper(ctx)
 
+        ctx.pin_kernel_args(
+            Q, CuSeqQ, CuSeqKv, KvSeqStart, BlockTable, block_table_stride
+        )
         ctx.init_sequence_indices()
         ctx.init_lds_view()
         ctx.init_thread_mapping()
@@ -380,8 +399,11 @@ def build_flash_attn_func_module_primary(
         ctx.init_kv_bounds()
         kv_upper = ctx.kv_upper
         kv_lower = ctx.kv_lower
+        if const_expr(traits.PAGED_PID_REGS):
+            kv_gmem_to_lds.page_ids.preload(kv_lower)
 
-        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf)]
+        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
+        # (K vecs if pipelined), (page id if paged K prefetch)]
         _use_dma_dbuf = traits.ENABLE_DMA and not traits.ENABLE_PREFETCH_3BUF
         _pipe_k = (
             traits.ENABLE_GFX942_KV_GPFETCH
@@ -389,6 +411,9 @@ def build_flash_attn_func_module_primary(
             and not traits.ENABLE_PREFETCH_3BUF
             and traits.N_SUBTILES == 1
         )
+        _pipe_paged_k = traits.PAGED_K_PREFETCH
+        # 16-byte global loads per K tile (VEC_WIDTH bf16 / 8): the V wait's count.
+        _k_prefetch_inflight = traits.NUM_BATCHES_KV * (traits.VEC_WIDTH // 8)
         init_args = [ctx.c_neg_inf, ctx.c_zero_f]
         for _ in range_constexpr(traits.D_CHUNKS):
             init_args.append(ctx.c_zero_v16f32)
@@ -400,6 +425,32 @@ def build_flash_attn_func_module_primary(
             _k0_vecs = kv_gmem_to_lds.coop_load_k_global(kv_lower)
             for _kb in range_constexpr(traits.NUM_BATCHES_KV):
                 init_args.append(_k0_vecs[_kb])
+        if const_expr(_pipe_paged_k):
+            _k0_names = []
+            _k0_zeros = kv_gmem_to_lds.zero_k_global_vecs()
+            for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                _k0_names.append("_pk0_%d" % _kb)
+            _k0_names.append("_pk0_pid")
+            _k0_zeros.append(fx.Index(0))
+
+            def _load_first_k(_names, *_st):
+                _pid0 = kv_gmem_to_lds._tile_page_id(kv_lower)
+                _vecs0 = kv_gmem_to_lds.coop_load_k_global(kv_lower, pid=_pid0)
+                _out0 = []
+                for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                    _out0.append(_vecs0[_kb])
+                _out0.append(_pid0)
+                return _out0
+
+            _k0_state = scf_if_dispatch(
+                kv_lower < kv_upper,
+                _load_first_k,
+                state_names=tuple(_k0_names),
+                state_values=_k0_zeros,
+            )
+            for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                init_args.append(_k0_state[_kb])
+            init_args.append(_k0_state[traits.NUM_BATCHES_KV])
 
         loop_results = init_args
         for kv_block_start, inner_iter_args in range(
@@ -416,7 +467,12 @@ def build_flash_attn_func_module_primary(
                     inner_iter_args[2 + traits.D_CHUNKS + _kb]
                     for _kb in range_constexpr(traits.NUM_BATCHES_KV)
                 ]
-                if _pipe_k
+                if (_pipe_k or _pipe_paged_k)
+                else None
+            )
+            _carried_k_pid = (
+                inner_iter_args[2 + traits.D_CHUNKS + traits.NUM_BATCHES_KV]
+                if _pipe_paged_k
                 else None
             )
             preload_k_count = (
@@ -444,6 +500,8 @@ def build_flash_attn_func_module_primary(
 
             for kv_sub in range_constexpr(traits.N_SUBTILES):
                 kv_start = kv_block_start + kv_sub * traits.BLOCK_N
+                # The tile's page id, looked up once and shared by its K and V loads.
+                _tile_pid = None
 
                 if const_expr(traits.ENABLE_PREFETCH_3BUF):
                     k_slot = (
@@ -481,6 +539,11 @@ def build_flash_attn_func_module_primary(
                         rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
                         _next_kv_start = kv_block_start + fx.Index(traits.BLOCK_N_OUT)
                         _next_k_vecs = kv_gmem_to_lds.coop_load_k_global(_next_kv_start)
+                    elif const_expr(_pipe_paged_k):
+                        _waitcnt_vm_n(0)
+                        kv_gmem_to_lds.coop_store_k_lds(_carried_k_vecs, k_slot)
+                        rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
+                        _tile_pid = _carried_k_pid
                     elif const_expr(traits.ENABLE_GFX942_KV_GPFETCH):
                         _kv_k_vecs = kv_gmem_to_lds.coop_load_k_global(kv_start)
                         kv_gmem_to_lds.coop_store_k_lds(_kv_k_vecs, k_slot)
@@ -489,10 +552,29 @@ def build_flash_attn_func_module_primary(
                         kv_gmem_to_lds.coop_dma_k(kv_start, k_slot)
                         rocdl.s_waitcnt(0)
                     else:
-                        kv_gmem_to_lds.coop_load_k(kv_start, k_slot)
+                        if const_expr(traits.PAGED):
+                            _tile_pid = kv_gmem_to_lds._tile_page_id(kv_start)
+                        kv_gmem_to_lds.coop_load_k(kv_start, k_slot, pid=_tile_pid)
                     gpu.barrier()
                 if const_expr(not _use_dma_dbuf):
                     k_base = kv_gmem_to_lds.k_buf_base(k_slot)
+
+                if const_expr(_pipe_paged_k):
+                    _next_kv = kv_start + fx.Index(traits.BLOCK_N_OUT)
+                    _has_next = _next_kv < kv_upper
+
+                    def _issue_next_pid(_names, *_st):
+                        return [kv_gmem_to_lds.page_ids.issue_page_id(_next_kv)]
+
+                    _next_pid_raw = scf_if_dispatch(
+                        _has_next,
+                        _issue_next_pid,
+                        state_names=("_npid",),
+                        state_values=[kv_gmem_to_lds.page_ids.zero_page_id_raw()],
+                    )
+                    # Keep the load ahead of GEMM1; the index conversion below is
+                    # what waits for it.
+                    rocdl.sched_barrier(0)
 
                 if const_expr(traits.KV_VECTORIZED and traits.V_NOMAJOR_DMA):
                     kv_gmem_to_lds.coop_dma_v_nomajor(kv_start, 0)
@@ -503,7 +585,9 @@ def build_flash_attn_func_module_primary(
                         or (not traits.ENABLE_DMA and not traits.ENABLE_PREFETCH_3BUF)
                     )
                 ):
-                    _v_vecs_prefetch = kv_gmem_to_lds.coop_load_v_global(kv_start)
+                    _v_vecs_prefetch = kv_gmem_to_lds.coop_load_v_global(
+                        kv_start, pid=_tile_pid
+                    )
 
                 # ==== GEMM1: S = K @ Q^T. Bulk-read K packs, DMA-prefetch V, pipeline MFMAs ====
                 _k_lo, _k_hi = kv_lds_to_vgpr.load_k_packs(k_base)
@@ -551,6 +635,31 @@ def build_flash_attn_func_module_primary(
                         kv_gmem_to_lds,
                         kv_start,
                     )
+
+                if const_expr(_pipe_paged_k):
+                    _next_pid = kv_gmem_to_lds.page_ids.consume_page_id(_next_pid_raw)
+                    _nk_names = []
+                    for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                        _nk_names.append("_nk%d" % _kb)
+
+                    def _issue_next_k(_names, *_st):
+                        return kv_gmem_to_lds.coop_load_k_global(
+                            _next_kv, pid=_next_pid
+                        )
+
+                    _next_k_state = scf_if_dispatch(
+                        _has_next,
+                        _issue_next_k,
+                        state_names=tuple(_nk_names),
+                        state_values=kv_gmem_to_lds.zero_k_global_vecs(),
+                    )
+                    if const_expr(traits.NUM_BATCHES_KV == 1):
+                        _next_k_state = [_next_k_state]
+                    _next_k_vecs = []
+                    for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+                        _next_k_vecs.append(_next_k_state[_kb])
+                    _yield_k_pid = _next_pid
+                    rocdl.sched_barrier(0)
 
                 # ==== Online softmax over 64 KV positions ====
                 s_raw_lo, s_raw_hi = softmax_helper.split_scores(s_acc_lo, s_acc_hi)
@@ -623,7 +732,20 @@ def build_flash_attn_func_module_primary(
                 else:
                     v_slot = 0
                     v_base = kv_gmem_to_lds.v_buf_base(v_slot)
-                    _waitcnt_vm_n(0)
+                    if const_expr(_pipe_paged_k):
+                        # vmcnt(N) completes the older V loads but not the N
+                        # prefetched K loads. The compiler still drains them at
+                        # the V store, as this point joins the path without a
+                        # prefetch (the last tile), which drains everything.
+                        def _wait_v_keep_k():
+                            _waitcnt_vm_n(_k_prefetch_inflight)
+
+                        def _wait_v_all():
+                            _waitcnt_vm_n(0)
+
+                        scf_if_dispatch(_has_next, _wait_v_keep_k, _wait_v_all)
+                    else:
+                        _waitcnt_vm_n(0)
                     if const_expr(traits.V_PERM_TR):
                         kv_gmem_to_lds.coop_store_v_lds_perm(_v_vecs_prefetch, v_slot)
                     else:
@@ -652,7 +774,12 @@ def build_flash_attn_func_module_primary(
                     )
                 else:
                     p_packs_lo = softmax_helper.build_p_packs(p_vals_lo)
-                    p_packs_hi = softmax_helper.build_p_packs(p_vals_hi)
+                    # Wave-split-K leaves the hi half to the other wave.
+                    p_packs_hi = (
+                        None
+                        if const_expr(traits.ENABLE_WAVE_SPLITK)
+                        else softmax_helper.build_p_packs(p_vals_hi)
+                    )
                     o_accs = gemm_helper.gemm2_pv(
                         kv_lds_to_vgpr, o_accs, p_packs_lo, p_packs_hi, v_base, corr_vec
                     )
@@ -666,16 +793,24 @@ def build_flash_attn_func_module_primary(
                     _yield_args.append(fx.Index(1) - _cur_buf_id)
                 else:
                     _yield_args.append(_cur_buf_id)
-            if const_expr(_pipe_k):
+            if const_expr(_pipe_k or _pipe_paged_k):
                 for _kb in range_constexpr(traits.NUM_BATCHES_KV):
                     _yield_args.append(_next_k_vecs[_kb])
+            if const_expr(_pipe_paged_k):
+                _yield_args.append(_yield_k_pid)
             loop_results = yield _yield_args
 
         # ---- Store O ----
         if const_expr(traits.SPLITK):
+            # Fold the waves' KV halves into one (m, l, acc) before storing.
+            if const_expr(traits.ENABLE_WAVE_SPLITK):
+                loop_results = softmax_helper.merge_wave_splitk(loop_results)
             # Split-K writes an unnormalized-then-reweighted partial to the workspace;
             # the combine kernel merges splits into the final O + LSE.
             store_helper.store_splitk_partial(loop_results, ctx.q_row)
+            if const_expr(traits.FUSED_COMBINE):
+                # No combine kernel: the last split to finish merges in place.
+                GenericFusedSplitKCombine(ctx).run()
         else:
             # Normalize and store O (128-bit buffer_store_dwordx4).
             store_helper.finalize_o(loop_results)
@@ -683,8 +818,6 @@ def build_flash_attn_func_module_primary(
     # Split-K combine: merge per-split partials into final O + LSE. The generic O
     # register/pack layout matches the dualwave path, so the shared combine kernel
     # reads the workspace verbatim.
-    # Threads per combine block; a block is the unit of CU assignment.
-    COMBINE_BLOCK = int(os.getenv("FLYDSL_COMBINE_BLOCK", "256"))
     COMBINE_LANES_PER_ROW = combine_lanes_per_row(traits.HEAD_DIM)
     # A row owns a whole wave: HEAD_DIM/combine_chunk lanes carry the head dim
     # and the remaining lanes divide the split dimension between them, merged
@@ -692,6 +825,11 @@ def build_flash_attn_func_module_primary(
     # block must be whole waves.
     COMBINE_ROWS_PER_BLOCK = (
         combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK) if traits.SPLITK else 1
+    )
+    _COMBINE_ROWS = (
+        traits.Q_PACK_QLEN * traits.Q_PACK_GROUP
+        if traits.Q_PACK_QLEN > 0 and traits.Q_PACK_GROUP > 0
+        else 0
     )
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
@@ -703,49 +841,20 @@ def build_flash_attn_func_module_primary(
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
     ):
-        c_ctx = DualwaveSplitKCombineContext(
-            traits, O, Workspace, batch_size, seq_len, stride_q_n, LSE=LSE
+        # seq_len is the exact packed-row count, so the in-bounds test also
+        # excludes every ceil-div padding row before stride-packed addressing.
+        run_splitk_combine(
+            traits,
+            O,
+            Workspace,
+            LSE,
+            batch_size,
+            seq_len,
+            stride_q_n,
+            COMBINE_ROWS_PER_BLOCK,
+            COMBINE_LANES_PER_ROW,
+            packed_rows=_COMBINE_ROWS,
         )
-        c_ctx.init_types_and_constants()
-        c_ctx.init_runtime_indices()
-        c_ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
-        # ceil-div grid can spawn rows past the last valid (batch, head, seq) row when
-        # seq_len is not a multiple of COMBINE_ROWS_PER_BLOCK; those overflow threads
-        # decode batch_idx >= batch_size. Clamp their row into range so workspace/O
-        # descriptors stay in-bounds, then drop their stores below (the real owner of
-        # the clamped row writes the correct value).
-        total_rows = (
-            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
-        )
-        c_ctx.row_in_bounds = c_ctx.row < total_rows
-        c_ctx.row = (c_ctx.row_in_bounds).select(c_ctx.row, fx.Index(0))
-        heads_per_batch = c_ctx.seq_len_v * traits.NUM_HEADS_Q
-        c_ctx.batch_idx = c_ctx.row // heads_per_batch
-        _rem = c_ctx.row % heads_per_batch
-        c_ctx.q_head_idx = _rem // c_ctx.seq_len_v
-        c_ctx.seq_idx = _rem % c_ctx.seq_len_v
-        c_ctx.init_workspace()
-        c_ctx.init_descriptors()
-
-        combine = DualwaveSplitKCombineHelper(c_ctx)
-        # Each split group reduces its own share against its own max, then the
-        # groups are merged across the wave.
-        m_max = combine.reduce_m_max()
-        m_max = combine.merge_m_max(m_max)
-        acc, den = combine.accumulate_splits(m_max)
-        den, acc = combine.merge_split_groups(den, acc)
-        o_pack = combine.pack_output(acc, den)
-        # Every group ends up with the merged result; one of them stores it.
-        # seq_len is the exact packed-row count, so row_in_bounds also excludes
-        # every ceil-div padding row before stride-packed output addressing.
-        _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
-
-        def _store_in_bounds():
-            combine.store_output(o_pack)
-            if const_expr(traits.RETURN_LSE):
-                combine.store_lse(m_max, den)
-
-        scf_if_dispatch(_owns_store, _store_in_bounds)
 
     @flyc.jit
     def launch_flash_attn_generic(
@@ -834,7 +943,7 @@ def build_flash_attn_func_module_primary(
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
-        if const_expr(traits.SPLITK):
+        if const_expr(traits.SPLITK and not traits.FUSED_COMBINE):
             # ceil-div: seq_len need not be a multiple of COMBINE_ROWS_PER_BLOCK
             # (generic supports arbitrary seq_len). Overflow rows in the last block
             # are dropped by the in-bounds guard inside the combine kernel.

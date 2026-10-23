@@ -75,13 +75,10 @@ def auto_split_k_coop(B: int, G: int, H_q: int, KV_MAX: int) -> int:
 # One CTA is one warp here, so split_k multiplies the warp count directly.
 # Above 256 the combine pass dominates: it stages per-partition stats in LDS and
 # its accumulation loop is unrolled over partitions, so cost grows linearly while
-# the extra parallelism has already saturated. Measured on MI350X at B=1, split
-# 512 was slower than 256 on every shape tried (ctx 32k..512k, D 64/128).
+# the extra parallelism has already saturated.
 _MAX_SPLIT_K_HP = 256
 
-# Tokens a split must own for its share of the combine pass to be worth it. The
-# measured knee sits between 256 and 2000 tokens/split and rises with context;
-# 256 puts the heuristic within ~9% of the per-shape optimum across that range.
+# Tokens a split must own for its share of the combine pass to be worth it.
 _MIN_CHUNK_TOKENS_HP = 256
 
 
@@ -191,10 +188,9 @@ def pa_decode_paged_launch(
 
     ``query_groups`` > 1 covers the query block in several shallower passes
     instead of one deep one. Each M-tile adds loop-carried accumulator, so depth
-    costs occupancy (measured 9 waves/SIMD at one tile down to 2 at eight) and at
-    D=128 spills past 6 tiles. Splitting into G passes uses ``Sq/G`` tokens each
-    -- ``G`` times the KV traffic, but shallower tiles. Measured 1.5x-2.0x for
-    G=2 where a single pass would spill. See `query_group_seqlen` for why this is exact.
+    costs occupancy and at D=128 spills past 6 tiles. Splitting into G passes
+    uses ``Sq/G`` tokens each -- ``G`` times the KV traffic, but shallower
+    tiles. See `query_group_seqlen` for why this is exact.
 
     Raises ValueError for configurations the kernel cannot serve (GQA ratio > 16,
     D % 32, page_size % 32, non-gfx950) -- there is no generic paged fallback, so
@@ -223,14 +219,11 @@ def pa_decode_paged_launch(
     parts = []
     for g in range(query_groups):
         kv_g = max(0, query_group_seqlen(max_seqlen_kv, Sq, query_groups, g))
-        # `.contiguous()` is load-bearing, not hygiene. The kernel's non-split
-        # epilogue addresses the output with Q's strides, so it requires the two
-        # to share a layout. A slice of the query block keeps the parent's
-        # stride(0) (Sq*...) while the freshly allocated output has span*...,
-        # and the mismatch silently corrupts every batch above the first.
+        # pa_decode_gfx950_launch makes the slice contiguous: its non-split
+        # epilogue addresses the output with Q's strides.
         parts.append(
             pa_decode_gfx950_launch(
-                q[:, g * span : (g + 1) * span].contiguous(),
+                q[:, g * span : (g + 1) * span],
                 k_cache,
                 v_cache,
                 (

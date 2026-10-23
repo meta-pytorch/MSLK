@@ -33,16 +33,15 @@ import flydsl.expr as fx  # pyre-ignore[21]
 import torch
 from flydsl.expr import (  # pyre-ignore[21]
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.typing import Int32, T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
+from mslk.flydsl import buffer_ops, vector_ops as vector
 
 from .utils import exp_f32, rcp_f32, WARP_SIZE, wave_reduce_max_f32, wave_reduce_sum_f32
 
