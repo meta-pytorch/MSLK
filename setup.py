@@ -809,6 +809,7 @@ def main(argv: List[str]) -> None:
         package_data={
             "mslk.flydsl": ["aot_artifacts/*"],
             "mslk.aiter": ["aiter_version.txt"],
+            "mslk.gemm.dispatch": ["tables/*.csv"],
         },
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
