@@ -28,18 +28,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, vector
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace as _TargetAddressSpace
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    math as fmath,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, const_expr, gpu, math as fmath, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.utils.smem_allocator import SmemPtr
+from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
 
@@ -592,7 +585,7 @@ def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -607,7 +600,7 @@ def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
     """
     c0 = buffer_ops._create_i32_constant(0)
     raw = rocdl.raw_ptr_buffer_load(
-        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, c0
+        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
@@ -898,7 +891,7 @@ def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
     """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
     if ASYNC_LDS:
         return rocdl.raw_ptr_buffer_load_async_lds(
-            rsrc, lds_ptr, size, voffset, soffset, offset, aux
+            rsrc, lds_ptr, size, voffset, soffset, offset, aux=aux
         )
     return rocdl.raw_ptr_buffer_load_lds(
         rsrc, lds_ptr, size, voffset, soffset, offset, aux
@@ -1327,6 +1320,8 @@ class FlashAttnGenericTraits:
     N_SUBTILES: int
     ENABLE_PREFETCH_3BUF: bool
     ENABLE_DMA: bool
+    # Paged KV: carry the next K tile in registers across the softmax.
+    PAGED_K_PREFETCH: bool
     ENABLE_LDS_VEC16: bool
     REDUCE_MODE: str
     NUM_PREFETCH_K: int
@@ -1377,6 +1372,7 @@ class FlashAttnGenericTraits:
     SKIP_KV_PAD_MASK: bool
     ENABLE_GFX942_DMA: bool
     ENABLE_GFX942_KV_GPFETCH: bool
+    ENABLE_WAVE_SPLITK: bool
     ENABLE_GFX942_VEC_K: bool
     V_PERM_TR: bool
     K_VEC_SIZE: int
@@ -1434,6 +1430,7 @@ class FlashAttnGenericTraits:
             self.N_SUBTILES,
             self.ENABLE_PREFETCH_3BUF,
             self.ENABLE_DMA,
+            self.PAGED_K_PREFETCH,
             self.ENABLE_LDS_VEC16,
             self.REDUCE_MODE,
             self.NUM_PREFETCH_K,
@@ -1484,6 +1481,7 @@ class FlashAttnGenericTraits:
             self.SKIP_KV_PAD_MASK,
             self.ENABLE_GFX942_DMA,
             self.ENABLE_GFX942_KV_GPFETCH,
+            self.ENABLE_WAVE_SPLITK,
             self.ENABLE_GFX942_VEC_K,
             self.V_PERM_TR,
             self.K_VEC_SIZE,
@@ -1523,6 +1521,9 @@ def _make_flash_attn_generic_traits(
     q_pack_qlen=0,
     q_pack_group=0,
     kv_lens=False,
+    paged_kv_dma=False,
+    paged_k_prefetch=False,
+    high_concurrency=False,
 ):
     """Build compile-time traits for ``flash_attn_generic``."""
     block_n = 64
@@ -1568,11 +1569,55 @@ def _make_flash_attn_generic_traits(
             or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
         )
     )
+    if paged:
+        # Paged DMA supports the linear, non-gappy layout only.
+        paged_dma_ok = (
+            has_lds_load_b128
+            and not gpu_arch.startswith("gfx942")
+            and kv_cache_layout == "linear"
+            and not gappy_kv
+        )
+        # FLYDSL_PAGED_KV_DMA=0/1 overrides the caller's choice.
+        forced = os.getenv("FLYDSL_PAGED_KV_DMA", "")
+        want = forced == "1" if forced in ("0", "1") else (enable_dma or paged_kv_dma)
+        enable_dma = paged_dma_ok and want
+    # FLYDSL_PAGED_K_PREFETCH=0/1 overrides the caller's choice.
+    forced_pf = os.getenv("FLYDSL_PAGED_K_PREFETCH", "")
+    if forced_pf in ("0", "1"):
+        paged_k_prefetch = forced_pf == "1"
+    paged_k_prefetch = paged and paged_k_prefetch and not enable_dma
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
         and not enable_prefetch_3buf
         and (not enable_dma or enable_gfx942_dma)
         and os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_KV_GPFETCH", "1") == "1"
+    )
+    # Split the workgroup's waves over KV columns instead of Q rows: wave w takes
+    # tile columns [w*K_SUB_N, (w+1)*K_SUB_N) and the halves are merged in LDS
+    # into one partial, so the combine's partial count is unchanged. Only valid
+    # while the real rows fit in one wave's share, since every wave owns all of
+    # them. GPFETCH's fused GEMM2 has no half-width form, and the DMA pipeline
+    # was not built for the half-width GEMMs.
+    #
+    # Limited to packed-GQA decode over a full (unwindowed) context. The merge
+    # costs two barriers and an LDS round trip per workgroup, and below
+    # FLYDSL_WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
+    # outright -- there it only pays at high concurrency. Whether a given call
+    # clears that bar turns on batch, which this builder cannot see:
+    # num_kv_splits does not stand in for it, because the batches that win and
+    # the batches that lose share a split count. The caller resolves it and
+    # passes the answer as `high_concurrency`.
+    _wsk_min_d = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_D", "128"))
+    enable_wave_splitk = (
+        int(num_kv_splits) > 1
+        and q_pack_group > 0
+        and q_pack_qlen == 1
+        and q_pack_group * q_pack_qlen <= rows_per_wave
+        and window_left < 0
+        and (head_dim >= _wsk_min_d or high_concurrency)
+        and not enable_gfx942_kv_gpfetch
+        and not enable_dma
+        and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "1") == "1"
     )
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")
@@ -1694,6 +1739,13 @@ def _make_flash_attn_generic_traits(
     lds_v_total_size = num_prefetch_v * lds_v_tile_size
     lds_kv_total_size = lds_k_total_size + lds_v_total_size
 
+    # The cross-wave merge stages (acc, m, l) through the K/V tile buffer, which
+    # is dead by then, so LDS stays flat. Gate rather than assert: an overrun
+    # would be silent.
+    if enable_wave_splitk:
+        merge_scratch_bytes = warp_size * (d_chunks * 16 + 4) * 4
+        enable_wave_splitk = merge_scratch_bytes <= lds_kv_total_size * 2
+
     return FlashAttnGenericTraits(
         NUM_HEADS_Q=num_heads,
         NUM_HEADS_KV=num_kv_heads,
@@ -1725,6 +1777,7 @@ def _make_flash_attn_generic_traits(
         N_SUBTILES=n_subtiles,
         ENABLE_PREFETCH_3BUF=enable_prefetch_3buf,
         ENABLE_DMA=enable_dma,
+        PAGED_K_PREFETCH=paged_k_prefetch,
         ENABLE_LDS_VEC16=enable_lds_vec16,
         REDUCE_MODE=reduce_mode,
         NUM_PREFETCH_K=num_prefetch_k,
@@ -1775,6 +1828,7 @@ def _make_flash_attn_generic_traits(
         SKIP_KV_PAD_MASK=skip_kv_pad_mask,
         ENABLE_GFX942_DMA=enable_gfx942_dma,
         ENABLE_GFX942_KV_GPFETCH=enable_gfx942_kv_gpfetch,
+        ENABLE_WAVE_SPLITK=enable_wave_splitk,
         ENABLE_GFX942_VEC_K=enable_gfx942_vec_k,
         V_PERM_TR=v_perm_tr,
         K_VEC_SIZE=k_vec_size,
@@ -2355,6 +2409,28 @@ class GenericFlashAttnContext:
         self.MFMA_LANE_K = traits.MFMA_LANE_K
         self.mma_atom_k16 = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, self.elem_dtype))
 
+    def pin_kernel_args(self, Q, CuSeqQ, CuSeqKv, KvSeqStart, BlockTable, bt_stride):
+        # Read the kernel arguments here so their loads issue together under one
+        # wait, rather than sunk to first use as serial round trips.
+        traits = self.traits
+        args = [self.seq_len, self.k_ptr, self.v_ptr, _extract_aligned_pointer(Q)]
+        if const_expr(traits.VARLEN):
+            args.append(_extract_aligned_pointer(CuSeqQ))
+        if const_expr(traits.VARLEN or traits.KV_LENS):
+            args.append(_extract_aligned_pointer(CuSeqKv))
+        if const_expr(traits.VARLEN and traits.GAPPY_KV):
+            args.append(_extract_aligned_pointer(KvSeqStart))
+        if const_expr(traits.PAGED):
+            args += [_extract_aligned_pointer(BlockTable), bt_stride]
+        irs = [as_mlir_value(a) for a in args]
+        llvm.inline_asm(
+            ir.Type.parse("!llvm.void"),
+            irs,
+            "",
+            ",".join(["s"] * len(irs)),
+            has_side_effects=True,
+        )
+
     def init_sequence_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
         self.seq_len_kv_v = fx.Index(self.seq_len_kv)
@@ -2381,7 +2457,14 @@ class GenericFlashAttnContext:
         self.tr_k_group = (self.lane % 16) // 4
         self.tr_col_sub = self.lane % 4
         self.tr_col_half = (self.lane % 32) // 16
-        self.wave_q_offset = self.wave_id * traits.ROWS_PER_WAVE
+        if const_expr(traits.ENABLE_WAVE_SPLITK):
+            # Every wave owns all the (packed) rows; wave_kv_half picks which
+            # K_SUB_N-wide column half of each tile it walks.
+            self.wave_q_offset = fx.Index(0)
+            self.wave_kv_half = self.wave_id
+        else:
+            self.wave_q_offset = self.wave_id * traits.ROWS_PER_WAVE
+            self.wave_kv_half = None
 
     def init_block_mapping(self):
         traits = self.traits
@@ -2799,16 +2882,32 @@ class GenericPageIdLoader:
             )
             self.bt_stride_v = fx.Index(block_table_stride)
 
-    def page_id(self, tile_start):
+    def issue_page_id(self, tile_start):
+        """Issue the block-table load and return the raw vector.
+
+        Converting that vector to an index waits for the load. Callers that
+        want the latency covered by later math must hold this vector and call
+        ``consume_page_id`` at the use.
+        """
         ctx = self.ctx
         tile_idx = tile_start // fx.Index(ctx.traits.PAGE_SIZE)
         bt_off = ctx.batch_idx * self.bt_stride_v + tile_idx
-        v = fly.copy_atom_call_ssa(
+        return fly.copy_atom_call_ssa(
             [ctx.v1i32_type],
             ctx.load_atom_32,
             fx.slice(self.bt_div, (None, fx.Int32(bt_off))),
         )
-        return fx.Index(Vec(v, (1,), fx.Int32)[0])
+
+    def consume_page_id(self, loaded):
+        """Index of a page id previously issued by ``issue_page_id``."""
+        return fx.Index(Vec(loaded, (1,), fx.Int32)[0])
+
+    def zero_page_id_raw(self):
+        """Placeholder raw page id for the untaken prefetch arm."""
+        return as_mlir_value(Vec.filled(1, 0, fx.Int32))
+
+    def page_id(self, tile_start):
+        return self.consume_page_id(self.issue_page_id(tile_start))
 
     def _bt_load(self, tile_idx):
         # Load block_table[batch, tile_idx], clamped to the row width so prefetch /
@@ -2938,7 +3037,7 @@ class GenericKvGmemToLdsLoader:
             return self.page_ids.page_row_idx_cached(pid, logical)
         return pid * fx.Index(traits.PAGE_SIZE) + row_total
 
-    def coop_load_k(self, tile_start, buf_id=0):
+    def coop_load_k(self, tile_start, buf_id=0, pid=None):
         """Cooperative K load (row-major, XOR-swizzled)."""
         ctx = self.ctx
         traits = ctx.traits
@@ -2946,7 +3045,7 @@ class GenericKvGmemToLdsLoader:
         row = ctx.load_row_in_batch
         col = ctx.load_col_base
         k_base = self.k_buf_base(buf_id)
-        if const_expr(traits.PAGED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
@@ -2977,11 +3076,22 @@ class GenericKvGmemToLdsLoader:
                     vec = self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, col))
                 Vec(vec).store(lds_kv, [lds_idx])
 
-    def coop_load_k_global(self, tile_start):
+    def zero_k_global_vecs(self):
+        """One zero K vector per global-load batch, matching ``coop_load_k_global``."""
+        ctx = self.ctx
+        traits = ctx.traits
+        zero_elem = fx.Float32(0.0).to(ctx.elem_dtype)
+        zero = as_mlir_value(Vec.filled(traits.VEC_WIDTH, zero_elem, ctx.elem_dtype))
+        vecs = []
+        for _kb in range_constexpr(traits.NUM_BATCHES_KV):
+            vecs.append(zero)
+        return vecs
+
+    def coop_load_k_global(self, tile_start, pid=None):
         ctx = self.ctx
         traits = ctx.traits
         vecs = []
-        if const_expr(traits.PAGED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
@@ -3066,12 +3176,16 @@ class GenericKvGmemToLdsLoader:
                     vec = self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, col))
                 self._v_store_to_lds(v_base, lds_row, vec)
 
-    def coop_load_v_global(self, tile_start):
-        """Issue global V loads; vectorized mode returns no-major v8 rows."""
+    def coop_load_v_global(self, tile_start, pid=None):
+        """Issue global V loads; vectorized mode returns no-major v8 rows.
+
+        ``pid`` is the tile's page id when the caller already has it.
+        """
         ctx = self.ctx
         traits = ctx.traits
-        if const_expr(traits.KV_VECTORIZED):
+        if const_expr(traits.PAGED and pid is None):
             pid = self._tile_page_id(tile_start)
+        if const_expr(traits.KV_VECTORIZED):
             base_v = pid * fx.Index(
                 traits.PAGE_STRIDE_VEC
             ) + ctx.kv_head_idx * fx.Index(traits.HEAD_STRIDE_VEC)
@@ -3088,8 +3202,6 @@ class GenericKvGmemToLdsLoader:
                 vecs.append(self.load_half_vec(ctx.v_ptr, src, traits.KV_VEC_SIZE))
             return vecs
         vecs = []
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
             if const_expr(traits.PAGED):
@@ -3202,7 +3314,7 @@ class GenericKvGmemToLdsLoader:
         )
         self._v_dma_sz = fx.Int32(16)
         self._v_dma_z = fx.Int32(0)
-        self._v_dma_aux = fx.Int32(1)
+        self._v_dma_aux = 1
         self._v_dma_no = ctx.lane // fx.Index(8)
         self._v_dma_dloc = ctx.lane % fx.Index(8)
 
@@ -3261,22 +3373,34 @@ class GenericKvGmemToLdsLoader:
         self._dma_size = fx.Int32(self.DMA_BYTES)
         self._dma_soff = fx.Int32(0)
         self._dma_off = fx.Int32(0)
-        self._dma_aux = fx.Int32(1)
-        self.k_rsrc = buffer_ops.create_buffer_resource(
-            ctx.K,
-            max_size=False,
-            num_records_bytes=ctx.kv_nrec_bytes,
-            base_byte_offset=ctx.kv_batch_byte_off,
-        )
+        self._dma_aux = 1
         self.NUM_DMA_K = (traits.BLOCK_N * traits.K_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_K_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
-        self.v_rsrc = buffer_ops.create_buffer_resource(
-            ctx.V,
-            max_size=False,
-            num_records_bytes=ctx.kv_nrec_bytes,
-            base_byte_offset=ctx.kv_batch_byte_off,
-        )
+        if const_expr(traits.PAGED):
+            # Paged: per-page resources are built in _coop_dma_row.
+            self.k_rsrc = None
+            self.v_rsrc = None
+            self._k_dma_base_i64 = fx.Int64(
+                buffer_ops.extract_base_index(ctx.K, address_space=1)
+            )
+            self._v_dma_base_i64 = fx.Int64(
+                buffer_ops.extract_base_index(ctx.V, address_space=1)
+            )
+            self._dma_page_bytes = fx.Int64(traits.PAGE_STRIDE_VEC * 2)
+        else:
+            self.k_rsrc = buffer_ops.create_buffer_resource(
+                ctx.K,
+                max_size=False,
+                num_records_bytes=ctx.kv_nrec_bytes,
+                base_byte_offset=ctx.kv_batch_byte_off,
+            )
+            self.v_rsrc = buffer_ops.create_buffer_resource(
+                ctx.V,
+                max_size=False,
+                num_records_bytes=ctx.kv_nrec_bytes,
+                base_byte_offset=ctx.kv_batch_byte_off,
+            )
         self.NUM_DMA_V = (traits.BLOCK_N * traits.V_STRIDE * 2) // self.DMA_BATCH_BYTES
         self.LANES_PER_V_ROW = traits.HEAD_DIM * 2 // self.DMA_BYTES
         self.ROWS_PER_DMA_BATCH_V = self.DMA_BATCH_BYTES // (traits.HEAD_DIM * 2)
@@ -3290,9 +3414,21 @@ class GenericKvGmemToLdsLoader:
         rows_per_batch,
         tile_start,
         xor_and,
+        paged_base=None,
     ):
         ctx = self.ctx
         traits = ctx.traits
+        if const_expr(paged_base is not None):
+            # One tile is one page. Clamped: an empty split's prologue reads past
+            # the last page.
+            pid = self.page_ids._bt_load(tile_start // fx.Index(traits.PAGE_SIZE))
+            rsrc = buffer_ops.create_buffer_resource_from_addr(
+                as_mlir_value(paged_base + fx.Int64(pid) * self._dma_page_bytes),
+                num_records_bytes=as_mlir_value(self._dma_page_bytes),
+            )
+            row_base = fx.Index(0)
+        else:
+            row_base = tile_start  # 0-based: batch base folded into k/v_rsrc
         for d in range_constexpr(num_dma):
             lds_addr = (
                 lds_byte_base
@@ -3305,9 +3441,7 @@ class GenericKvGmemToLdsLoader:
             swiz_col_f16 = (ctx.tid % lanes_per_row) * (self.DMA_BYTES // 2)
             xor_mask = (row_in_tile & fx.Index(xor_and)) << fx.Index(4)
             col_byte = (swiz_col_f16 ^ xor_mask) * 2
-            global_row = (
-                tile_start + row_in_tile
-            )  # 0-based: batch base folded into k/v_rsrc
+            global_row = row_base + row_in_tile
             global_byte = (
                 global_row * fx.Index(traits.STRIDE_TOKEN_KV * 2)
                 + ctx.kv_head_idx * fx.Index(traits.HEAD_DIM * 2)
@@ -3370,7 +3504,8 @@ class GenericKvGmemToLdsLoader:
                 self.LANES_PER_K_ROW,
                 self.ROWS_PER_DMA_BATCH,
                 tile_start,
-                0x7,
+                traits.K_SWZ_ROWMASK,
+                paged_base=self._k_dma_base_i64 if traits.PAGED else None,
             )
 
     def coop_dma_v(self, tile_start, buf_id=0):
@@ -3387,6 +3522,7 @@ class GenericKvGmemToLdsLoader:
             self.ROWS_PER_DMA_BATCH_V,
             tile_start,
             0x3,
+            paged_base=self._v_dma_base_i64 if traits.PAGED else None,
         )
 
 
@@ -3411,11 +3547,24 @@ class GenericKvLdsToVgprLoader:
         traits = ctx.traits
         k_hi_offset = traits.K_SUB_N * traits.K_STRIDE
         k_swz_mask = (ctx.lane_mod_32 & fx.Index(traits.K_SWZ_ROWMASK)) << fx.Index(4)
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
+        # The swizzle depends on lane_mod_32 only, so shifting the base by whole
+        # K_SUB_N rows reaches exactly the addresses the `hi` form used.
+        if half_only:
+            half_off = ctx.wave_kv_half * fx.Index(
+                traits.K_VEC_HI_N_OFFSET
+                if const_expr(traits.ENABLE_GFX942_VEC_K)
+                else k_hi_offset
+            )
+        else:
+            half_off = fx.Index(0)
 
         def _idx(ks, hi):
             if const_expr(traits.ENABLE_GFX942_VEC_K):
-                base = k_base + (
-                    fx.Index(traits.K_VEC_HI_N_OFFSET) if hi else fx.Index(0)
+                base = (
+                    k_base
+                    + half_off
+                    + (fx.Index(traits.K_VEC_HI_N_OFFSET) if hi else fx.Index(0))
                 )
                 return (
                     base
@@ -3426,6 +3575,7 @@ class GenericKvLdsToVgprLoader:
             col = fx.Index(ks * traits.K_STEP_QK) + ctx.lane_div_32 * ctx.MFMA_LANE_K
             base = (
                 k_base
+                + half_off
                 + (k_hi_offset if hi else fx.Index(0))
                 + ctx.lane_mod_32 * traits.K_STRIDE
             )
@@ -3433,14 +3583,19 @@ class GenericKvLdsToVgprLoader:
 
         depth = traits.QK_PREFETCH_DEPTH
         lo = [None] * traits.K_STEPS_QK
-        hi = [None] * traits.K_STEPS_QK
+        hi = None if half_only else [None] * traits.K_STEPS_QK
         for p in range_constexpr(depth):
             lo[p] = Vec.load(
                 ctx.mfma_pack_type, ctx.lds_kv, [_idx(p, False)]
             ).ir_value()
-            hi[p] = Vec.load(ctx.mfma_pack_type, ctx.lds_kv, [_idx(p, True)]).ir_value()
+            if const_expr(not half_only):
+                hi[p] = Vec.load(
+                    ctx.mfma_pack_type, ctx.lds_kv, [_idx(p, True)]
+                ).ir_value()
         if const_expr(traits.ENABLE_GFX942_VEC_K or traits.ENABLE_GFX942_KV_GPFETCH):
-            rocdl.sched_group_barrier(rocdl.mask_dsrd, depth * 2, 0)
+            rocdl.sched_group_barrier(
+                rocdl.mask_dsrd, depth * (1 if half_only else 2), 0
+            )
         self._k_idx = _idx
         self._k_depth = depth
         return lo, hi
@@ -3450,6 +3605,8 @@ class GenericKvLdsToVgprLoader:
         lo = Vec.load(
             ctx.mfma_pack_type, ctx.lds_kv, [self._k_idx(ks, False)]
         ).ir_value()
+        if const_expr(ctx.traits.ENABLE_WAVE_SPLITK):
+            return lo, None
         hi = Vec.load(
             ctx.mfma_pack_type, ctx.lds_kv, [self._k_idx(ks, True)]
         ).ir_value()
@@ -3459,6 +3616,7 @@ class GenericKvLdsToVgprLoader:
         ctx = self.ctx
         traits = ctx.traits
         dc, pks = self._pv_steps[step_idx]
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
         if const_expr(traits.KV_VECTORIZED):
             # No-major V: one aligned v8 per (dc,pks) half. Lane l reads
             # V[d=dc*32+l%32, n=pks*16+(l//32)*8+0..7] (lo) / +32 (hi).
@@ -3474,9 +3632,13 @@ class GenericKvLdsToVgprLoader:
                 + pks * (traits.PV_K_STEP // 8) * traits.VEC_V_D128
             )
             hi_off = lo_off + (traits.K_SUB_N // 8) * traits.VEC_V_D128
+            if half_only:
+                v_lane_base = v_lane_base + ctx.wave_kv_half * fx.Index(hi_off - lo_off)
             vl = Vec.load(
                 ctx.mfma_pack_type, ctx.lds_kv, [v_lane_base + fx.Index(lo_off)]
             )
+            if half_only:
+                return vl, None
             vh = Vec.load(
                 ctx.mfma_pack_type, ctx.lds_kv, [v_lane_base + fx.Index(hi_off)]
             )
@@ -3492,23 +3654,37 @@ class GenericKvLdsToVgprLoader:
             )
             d_col_eff = ctx.v_swizzle(k_row, d_col) if traits.ENABLE_DMA else d_col
             lds_lo = v_base + k_row * traits.V_STRIDE + d_col_eff
+            # v_swizzle keys on k_row and the hi form reuses the lo d_col_eff, so
+            # a whole-half row shift lands on the same addresses.
+            if half_only:
+                lds_lo = lds_lo + ctx.wave_kv_half * fx.Index(
+                    traits.K_SUB_N * traits.V_STRIDE
+                )
             lds_hi = lds_lo + fx.Index(traits.K_SUB_N * traits.V_STRIDE)
             if const_expr(traits.USE_K16):
                 vl_a = self.ds_read_tr_v4f16(lds_lo)
                 vl_b = self.ds_read_tr_v4f16(lds_lo + fx.Index(8 * traits.V_STRIDE))
                 vl = Vec(vl_a).shuffle(Vec(vl_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
+                if half_only:
+                    return vl, None
                 vh_a = self.ds_read_tr_v4f16(lds_hi)
                 vh_b = self.ds_read_tr_v4f16(lds_hi + fx.Index(8 * traits.V_STRIDE))
                 vh = Vec(vh_a).shuffle(Vec(vh_b), [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
             else:
                 vl = self.ds_read_tr_v4f16(lds_lo)
+                if half_only:
+                    return vl, None
                 vh = self.ds_read_tr_v4f16(lds_hi)
             return vl, vh
         d_pos = fx.Index(dc * traits.D_CHUNK) + ctx.lane_mod_32
         k_col = fx.Index(pks * traits.PV_K_STEP) + ctx.lane_div_32 * 4
         v_lo_idx = v_base + d_pos * traits.VT_STRIDE + k_col
+        if half_only:
+            v_lo_idx = v_lo_idx + ctx.wave_kv_half * fx.Index(traits.K_SUB_N)
         v_hi_idx = v_lo_idx + fx.Index(traits.K_SUB_N)
         vl = Vec.load(ctx.v4f16_type, ctx.lds_kv, [v_lo_idx])
+        if half_only:
+            return vl, None
         vh = Vec.load(ctx.v4f16_type, ctx.lds_kv, [v_hi_idx])
         return vl, vh
 
@@ -3560,8 +3736,11 @@ class GenericGemmHelper:
         ctx = self.ctx
         traits = ctx.traits
         depth = traits.QK_PREFETCH_DEPTH
+        # Wave-split-K gives this wave one column half: one accumulator, one MFMA
+        # per k-step instead of two.
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
         s_lo = ctx.c_zero_v16f32
-        s_hi = ctx.c_zero_v16f32
+        s_hi = None if half_only else ctx.c_zero_v16f32
         for ks in range_constexpr(traits.K_STEPS_QK):
             if const_expr(
                 traits.ENABLE_DMA
@@ -3572,11 +3751,13 @@ class GenericGemmHelper:
                 kv_gmem_to_lds.coop_dma_v(kv_start, 0)
                 rocdl.sched_barrier(0)
             s_lo = self.mfma_acc(k_lo[ks], q_b_packs[ks], s_lo)
-            s_hi = self.mfma_acc(k_hi[ks], q_b_packs[ks], s_hi)
+            if const_expr(not half_only):
+                s_hi = self.mfma_acc(k_hi[ks], q_b_packs[ks], s_hi)
             if const_expr(ks + depth < traits.K_STEPS_QK):
-                k_lo[ks + depth], k_hi[ks + depth] = kv_lds_to_vgpr.load_k_pack_at(
-                    ks + depth
-                )
+                _lo, _hi = kv_lds_to_vgpr.load_k_pack_at(ks + depth)
+                k_lo[ks + depth] = _lo
+                if const_expr(not half_only):
+                    k_hi[ks + depth] = _hi
         return s_lo, s_hi
 
     def gemm2_pv(
@@ -3584,6 +3765,7 @@ class GenericGemmHelper:
     ):
         # O += V^T_lo @ P_lo + V^T_hi @ P_hi with interleaved V prefetch.
         traits = self.ctx.traits
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
         steps = kv_lds_to_vgpr._pv_steps
         total = kv_lds_to_vgpr.total_pv
         v_lo_cur, v_hi_cur = kv_lds_to_vgpr.read_v_pack(0, v_base)
@@ -3592,14 +3774,16 @@ class GenericGemmHelper:
             if const_expr(si + 1 < total):
                 v_lo_nxt, v_hi_nxt = kv_lds_to_vgpr.read_v_pack(si + 1, v_base)
             o_accs[dc] = self.mfma_acc(v_lo_cur, p_packs_lo[pks], o_accs[dc])
-            o_accs[dc] = self.mfma_acc(v_hi_cur, p_packs_hi[pks], o_accs[dc])
+            if const_expr(not half_only):
+                o_accs[dc] = self.mfma_acc(v_hi_cur, p_packs_hi[pks], o_accs[dc])
             if const_expr(
                 not traits.USE_HW_TR and dc == 0 and pks < traits.D_CHUNKS - 1
             ):
                 o_accs[pks + 1] = Vec(o_accs[pks + 1]) * corr_vec
             if const_expr(si + 1 < total):
                 v_lo_cur = v_lo_nxt
-                v_hi_cur = v_hi_nxt
+                if const_expr(not half_only):
+                    v_hi_cur = v_hi_nxt
         return o_accs
 
 
@@ -3616,7 +3800,19 @@ class GenericSoftmaxHelper:
         return fx.Float32(v_f32).shuffle_xor(ctx.shuf_32_i32, ctx.width_i32)
 
     def split_scores(self, s_acc_lo, s_acc_hi):
+        if const_expr(self.ctx.traits.ENABLE_WAVE_SPLITK):
+            return [Vec(s_acc_lo)[r] for r in range_constexpr(16)], None
         return _score_pair_to_lists((s_acc_lo, s_acc_hi))
+
+    def _half_kv_start(self, kv_start):
+        # Column base of this thread's fragment: under wave-split-K wave w owns
+        # tile columns [w*K_SUB_N, (w+1)*K_SUB_N) rather than the lo half.
+        ctx = self.ctx
+        if const_expr(ctx.traits.ENABLE_WAVE_SPLITK):
+            return fx.Int32(kv_start) + fx.Int32(ctx.wave_kv_half) * fx.Int32(
+                ctx.traits.K_SUB_N
+            )
+        return fx.Int32(kv_start)
 
     def _kv_mask_lane_off(self, kv_start_i32):
         # Physical KV column base per lane; KV_VECTORIZED applies sigma(kv) in the K load.
@@ -3635,8 +3831,8 @@ class GenericSoftmaxHelper:
         # QK*scale + bias; -inf propagates.
         ctx = self.ctx
         traits = ctx.traits
-        kv_start_i32 = fx.Int32(kv_start)
-        col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
+        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
         # The bounded plane resource (init_bias) zero-fills OOB rows (q_row>=Sq) in
         # hardware, so no index clamp is needed; a within-row kv overrun reads a
         # neighboring in-bounds value that is masked to -inf afterward.
@@ -3647,11 +3843,14 @@ class GenericSoftmaxHelper:
         for r in range_constexpr(16):
             kv_col = col_base_i32 + fx.Int32(moff[r])
             off_lo = (row_base_i32 + kv_col) * eb
-            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
             b_lo = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_lo)
-            b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
             s_raw_lo[r] = _fadd(s_raw_lo[r], _fmul(b_lo, inv, ctx.fm_fast), ctx.fm_fast)
-            s_raw_hi[r] = _fadd(s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast)
+            if const_expr(not half_only):
+                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+                b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
+                s_raw_hi[r] = _fadd(
+                    s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast
+                )
         return s_raw_lo, s_raw_hi
 
     def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
@@ -3660,8 +3859,8 @@ class GenericSoftmaxHelper:
         # after online_softmax. The 1/(1-p) scale is applied to the output.
         ctx = self.ctx
         traits = ctx.traits
-        kv_start_i32 = fx.Int32(kv_start)
-        col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
+        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
         # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
         # lanes are already zero post-softmax, so no index clamp is needed.
         row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
@@ -3670,19 +3869,24 @@ class GenericSoftmaxHelper:
         for r in range_constexpr(16):
             kv_col = col_base_i32 + fx.Int32(moff[r])
             off_lo = (row_base_i32 + kv_col) * eb
-            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
             # keep bit is 0/1; the 1/(1-p) scale is applied to the output by the
             # caller (constant factor, so it factors out of the per-(q,k) sum).
             m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
-            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
             p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
-            p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
+            if const_expr(not half_only):
+                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+                m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
+                p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
         return p_vals_lo, p_vals_hi
 
     def apply_kv_mask(self, s_raw_lo, s_raw_hi, kv_start):
         ctx = self.ctx
         traits = ctx.traits
         kv_start_i32 = fx.Int32(kv_start)
+        # tile_needs_mask is judged over the whole BLOCK_N tile so both waves take
+        # the same branch; the per-element bounds use this wave's column base.
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
+        half_start_i32 = self._half_kv_start(kv_start)
         if const_expr(traits.CAUSAL):
             # tile_needs_mask lets below-diagonal tiles skip the 32 selects; the
             # scf.if carries the 32 scores as explicit state (a list can't cross it).
@@ -3718,51 +3922,51 @@ class GenericSoftmaxHelper:
                     q_end_i32 = fx.Int32(ctx.q_start + traits.BLOCK_M) + ctx.delta_i32
                 window_lo_edge_i32 = q_end_i32 - window_left_i32
                 tile_needs_mask = tile_needs_mask | (kv_start_i32 < window_lo_edge_i32)
-            col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+            col_base_i32, moff = self._kv_mask_lane_off(half_start_i32)
             c_neg_inf = ctx.c_neg_inf
+
+            def _mask_one(score, kv_col):
+                # Causal upper bound: kv_col <= q_mask_limit.
+                masked = (kv_col > q_mask_limit_i32).select(c_neg_inf, score)
+                if top_left:
+                    # Drop padding columns kv_col >= seqlen_kv (top-left q>k).
+                    masked = (kv_col >= seq_len_kv_i32).select(c_neg_inf, masked)
+                if has_window:
+                    # Left window bound: keep kv_col > q_row - WINDOW_LEFT,
+                    # i.e. drop kv_col <= q_mask_limit - WINDOW_LEFT.
+                    win_edge_i32 = q_mask_limit_i32 - fx.Int32(traits.WINDOW_LEFT)
+                    masked = (kv_col <= win_edge_i32).select(c_neg_inf, masked)
+                return masked
 
             def _apply_causal_mask(_names, *scores):
                 out = []
                 for r in range_constexpr(16):
                     kv_col = col_base_i32 + fx.Int32(moff[r])
-                    kv_col_hi = kv_col + fx.Int32(traits.K_SUB_N)
-                    # Causal upper bound: kv_col <= q_mask_limit.
-                    masked_lo = (kv_col > q_mask_limit_i32).select(
-                        c_neg_inf, scores[2 * r]
-                    )
-                    masked_hi = (kv_col_hi > q_mask_limit_i32).select(
-                        c_neg_inf, scores[2 * r + 1]
-                    )
-                    if top_left:
-                        # Drop padding columns kv_col >= seqlen_kv (top-left q>k).
-                        masked_lo = (kv_col >= seq_len_kv_i32).select(
-                            c_neg_inf, masked_lo
+                    if half_only:
+                        out.append(_mask_one(scores[r], kv_col))
+                    else:
+                        out.append(_mask_one(scores[2 * r], kv_col))
+                        out.append(
+                            _mask_one(
+                                scores[2 * r + 1], kv_col + fx.Int32(traits.K_SUB_N)
+                            )
                         )
-                        masked_hi = (kv_col_hi >= seq_len_kv_i32).select(
-                            c_neg_inf, masked_hi
-                        )
-                    if has_window:
-                        # Left window bound: keep kv_col > q_row - WINDOW_LEFT,
-                        # i.e. drop kv_col <= q_mask_limit - WINDOW_LEFT.
-                        win_edge_i32 = q_mask_limit_i32 - fx.Int32(traits.WINDOW_LEFT)
-                        masked_lo = (kv_col <= win_edge_i32).select(
-                            c_neg_inf, masked_lo
-                        )
-                        masked_hi = (kv_col_hi <= win_edge_i32).select(
-                            c_neg_inf, masked_hi
-                        )
-                    out.append(masked_lo)
-                    out.append(masked_hi)
                 return out
 
-            mask_names = tuple("_sm%d" % i for i in range(32))
-            interleaved = [v for r in range(16) for v in (s_raw_lo[r], s_raw_hi[r])]
+            n_state = 16 if half_only else 32
+            mask_names = tuple("_sm%d" % i for i in range(n_state))
+            if half_only:
+                interleaved = list(s_raw_lo)
+            else:
+                interleaved = [v for r in range(16) for v in (s_raw_lo[r], s_raw_hi[r])]
             masked = scf_if_dispatch(
                 tile_needs_mask,
                 _apply_causal_mask,
                 state_names=mask_names,
                 state_values=interleaved,
             )
+            if half_only:
+                return list(masked), None
             return [masked[2 * r] for r in range(16)], [
                 masked[2 * r + 1] for r in range(16)
             ]
@@ -3770,17 +3974,18 @@ class GenericSoftmaxHelper:
         # Non-causal: mask physical KV columns outside seqlen so tail rows stay out of softmax.
         seq_len_i32 = fx.Int32(ctx.seqlen_kv_b)
         if const_expr(not traits.SKIP_KV_PAD_MASK):
-            col_base_i32, moff = self._kv_mask_lane_off(kv_start_i32)
+            col_base_i32, moff = self._kv_mask_lane_off(half_start_i32)
             kv_tile_end = kv_start + fx.Index(traits.BLOCK_N)
             needs_pad_mask = fx.Int32(kv_tile_end) > seq_len_i32
             for r in range_constexpr(16):
                 kv_col = col_base_i32 + fx.Int32(moff[r])
                 masked_lo = (kv_col >= seq_len_i32).select(ctx.c_neg_inf, s_raw_lo[r])
-                masked_hi = (kv_col + fx.Int32(traits.K_SUB_N) >= seq_len_i32).select(
-                    ctx.c_neg_inf, s_raw_hi[r]
-                )
                 s_raw_lo[r] = (needs_pad_mask).select(masked_lo, s_raw_lo[r])
-                s_raw_hi[r] = (needs_pad_mask).select(masked_hi, s_raw_hi[r])
+                if const_expr(not half_only):
+                    masked_hi = (
+                        kv_col + fx.Int32(traits.K_SUB_N) >= seq_len_i32
+                    ).select(ctx.c_neg_inf, s_raw_hi[r])
+                    s_raw_hi[r] = (needs_pad_mask).select(masked_hi, s_raw_hi[r])
         return s_raw_lo, s_raw_hi
 
     def _exp2(self, x):
@@ -3794,18 +3999,24 @@ class GenericSoftmaxHelper:
         traits = ctx.traits
         fm_fast = ctx.fm_fast
 
+        # Wave-split-K gives this wave 16 scores (its column half), not 32.
+        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
         if const_expr(os.getenv("FLYDSL_FLASH_ATTN_FUNC_TREE_REDUCE", "0") == "1"):
 
             def _max_pair(a, b):
                 return _fmax(a, b, fm_fast)
 
-            local_max = _tree_reduce(list(s_raw_lo) + list(s_raw_hi), _max_pair)
+            local_max = _tree_reduce(
+                list(s_raw_lo) if half_only else list(s_raw_lo) + list(s_raw_hi),
+                _max_pair,
+            )
         else:
             local_max = s_raw_lo[0]
             for r in range_constexpr(15):
                 local_max = _fmax(local_max, s_raw_lo[r + 1], fm_fast)
-            for r in range_constexpr(16):
-                local_max = _fmax(local_max, s_raw_hi[r], fm_fast)
+            if const_expr(not half_only):
+                for r in range_constexpr(16):
+                    local_max = _fmax(local_max, s_raw_hi[r], fm_fast)
         row_max = _fmax(local_max, self.reduction_peer(local_max), fm_fast)
         m_new_raw = _fmax(m_running, row_max, fm_fast)
         # Clamp the running max off -inf so a fully-masked row (all scores -inf)
@@ -3830,8 +4041,9 @@ class GenericSoftmaxHelper:
             m_running, s_raw_lo, s_raw_hi
         )
 
+        half_only = const_expr(ctx.traits.ENABLE_WAVE_SPLITK)
         p_vals_lo = []
-        p_vals_hi = []
+        p_vals_hi = None if half_only else []
         local_sum = ctx.c_zero_f
         for r in range_constexpr(16):
             diff_lo = fmath.fma(
@@ -3840,13 +4052,17 @@ class GenericSoftmaxHelper:
             p_lo = self._exp2(diff_lo)
             p_vals_lo.append(p_lo)
             local_sum = _fadd(local_sum, p_lo, fm_fast)
-        for r in range_constexpr(16):
-            diff_hi = fmath.fma(
-                s_raw_hi[r], ctx.c_sm_scale_log2e, neg_scaled_max, fastmath=ctx.fm_fast
-            )
-            p_hi = self._exp2(diff_hi)
-            p_vals_hi.append(p_hi)
-            local_sum = _fadd(local_sum, p_hi, fm_fast)
+        if const_expr(not half_only):
+            for r in range_constexpr(16):
+                diff_hi = fmath.fma(
+                    s_raw_hi[r],
+                    ctx.c_sm_scale_log2e,
+                    neg_scaled_max,
+                    fastmath=ctx.fm_fast,
+                )
+                p_hi = self._exp2(diff_hi)
+                p_vals_hi.append(p_hi)
+                local_sum = _fadd(local_sum, p_hi, fm_fast)
 
         tile_sum = _fadd(local_sum, self.reduction_peer(local_sum), fm_fast)
         l_new = _fadd(_fmul(corr, l_running, fm_fast), tile_sum, fm_fast)
@@ -3862,6 +4078,91 @@ class GenericSoftmaxHelper:
             for dc in range_constexpr(traits.D_CHUNKS):
                 o_accs[dc] = _fmul(Vec(o_accs[dc]), corr_vec, ctx.fm_fast)
         return o_accs, corr_vec
+
+    def merge_wave_splitk(self, loop_results):
+        """Fold the workgroup's two KV halves into one partial, through LDS.
+
+        Both waves own the same Q rows and the same accumulator layout, so the
+        merge is elementwise at matching (lane, element), using the same
+        log-sum-exp reweighting the split-K combine applies across splits:
+        m = max(m_i), c_i = exp2((m_i - m) * sm_scale * log2e), then l and acc
+        are the c_i-weighted sums. Wave 1 publishes; only wave 0 stores.
+        """
+        ctx = self.ctx
+        traits = ctx.traits
+        fm = ctx.fm_fast
+        n_acc = traits.D_CHUNKS * 16
+        # Per-lane row: n_acc accumulator floats then (m, l), padded to a
+        # multiple of 4 so every dwordx4 stays 16B-aligned.
+        stride = n_acc + 4
+        scratch = SmemPtr(
+            ctx.base_ptr,
+            ctx.lds_kv_offset,
+            fx.Float32.ir_type,
+            shape=(traits.WARP_SIZE * stride,),
+        ).get()
+        v4f32_type = Vec.make_type(4, fx.Float32)
+        v2f32_type = Vec.make_type(2, fx.Float32)
+        row = ctx.lane * fx.Index(stride)
+
+        m_self = loop_results[0]
+        l_self = loop_results[1]
+        acc_self = [loop_results[2 + dc] for dc in range_constexpr(traits.D_CHUNKS)]
+
+        # The K/V tile buffer is dead once the loop exits, so it doubles as the
+        # merge scratch. The barrier retires the last iteration's ds_reads of it.
+        gpu.barrier()
+
+        def _publish():
+            for dc in range_constexpr(traits.D_CHUNKS):
+                for g in range_constexpr(4):
+                    Vec.from_elements(
+                        [
+                            as_mlir_value(Vec(acc_self[dc])[g * 4 + i])
+                            for i in range_constexpr(4)
+                        ],
+                        fx.Float32,
+                    ).store(scratch, [row + fx.Index(dc * 16 + g * 4)])
+            Vec.from_elements(
+                [as_mlir_value(m_self), as_mlir_value(l_self)], fx.Float32
+            ).store(scratch, [row + fx.Index(n_acc)])
+
+        scf_if_dispatch(ctx.wave_kv_half == fx.Index(1), _publish)
+        gpu.barrier()
+
+        # Read unconditionally: wave 1 reads its own row back and merges with
+        # itself, which is harmless because it does not store.
+        peer_acc = []
+        for dc in range_constexpr(traits.D_CHUNKS):
+            elems = []
+            for g in range_constexpr(4):
+                part = Vec.load(v4f32_type, scratch, [row + fx.Index(dc * 16 + g * 4)])
+                for i in range_constexpr(4):
+                    elems.append(as_mlir_value(part[i]))
+            peer_acc.append(Vec.from_elements(elems, fx.Float32).ir_value())
+        peer_ml = Vec.load(v2f32_type, scratch, [row + fx.Index(n_acc)])
+
+        # Clamp off -inf first: an empty split never enters the loop and arrives
+        # with m = -inf, and -inf - -inf is NaN under fast math, which would
+        # poison an acc the combine otherwise skips on l == 0.
+        m_a = _fmax(m_self, ctx.c_neg_floor, fm)
+        m_b = _fmax(peer_ml[0], ctx.c_neg_floor, fm)
+        m_new = _fmax(m_a, m_b, fm)
+        corr_a = self._exp2(_fmul(_fsub(m_a, m_new, fm), ctx.c_sm_scale_log2e, fm))
+        corr_b = self._exp2(_fmul(_fsub(m_b, m_new, fm), ctx.c_sm_scale_log2e, fm))
+        l_new = _fadd(_fmul(corr_a, l_self, fm), _fmul(corr_b, peer_ml[1], fm), fm)
+        vec_a = Vec.from_elements([corr_a], fx.Float32).broadcast_to(16)
+        vec_b = Vec.from_elements([corr_b], fx.Float32).broadcast_to(16)
+        merged = [m_new, l_new]
+        for dc in range_constexpr(traits.D_CHUNKS):
+            merged.append(
+                _fadd(
+                    _fmul(Vec(acc_self[dc]), vec_a, fm),
+                    _fmul(Vec(peer_acc[dc]), vec_b, fm),
+                    fm,
+                )
+            )
+        return merged
 
     def build_p_packs(self, p_vals):
         ctx = self.ctx
@@ -4045,10 +4346,15 @@ class GenericStoreHelper:
         local_ml_idx = _splitk_local_ml_idx(ctx.q_head_idx, ctx.seq_len_v, q_row)
         seq_len_v = ctx.seq_len_v
         lane = ctx.lane
+        # Wave-split-K zeroes wave_q_offset, so both waves cover the same rows
+        # and would race on one workspace slot; wave 0 is the sole writer.
+        owns_row = q_row < seq_len_v
+        if const_expr(traits.ENABLE_WAVE_SPLITK):
+            owns_row = owns_row & (ctx.wave_kv_half == fx.Index(0))
 
         @flyc.jit
         def _store_splitk_partial_if_qrow():
-            if q_row < seq_len_v:
+            if owns_row:
                 self._store_splitk_partial_o_row(v_o, local_opart_base, opart_rsrc)
                 if lane < fx.Index(32):
                     _store_splitk_ml_row(
@@ -5891,18 +6197,21 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
 
     def _mfma_acc_fp8_wide(self, a_i32x8, b_i32x8, c_v16):
         # Wide fp8 QK: mfma_scale (32x32x64) with unit E8M0 scales, i32x8 operands.
+        # Operands: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b.
         return rocdl.mfma_scale_f32_32x32x64_f8f6f4(
             self.v16f32_type,
-            as_mlir_value(a_i32x8),
-            as_mlir_value(b_i32x8),
-            as_mlir_value(c_v16),
-            0,
-            0,
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-            0,
-            as_mlir_value(fx.Int32(0x7F7F7F7F)),
-        ).result
+            [
+                as_mlir_value(a_i32x8),
+                as_mlir_value(b_i32x8),
+                as_mlir_value(c_v16),
+                0,
+                0,
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+                0,
+                as_mlir_value(fx.Int32(0x7F7F7F7F)),
+            ],
+        )
 
     def _mfma_acc_bf16(self, a_v8, b_v8, c_v16):
         return fly.mma_atom_call_ssa(
@@ -6830,11 +7139,12 @@ def _stagger_extra_barrier_if_one(stagger_i32):
 
 def _debug_atomic_inc_lazy_count(byte_offset, debug_counts_rsrc):
     rocdl.raw_buffer_atomic_fadd(
+        T.f32,
         as_mlir_value(fx.Float32(1.0)),
         debug_counts_rsrc,
         as_mlir_value(fx.Int32(byte_offset)),
         as_mlir_value(fx.Int32(0)),
-        as_mlir_value(fx.Int32(0)),
+        aux=ir.IntegerAttr.get(T.i32, 0),
     )
 
 
