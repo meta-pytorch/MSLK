@@ -32,6 +32,13 @@ def test_target_requires_gfx950_and_flydsl():
     assert is_flydsl_available(), "requires FlyDSL"
 
 
+@pytest.fixture(autouse=True)
+def _generic_paged_route(monkeypatch):
+    """Keep decodes on the generic split-K kernel these tests inspect, rather
+    than pa_decode_swa (covered by pa_decode_swa_test.py)."""
+    monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", "0")
+
+
 def _paged_inputs(B, Sq, ctx, D, device="cuda", dtype=torch.bfloat16):
     pages_per_req = ctx // PAGE
     total = B * pages_per_req
@@ -1808,3 +1815,84 @@ def test_query_grouping_clamps_empty_prefix(monkeypatch):
     )
     assert [kv_max for kv_max, _ in launches] == [0, 4]
     assert [int(length.item()) for _, length in launches] == [0, 4]
+
+
+def _wave_splitk_shapes():
+    """Shapes the wave-split-K gate admits, beyond the 32x4 bf16 pair above.
+
+    The gate turns on for packed-GQA decode at HEAD_DIM >= 128 over a full
+    context, so it covers every GQA ratio and both 16-bit dtypes -- a far wider
+    set than the benchmark suite, which only ever runs 32 query heads over 4 KV
+    heads in bf16. The ratio matters because the gate's
+    ``q_pack_group * q_pack_qlen <= rows_per_wave`` bound is what keeps a wave's
+    share of the packed rows addressable; the dtype and head dim matter because
+    they set how much MFMA work each tile carries against the merge's fixed cost.
+
+    Only HEAD_DIM 128 appears: the gate says ``head_dim >= 128``, but the native
+    paged route rejects anything outside {64, 128} before the builder is reached,
+    and the gappy route that does take other head dims cannot GQA-pack (packing
+    needs ``kv_seqstart is None``, gappy needs it set), so ``q_pack_group > 0``
+    fails there. 128 is therefore the whole of the gate's reach -- see
+    ``test_native_paged_head_dim_bound`` below, which pins that.
+    """
+    return [
+        (128, hkv, dt)
+        for hkv in (1, 2, 4, 16, 32)  # H // hkv = GQA ratio 32, 16, 8, 2, 1
+        for dt in (torch.bfloat16, torch.float16)
+    ]
+
+
+@pytest.mark.parametrize("D,hkv,dtype", _wave_splitk_shapes())
+def test_wave_splitk_matches_single_split(monkeypatch, D, hkv, dtype):
+    """Wave-split-K must not change the result, at any admitted shape.
+
+    The single-split reference cannot reach wave-split-K -- the gate requires
+    ``num_kv_splits > 1`` -- so it is a genuine oracle here. Toggling the env
+    var would not work: the builders are lru_cached on their arguments and the
+    flag is read inside the trait builder, so a second call with the flag
+    flipped returns the already-built kernel.
+    """
+    B, Sq, ctx = 1, 1, 32768
+    pages_per_req = ctx // PAGE
+    total = B * pages_per_req
+    torch.manual_seed(0)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(total, PAGE, hkv, D, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    block_table = torch.arange(total, device="cuda", dtype=torch.int32).view(
+        B, pages_per_req
+    )
+    seqlen_k = torch.full((B,), ctx, device="cuda", dtype=torch.int32)
+
+    def call(num_kv_splits):
+        return flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=hkv,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            num_kv_splits=num_kv_splits,
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(fai, "_paged_num_kv_splits", lambda *a, **kw: 1)
+        ref = call(1)
+    got = call(0)
+    # Same tolerance as the 32x4 case: wave-split-K reorders the softmax
+    # reduction within a workgroup, which is 16-bit rounding, not structure.
+    torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
+
+
+def test_native_paged_head_dim_bound():
+    """Native paged KV takes 64 or 128 only.
+
+    This is what bounds wave-split-K's ``head_dim >= 128`` from above: without
+    it the gate would read as open-ended. If this bound ever widens, the gate
+    inherits head dims it has never run on, so the two must move together.
+    """
+    args = _paged_inputs(1, 1, 8192, 256)
+    with pytest.raises(NotImplementedError, match="head_dim=64 or 128"):
+        _run(*args, num_kv_splits=0)
