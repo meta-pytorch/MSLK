@@ -19,10 +19,13 @@ from flydsl._mlir.dialects import (  # pyre-ignore[21]  # pyre-ignore[21]
     llvm,
     math as mlir_math,
 )
-from flydsl.expr import arith, buffer_ops, rocdl  # pyre-ignore[21]
+from flydsl.expr import arith, rocdl  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
-from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP  # pyre-ignore[21]
+from flydsl.runtime.device import (  # pyre-ignore[21]  # pyre-ignore[21]
+    get_rocm_arch,
+    SMEM_CAPACITY_MAP,
+)
+from mslk.flydsl import buffer_ops
 
 
 WARP_SIZE: int = 64  # CDNA wave64 (gfx942, gfx950)

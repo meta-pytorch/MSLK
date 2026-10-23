@@ -677,59 +677,74 @@ class FP8Tests(unittest.TestCase):
             )
 
     @skipUnlessRocm()
-    def test_grouped_gemm_single_cta_group_boundary(self) -> None:
-        device_max_groups = torch.cuda.get_device_properties(
-            self.device
-        ).max_threads_per_block
-        M, N, K_per_group = 1, 8, 8
+    def test_gemm_rowwise_weight_at_reused_address(self) -> None:
+        # Each weight is freed just before the next is quantized, and no other
+        # tensor here has its size, so the allocator hands the new weight the
+        # old one's address; every result must still come from its own weight.
+        M, K, N = 128, 256, 1024
+        wq = None
+        for _ in range(3):
+            x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+            w = torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+            xq, x_scale = quantize_fp8_row(x)
+            del wq
+            wq, w_scale = quantize_fp8_row(w)
+            out = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale)
+            ref = (xq.float() @ wq.float().T) * x_scale[:, None] * w_scale[None, :]
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+    @skipUnlessRocm()
+    def test_grouped_gemm_more_groups_than_threads_per_block(self) -> None:
+        # ROCm serves these ops from FlyDSL, which grid-strides over groups
+        # rather than giving each its own thread in a single CTA, so group
+        # counts past the CTA size must still compute every group.
+        M, N, K_per_group = 2, 16, 16
         fp8_dtype = quantize_fp8_row(
             torch.zeros((1, K_per_group), dtype=torch.bfloat16, device=self.device)
         )[0].dtype
+        max_threads = torch.cuda.get_device_properties(
+            self.device
+        ).max_threads_per_block
 
-        def inputs(group_count: int):
-            total_k = group_count * K_per_group
-            xq = torch.zeros((M, total_k), dtype=fp8_dtype, device=self.device)
-            wq = torch.zeros((N, total_k), dtype=fp8_dtype, device=self.device)
-            x_scale = torch.ones(
-                (group_count * M,), dtype=torch.float32, device=self.device
-            )
-            w_scale = torch.ones(
-                (group_count * N,), dtype=torch.float32, device=self.device
-            )
+        def fp8(*shape: int) -> torch.Tensor:
+            return torch.randn(shape, device=self.device).to(fp8_dtype)
+
+        def scales(n: int) -> torch.Tensor:
+            return torch.rand(n, dtype=torch.float32, device=self.device) + 0.5
+
+        for G in (32, max_threads + 1):
+            # 2D-2D: groups along K.
+            xq, wq = fp8(M, G * K_per_group), fp8(N, G * K_per_group)
+            x_scale, w_scale = scales(G * M), scales(G * N)
             offsets = torch.arange(
                 K_per_group,
-                total_k + 1,
+                G * K_per_group + 1,
                 K_per_group,
                 dtype=torch.int32,
                 device=self.device,
             )
-            out = torch.empty(
-                (group_count, M, N), dtype=torch.bfloat16, device=self.device
+            out = torch.empty((G, M, N), dtype=torch.bfloat16, device=self.device)
+            torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(
+                xq, wq, x_scale, w_scale, offsets, out
             )
-            return xq, wq, x_scale, w_scale, offsets, out
-
-        valid_groups = min(32, device_max_groups)
-        valid_inputs = inputs(valid_groups)
-        output = torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(*valid_inputs)
-        self.assertEqual(output.shape, (valid_groups, M, N))
-
-        invalid_groups = device_max_groups + 1
-        invalid_inputs = inputs(invalid_groups)
-        with self.assertRaisesRegex(
-            RuntimeError, "requires one thread per group in a single CTA"
-        ):
-            torch.ops.mslk.f8f8bf16_rowwise_grouped_mm(*invalid_inputs)
-
-        with self.assertRaisesRegex(
-            RuntimeError, "requires one thread per group in a single CTA"
-        ):
-            torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked(
-                torch.zeros((1, 1), dtype=fp8_dtype, device=self.device),
-                torch.zeros((1, 1, 1), dtype=fp8_dtype, device=self.device),
-                torch.ones((1,), dtype=torch.float32, device=self.device),
-                torch.ones((1,), dtype=torch.float32, device=self.device),
-                torch.ones((invalid_groups,), dtype=torch.int64, device=self.device),
+            ref = torch.einsum(
+                "mgk,ngk->gmn",
+                xq.float().view(M, G, K_per_group),
+                wq.float().view(N, G, K_per_group),
             )
+            ref = ref * x_scale.view(G, M, 1) * w_scale.view(G, 1, N)
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+            # Stacked: one row per group, groups along M.
+            xq, wq = fp8(G, K_per_group), fp8(G, N, K_per_group)
+            x_scale, w_scale = scales(G), scales(G * N)
+            m_sizes = torch.ones((G,), dtype=torch.int64, device=self.device)
+            out = torch.ops.mslk.f8f8bf16_rowwise_grouped_stacked(
+                xq, wq, x_scale, w_scale, m_sizes
+            )
+            ref = torch.einsum("gk,gnk->gn", xq.float(), wq.float())
+            ref = ref * x_scale.view(G, 1) * w_scale.view(G, N)
+            torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
 
     @parameterized.expand(
         [

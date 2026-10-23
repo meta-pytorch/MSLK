@@ -32,6 +32,13 @@ def test_target_requires_gfx950_and_flydsl():
     assert is_flydsl_available(), "requires FlyDSL"
 
 
+@pytest.fixture(autouse=True)
+def _generic_paged_route(monkeypatch):
+    """Keep decodes on the generic split-K kernel these tests inspect, rather
+    than pa_decode_swa (covered by pa_decode_swa_test.py)."""
+    monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", "0")
+
+
 def _paged_inputs(B, Sq, ctx, D, device="cuda", dtype=torch.bfloat16):
     pages_per_req = ctx // PAGE
     total = B * pages_per_req
@@ -984,6 +991,8 @@ def test_window_sized_splits_do_not_exceed_tile_or_configured_caps(monkeypatch):
 
 
 def _paged_window_reference(q, k, v, ctx, window):
+    """Bottom-right causal attention with a flash-attention window: each query
+    sees ``window`` keys before its own position plus that position."""
     _, seqlen_q, num_heads, head_dim = q.shape
     flat_k = k.reshape(-1, HKV, head_dim).float()[:ctx]
     flat_v = v.reshape(-1, HKV, head_dim).float()[:ctx]
@@ -996,7 +1005,7 @@ def _paged_window_reference(q, k, v, ctx, window):
             scores = (q[0, row, head].float() @ flat_k[:, kv_head].T) / math.sqrt(
                 head_dim
             )
-            keep = (columns <= query_position) & (columns > query_position - window)
+            keep = (columns <= query_position) & (columns >= query_position - window)
             output[row, head] = (
                 scores.masked_fill(~keep, -math.inf).softmax(-1) @ flat_v[:, kv_head]
             )
@@ -1095,7 +1104,8 @@ def test_paged_window_reaches_light_builder(monkeypatch):
         max_seqlen_kv=2048,
         window_left=255,
     )
-    assert seen[-1]["window_left"] == 255
+    # The builder takes the exclusive bound, window_left + 1.
+    assert seen[-1]["window_left"] == 256
     assert seen[-1]["q_pack_qlen"] == 4
 
 
@@ -1162,8 +1172,11 @@ def _count_hp_calls(monkeypatch):
     pin -- so they select it explicitly rather than depending on which
     mechanism happens to win.
     """
+    from flydsl.runtime.device import get_rocm_arch
     from mslk.attention.flydsl.decode import pa_decode_dense
 
+    if not get_rocm_arch().startswith("gfx950"):
+        pytest.skip("the head-packed decode route is gfx950-only")
     monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
     calls = []
     real = pa_decode_dense.pa_decode_paged_launch
@@ -1203,14 +1216,17 @@ def calls_groups(calls):
     return calls[0].get("query_groups", 1)
 
 
-def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
-    """The two kernels must agree; the head-packed one is the faster path."""
+def test_head_packed_matches_generic_at_sq1(monkeypatch):
+    """The head-packed decode kernel must agree with the generic kernel."""
 
+    calls = _count_hp_calls(monkeypatch)
     args = _paged_inputs(2, 1, 32768, 64)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
     ref = _run_single_pass(monkeypatch, *args)
+    assert calls == []
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
+    assert len(calls) == 1
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
@@ -1329,19 +1345,22 @@ def test_head_packed_floor_does_not_reject_shallow_tiling(monkeypatch):
 
 
 @pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])
-def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
-    """Packed (qtok, head) rows must agree with the dualwave path.
+def test_head_packed_matches_generic_multi_token(monkeypatch, Sq, D):
+    """Packed (qtok, head) rows must agree with the generic kernel.
 
     This is the check on the per-query-token causal bound: the kernel applies
     `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
     as a mismatch on the earlier query rows only.
     """
 
+    calls = _count_hp_calls(monkeypatch)
     args = _paged_inputs(2, Sq, 32768, D)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
     ref = _run_single_pass(monkeypatch, *args)
+    assert calls == []
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
+    assert len(calls) == 1
     assert got.shape == ref.shape == (2, Sq, H, D)
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
@@ -1766,16 +1785,19 @@ def test_head_packed_kill_switch(monkeypatch):
     assert calls == []
 
 
-def test_head_packed_exceeds_dualwave_page_table_cap():
+def test_head_packed_exceeds_dualwave_page_table_cap(monkeypatch):
     """The dualwave path caps at 2048 pages/split (131072 tokens at page 64).
 
     The decode kernel reads the block table straight from memory, so it has no
-    such window -- this context would raise on the old path.
+    such window and runs this context.
     """
+    calls = _count_hp_calls(monkeypatch)
     ctx = 262144
-    out = _run(*_paged_inputs(1, 1, ctx, 64), 0)
-    assert out.shape == (1, 1, H, 64)
-    assert torch.isfinite(out).all()
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 1, ctx, 64)
+    out = _run(q, k, v, block_table, seqlen_k, 0)
+    assert len(calls) == 1
+    ref = _paged_reference(q, k, v, block_table, seqlen_k, causal=True)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 def test_query_grouping_clamps_empty_prefix(monkeypatch):
@@ -1808,3 +1830,84 @@ def test_query_grouping_clamps_empty_prefix(monkeypatch):
     )
     assert [kv_max for kv_max, _ in launches] == [0, 4]
     assert [int(length.item()) for _, length in launches] == [0, 4]
+
+
+def _wave_splitk_shapes():
+    """Shapes the wave-split-K gate admits, beyond the 32x4 bf16 pair above.
+
+    The gate turns on for packed-GQA decode at HEAD_DIM >= 128 over a full
+    context, so it covers every GQA ratio and both 16-bit dtypes -- a far wider
+    set than the benchmark suite, which only ever runs 32 query heads over 4 KV
+    heads in bf16. The ratio matters because the gate's
+    ``q_pack_group * q_pack_qlen <= rows_per_wave`` bound is what keeps a wave's
+    share of the packed rows addressable; the dtype and head dim matter because
+    they set how much MFMA work each tile carries against the merge's fixed cost.
+
+    Only HEAD_DIM 128 appears: the gate says ``head_dim >= 128``, but the native
+    paged route rejects anything outside {64, 128} before the builder is reached,
+    and the gappy route that does take other head dims cannot GQA-pack (packing
+    needs ``kv_seqstart is None``, gappy needs it set), so ``q_pack_group > 0``
+    fails there. 128 is therefore the whole of the gate's reach -- see
+    ``test_native_paged_head_dim_bound`` below, which pins that.
+    """
+    return [
+        (128, hkv, dt)
+        for hkv in (1, 2, 4, 16, 32)  # H // hkv = GQA ratio 32, 16, 8, 2, 1
+        for dt in (torch.bfloat16, torch.float16)
+    ]
+
+
+@pytest.mark.parametrize("D,hkv,dtype", _wave_splitk_shapes())
+def test_wave_splitk_matches_single_split(monkeypatch, D, hkv, dtype):
+    """Wave-split-K must not change the result, at any admitted shape.
+
+    The single-split reference cannot reach wave-split-K -- the gate requires
+    ``num_kv_splits > 1`` -- so it is a genuine oracle here. Toggling the env
+    var would not work: the builders are lru_cached on their arguments and the
+    flag is read inside the trait builder, so a second call with the flag
+    flipped returns the already-built kernel.
+    """
+    B, Sq, ctx = 1, 1, 32768
+    pages_per_req = ctx // PAGE
+    total = B * pages_per_req
+    torch.manual_seed(0)
+    q = torch.randn(B, Sq, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(total, PAGE, hkv, D, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    block_table = torch.arange(total, device="cuda", dtype=torch.int32).view(
+        B, pages_per_req
+    )
+    seqlen_k = torch.full((B,), ctx, device="cuda", dtype=torch.int32)
+
+    def call(num_kv_splits):
+        return flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=hkv,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            num_kv_splits=num_kv_splits,
+        )
+
+    with monkeypatch.context() as m:
+        m.setattr(fai, "_paged_num_kv_splits", lambda *a, **kw: 1)
+        ref = call(1)
+    got = call(0)
+    # Same tolerance as the 32x4 case: wave-split-K reorders the softmax
+    # reduction within a workgroup, which is 16-bit rounding, not structure.
+    torch.testing.assert_close(got.float(), ref.float(), atol=2e-3, rtol=2e-3)
+
+
+def test_native_paged_head_dim_bound():
+    """Native paged KV takes 64 or 128 only.
+
+    This is what bounds wave-split-K's ``head_dim >= 128`` from above: without
+    it the gate would read as open-ended. If this bound ever widens, the gate
+    inherits head dims it has never run on, so the two must move together.
+    """
+    args = _paged_inputs(1, 1, 8192, 256)
+    with pytest.raises(NotImplementedError, match="head_dim=64 or 128"):
+        _run(*args, num_kv_splits=0)

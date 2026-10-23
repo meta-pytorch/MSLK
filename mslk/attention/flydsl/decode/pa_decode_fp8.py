@@ -31,16 +31,15 @@ from flydsl._mlir.dialects import llvm  # pyre-ignore[21]
 from flydsl.compiler.kernel_function import CompilationContext  # pyre-ignore[21]
 from flydsl.expr import (  # pyre-ignore[21]
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.typing import Int32, T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
+from mslk.flydsl import buffer_ops, vector_ops as vector
 
 from .utils import dpp_xor_f32, maxnumf as _maxnumf, rcp_f32 as _rcp_f32, WARP_SIZE
 
