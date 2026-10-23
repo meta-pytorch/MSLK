@@ -52,10 +52,8 @@ def is_supported() -> bool:
     if not (is_gfx950() or is_gfx942()):
         return False
     try:
-        return (
-            getattr(importlib.import_module("flydsl.expr"), "buffer_ops", None)
-            is not None
-        )
+        importlib.import_module("mslk.flydsl.buffer_ops")
+        return True
     except ImportError:
         return False
 

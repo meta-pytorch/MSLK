@@ -63,18 +63,12 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    vector,
-)
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk.flydsl.kernels.common.kernels_common import default_f8_type
 from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
@@ -487,13 +481,16 @@ def compile_fp8_grouped_gemm(
 
         # LDS setup: ping-pong A buffers (preshuffle) or A ping-pong + single B
         # buffer (plain). B LDS is only needed for the plain path.
-        # The A/B arena is addressed as raw bytes -- T.f8 is its byte element
+        # The A/B arena is addressed as raw bytes -- default_f8_type() is its byte element
         # type, not the dtype of the operands -- so its shapes, strides and
         # column coordinates are all byte quantities. That is what lets the
         # XOR16 swizzle and the LDS pack loads be shared across input dtypes.
         base_ptr = allocator.get_base()
         lds_a = SmemPtr(
-            base_ptr, lds_alloc_offset, T.f8, shape=(2 * tile_m * tile_k_bytes,)
+            base_ptr,
+            lds_alloc_offset,
+            default_f8_type(),
+            shape=(2 * tile_m * tile_k_bytes,),
         ).get()
         lds_stride = tile_k_bytes
         layout_lds = fx.make_layout((tile_m, tile_k_bytes), stride=(lds_stride, 1))
@@ -505,7 +502,7 @@ def compile_fp8_grouped_gemm(
             lds_b = SmemPtr(
                 base_ptr,
                 lds_alloc_offset,
-                T.f8,
+                default_f8_type(),
                 shape=((lds_b_offset_bytes + tile_n * tile_k_bytes),),
             ).get()
             layout_lds_b = fx.make_layout(
