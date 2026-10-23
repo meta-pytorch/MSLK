@@ -15,10 +15,11 @@ from typing import Optional
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import buffer_ops, const_expr, gpu, math, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops, vector_ops
 from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     _buffer_load_vec,
@@ -564,7 +565,7 @@ def compile_preshuffle_gemm_a8(
             return load_b_pack_k32(
                 buffer_ops,
                 fx.arith,
-                fx.vector,
+                vector_ops,
                 arg_b=arg_b,
                 b_rsrc=b_rsrc,
                 layout_b=layout_b,
@@ -642,7 +643,7 @@ def compile_preshuffle_gemm_a8(
             vec_elems = 16 if elem_bytes == 1 else 8
             b16 = _buffer_load_vec(
                 buffer_ops,
-                fx.vector,
+                vector_ops,
                 b_rsrc,
                 idx_pack,
                 elem_type=_elem_type(),
@@ -723,7 +724,7 @@ def compile_preshuffle_gemm_a8(
         def load_a_16(idx_elem):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops,
-                fx.vector,
+                vector_ops,
                 elem_type=_elem_type(),
                 idx_i32=idx_elem,
                 rsrc=a_rsrc,
@@ -826,7 +827,7 @@ def compile_preshuffle_gemm_a8(
                 size_i32 = fx.Int32(dma_bytes_v)
                 soffset = fx.Int32(0)
                 offset_imm = fx.Int32(0)
-                aux = fx.Int32(1)
+                aux = 1
 
                 rocdl.raw_ptr_buffer_load_lds(
                     a_rsrc_v,
@@ -1264,7 +1265,7 @@ def compile_preshuffle_gemm_a8(
                 mfma_epilog(
                     use_cshuffle=True,
                     arith=fx.arith,
-                    vector=fx.vector,
+                    vector=vector_ops,
                     gpu=gpu,
                     range_constexpr=range_constexpr,
                     tile_m=tile_m,
