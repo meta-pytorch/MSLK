@@ -34,16 +34,15 @@ import torch
 from flydsl._mlir.dialects import llvm as _llvm  # pyre-ignore[21]
 from flydsl.expr import (  # pyre-ignore[21]
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
+from mslk.flydsl import buffer_ops, vector_ops as vector
 
 from .pa_decode_reduce import pa_decode_reduce
 from .utils import (
@@ -235,7 +234,7 @@ def compile_pa_decode_gfx950_coop(
         _dma_size = fx.Int32(DMA_BYTES)
         _dma_soff = fx.Int32(0)
         _dma_off = fx.Int32(0)
-        _dma_aux = fx.Int32(1)
+        _dma_aux = 1
 
         # Pre-load Q
         q_frags = []
