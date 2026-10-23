@@ -22,14 +22,34 @@ import mslk.gemm  # noqa: F401
 import torch
 from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import device_key, OpRouting
+from mslk.gemm.dispatch import f4f4bf16
+from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
 from mslk.testing.device import skipUnlessRocm
 from parameterized import parameterized
 
 Args = Tuple[Tuple[Any, ...], Dict[str, Any]]
 
 
+def _f4f4bf16_args(row: Dict[str, str]) -> Args:
+    M, N, K = int(row["M_max"]), int(row["N"]), int(row["K"])
+    aq, a_scale = triton_quantize_mx4_unpack(
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    )
+    bq, b_scale = triton_quantize_mx4_unpack(
+        torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    )
+    return (aq, bq, a_scale, b_scale), {}
+
+
 # (name, routing, the registered op, arguments for a table row)
-CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = []
+CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
+    (
+        "f4f4bf16",
+        f4f4bf16.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.f4f4bf16(*a, **kw),
+        _f4f4bf16_args,
+    ),
+]
 
 
 @skipUnlessRocm()
