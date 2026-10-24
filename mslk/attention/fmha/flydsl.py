@@ -444,9 +444,10 @@ class FwOp(AttentionFwOpBase):
 
         kw: dict = {"causal": causal, "num_kv_heads": inp.key.shape[-2]}
 
-        # window_left = _window_size (xformers keeps kv > q - window_size).
+        # xformers keeps kv > q - window_size (window_size keys); window_left
+        # counts the keys before the query's own, as in flash-attention.
         if isinstance(bias, _WINDOW_BIAS_TYPES):
-            kw["window_left"] = int(bias._window_size)
+            kw["window_left"] = int(bias._window_size) - 1
 
         if isinstance(bias, torch.Tensor):
             kw["bias"] = bias

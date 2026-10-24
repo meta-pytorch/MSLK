@@ -35,8 +35,8 @@ def compile_fmha_bwd_convert_dq(*, dtype_str: str = "bf16"):
         dq_out: fx.Tensor,
         n_elems: fx.Int32,
     ):
-        from flydsl.expr import buffer_ops as _bops
         from flydsl.expr.typing import Vector as Vec
+        from mslk.flydsl import buffer_ops as _bops
 
         # Derive elem type from dtype_str INSIDE the kernel so dtype_str is a
         # closure freevar and enters FlyDSL's JIT cache key. Otherwise bf16/f16
