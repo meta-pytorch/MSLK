@@ -28,10 +28,12 @@ from collections import namedtuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import math as math_dialect
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
+from mslk.flydsl import buffer_ops, vector_ops as vector
 from mslk.flydsl.common import lds_capacity_bytes
+from mslk.flydsl.kernels.common.kernels_common import default_f8_type
 from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     crd2idx,
     lds_store_16b_xor16,
@@ -814,7 +816,7 @@ def make_a_tile_loaders(
                 arith,
                 vector,
                 lds_memref=lds_a,
-                vec16_ty=T.f8x16,
+                vec16_ty=T.vec(16, default_f8_type()),
                 layout_lds=layout_lds,
                 row_local=a_row_local[i],
                 col_local_i32=a_col_local_i32[i],
@@ -940,7 +942,7 @@ def make_b_tile_loaders(
                 arith,
                 vector,
                 lds_memref=lds_b,
-                vec16_ty=T.f8x16,
+                vec16_ty=T.vec(16, default_f8_type()),
                 layout_lds=layout_lds_b,
                 row_local=b_row_local[i],
                 col_local_i32=b_col_local_i32[i],
@@ -980,7 +982,7 @@ def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
     which loads 16B from LDS with the XOR16 swizzle and returns the two
     i64 halves.
 
-    The load is of 16 raw bytes -- `T.f8` names the LDS arena's byte element
+    The load is of 16 raw bytes -- `default_f8_type()` names the LDS arena's byte element
     type, not the dtype of the data -- so this is the same for every input
     dtype. What differs downstream is how much of a pack one MFMA consumes:
     see `make_compute_tile`.
@@ -989,7 +991,7 @@ def make_lds_loader(*, lds_a, layout_lds, k_blocks16):
     def lds_load_packs_k64(curr_row_a_lds, col_base_bytes, lds_base):
         col_base_swz_bytes = swizzle_xor16(curr_row_a_lds, col_base_bytes, k_blocks16)
         idx_a16 = crd2idx((curr_row_a_lds, col_base_swz_bytes), layout_lds) + lds_base
-        loaded_a16 = Vector.load(T.vec(16, T.f8), lds_a, [idx_a16])
+        loaded_a16 = Vector.load(T.vec(16, default_f8_type()), lds_a, [idx_a16])
         a_i64x2 = loaded_a16.bitcast(fx.Int64)
         return a_i64x2[0], a_i64x2[1]
 
@@ -1008,7 +1010,7 @@ def make_lds_b_loader(*, lds_b, layout_lds_b, k_blocks16_b):
     def lds_load_b_packs_k64(row_n_lds, col_base_bytes, lds_base_b):
         col_base_swz_bytes = swizzle_xor16(row_n_lds, col_base_bytes, k_blocks16_b)
         idx_b16 = crd2idx((row_n_lds, col_base_swz_bytes), layout_lds_b) + lds_base_b
-        loaded_b16 = Vector.load(T.vec(16, T.f8), lds_b, [idx_b16])
+        loaded_b16 = Vector.load(T.vec(16, default_f8_type()), lds_b, [idx_b16])
         b_i64x2 = loaded_b16.bitcast(fx.Int64)
         return b_i64x2[0], b_i64x2[1]
 
@@ -1096,7 +1098,7 @@ def make_b_loader(
             n_blk=n_blk_list[ni],
             n_intra=n_intra_list[ni],
             lane_div_16=lane_div_16,
-            elem_type=T.f8,
+            elem_type=default_f8_type(),
             kpack_bytes=kpack_bytes,
             elem_bytes=elem_bytes,
         )

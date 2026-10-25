@@ -46,19 +46,13 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import math as math_dialect, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    vector,
-)
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk.flydsl.kernels.common.kernels_common import default_f8_type
 from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
@@ -399,7 +393,7 @@ def compile_fp8_blockwise_gemm(
         # ---- LDS ----
         base_ptr = allocator.get_base()
         lds_a = SmemPtr(
-            base_ptr, lds_alloc_offset, T.f8, shape=(2 * tile_m * tile_k,)
+            base_ptr, lds_alloc_offset, default_f8_type(), shape=(2 * tile_m * tile_k,)
         ).get()
         layout_lds = fx.make_layout((tile_m, tile_k), stride=(tile_k, 1))
         lds_base_pong = fx.Index(0)
@@ -409,7 +403,7 @@ def compile_fp8_blockwise_gemm(
             lds_b = SmemPtr(
                 base_ptr,
                 lds_alloc_offset,
-                T.f8,
+                default_f8_type(),
                 shape=((lds_b_offset_elems + tile_n * tile_k),),
             ).get()
             layout_lds_b = fx.make_layout((tile_n, tile_k), stride=(tile_k, 1))
