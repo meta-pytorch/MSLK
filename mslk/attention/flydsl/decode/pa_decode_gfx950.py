@@ -34,17 +34,29 @@ import torch
 from flydsl._mlir.dialects import llvm as _llvm  # pyre-ignore[21]
 from flydsl.expr import (  # pyre-ignore[21]
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
+from mslk.flydsl import buffer_ops, vector_ops as vector
 
+from .head_packed_common import (
+    finalize_smem,
+    FX_DTYPE as _FX_DTYPE,
+    load_q_frags,
+    LOG2E,
+    mfma_16x16x32,
+    MFMA_K_QK,
+    MFMA_M,
+    MFMA_N,
+    N_SUBTILE,
+    read_v_frag_tr,
+    TILE_N,
+)
 from .pa_decode_reduce import pa_decode_reduce
 from .utils import (
     dpp_xor_f32,
@@ -55,35 +67,19 @@ from .utils import (
     WARP_SIZE,
 )
 
-MFMA_M = 16  # heads packed on the QK MFMA M-axis
-MFMA_N = 16  # tokens per QK sub-tile (N-axis)
-MFMA_K_QK = 32  # QK MFMA K-dim (head-dim elements per call)
-TILE_N = 32  # tokens per streaming tile (= PV MFMA K-dim)
-N_SUBTILE = TILE_N // MFMA_N  # 2 QK sub-tiles per tile
 BLOCK = WARP_SIZE  # one warp per CTA
 
 # Query blocks longer than MFMA_M//ratio need several M-tiles, looped inside the
 # KV loop so one K/V stream feeds them all. Each tile adds loop-carried
-# accumulator, so the count is bounded by where the compiler starts spilling.
-#
-# Measured on gfx950 (rocprofv3 --kernel-trace, VGPR_Count + Scratch_Size):
-#
-#   tiles     1    2    3    4    5    6      7      8
-#   D=64     52   76  104  132  140  168    188    212      all clean
-#   D=128    88  120  148  184  220  256   256*   256*      * spills (280B, 916B)
-#
-# So D=64 is clean to 8 tiles and D=128 to 6. Spilling a bandwidth-bound decode
-# kernel is self-defeating.
+# accumulator, so the count is bounded by where the compiler starts spilling:
+# D=64 compiles without scratch up to 8 tiles and D=128 up to 6. Spilling a
+# bandwidth-bound decode kernel is self-defeating.
 MAX_M_TILES_BY_HEAD_DIM = {64: 8, 128: 6}
 
 
 def max_m_tiles(head_dim: int) -> int:
     """Largest M-tile count that does not spill at this head dim."""
     return MAX_M_TILES_BY_HEAD_DIM.get(head_dim, 2)
-
-
-_FX_DTYPE = {"f32": fx.Float32, "f16": fx.Float16, "bf16": fx.BFloat16}
-LOG2E: float = 1.4426950408889634
 
 
 @functools.lru_cache(maxsize=256)
@@ -120,7 +116,7 @@ def compile_pa_decode_gfx950(
     _PAGED = bool(paged)
     _PAGE_SIZE = int(page_size)
     # Paged caches past 4 GiB need 64-bit page offsets. That costs a descriptor
-    # per tile (measured ~6% at D=128), so it is only compiled in when needed.
+    # per tile, so it is only compiled in when needed.
     _KV_I64 = _PAGED and bool(kv_i64)
 
     # M-axis packing. The 16 M slots hold (query-token, head) pairs laid out as
@@ -142,11 +138,7 @@ def compile_pa_decode_gfx950(
     _FX_OUT = _FX_DTYPE[output_dtype_str]
     _QK_GRP = _HEAD // MFMA_K_QK  # head-dim groups for QK (4 at D=128)
     _DN = _HEAD // MFMA_N  # d-passes for PV (8 at D=128)
-    _mfma = (
-        rocdl.mfma_f32_16x16x32_bf16
-        if kv_dtype_str == "bf16"
-        else rocdl.mfma_f32_16x16x32_f16
-    )
+    _mfma = mfma_16x16x32(kv_dtype_str)
 
     # LDS: P[MFMA_M, TILE_N] f32 + double-buffered V ([dpass][tok][16] transpose tiles).
     _NUM_DMA_V = (TILE_N * _HEAD // 8) // WARP_SIZE  # 16B (8 f16) chunks / 64 lanes
@@ -197,7 +189,6 @@ def compile_pa_decode_gfx950(
         num_g: fx.Int32,
         kv_max: fx.Int32,
         num_hkv: fx.Int32,
-        ratio: fx.Int32,
         softmax_scale: fx.Float32,
         split_total: fx.Int32,
     ) -> None:
@@ -217,7 +208,7 @@ def compile_pa_decode_gfx950(
         rest2 = rest // num_hkv
         g_idx = rest2 % num_g
         b_idx = rest2 // num_g
-        hq_base = hkv_abs * ratio  # first query head sharing this KV head
+        hq_base = hkv_abs * fx.Int32(_RATIO)  # first query head sharing this KV head
 
         c_zero = arith.constant(0.0, type=T.f32)
         c_one = arith.constant(1.0, type=T.f32)
@@ -239,7 +230,8 @@ def compile_pa_decode_gfx950(
         if const_expr(_PAGED):
             # Paged lengths are exact: an empty (e.g. padding) request, or a
             # query group whose shifted length went negative, attends to nothing
-            # rather than walking stale block-table entries up to kv_max.
+            # rather than walking stale block-table entries up to kv_max, and
+            # no request reaches past kv_max.
             t_full = arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0))
             t_full = arith.select(t_full < kv_max, t_full, kv_max)
         else:
@@ -273,28 +265,12 @@ def compile_pa_decode_gfx950(
         # clamped to the last valid token here (a harmless duplicate load) and
         # discarded in the epilogue.
         q_head = tok_lane % fx.Int32(_RATIO)
-        q_tok_local = tok_lane // fx.Int32(_RATIO)
         q_base_bh = (
             b_idx * stride_qb + g_idx * stride_qg + (hq_base + q_head) * stride_qh
         )
-        q_frags = []  # q_frags[m_tile][g]
-        for t in range_constexpr(_M_TILES):
-            q_tok = q_tok_local + fx.Int32(t * _T_PACK)
-            q_tok = fx.Int32(
-                arith.select(
-                    arith.unwrap(q_tok < fx.Int32(_SQ)),
-                    arith.unwrap(q_tok),
-                    arith.constant(_SQ - 1, type=T.i32),
-                )
-            )
-            q_base = q_base_bh + q_tok * stride_qs
-            frags = []
-            for g in range_constexpr(_QK_GRP):
-                q_off = q_base + fx.Int32(g * MFMA_K_QK) + grp * fx.Int32(8)
-                frags.append(
-                    buffer_ops.buffer_load(q_rsrc, q_off, vec_width=8, dtype=_FX_KV)
-                )
-            q_frags.append(frags)
+        q_frags = load_q_frags(  # q_frags[m_tile][g]
+            q_rsrc, q_base_bh, stride_qs, tok_lane, grp, _RATIO, _SQ, _HEAD, _FX_KV
+        )
 
         # Dense: the (b, g) origin is a fixed offset. Paged: (b, token) is resolved per
         # tile through the block table, so only the kv-head offset is loop-invariant.
@@ -469,6 +445,14 @@ def compile_pa_decode_gfx950(
                             )
                         )
                     )
+                    # A row that has seen no key keeps max -inf, and
+                    # (-inf) - (-inf) is NaN; its sum and accumulator are
+                    # still zero, so any finite rescale is exact.
+                    a = fx.Float32(
+                        arith.select(
+                            arith.unwrap(nm) > c_neginf, arith.unwrap(a), c_one
+                        )
+                    )
                     alpha[t].append(a)
 
             # P = exp2((score - new_max)*log2e); write to LDS[m_tile][m, tok];
@@ -583,7 +567,6 @@ def compile_pa_decode_gfx950(
                     )
                 p_frags.append(p_frag)
 
-            _v4h = T.vec(4, _FX_KV.ir_type)
             for dpass in range_constexpr(_DN):
                 # B-frag V via two ds_read_tr16_b64 (128-bit HW transpose): group grp
                 # owns toks grp*8..+7 -> V[tok, d=dpass*16+tok_lane].
@@ -591,21 +574,8 @@ def compile_pa_decode_gfx950(
                     16
                 )
                 _off_lo = v_lds_f16 + fx.Index(_GB) + (fx.Index(tok_lane)) * fx.Index(4)
-                _vlo = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_lo * fx.Index(2)), address_space=3
-                    ),
-                ).result
-                _off_hi = _off_lo + fx.Index(4 * 16)
-                _vhi = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_hi * fx.Index(2)), address_space=3
-                    ),
-                ).result
                 # v_frag is indexed by lane only, so one read feeds every M-tile.
-                v_frag = vector.shuffle(_vlo, _vhi, [0, 1, 2, 3, 4, 5, 6, 7])
+                v_frag = read_v_frag_tr(_off_lo, _off_lo + fx.Index(4 * 16), _FX_KV)
                 for t in range_constexpr(_M_TILES):
                     c_in = zero_v4
                     for e in range_constexpr(4):
@@ -770,19 +740,12 @@ def _make_gfx950_jit_launcher(
         num_g,
         kv_max,
         num_hkv,
-        ratio,
         scale,
         split_total,
         grid_x,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        from flydsl._mlir import ir as _ir
-        from flydsl.compiler.kernel_function import CompilationContext
-
-        _alloc.finalized = False
-        ctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(ctx.gpu_module_body):
-            _alloc.finalize()
+        finalize_smem(_alloc)
         kernel(
             out_ptr,
             pm_ptr,
@@ -805,7 +768,6 @@ def _make_gfx950_jit_launcher(
             num_g,
             kv_max,
             num_hkv,
-            ratio,
             scale,
             split_total,
         ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
@@ -970,7 +932,6 @@ def pa_decode_gfx950_launch(
             G,
             KV_MAX,
             H_kv,
-            ratio,
             softmax_scale,
             split_k,
             n_cta_base,
@@ -1014,7 +975,6 @@ def pa_decode_gfx950_launch(
             G,
             KV_MAX,
             H_kv,
-            ratio,
             softmax_scale,
             split_k,
             n_cta_base * split_k,
