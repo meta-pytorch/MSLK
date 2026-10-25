@@ -53,10 +53,8 @@ from .flash_attn_utils import (
     DualwavePageIdLoader,
     DualwaveQLoader,
     DualwaveSoftmaxHelper,
-    DualwaveSplitKCombineContext,
-    DualwaveSplitKCombineHelper,
     DualwaveStoreHelper,
-    scf_if_dispatch,
+    run_splitk_combine,
 )
 
 
@@ -791,39 +789,17 @@ def build_flash_attn_dualwave_swp_module(
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
     ):
-        ctx = DualwaveSplitKCombineContext(
-            traits, O, WS, batch_size, seq_len, stride_q_n, LSE=LSE
+        run_splitk_combine(
+            traits,
+            O,
+            WS,
+            LSE,
+            batch_size,
+            seq_len,
+            stride_q_n,
+            COMBINE_ROWS_PER_BLOCK,
+            COMBINE_LANES_PER_ROW,
         )
-        ctx.init_types_and_constants()
-        ctx.init_runtime_indices()
-        ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
-        total_rows = (
-            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
-        )
-        ctx.row_in_bounds = ctx.row < total_rows
-        ctx.row = ctx.row_in_bounds.select(ctx.row, fx.Index(0))
-        heads_per_batch = ctx.seq_len_v * traits.NUM_HEADS_Q
-        ctx.batch_idx = ctx.row // heads_per_batch
-        rem = ctx.row % heads_per_batch
-        ctx.q_head_idx = rem // ctx.seq_len_v
-        ctx.seq_idx = rem % ctx.seq_len_v
-        ctx.init_workspace()
-        ctx.init_descriptors()
-
-        combine = DualwaveSplitKCombineHelper(ctx)
-        m_max = combine.reduce_m_max()
-        m_max = combine.merge_m_max(m_max)
-        acc, den = combine.accumulate_splits(m_max)
-        den, acc = combine.merge_split_groups(den, acc)
-        o_pack = combine.pack_output(acc, den)
-
-        # Every split group holds the merged result; one of them stores it.
-        def _store():
-            combine.store_output(o_pack)
-            if const_expr(traits.RETURN_LSE):
-                combine.store_lse(m_max, den)
-
-        scf_if_dispatch(ctx.row_in_bounds & (ctx.sgrp == fx.Index(0)), _store)
 
     @flyc.jit
     def launch_flash_attn_dualwave_swp(
