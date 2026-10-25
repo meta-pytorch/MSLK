@@ -23,12 +23,14 @@ _INSTALL_HINT: str = (
     "Install it with `pip install flydsl`."
 )
 
-# Minimum FlyDSL release the MSLK kernels are written against. Keep in sync
-# with ``ci/flydsl_version.txt`` (the version setup.py pins for OSS installs).
+# Minimum FlyDSL release the MSLK kernels are written against. This is a floor,
+# not the pin: ``ci/flydsl_version.txt`` holds the exact version setup.py pins
+# for OSS installs, which follows aiter's FlyDSL pin and may be newer. Raise
+# this only when the kernels start using APIs from a newer release.
 # Older releases are missing APIs the kernels use (e.g. ``flydsl.expr.Pointer``
 # and ``flydsl.compiler.protocol.extract_to_ir_values``) and fail at compile
 # time rather than at import, so callers must gate on the version explicitly.
-MIN_FLYDSL_VERSION: str = "0.2.4"
+MIN_FLYDSL_VERSION: str = "0.4.0"
 
 # Bundled AOT cache shipped inside the package (populated at build time).
 # Shared across all FlyDSL kernel categories (gemm, moe, ...), so it lives
@@ -47,8 +49,10 @@ def is_flydsl_available() -> bool:
     if importlib.util.find_spec("flydsl") is None:
         return False
     try:
-        from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
-        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP  # pyre-ignore[21]
+        from flydsl.runtime.device import (  # pyre-ignore[21]  # pyre-ignore[21]
+            get_rocm_arch,
+            SMEM_CAPACITY_MAP,
+        )
 
         return get_rocm_arch() in SMEM_CAPACITY_MAP
     except Exception:
@@ -116,7 +120,7 @@ def lds_capacity_bytes(arch=None):
     it; unknown architectures fall back to the conservative 64 KiB.
     """
     try:
-        from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+        from flydsl.runtime.device import SMEM_CAPACITY_MAP
     except Exception:
         return _LDS_CAPACITY_FALLBACK_BYTES
     return SMEM_CAPACITY_MAP.get(str(arch), _LDS_CAPACITY_FALLBACK_BYTES)

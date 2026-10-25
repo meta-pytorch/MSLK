@@ -25,9 +25,29 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
     scf as _scf,
 )
-from flydsl.expr import arith as _expr_arith, buffer_ops, const_expr
+from flydsl.expr import arith as _expr_arith, const_expr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+from mslk.flydsl import buffer_ops
+
+
+def default_f8_type():
+    """The FP8 element type this GPU's MFMAs take: e4m3fn on gfx95*/gfx12*,
+    e4m3fnuz on gfx94*. Stands in for FlyDSL 0.2.4's ``T.f8``, which 0.4.0
+    dropped. gfx11* has no FP8 instructions, so it fails here instead of in
+    instruction selection."""
+    try:
+        arch = str(get_rocm_arch())
+    except Exception:
+        arch = ""
+    if "gfx95" in arch or "gfx12" in arch:
+        return fx.Float8E4M3FN.ir_type
+    if arch.startswith("gfx11"):
+        raise RuntimeError(
+            f"default_f8_type(): no native FP8 support on {arch}; FP8 "
+            "instructions are available on gfx94*, gfx95* and gfx12*."
+        )
+    return fx.Float8E4M3FNUZ.ir_type
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type=None):
