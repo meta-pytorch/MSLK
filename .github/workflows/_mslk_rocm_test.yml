@@ -124,6 +124,13 @@ jobs:
     - name: Install FlyDSL
       run: . $PRELUDE; install_flydsl_pip $BUILD_ENV
 
+    # aiter is optional for MSLK users, but CI installs the pinned build so that
+    # the ops' aiter paths are tested. If it cannot be installed (it comes from
+    # AMD's staging server), the job continues without it, with a warning, and
+    # those tests skip. A FlyDSL pin that differs from aiter's fails the step.
+    - name: Install aiter
+      run: . $PRELUDE; install_aiter_pip $BUILD_ENV
+
     - name: Download Wheel Artifact from GHA
       if: ${{ inputs.mslk-channel-version == '' }}
       uses: actions/download-artifact@v4
