@@ -25,18 +25,11 @@ import math as _math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    math as fly_math,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, const_expr, gpu, math as fly_math, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from mslk.flydsl import buffer_ops
 
 
 # Inlined (not imported from kernels.kernels_common / kernels.common.kernels_common):
@@ -304,7 +297,7 @@ def compile_fmha_bwd_dvdk_mfma(
         # batch_idx*seq_len_idx/seq_len_idx -- see module docstring. Non-varlen:
         # these reduce to exactly the original formulas (B_logical==1-style).
         if const_expr(varlen):
-            from flydsl.expr import buffer_ops as _seq_bops
+            from mslk.flydsl import buffer_ops as _seq_bops
 
             seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
             seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
@@ -407,7 +400,7 @@ def compile_fmha_bwd_dvdk_mfma(
         def _dvec_row(q_pos, head_idx):
             return fx.Int32((q_start + q_pos) * n_heads_idx + head_idx)
 
-        from flydsl.expr import buffer_ops as _bops
+        from mslk.flydsl import buffer_ops as _bops
 
         q_rsrc = _bops.create_buffer_resource(Q)
         k_rsrc = _bops.create_buffer_resource(K)
@@ -988,7 +981,7 @@ def compile_fmha_bwd_dq_mfma(
         # (per-batch REAL length, for masking) replace the globally-uniform
         # batch_idx*seq_len_idx/seq_len_idx. Non-varlen: reduces to the original.
         if const_expr(varlen):
-            from flydsl.expr import buffer_ops as _seq_bops
+            from mslk.flydsl import buffer_ops as _seq_bops
 
             seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
             seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
@@ -1073,7 +1066,7 @@ def compile_fmha_bwd_dq_mfma(
         def _dvec_row(q_pos):
             return _q_row_out(q_pos)
 
-        from flydsl.expr import buffer_ops as _bops
+        from mslk.flydsl import buffer_ops as _bops
 
         q_rsrc = _bops.create_buffer_resource(Q)
         k_rsrc = _bops.create_buffer_resource(K)
@@ -1699,7 +1692,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
         # seqstart lookup instead of a globally-uniform batch_idx*seq_len_idx --
         # see module docstring. Non-varlen: these reduce to the original formulas.
         if const_expr(varlen):
-            from flydsl.expr import buffer_ops as _seq_bops
+            from mslk.flydsl import buffer_ops as _seq_bops
 
             seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
             seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
@@ -1805,7 +1798,7 @@ def compile_fmha_bwd_dqdkdv_mfma(
         def _dvec_row(q_pos, head_idx):
             return _q_row_out(q_pos, head_idx)
 
-        from flydsl.expr import buffer_ops as _bops
+        from mslk.flydsl import buffer_ops as _bops
 
         q_rsrc = _bops.create_buffer_resource(Q)
         k_rsrc = _bops.create_buffer_resource(K)
@@ -1867,11 +1860,12 @@ def compile_fmha_bwd_dqdkdv_mfma(
         def _atomic_add_f32(rsrc, flat_elem, val_f32):
             # f32 atomic add into rsrc[flat_elem]; offset is in BYTES.
             rocdl.raw_buffer_atomic_fadd(
+                _T.f32,
                 _raw(val_f32),
                 rsrc,
                 _raw(fx.Int32(fx.Index(flat_elem) * 4)),
                 _raw(fx.Int32(0)),
-                _raw(fx.Int32(0)),
+                aux=_ir_d.IntegerAttr.get(_T.i32, 0),
             )
 
         def _atomic_add_dq(flat_elem, val_f32):
