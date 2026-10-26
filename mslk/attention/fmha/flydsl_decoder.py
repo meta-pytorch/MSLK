@@ -43,7 +43,7 @@ def _flydsl_decode_forward(
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """FlyDSL dense decode op (gfx942/gfx950). f16/bf16/f32 KV, dense padded layout, GQA/MQA."""
+    """FlyDSL dense decode op (gfx942/gfx950). f16/bf16 KV, dense padded layout, GQA/MQA."""
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
