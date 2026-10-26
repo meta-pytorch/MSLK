@@ -219,7 +219,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = True
     SUPPORTS_BMGHK = True
-    SUPPORTS_PARTIAL = False
+    SUPPORTS_PARTIAL = True
     # The kernel writes padded per-batch LSE [B, H, max_seqlen_q]; _apply_bmhk
     # repacks varlen LSE to [1, H, total_q] so this matches BwOp/ck.BwOp (True).
     VARLEN_LSE_PACKED = True
@@ -322,6 +322,11 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
+        # Partial attention needs the LSE, which native paged cannot emit.
+        if d.is_partial and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
+            reasons.append(
+                "native paged KV does not support partial attention (no LSE)"
+            )
 
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
         # ignored (only gappy paged folds sm_scale).
