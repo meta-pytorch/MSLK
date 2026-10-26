@@ -13,7 +13,7 @@ from mslk.flydsl.common import is_flydsl_available, require_flydsl
 from ..flydsl.decode.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
-from .utils.op_common import get_operator, register_operator
+from .utils.op_common import register_operator
 
 # FlyDSL is a mandatory ROCm-only backend but absent on CUDA/CPU builds; guard the
 # kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
@@ -43,7 +43,8 @@ def _flydsl_splitk_forward(
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_splitk_ck")
+    # Python callable rather than a torch.ops handle (cf. flydsl.FwOp).
+    OPERATOR = staticmethod(is_flydsl_available)
     SUPPORTED_DEVICES = {"cuda"}
     SUPPORTED_DTYPES = {
         torch.half,

@@ -8,6 +8,7 @@
 
 import logging
 import math
+import sys
 import unittest.mock
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Type
@@ -1196,6 +1197,25 @@ def test_splitk_decoder_declines_int32_kv(op, num_groups: int) -> None:
 
     reasons = op.not_supported_reasons(fmha.Inputs(q, k, v))
     assert "quantized (int32) key/value not supported" in reasons
+
+
+@pytest.mark.parametrize("op", [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp])
+def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    q = torch.randn(1, 4, 1, 8, 128, dtype=torch.bfloat16, device=device)
+    k = torch.randn(1, 4 * 256, 1, 1, 128, dtype=torch.bfloat16, device=device)
+    k = k.expand(1, 4 * 256, 1, 8, 128)
+    bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * 4, kv_padding=256, kv_seqlen=[256] * 4, device=device
+    )
+    inp = fmha.Inputs(q, k, k, attn_bias=bias)
+    reason = "FlyDSL is not available for this GPU architecture"
+
+    module = sys.modules[op.__module__]
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: False)
+    assert reason in op.not_supported_reasons(inp)
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: True)
+    assert reason not in op.not_supported_reasons(inp)
 
 
 @rocm_only
