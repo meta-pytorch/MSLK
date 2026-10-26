@@ -4748,14 +4748,22 @@ class GenericStoreHelper:
                 fmath.log(l_final, fastmath=ctx.fm_fast),
                 ctx.fm_fast,
             )
+            # Fully-masked row (l=0): fast-math log is poison, store -inf.
+            lse_val = (fx.Float32(l_final) > ctx.c_zero_f).select(
+                lse_val, ctx.c_neg_inf
+            )
             self.store_lse(lse_val, q_row)
 
         inv_l_rcp = rocdl.rcp(T.f32, l_final)
         # Fully-masked row has l_final == 0 -> rcp*0 = NaN; emit 0 instead (matches
         # CK). Rows can be fully masked under causal, an all -inf bias row, or an
-        # empty paged request.
+        # empty paged or varlen sequence.
         if const_expr(
-            traits.CAUSAL or traits.HAS_BIAS or traits.PAGED or traits.WINDOW_LEFT >= 0
+            traits.CAUSAL
+            or traits.HAS_BIAS
+            or traits.PAGED
+            or traits.VARLEN
+            or traits.WINDOW_LEFT >= 0
         ):
             inv_l = (fx.Float32(l_final) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         else:
@@ -6062,6 +6070,8 @@ class DualwaveStoreHelper(DualwaveKernelContext):
             fmath.log(l_row, fastmath=self.fm_fast),
             self.fm_fast,
         )
+        # Fully-masked row (l=0): fast-math log is poison, store -inf.
+        lse_val = (fx.Float32(l_row) > self.c_zero_f).select(lse_val, self.c_neg_inf)
         self.store_lse(lse_val, q_row)
 
     def store_lse(self, lse_val, q_row):
@@ -7388,6 +7398,10 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
             _fmul(m_max, fx.Float32(ln2), self.fm_fast),
             fmath.log(den, fastmath=self.fm_fast),
             self.fm_fast,
+        )
+        # Every split empty (den=0): fast-math log is poison, store -inf.
+        lse_val = (fx.Float32(den) > self.c_zero_f).select(
+            lse_val, fx.Float32(float("-inf"))
         )
         lse_rsrc, oob = _make_lse_rsrc(
             self.LSE, self.batch_idx, self.traits.NUM_HEADS_Q, self.seq_len_v
