@@ -356,9 +356,7 @@ def build_flash_attn_func_module_primary(
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
         Dropout: fx.Tensor,
-        dropout_stride_b: fx.Int32,
-        dropout_stride_h: fx.Int32,
-        dropout_stride_q: fx.Int32,
+        dropout_threshold: fx.Int32,
     ):
         # Make shape/mode traits visible to the JIT cache key.
         _ = _flash_attn_generic_cache_tag
@@ -398,9 +396,7 @@ def build_flash_attn_func_module_primary(
         if const_expr(traits.HAS_BIAS):
             ctx.init_bias(Bias, bias_stride_b, bias_stride_h, bias_stride_q)
         if const_expr(traits.HAS_DROPOUT):
-            ctx.init_dropout(
-                Dropout, dropout_stride_b, dropout_stride_h, dropout_stride_q
-            )
+            ctx.init_dropout(Dropout, dropout_threshold)
         if const_expr(traits.ENABLE_DMA):
             kv_gmem_to_lds.init_dma()
 
@@ -902,9 +898,7 @@ def build_flash_attn_func_module_primary(
         bias_stride_h: fx.Int32,
         bias_stride_q: fx.Int32,
         Dropout: fx.Tensor,
-        dropout_stride_b: fx.Int32,
-        dropout_stride_h: fx.Int32,
-        dropout_stride_q: fx.Int32,
+        dropout_threshold: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -950,9 +944,7 @@ def build_flash_attn_func_module_primary(
             bias_stride_h,
             bias_stride_q,
             Dropout,
-            dropout_stride_b,
-            dropout_stride_h,
-            dropout_stride_q,
+            dropout_threshold,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": (
@@ -1027,9 +1019,7 @@ def build_flash_attn_func_module_primary(
         bias_stride_h=0,
         bias_stride_q=0,
         dropout=None,
-        dropout_stride_b=0,
-        dropout_stride_h=0,
-        dropout_stride_q=0,
+        dropout_threshold=0,
         stream=None,
     ):
         if traits.RETURN_LSE and lse is None:
@@ -1037,7 +1027,7 @@ def build_flash_attn_func_module_primary(
         if traits.HAS_BIAS and bias is None:
             raise ValueError("has_bias=True requires a bias tensor")
         if traits.HAS_DROPOUT and dropout is None:
-            raise ValueError("has_dropout=True requires a dropout mask tensor")
+            raise ValueError("has_dropout=True requires a dropout seed tensor")
         if traits.GAPPY_KV and kv_seqstart is None:
             raise ValueError("gappy_kv=True requires a kv_seqstart tensor")
         if traits.SPLITK and workspace is None:
@@ -1088,9 +1078,7 @@ def build_flash_attn_func_module_primary(
                 bias_stride_h,
                 bias_stride_q,
                 drop_t,
-                dropout_stride_b,
-                dropout_stride_h,
-                dropout_stride_q,
+                dropout_threshold,
                 stream_arg,
             )
 
@@ -1117,9 +1105,7 @@ def build_flash_attn_func_module_primary(
                 bias_stride_h,
                 bias_stride_q,
                 drop_t,
-                dropout_stride_b,
-                dropout_stride_h,
-                dropout_stride_q,
+                dropout_threshold,
                 stream_arg,
             )
         _cf_cache[tuple(key)] = cf
@@ -1143,7 +1129,7 @@ def build_flash_attn_func_module_primary(
         if traits.HAS_BIAS and bias is None:
             raise ValueError("has_bias=True requires a bias tensor")
         if traits.HAS_DROPOUT and dropout is None:
-            raise ValueError("has_dropout=True requires a dropout mask tensor")
+            raise ValueError("has_dropout=True requires a dropout seed tensor")
         lse_t = lse if lse is not None else Out
         bias_t = bias if bias is not None else Out
         drop_t = dropout if dropout is not None else Out
@@ -1171,8 +1157,6 @@ def build_flash_attn_func_module_primary(
                 0,
                 0,
                 drop_t,
-                0,
-                0,
                 0,
                 fx.Stream(stream),
             )
