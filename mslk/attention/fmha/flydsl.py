@@ -12,19 +12,21 @@ that judges CK's `ck.BwOp` (both are covered by `test_backward`'s `ALL_BW_OPS`
 parametrization there).
 
 Part of `ALL_BW_OPS` in `mslk/attention/fmha/__init__.py` (guarded by
-`torch.version.hip`) for TEST-ENUMERATION purposes only -- this broadens which
-test files (`test_mem_eff_attention.py`, `test_forward.py`) exercise this op.
-It is deliberately NOT wired into `dispatch.py`'s live `_dispatch_bw()`
-priority list, which still hardcodes `[ck.BwOp]` on ROCm -- this op is not a
-live production backend.
+`torch.version.hip`), which broadens which test files (`test_mem_eff_attention.py`,
+`test_forward.py`) exercise this op. It is also the second entry of
+`dispatch.py`'s ROCm `_dispatch_bw()` priority list, after `ck.BwOp`: CK wins
+on the archs it is built for and declines the rest (`SUPPORTED_GFX_ARCHS`), which
+is when this op is selected.
 
 Stride-aware addressing: the kernel supports Q/K/V/dO with a possibly-non-
 contiguous per-tensor row pitch — e.g. a packed-`qkv` tensor sliced/unbound
 into Q/K/V views. The kernel still requires each tensor to be flat *within* a
 row (last dim D stride-1, H-axis stride exactly D — i.e. only the outer
-B/M-or-N row pitch may differ from the contiguous `H*D`); this is checked in
-`not_supported_reasons()` below. Real per-axis arbitrary strides (transposed H,
-non-unit D stride) remain unsupported.
+B/M-or-N row pitch may differ from the contiguous `H*D`). Inputs that violate
+this (transposed H, non-unit D stride, a stride-0 broadcast grad such as the one
+`out.sum().backward()` produces) and K/V with different row pitches are copied
+to a contiguous layout in `apply` rather than declined. Head dims that are not a
+multiple of 32 are zero-padded there too.
 
 Non-goals (intentionally excluded rather than left as silent gaps -- each
 entry below is enforced generically, see the cited mechanism, and has its own
@@ -32,8 +34,7 @@ negative-path test in `test_backward.py`):
 - Dropout (`d.p != 0.0`): no MSLK caller passes dropout through this op;
   rejected generically by `AttentionOpBase.not_supported_reasons()`'s
   `(d.p != 0.0) and not cls.SUPPORTS_DROPOUT` check (`SUPPORTS_DROPOUT = False`
-  below). Revisit if `flydsl.BwOp` is ever added to a live dispatch path and a
-  caller trips this.
+  below). Revisit if a caller trips this now that the op is dispatched.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
@@ -46,20 +47,13 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
-- Tensor-bias / ALiBi (`LowerTriangularMaskWithTensorBias` and similar): no
-  MSLK caller found for this backward op. Rejected the same way, via
-  `SUPPORTED_ATTN_BIAS_TYPES` omission.
-- Bottom-right varlen (`BlockDiagonalCausalFromBottomRightMask` and other
-  bottom-right alignment variants): only top-left causal alignment, including
-  `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
-  way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
-  bottom-right causal masking specifically.
 """
 
 import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
+from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
     BlockDiagonalCausalFromBottomRightMask,
@@ -334,6 +328,14 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
+
+        # Dropout masks are drawn with torch.rand inside the forward, so no
+        # backward can reproduce them; `apply` would raise after selection.
+        if _needs_grad and d.p != 0.0:
+            reasons.append(
+                "dropout with gradients is not supported (the mask is not "
+                "reproducible in the backward)"
+            )
 
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
         # ignored (only gappy paged folds sm_scale).
@@ -697,6 +699,21 @@ def _uniform_row_pitch_reason(
     return None
 
 
+def _with_kernel_layout(
+    t: torch.Tensor, allow_broadcast_heads: bool = False
+) -> torch.Tensor:
+    """`t` itself if the kernel's stride-aware addressing can read it as is,
+    else a contiguous copy."""
+    reason = _uniform_row_pitch_reason("", t, allow_broadcast_heads)
+    return t if reason is None else t.contiguous()
+
+
+def _pad_last_dim(t: torch.Tensor, size: int) -> torch.Tensor:
+    """Zero-pad the last dim of `t` up to `size`."""
+    pad = size - t.shape[-1]
+    return torch.nn.functional.pad(t, (0, pad)) if pad else t
+
+
 def _num_kv_heads(key: torch.Tensor) -> int:
     """Real number of distinct KV heads (GQA).
 
@@ -872,8 +889,10 @@ def _flydsl_bwd(
     LSE_2d = lse.contiguous().view(_lse_dvec_rows, 1)
     stream = torch.cuda.current_stream()
     # D_vec = rowsum(dO * O) per query row. Use the FlyDSL preprocess kernel
-    # when D is compatible (D%64==0), otherwise fall back to PyTorch ops.
-    _use_preprocess_kernel = D % 64 == 0
+    # when D is compatible, otherwise fall back to PyTorch ops. The kernel
+    # reduces D/8 threads per row with xor shuffles, so D/8 must be a power of
+    # two (D=192 would use 24 lanes and sum the wrong ones).
+    _use_preprocess_kernel = D in (64, 128, 256)
     if _use_preprocess_kernel:
         from mslk.attention.flydsl.fmha_bwd_preprocess import (
             compile_fmha_bwd_preprocess,
@@ -953,9 +972,8 @@ def _flydsl_bwd(
     # is untouched below -- this kernel hard-asserts gfx950). The kernel
     # writes dV/dK PER QUERY HEAD, uncompacted (`ck_scope_dvdk=True`), and the
     # GQA-combine reduction happens HERE, outside the kernel, via
-    # `.unflatten().sum()` -- see the reduce below. dQ stays atomic-add
-    # (`deterministic=False`); the deterministic branch is not yet the
-    # default for any caller.
+    # `.unflatten().sum()` -- see the reduce below. dQ is atomic-add unless
+    # torch.use_deterministic_algorithms is set (see `deterministic` below).
     if _is_gfx950:
         from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
             compile_fmha_bwd_dqdkdv_mfma_gfx950,
@@ -964,6 +982,16 @@ def _flydsl_bwd(
 
         BLOCK_M_CK, BLOCK_N_CK = gfx950_tile_defaults(D, N, gpu_arch)
         n_M_tiles = (M + BLOCK_M_CK - 1) // BLOCK_M_CK
+        # Under torch.use_deterministic_algorithms the kernel stores each N-tile's
+        # dQ partial into its own slot of a [num_N_tiles, B*M*H*D] workspace
+        # instead of atomic-adding into one buffer; the slots are summed below in
+        # a fixed order. dK/dV have a single writer per element either way.
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        num_dq_splits = (N + BLOCK_N_CK - 1) // BLOCK_N_CK if deterministic else 1
+        if deterministic:
+            dQ_out = torch.zeros(
+                num_dq_splits * alloc_m * H * D, 1, device=device, dtype=torch.float32
+            )
         # dV/dK per-query-head (uncompacted [B,N,H,D]) under ck_scope_dvdk --
         # see compile_fmha_bwd_dqdkdv_mfma_gfx950's own docstring/kwarg doc.
         dV_out = torch.zeros(alloc_n * H * D, 1, device=device, dtype=torch.float32)
@@ -1010,6 +1038,7 @@ def _flydsl_bwd(
             has_bias,
             emit_dbias,
             window_left,
+            deterministic,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1024,7 +1053,7 @@ def _flydsl_bwd(
                 varlen=varlen,
                 window_left=window_left,
                 gpu_arch=gpu_arch,
-                deterministic=False,
+                deterministic=deterministic,
                 ck_scope_dvdk=True,
                 has_bias=has_bias,
                 emit_dbias=emit_dbias,
@@ -1080,6 +1109,10 @@ def _flydsl_bwd(
             compile_fmha_bwd_convert_dq,
         )
 
+        if deterministic:
+            dQ_acc = dQ_out.view(num_dq_splits, dq_n_elems).sum(0).view(-1, 1)
+        else:
+            dQ_acc = dQ_out
         dq_converted = torch.empty(dq_n_elems, 1, device=device, dtype=dtype)
         convert_key = dtype_str
         compiled_convert = _convert_dq_kernel_cache.get(convert_key)
@@ -1087,10 +1120,10 @@ def _flydsl_bwd(
             launch_convert = compile_fmha_bwd_convert_dq(dtype_str=dtype_str)
             tmp_dq_conv = torch.empty_like(dq_converted)
             compiled_convert = flyc.compile(
-                launch_convert, dQ_out, tmp_dq_conv, dq_n_elems, stream
+                launch_convert, dQ_acc, tmp_dq_conv, dq_n_elems, stream
             )
             _convert_dq_kernel_cache[convert_key] = compiled_convert
-        compiled_convert(dQ_out, dq_converted, dq_n_elems, stream)
+        compiled_convert(dQ_acc, dq_converted, dq_n_elems, stream)
         dq = dq_converted.view(out_b, out_m, H, D)
         # GQA-combine: dV/dK came back per-query-head ([B,N,H,D], H not Hkv).
         # Reduce across the heads_per_kv group and convert to output dtype.
@@ -1446,14 +1479,12 @@ class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
-    # Kernel wave-tiling requires D a multiple of 32 (D=32/96 done via
-    # ceil-div wave assignment + out-of-range guards, see fmha_bwd_mfma.py's
-    # D_SUBS_PER_WAVE comment).
+    # Head dims that are not a multiple of 32 are zero-padded in `apply`.
     SUPPORTED_MAX_K = 256
-    SUPPORTED_MIN_K = 32
+    SUPPORTED_MIN_K = 1
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     # GQA is supported via the plain 4D BMHK path (key/value with Hkv < Hq,
     # either a genuine (B,N,Hkv,D) tensor or a stride-0 `.expand()` broadcast
     # -- see _num_kv_heads/_uniform_row_pitch_reason), matching how
@@ -1461,16 +1492,11 @@ class BwOp(AttentionBwOpBase):
     # unrelated case (true 5D BMGHK tensors) that this kernel does not
     # implement -- stays False.
     SUPPORTS_BMGHK = False
-    # False since the internal dispatch switched to the fused dqdkdv kernel:
-    # dQ (always) and dV/dK (when M_SPLIT>1, the gfx950 default) are
-    # atomic-add, unlike the old split dvdk+dq path's pure
-    # register-accumulate-then-store. The D=256/gfx942 fallback (the
-    # split path, kept only because dqdkdv structurally can't fit there) IS
-    # deterministic, but this flag is a single class-level value covering
-    # every shape -- conservatively False for the whole op rather than
-    # per-shape-conditional, since AttentionBwOpBase.not_supported_reasons()
-    # checks this BEFORE the op knows which internal path a given D will take.
-    IS_DETERMINISTIC = False
+    # gfx950 honours torch.use_deterministic_algorithms: dQ goes through the
+    # kernel's per-N-tile workspace and a fixed-order reduction instead of
+    # atomics (see `_flydsl_bwd`). Other archs have no such path, so
+    # `not_supported_reasons` declines them while the mode is on.
+    IS_DETERMINISTIC = True
     # db is emitted by the gfx950 fused kernel as the unscaled dS; broadcast
     # bias is rejected in not_supported_reasons, so no reduction is involved.
     SUPPORTS_ATTN_BIAS_GRAD = True
@@ -1485,8 +1511,8 @@ class BwOp(AttentionBwOpBase):
     # (never seqstart-global), which already implements per-block causal
     # masking correctly given per-batch tiling -- confirmed via
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
-    # Bottom-right is the tri-state's second mode. The bottom-right LOCAL
-    # types stay out: the window term still uses the top-left diagonal.
+    # Bottom-right is the tri-state's second mode; its window term is measured
+    # from the bottom-right diagonal (see _window_keep).
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,
@@ -1498,27 +1524,22 @@ class BwOp(AttentionBwOpBase):
         # Bottom-right alignment, dense and per-block.
         LowerTriangularFromBottomRightMask,
         BlockDiagonalCausalFromBottomRightMask,
+        # Bottom-right alignment + sliding window.
+        LowerTriangularFromBottomRightLocalAttentionMask,
     )
-    _TEST_K: List[int] = [32, 64, 96, 128, 256]
+    _TEST_K: List[int] = [32, 48, 64, 96, 128, 256]
     NAME = "flydslB"
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
-        reason = _uniform_row_pitch_reason("query", d.query)
-        if reason is not None:
-            reasons.append(reason)
-        # key/value get the GQA broadcast exception (allow_broadcast_heads) --
-        # query never does (no broadcast-Q case exists).
-        for name, t in (("key", d.key), ("value", d.value)):
-            reason = _uniform_row_pitch_reason(name, t, allow_broadcast_heads=True)
-            if reason is not None:
-                reasons.append(reason)
-        # K and V share a single kv_stride_n kernel arg -- reject if they differ.
-        if d.key.stride(1) != d.value.stride(1):
-            reasons.append("key and value must share the same row pitch (stride(1))")
-        if d.query.shape[-1] % 32 != 0:
-            reasons.append("head_dim must be a multiple of 32")
+        if not _is_flydsl_available():
+            reasons.append("FlyDSL unavailable on this device/arch")
+        if torch.are_deterministic_algorithms_enabled() and not is_gfx950():
+            reasons.append(
+                "deterministic backward is implemented for gfx950 only, but "
+                "`torch.use_deterministic_algorithms` is set"
+            )
         # GQA: Hq must be a whole multiple of Hkv -- the kernel's
         # heads_per_kv = Hq // Hkv grid-regroup requires this.
         h_kv = _num_kv_heads(d.key)
@@ -1579,11 +1600,28 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
+        query, key, value, out = inp.query, inp.key, inp.value, ctx.out
+        # The kernel takes one head dim for every tensor and needs a multiple of
+        # 32. Q/K only contract over qk_dim and V/dO only over v_dim, so zero-
+        # padding all of them to a common size changes no product (and `scale`
+        # is passed explicitly, so the softmax scale is unchanged). The padded
+        # gradient columns are sliced off below.
+        qk_dim, v_dim = query.shape[-1], value.shape[-1]
+        kernel_dim = -(-max(qk_dim, v_dim) // 32) * 32
+        query, key = _pad_last_dim(query, kernel_dim), _pad_last_dim(key, kernel_dim)
+        value, out, grad = (_pad_last_dim(t, kernel_dim) for t in (value, out, grad))
+        query = _with_kernel_layout(query)
+        key = _with_kernel_layout(key, allow_broadcast_heads=True)
+        value = _with_kernel_layout(value, allow_broadcast_heads=True)
+        grad = _with_kernel_layout(grad)
+        # K and V share a single kv_stride_n kernel argument.
+        if key.stride(1) != value.stride(1):
+            key, value = key.contiguous(), value.contiguous()
         dq, dk, dv, db = cls.OPERATOR(
-            inp.query,
-            inp.key,
-            inp.value,
-            ctx.out,
+            query,
+            key,
+            value,
+            out,
             ctx.lse,
             grad,
             inp.scale_float,
@@ -1619,6 +1657,7 @@ class BwOp(AttentionBwOpBase):
         # autograd graph, no `ExpandBackward` reduction), this op's contract
         # is "correct after an `ExpandBackward` reduction", matching every
         # other op's broadcast-GQA contract.
+        dq, dk, dv = dq[..., :qk_dim], dk[..., :qk_dim], dv[..., :v_dim]
         if dk.shape[2] != inp.key.shape[2]:
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
             dk = (dk / heads_per_kv).expand(inp.key.shape)

@@ -22,6 +22,7 @@ from typing import (
 )
 
 import torch
+from mslk.utils.device import get_gfx_arch_name, gfx_arch_in
 
 from .attn_bias import (
     AttentionBias,
@@ -480,6 +481,9 @@ class AttentionOpBase(BaseOperator):
     SUPPORTED_DEVICES: Set[str]  # pyre-ignore[13]
     CUDA_MINIMUM_COMPUTE_CAPABILITY: Tuple[int, int] = (5, 0)
     CUDA_MAXIMUM_COMPUTE_CAPABILITY: Optional[Tuple[int, int]] = None
+    # ROCm counterpart of the CUDA capability bounds above: gfx architectures
+    # (e.g. {"gfx942"}) the op has a device image for. None means any arch.
+    SUPPORTED_GFX_ARCHS: Optional[Set[str]] = None
     SUPPORTED_DTYPES: Set[torch.dtype]  # pyre-ignore[13]
     SUPPORTED_MAX_K: float  # pyre-ignore[13]
     SUPPORTED_MIN_K: int = 0
@@ -556,6 +560,16 @@ class AttentionOpBase(BaseOperator):
                     f"requires device with capability <= {cls.CUDA_MAXIMUM_COMPUTE_CAPABILITY} "
                     f"but your GPU has capability {device_capability} (too new)"
                 )
+        if (
+            device_type == "cuda"
+            and torch.version.hip is not None
+            and cls.SUPPORTED_GFX_ARCHS is not None
+            and not gfx_arch_in(cls.SUPPORTED_GFX_ARCHS)
+        ):
+            reasons.append(
+                f"requires gfx arch in {sorted(cls.SUPPORTED_GFX_ARCHS)} "
+                f"but your GPU is {get_gfx_arch_name()!r}"
+            )
         if dtype not in cls.SUPPORTED_DTYPES:
             reasons.append(f"dtype={dtype} (supported: {cls.SUPPORTED_DTYPES})")
         if d.key.dtype == torch.int32 and not cls.SUPPORTS_QUANTIZED_KV:

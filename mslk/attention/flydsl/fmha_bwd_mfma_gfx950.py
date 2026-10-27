@@ -22,6 +22,7 @@ from mslk.attention.flydsl.fmha_bwd_mfma import (
     _grad_ds_unscaled,
     _LOG2E,
     _softmax_p,
+    _window_keep,
     CAUSAL_BOTTOM_RIGHT,
     CAUSAL_NONE,
     CAUSAL_TOP_LEFT,
@@ -1574,10 +1575,13 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                                     <= m_row_abs + this_seqlen_k
                                                 )
                                             if const_expr(window_left >= 0):
-                                                # Keep kv > q - window_size
-                                                # (xformers convention).
-                                                valid_mn = valid_mn & (
-                                                    n_row_abs + window_left > m_row_abs
+                                                valid_mn = valid_mn & _window_keep(
+                                                    causal_mode,
+                                                    window_left,
+                                                    n_row_abs,
+                                                    m_row_abs,
+                                                    this_seqlen_q,
+                                                    this_seqlen_k,
                                                 )
                                             neg_log2e_lse = fx.Float32(
                                                 arith.mulf(
