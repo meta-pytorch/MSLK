@@ -3,132 +3,112 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# pyre-unsafe
 
-"""Dropout keep-mask that is bit-identical to CK's FMHA dropout.
+"""In-kernel Philox dropout shared by the FlyDSL forward and backward kernels.
 
-CK draws the mask with a 7-round Philox keyed on (seed, offset) and counters
-laid out per 32x32 tile of the [Mq, Mkv] score matrix of each (batch, head):
-
-    philox(seed, offset + (batch * H + head) * 64 + lane)
-        .get_philox_4x32(subsequence = (tile_row, tile_col))
-
-Each of the 64 lanes of a tile owns 16 random bytes, and byte r of lane l lands
-at row (r // 8) * 16 + (l // 32) * 8 + r % 8, column l % 32 of the tile. An
-element is kept iff its byte is <= floor((1 - p) * 255).
-
-Because the mask is a pure function of (seed, offset, shape, p), the FlyDSL
-forward and backward can both regenerate it and stay interchangeable with CK's
-forward and backward, which exchange the same (seed, offset) through
-`Context.rng_state`.
-
-Reference: ck_tile/core/utility/philox_rand.hpp, ck_tile/ops/fmha/block/
-block_dropout.hpp and ck_tile/host/reference/reference_batched_dropout_randval.hpp.
+The mask is never stored; both kernels derive the keep bit of P[b, h, m, n]:
+Philox4x32-10 (as triton.language.random) with key = seed and counter =
+(n // 4, m, b * H + h, 0), H = query heads. Word n % 4 is the random value; keep
+if it is >= round(p * 2**32). The seed is a device int64[1] tensor, so neither
+side syncs with the host and CUDA graph replays draw fresh masks.
 """
 
+import flydsl.expr as fx
 import torch
+from mslk.flydsl import buffer_ops
 
-_PHILOX_KEY_A = 0x9E3779B9
-_PHILOX_KEY_B = 0xBB67AE85
-_PHILOX_MUL_A = 0xD2511F53
-_PHILOX_MUL_B = 0xCD9E8D57
+PHILOX_KEY_A = 0x9E3779B9
+PHILOX_KEY_B = 0xBB67AE85
+PHILOX_ROUND_A = 0xD2511F53
+PHILOX_ROUND_B = 0xCD9E8D57
+PHILOX_ROUNDS = 10
+# Consecutive columns of a row that share one Philox call.
+DROPOUT_COLS_PER_CALL = 4
+
+
+def dropout_drop_threshold(p: float) -> int:
+    """Random words below this are dropped: round(p * 2**32), as an i32 bit pattern."""
+    thr = min(int(round(p * 2**32)), 2**32 - 1)
+    return thr - 2**32 if thr >= 2**31 else thr
+
+
+def draw_dropout_seed(device: torch.device) -> torch.Tensor:
+    """Fresh per-call Philox seed as a device int64[1] tensor (graph-capture safe)."""
+    return torch.randint(0, 2**62, (1,), dtype=torch.int64, device=device)
+
+
+def _mulhilo(a, b):
+    prod = a.to(fx.Uint64) * b.to(fx.Uint64)
+    return (prod >> 32).to(fx.Uint32), prod.to(fx.Uint32)
+
+
+def philox_4x32(c0, c1, c2, c3, k0, k1):
+    """Philox4x32-10 on Uint32 values (matches triton.language.random.philox)."""
+    for i in range(PHILOX_ROUNDS):
+        hi0, lo0 = _mulhilo(fx.Uint32(PHILOX_ROUND_A), c0)
+        hi1, lo1 = _mulhilo(fx.Uint32(PHILOX_ROUND_B), c2)
+        c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
+        if i < PHILOX_ROUNDS - 1:
+            k0 = k0 + fx.Uint32(PHILOX_KEY_A)
+            k1 = k1 + fx.Uint32(PHILOX_KEY_B)
+    return c0, c1, c2, c3
+
+
+def load_dropout_key(seed_tensor):
+    """In-kernel: the (lo, hi) Uint32 Philox key from the int64[1] seed tensor."""
+    rsrc = buffer_ops.create_buffer_resource(seed_tensor)
+    lo = buffer_ops.buffer_load(rsrc, 0, vec_width=1, dtype=fx.Int32)
+    hi = buffer_ops.buffer_load(rsrc, 1, vec_width=1, dtype=fx.Int32)
+    return fx.Uint32(lo), fx.Uint32(hi)
+
+
+def _u32(index):
+    return fx.Uint32(fx.Int32(index))
+
+
+def dropout_random_words(key, bh, row, col):
+    """In-kernel: random words for columns 4*(col//4) .. 4*(col//4)+3 of a row."""
+    return philox_4x32(
+        _u32(col // DROPOUT_COLS_PER_CALL),
+        _u32(row),
+        _u32(bh),
+        fx.Uint32(0),
+        key[0],
+        key[1],
+    )
+
+
+def select_word(words, col):
+    """In-kernel: word col % 4 of a dropout_random_words result."""
+    i = col % DROPOUT_COLS_PER_CALL
+    word = words[0]
+    for w in range(1, DROPOUT_COLS_PER_CALL):
+        word = (i == fx.Index(w)).select(words[w], word)
+    return word
+
+
+def keep_flag(word, threshold):
+    """In-kernel: 1.0 if the element survives dropout, else 0.0 (Float32)."""
+    keep = word >= fx.Uint32(threshold)
+    return keep.select(fx.Float32(1.0), fx.Float32(0.0))
+
+
 _U32 = 0xFFFFFFFF
 
-_TILE = 32  # CK draws random numbers per 32x32 tile of the score matrix
-_PHILOX_PER_TILE = 64  # Philox calls per tile: 64 lanes x 16 bytes = 32 x 32
-# Bound on live Philox results per chunk; each costs a few int64 temporaries.
-_MAX_CALLS_PER_CHUNK = 1 << 22
 
-
-def keep_threshold(p: float) -> int:
-    """Largest random byte that is kept (CK's `p_undrop_in_uint8_t`)."""
-    return int((1.0 - p) * 255.0)
-
-
-def philox_offset_increment(B: int, H: int, Mq: int, Mkv: int) -> int:
-    """Generator offset to reserve per call, as CK's forward does."""
-    return (B + 3) * (H + 1) * (Mq + 1) * (Mkv + 1)
-
-
-def _mulhilo32(const: int, x: torch.Tensor):
-    """(lo, hi) 32-bit halves of const * x for x < 2**32, in int64 arithmetic."""
+def _mulhilo32_ref(const: int, x: torch.Tensor):
+    """(hi, lo) 32-bit halves of const * x for 0 <= x < 2**32, exact in int64."""
     x_lo = x & 0xFFFF
     x_hi = x >> 16
     p0 = const * x_lo
     p1 = const * x_hi
     t = p0 + ((p1 & 0xFFFF) << 16)
-    return t & _U32, (p1 >> 16) + (t >> 32)
+    return (p1 >> 16) + (t >> 32), t & _U32
 
 
-def _philox_4x32(seed: int, ctr_x, ctr_y, ctr_z, ctr_w):
-    key_x, key_y = seed & _U32, (seed >> 32) & _U32
-    for _ in range(7):
-        lo0, hi0 = _mulhilo32(_PHILOX_MUL_A, ctr_x)
-        lo1, hi1 = _mulhilo32(_PHILOX_MUL_B, ctr_z)
-        ctr_x, ctr_y, ctr_z, ctr_w = (
-            hi1 ^ ctr_y ^ key_x,
-            lo1,
-            hi0 ^ ctr_w ^ key_y,
-            lo0,
-        )
-        key_x = (key_x + _PHILOX_KEY_A) & _U32
-        key_y = (key_y + _PHILOX_KEY_B) & _U32
-    return ctr_x, ctr_y, ctr_z, ctr_w
-
-
-def philox_randval(
+def reference_keep_mask(
     seed: int,
-    offset: int,
-    B: int,
-    H: int,
-    Mq: int,
-    Mkv: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """CK's uint8 random values, shape [B, H, Mq, Mkv]."""
-    rows = -(-Mq // _TILE)
-    cols = -(-Mkv // _TILE)
-    out = torch.empty(
-        B, H, rows * _TILE, cols * _TILE, dtype=torch.uint8, device=device
-    )
-    lane = torch.arange(_PHILOX_PER_TILE, device=device, dtype=torch.int64)
-    tile_row = torch.arange(rows, device=device, dtype=torch.int64)
-    tile_col = torch.arange(cols, device=device, dtype=torch.int64)
-    calls_per_head = rows * cols * _PHILOX_PER_TILE
-    heads_per_chunk = max(1, _MAX_CALLS_PER_CHUNK // calls_per_head)
-    bh = B * H
-    for start in range(0, bh, heads_per_chunk):
-        idx = torch.arange(start, min(bh, start + heads_per_chunk), device=device)
-        n = idx.numel()
-        shape = (n, rows, cols, _PHILOX_PER_TILE)
-        # 64-bit counter offset + (batch * H + head) * 64 + lane
-        head_off = offset + idx.view(n, 1, 1, 1) * _PHILOX_PER_TILE + lane
-        words = _philox_4x32(
-            seed,
-            (head_off & _U32).expand(shape),
-            (head_off >> 32).expand(shape),
-            tile_row.view(1, rows, 1, 1).expand(shape),
-            tile_col.view(1, 1, cols, 1).expand(shape),
-        )
-        # byte r of the lane's 16 bytes: word r // 4, byte r % 4 (little endian)
-        vals = torch.stack(
-            [
-                ((words[r // 4] >> (8 * (r % 4))) & 0xFF).to(torch.uint8)
-                for r in range(16)
-            ],
-            dim=-1,
-        )
-        # [n, rows, cols, half, 32 j, rh, rl] with r = rh * 8 + rl and
-        # i = rh * 16 + half * 8 + rl, j = lane % 32.
-        vals = vals.view(n, rows, cols, 2, _TILE, 2, 8)
-        vals = vals.permute(0, 1, 5, 3, 6, 2, 4)  # n, rows, rh, half, rl, cols, j
-        chunk = vals.reshape(n, rows * _TILE, cols * _TILE)
-        out.view(bh, rows * _TILE, cols * _TILE)[idx] = chunk
-    return out[:, :, :Mq, :Mkv]
-
-
-def philox_keep_mask(
-    seed: int,
-    offset: int,
     p: float,
     B: int,
     H: int,
@@ -136,6 +116,28 @@ def philox_keep_mask(
     Mkv: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """uint8 keep-mask (1 = kept), shape [B, H, Mq, Mkv], contiguous."""
-    randval = philox_randval(seed, offset, B, H, Mq, Mkv, device)
-    return (randval <= keep_threshold(p)).to(torch.uint8).contiguous()
+    """Host-side reference of the kernels' keep bits: uint8 [B, H, Mq, Mkv], 1 = kept.
+
+    For tests and benchmarks; memory is O(B * H * Mq * Mkv).
+    """
+    groups = -(-Mkv // DROPOUT_COLS_PER_CALL)
+    shape = (B * H, Mq, groups)
+    c0 = torch.arange(groups, device=device, dtype=torch.int64).expand(shape)
+    c1 = torch.arange(Mq, device=device, dtype=torch.int64).view(1, Mq, 1).expand(shape)
+    c2 = (
+        torch.arange(B * H, device=device, dtype=torch.int64)
+        .view(-1, 1, 1)
+        .expand(shape)
+    )
+    c3 = torch.zeros(shape, device=device, dtype=torch.int64)
+    k0, k1 = seed & _U32, (seed >> 32) & _U32
+    for i in range(PHILOX_ROUNDS):
+        hi0, lo0 = _mulhilo32_ref(PHILOX_ROUND_A, c0)
+        hi1, lo1 = _mulhilo32_ref(PHILOX_ROUND_B, c2)
+        c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
+        if i < PHILOX_ROUNDS - 1:
+            k0 = (k0 + PHILOX_KEY_A) & _U32
+            k1 = (k1 + PHILOX_KEY_B) & _U32
+    words = torch.stack((c0, c1, c2, c3), dim=-1).reshape(B * H, Mq, -1)[..., :Mkv]
+    threshold = min(int(round(p * 2**32)), 2**32 - 1)
+    return (words >= threshold).to(torch.uint8).reshape(B, H, Mq, Mkv)
