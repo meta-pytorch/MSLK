@@ -170,6 +170,9 @@ class FwOp(AttentionFwOpBase):
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
+    # Must match the --offload-arch the CK FMHA library is built for
+    # (MslkDefault.cmake); on any other arch there is no device image.
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     SUPPORTED_MAX_K = 256
 
@@ -378,6 +381,7 @@ class BwOp(AttentionBwOpBase):
 
     OPERATOR = get_operator("xformers", "efficient_attention_backward_ck")
     SUPPORTED_DEVICES = FwOp.SUPPORTED_DEVICES
+    SUPPORTED_GFX_ARCHS = FwOp.SUPPORTED_GFX_ARCHS
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (

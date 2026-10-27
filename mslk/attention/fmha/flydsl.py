@@ -12,33 +12,30 @@ that judges CK's `ck.BwOp` (both are covered by `test_backward`'s `ALL_BW_OPS`
 parametrization there).
 
 Part of `ALL_BW_OPS` in `mslk/attention/fmha/__init__.py` (guarded by
-`torch.version.hip`) for TEST-ENUMERATION purposes only -- this broadens which
-test files (`test_mem_eff_attention.py`, `test_forward.py`) exercise this op.
-It is deliberately NOT wired into `dispatch.py`'s live `_dispatch_bw()`
-priority list, which still hardcodes `[ck.BwOp]` on ROCm -- this op is not a
-live production backend.
+`torch.version.hip`), which broadens which test files (`test_mem_eff_attention.py`,
+`test_forward.py`) exercise this op. It is also the second entry of
+`dispatch.py`'s ROCm `_dispatch_bw()` priority list, after `ck.BwOp`: CK wins
+on the archs it is built for and declines the rest (`SUPPORTED_GFX_ARCHS`), which
+is when this op is selected.
 
 Stride-aware addressing: the kernel supports Q/K/V/dO with a possibly-non-
 contiguous per-tensor row pitch — e.g. a packed-`qkv` tensor sliced/unbound
 into Q/K/V views. The kernel still requires each tensor to be flat *within* a
 row (last dim D stride-1, H-axis stride exactly D — i.e. only the outer
-B/M-or-N row pitch may differ from the contiguous `H*D`); this is checked in
-`not_supported_reasons()` below. Real per-axis arbitrary strides (transposed H,
-non-unit D stride) remain unsupported.
+B/M-or-N row pitch may differ from the contiguous `H*D`). Inputs that violate
+this (transposed H, non-unit D stride, a stride-0 broadcast grad such as the one
+`out.sum().backward()` produces) and K/V with different row pitches are copied
+to a contiguous layout in `apply` rather than declined. Head dims that are not a
+multiple of 32 are zero-padded there too.
 
 Non-goals (intentionally excluded rather than left as silent gaps -- each
 entry below is enforced generically, see the cited mechanism, and has its own
 negative-path test in `test_backward.py`):
-- Dropout (`d.p != 0.0`): no MSLK caller passes dropout through this op;
-  rejected generically by `AttentionOpBase.not_supported_reasons()`'s
-  `(d.p != 0.0) and not cls.SUPPORTS_DROPOUT` check (`SUPPORTS_DROPOUT = False`
-  below). Revisit if `flydsl.BwOp` is ever added to a live dispatch path and a
-  caller trips this.
 - True 5D BMGHK (`d.query.ndim == 5`, multi-query-group layout distinct from
   GQA-via-4D-broadcast, which IS supported): no MSLK caller found; rejected
   generically by the same `not_supported_reasons()`'s
   `not cls.SUPPORTS_BMGHK and d.query.ndim == 5` check (`SUPPORTS_BMGHK = False`
-  below). Revisit under the same condition as dropout.
+  below). Revisit if a caller trips this.
 - Paged-KV / gappy-keys backward (`PagedBlockDiagonal*Mask`,
   `BlockDiagonal*GappyKeys*Mask`): these are inference-serving-only shapes in
   MSLK (`tree_attention.py`'s forward-only code path never reaches
@@ -46,20 +43,17 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
-- Tensor-bias / ALiBi (`LowerTriangularMaskWithTensorBias` and similar): no
-  MSLK caller found for this backward op. Rejected the same way, via
-  `SUPPORTED_ATTN_BIAS_TYPES` omission.
-- Bottom-right varlen (`BlockDiagonalCausalFromBottomRightMask` and other
-  bottom-right alignment variants): only top-left causal alignment, including
-  `BlockDiagonalCausalLocalAttentionMask`, is implemented. Rejected the same
-  way, via `SUPPORTED_ATTN_BIAS_TYPES` omission. Revisit if a caller needs
-  bottom-right causal masking specifically.
+- Bottom-right local attention (`LowerTriangularFromBottomRightLocalAttentionMask`):
+  the window term uses the top-left diagonal, so it cannot be combined with
+  bottom-right alignment. Rejected via `SUPPORTED_ATTN_BIAS_TYPES` omission.
 """
 
 import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
+from mslk.attention.flydsl.fmha_dropout import philox_keep_mask, philox_offset_increment
+from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
     BlockDiagonalCausalFromBottomRightMask,
@@ -462,24 +456,21 @@ class FwOp(AttentionFwOpBase):
 
         kw["return_lse"] = needs_gradient
 
-        # Dropout (dense only): Python-only mask via native torch RNG. This is
-        # CUDA-graph-safe and advances per replay, and drops the CK philox
-        # dependency. NOTE: backward mask regeneration is not implemented yet --
-        # training (needs_gradient) with dropout is rejected below until a
-        # flydsl dropout backward that reproduces this mask lands.
+        # Dropout (dense only): the keep-mask is a pure function of the philox
+        # (seed, offset) drawn from the torch CUDA generator, laid out exactly as
+        # CK's dropout does. The backward (this op's or CK's) regenerates it from
+        # `Context.rng_state`, so the mask is never stored.
+        rng_state = None
         if inp.p != 0.0:
             B = inp.query.shape[0]
             Sq = inp.query.shape[1]
             H = inp.query.shape[2]
             Skv = inp.key.shape[1]
-            keep = (
-                torch.rand(B, H, Sq, Skv, device=inp.query.device, dtype=torch.float32)
-                >= inp.p
+            seed, offset = _reserve_philox_state(inp.query.device, B, H, Sq, Skv)
+            rng_state = torch.tensor([seed, offset], dtype=torch.int64, device="cpu")
+            kw["dropout_mask"] = philox_keep_mask(
+                seed, offset, inp.p, B, H, Sq, Skv, inp.query.device
             )
-            # uint8 keep-mask (0/1), half the memory of a bf16/f16 mask. The
-            # 1/(1-p) inverted-dropout scale is applied to the output in _run
-            # (a constant factor, so it factors out of the per-(q,k) sum).
-            kw["dropout_mask"] = keep.to(torch.uint8)
 
         # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
         # restore input shape (slice/reshape are no-ops when a path didn't pad).
@@ -647,16 +638,6 @@ class FwOp(AttentionFwOpBase):
         if needs_gradient:
             if lse is None:
                 raise RuntimeError("FlyDSL forward did not return LSE for backward")
-            if inp.p != 0.0:
-                # TODO: implement a flydsl dropout backward that regenerates the
-                # Python (torch RNG) mask. Until then the mask cannot be
-                # reproduced in the backward (ck.BwOp only knows CK philox), so
-                # reject training + dropout rather than return wrong gradients.
-                raise NotImplementedError(
-                    "flydsl dropout backward is not implemented yet for the "
-                    "Python-generated mask; dropout is currently forward/"
-                    "inference-only (needs_gradient=False)."
-                )
             # op_bw=None lets _dispatch_bw pick a compatible backward
             # (VARLEN_LSE_PACKED=True). It currently resolves to ck.BwOp, which
             # matches this forward for bf16 and f16. The native BwOp below is NOT
@@ -664,7 +645,21 @@ class FwOp(AttentionFwOpBase):
             # f16 (never tested together upstream) and needs numerical
             # verification before it can be preferred here.
             ctx = Context(lse=lse, out=out, op_bw=None)
+            if rng_state is not None:
+                ctx.rng_state = rng_state
         return out, ctx
+
+
+def _reserve_philox_state(device: torch.device, B: int, H: int, Mq: int, Mkv: int):
+    """(seed, offset) for one dropout call, advancing the CUDA generator by what
+    CK's forward reserves so the two backends consume it identically."""
+    gen = torch.cuda.default_generators[
+        device.index if device.index is not None else torch.cuda.current_device()
+    ]
+    seed, offset = gen.initial_seed(), gen.get_offset()
+    gen.set_offset(offset + -(-philox_offset_increment(B, H, Mq, Mkv) // 4) * 4)
+    # The generator reports the seed unsigned; CK carries it as int64.
+    return (seed - (1 << 64) if seed >= (1 << 63) else seed), offset
 
 
 def _uniform_row_pitch_reason(
@@ -695,6 +690,21 @@ def _uniform_row_pitch_reason(
     if t.stride(-3) == 0:
         return f"{name} has a broadcast (stride-0) row pitch, not supported"
     return None
+
+
+def _with_kernel_layout(
+    t: torch.Tensor, allow_broadcast_heads: bool = False
+) -> torch.Tensor:
+    """`t` itself if the kernel's stride-aware addressing can read it as is,
+    else a contiguous copy."""
+    reason = _uniform_row_pitch_reason("", t, allow_broadcast_heads)
+    return t if reason is None else t.contiguous()
+
+
+def _pad_head_dim_to_32(t: torch.Tensor) -> torch.Tensor:
+    """Zero-pad the last dim up to a multiple of 32 (the kernel's wave tiling)."""
+    pad = -t.shape[-1] % 32
+    return torch.nn.functional.pad(t, (0, pad)) if pad else t
 
 
 def _num_kv_heads(key: torch.Tensor) -> int:
@@ -796,6 +806,8 @@ def _flydsl_bwd(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
+    dropout_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # pyre-ignore[21]: FlyDSL is available only in AMD builds.
     import flydsl.compiler as flyc
@@ -872,8 +884,10 @@ def _flydsl_bwd(
     LSE_2d = lse.contiguous().view(_lse_dvec_rows, 1)
     stream = torch.cuda.current_stream()
     # D_vec = rowsum(dO * O) per query row. Use the FlyDSL preprocess kernel
-    # when D is compatible (D%64==0), otherwise fall back to PyTorch ops.
-    _use_preprocess_kernel = D % 64 == 0
+    # when D is compatible, otherwise fall back to PyTorch ops. The kernel
+    # reduces D/8 threads per row with xor shuffles, so D/8 must be a power of
+    # two (D=192 would use 24 lanes and sum the wrong ones).
+    _use_preprocess_kernel = D in (64, 128, 256)
     if _use_preprocess_kernel:
         from mslk.attention.flydsl.fmha_bwd_preprocess import (
             compile_fmha_bwd_preprocess,
@@ -929,6 +943,21 @@ def _flydsl_bwd(
             "mslk_flydsl::fmha_bwd does not support attn_bias on "
             f"{gpu_arch}; the tensor-bias backward is implemented for gfx950 only."
         )
+    has_dropout = dropout_mask is not None
+    if has_dropout and not _is_gfx950:
+        raise NotImplementedError(
+            "mslk_flydsl::fmha_bwd does not support dropout on "
+            f"{gpu_arch}; the dropout backward is implemented for gfx950 only."
+        )
+    # Dense [B, H, Mq, Mk] uint8 keep-mask (1 = kept) with unit last-dim stride.
+    _dummy_dropout = torch.zeros(1, device=device, dtype=torch.uint8)
+    _dropout_arg = dropout_mask if has_dropout else _dummy_dropout
+    if has_dropout:
+        drop_stride_b = dropout_mask.stride(0)
+        drop_stride_h = dropout_mask.stride(1)
+        drop_stride_q = dropout_mask.stride(2)
+    else:
+        drop_stride_b = drop_stride_h = drop_stride_q = 0
     _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
     _bias_arg = attn_bias if has_bias else _dummy_bias
     if attn_bias is not None:
@@ -995,6 +1024,10 @@ def _flydsl_bwd(
             bias_stride_q,
             dBias_out,
             dbias_sink,
+            _dropout_arg,
+            drop_stride_b,
+            drop_stride_h,
+            drop_stride_q,
             stream,
         )
         gfx950_key = (
@@ -1010,6 +1043,8 @@ def _flydsl_bwd(
             has_bias,
             emit_dbias,
             window_left,
+            has_dropout,
+            dropout_p,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1025,6 +1060,8 @@ def _flydsl_bwd(
                 window_left=window_left,
                 gpu_arch=gpu_arch,
                 deterministic=False,
+                has_dropout=has_dropout,
+                dropout_p=dropout_p,
                 ck_scope_dvdk=True,
                 has_bias=has_bias,
                 emit_dbias=emit_dbias,
@@ -1064,6 +1101,10 @@ def _flydsl_bwd(
                 bias_stride_q,
                 torch.zeros_like(dBias_out),
                 dbias_sink,
+                _dropout_arg,
+                drop_stride_b,
+                drop_stride_h,
+                drop_stride_q,
                 stream,
             )
             compiled_gfx950 = flyc.compile(launch_gfx950, *args_compile)
@@ -1413,6 +1454,8 @@ def _flydsl_bwd_abstract(
     attn_bias: Optional[torch.Tensor] = None,
     needs_dbias: bool = False,
     window_left: int = -1,
+    dropout_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # db is empty (not None) when no bias gradient was requested: the schema's
     # return arity is fixed, so `apply` keys off numel() rather than None.
@@ -1446,12 +1489,12 @@ class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
-    # Kernel wave-tiling requires D a multiple of 32 (D=32/96 done via
-    # ceil-div wave assignment + out-of-range guards, see fmha_bwd_mfma.py's
-    # D_SUBS_PER_WAVE comment).
+    # Head dims that are not a multiple of 32 are zero-padded in `apply`.
     SUPPORTED_MAX_K = 256
-    SUPPORTED_MIN_K = 32
-    SUPPORTS_DROPOUT = False
+    SUPPORTED_MIN_K = 1
+    # The mask is regenerated from the forward's philox state (see
+    # fmha_dropout.py), so this backward pairs with either FlyDSL's or CK's forward.
+    SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     # GQA is supported via the plain 4D BMHK path (key/value with Hkv < Hq,
@@ -1499,26 +1542,27 @@ class BwOp(AttentionBwOpBase):
         LowerTriangularFromBottomRightMask,
         BlockDiagonalCausalFromBottomRightMask,
     )
-    _TEST_K: List[int] = [32, 64, 96, 128, 256]
+    _TEST_K: List[int] = [32, 48, 64, 96, 128, 256]
     NAME = "flydslB"
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
-        reason = _uniform_row_pitch_reason("query", d.query)
-        if reason is not None:
-            reasons.append(reason)
-        # key/value get the GQA broadcast exception (allow_broadcast_heads) --
-        # query never does (no broadcast-Q case exists).
-        for name, t in (("key", d.key), ("value", d.value)):
-            reason = _uniform_row_pitch_reason(name, t, allow_broadcast_heads=True)
-            if reason is not None:
-                reasons.append(reason)
-        # K and V share a single kv_stride_n kernel arg -- reject if they differ.
-        if d.key.stride(1) != d.value.stride(1):
-            reasons.append("key and value must share the same row pitch (stride(1))")
-        if d.query.shape[-1] % 32 != 0:
-            reasons.append("head_dim must be a multiple of 32")
+        if not _is_flydsl_available():
+            reasons.append("FlyDSL unavailable on this device/arch")
+        if d.p != 0.0:
+            if not is_gfx950():
+                reasons.append("dropout backward is implemented for gfx950 only")
+            if isinstance(
+                d.attn_bias,
+                _VARLEN_BIAS_TYPES
+                + _PADDED_GAPPY_BIAS_TYPES
+                + _PAGED_BIAS_TYPES
+                + _PAGED_GAPPY_TYPES,
+            ):
+                reasons.append(
+                    "dropout only supported on the dense self-attention path"
+                )
         # GQA: Hq must be a whole multiple of Hkv -- the kernel's
         # heads_per_kv = Hq // Hkv grid-regroup requires this.
         h_kv = _num_kv_heads(d.key)
@@ -1579,11 +1623,48 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
+        query, key, value, out = inp.query, inp.key, inp.value, ctx.out
+        # Head dims that are not a multiple of 32 run on zero-padded inputs
+        # (zeros add nothing to QK^T, dO.O or the gradients). `scale` is passed
+        # explicitly below, so padding does not change the softmax scale.
+        head_dim = query.shape[-1]
+        if head_dim % 32:
+            query, key, value, out, grad = (
+                _pad_head_dim_to_32(t) for t in (query, key, value, out, grad)
+            )
+        query = _with_kernel_layout(query)
+        key = _with_kernel_layout(key, allow_broadcast_heads=True)
+        value = _with_kernel_layout(value, allow_broadcast_heads=True)
+        grad = _with_kernel_layout(grad)
+        # K and V share a single kv_stride_n kernel argument.
+        if key.stride(1) != value.stride(1):
+            key, value = key.contiguous(), value.contiguous()
+        dropout_mask = None
+        if inp.p != 0.0:
+            rng_state = ctx.rng_state
+            if (
+                rng_state is None
+                or rng_state.dtype != torch.int64
+                or rng_state.device.type != "cpu"
+                or rng_state.shape != (2,)
+            ):
+                raise NotImplementedError(f"Invalid rng_state: {rng_state}")
+            seed, offset = rng_state.tolist()
+            dropout_mask = philox_keep_mask(
+                seed,
+                offset,
+                inp.p,
+                inp.query.shape[0],
+                inp.query.shape[2],
+                inp.query.shape[1],
+                inp.key.shape[1],
+                inp.query.device,
+            )
         dq, dk, dv, db = cls.OPERATOR(
-            inp.query,
-            inp.key,
-            inp.value,
-            ctx.out,
+            query,
+            key,
+            value,
+            out,
             ctx.lse,
             grad,
             inp.scale_float,
@@ -1593,6 +1674,8 @@ class BwOp(AttentionBwOpBase):
             bias_t,
             needs_dbias,
             window_left,
+            dropout_mask,
+            inp.p,
         )
         # GQA-via-broadcast (`key`/`value` genuinely Hkv-headed, exposed to
         # the caller as an H-headed stride-0 `.expand()` view -- see
@@ -1619,6 +1702,8 @@ class BwOp(AttentionBwOpBase):
         # autograd graph, no `ExpandBackward` reduction), this op's contract
         # is "correct after an `ExpandBackward` reduction", matching every
         # other op's broadcast-GQA contract.
+        if head_dim % 32:
+            dq, dk, dv = dq[..., :head_dim], dk[..., :head_dim], dv[..., :head_dim]
         if dk.shape[2] != inp.key.shape[2]:
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
             dk = (dk / heads_per_kv).expand(inp.key.shape)

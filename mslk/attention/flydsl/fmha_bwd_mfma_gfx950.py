@@ -105,6 +105,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     has_bias: bool = False,
     emit_dbias: bool = False,
     window_left: int = -1,
+    has_dropout: bool = False,
+    dropout_p: float = 0.0,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -390,6 +392,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
+        Dropout: fx.Tensor,
+        drop_stride_b: fx.Int32,
+        drop_stride_h: fx.Int32,
+        drop_stride_q: fx.Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -580,6 +586,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_plane_base = batch_idx * fx.Index(bias_stride_b) + head_idx * fx.Index(
                 bias_stride_h
             )
+        # Dropout keep-mask: dense uint8 [B, H, Mq, Mk] (1 = kept) regenerated from the
+        # forward's philox state. The resource is rebased to this (batch, head) plane
+        # so the in-plane byte offset stays within i32 at long sequence lengths.
+        if const_expr(has_dropout):
+            drop_rsrc = _bops.create_buffer_resource(
+                Dropout,
+                max_size=False,
+                num_records_bytes=fx.Index(seq_M_idx) * fx.Index(drop_stride_q),
+                base_byte_offset=batch_idx * fx.Index(drop_stride_b)
+                + head_idx * fx.Index(drop_stride_h),
+            )
         # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
         # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
         if const_expr(emit_dbias):
@@ -597,6 +614,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # returns). Build the descriptor manually (flash_attn_gfx950.py:741 recipe).
         from flydsl._mlir.dialects import fly as _fly_d, llvm as _llvm_d
         from flydsl.expr.typing import T as _T
+
+        def _u8_load_f32(rsrc, elem_off):
+            # uint8 keep bit (0/1) -> f32 at a byte offset (1-byte elements).
+            raw = _bops.buffer_load(rsrc, elem_off, vec_width=1, dtype=_T.i8)
+            return fx.Float32(_llvm_d.UIToFPOp(fx.Float32.ir_type, _raw(raw)).result)
+
+        # Inverted-dropout scale folded into the keep bit: kept elements are scaled
+        # by 1 / (1 - p), the same factor the forward applied to its output.
+        _rp_undrop = 1.0 / (1.0 - dropout_p) if has_dropout else 1.0
 
         def _make_raw_f32_rsrc(tensor, num_records_bytes=None):
             base_ptr = _fly_d.extract_aligned_pointer_as_index(
@@ -1482,7 +1508,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         # re-reads no LDS -- the emitted work is the same, only its
                         # order differs.
                         _epi_passes = 2
-                        _epi_p_vals, _epi_valids = {}, {}
+                        _epi_p_vals, _epi_valids, _epi_keeps = {}, {}, {}
                         for _epi_pass in range_constexpr(_epi_passes):
                             _epi_do_p = _epi_pass == 0
                             _epi_do_ds = _epi_pass == 1
@@ -1615,12 +1641,58 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             )
                                             _epi_p_vals[(n_grp, m_half, r)] = p_val
                                             _epi_valids[(n_grp, m_half, r)] = valid_mn
+                                            # dV uses the dropped, rescaled P; dS and
+                                            # the D_vec correction keep the undropped
+                                            # P, and dP is masked the same way below.
+                                            p_dv_val = p_val
+                                            if const_expr(has_dropout):
+                                                # Invalid lanes read plane element 0
+                                                # (valid_mn already zeroes P there).
+                                                d_off = fx.Index(m_row_abs) * fx.Index(
+                                                    drop_stride_q
+                                                ) + fx.Index(n_row_abs)
+                                                safe_d_off = bias_load_valid.select(
+                                                    fx.Index(d_off), fx.Index(0)
+                                                )
+                                                keep_scale = fx.Float32(
+                                                    arith.mulf(
+                                                        _raw(
+                                                            _u8_load_f32(
+                                                                drop_rsrc, safe_d_off
+                                                            )
+                                                        ),
+                                                        _raw(fx.Float32(_rp_undrop)),
+                                                        fastmath=fm,
+                                                    )
+                                                )
+                                                _epi_keeps[(n_grp, m_half, r)] = (
+                                                    keep_scale
+                                                )
+                                                p_dv_val = fx.Float32(
+                                                    arith.mulf(
+                                                        _raw(p_val),
+                                                        _raw(keep_scale),
+                                                        fastmath=fm,
+                                                    )
+                                                )
                                         else:
                                             p_val = _epi_p_vals[(n_grp, m_half, r)]
                                             valid_mn = _epi_valids[(n_grp, m_half, r)]
                                         if const_expr(_epi_do_ds):
                                             dm_val = Vec(dm_grp)[r]
                                             dp_val = Vec(dp_accs[ai])[r]
+                                            if const_expr(has_dropout):
+                                                dp_val = fx.Float32(
+                                                    arith.mulf(
+                                                        _raw(dp_val),
+                                                        _raw(
+                                                            _epi_keeps[
+                                                                (n_grp, m_half, r)
+                                                            ]
+                                                        ),
+                                                        fastmath=fm,
+                                                    )
+                                                )
                                             ds_val = _grad_ds_unscaled(
                                                 p_val, dp_val, dm_val, valid_mn, fm
                                             )
@@ -1634,7 +1706,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                         if const_expr(_epi_do_p):
                                             fx.memref_store(
                                                 Vec.from_elements(
-                                                    [p_val], fx.Float32
+                                                    [p_dv_val], fx.Float32
                                                 ).to(elem_dtype)[0],
                                                 p_regs_ns[ai],
                                                 r,
@@ -2102,6 +2174,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         bias_stride_q: fx.Int32,
         dBias: fx.Tensor,
         dbias_sink: fx.Int32,
+        Dropout: fx.Tensor,
+        drop_stride_b: fx.Int32,
+        drop_stride_h: fx.Int32,
+        drop_stride_q: fx.Int32,
         stream: fx.Stream,
     ):
         from flydsl._mlir import ir
@@ -2146,6 +2222,10 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             bias_stride_q,
             dBias,
             dbias_sink,
+            Dropout,
+            drop_stride_b,
+            drop_stride_h,
+            drop_stride_q,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_SIZE, 1, 1),

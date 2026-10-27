@@ -486,3 +486,285 @@ def test_backward_flydsl_block_diagonal_causal_local_and_unwindowed(head_dim):
                 atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
                 rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
             )
+
+
+@cuda_or_mtia_only
+def test_dispatch_bw_falls_back_to_flydsl_on_arch_ck_is_not_built_for(monkeypatch):
+    if not torch.version.hip:
+        pytest.skip("ROCm dispatch list")
+    if not fmha.flydsl._is_flydsl_available():
+        pytest.skip("FlyDSL unavailable on this device/arch")
+    from mslk.attention.fmha.dispatch import _dispatch_bw
+
+    device = torch._C._get_accelerator().type
+    query, key, value, attn_bias = create_tensors(
+        *(fmha.flydsl.BwOp, device, torch.bfloat16, type(None), 1, 128, 128, 4, 64, 64),
+        attn_bias_requires_grad=False,
+        fmt="BMHK",
+    )
+    inp = fmha.Inputs(query, key, value, attn_bias)
+
+    # An arch outside CK's build set makes it decline, so the next op is chosen.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", {"gfx_not_this_one"})
+    reasons = fmha.ck.BwOp.not_supported_reasons(inp)
+    assert any("gfx arch" in r for r in reasons), reasons
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.flydsl.BwOp
+
+    # With the real arch set on CK, CK stays preferred wherever it is built.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", None)
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.ck.BwOp
+
+
+def _assert_grad_close(got, ref, msg, rel_tol=3e-2):
+    """Max error relative to the reference's largest entry. The harness's
+    absolute tolerances are loose enough to hide O(10%) gradient errors."""
+    assert got.shape == ref.shape, f"{msg}: shape {got.shape} != {ref.shape}"
+    rel = (got.float() - ref.float()).abs().max() / ref.float().abs().max()
+    assert rel < rel_tol, f"{msg}: max relative error {rel.item():.3e} >= {rel_tol}"
+
+
+def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss, dtype=torch.bfloat16):
+    """Runs flydsl.FwOp/BwOp against the reference for inputs `make_inputs`
+    builds as (leaf tensors, q, k, v) and a loss built by `make_grad_loss`."""
+    device = torch._C._get_accelerator().type
+    torch.manual_seed(0)
+    leaves, query, key, value = make_inputs(device, dtype, head_dim)
+    out = fmha.memory_efficient_attention(
+        query, key, value, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    make_grad_loss(out).backward()
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+
+    out_ref = ref_attention_for_test(query, key, value, None)
+    make_grad_loss(out_ref).backward()
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+def _plain_inputs(device, dtype, head_dim):
+    shape = (2, 96, 4, head_dim)
+    leaves = [
+        torch.randn(shape, device=device, dtype=dtype).requires_grad_(True)
+        for _ in range(3)
+    ]
+    return leaves, *leaves
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [16, 48, 80, 112, 200])
+def test_backward_flydsl_head_dim_not_multiple_of_32(head_dim):
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    _flydsl_bwd_case(head_dim, _plain_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_broadcast_grad():
+    # `out.sum().backward()` hands the op a stride-0 expanded grad.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    _flydsl_bwd_case(64, _plain_inputs, lambda out: out.sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_key_value_row_pitch_differs():
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        # key is a view into a wider buffer (row pitch 2*H*D), value is dense.
+        key_buf = torch.randn(B, N, 2 * H, head_dim, device=device, dtype=dtype)
+        value = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        leaves = [t.requires_grad_(True) for t in (q, key_buf, value)]
+        return leaves, leaves[0], leaves[1][:, :, :H], leaves[2]
+
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves, query, key, value = make_inputs(device, dtype, 64)
+    assert key.stride(1) != value.stride(1)
+    out = fmha.memory_efficient_attention(
+        query, key, value, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    ref = ref_attention_for_test(query, key, value, None)
+    ref.backward(grad_out)
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
+def test_backward_flydsl_fwd_bwd_pair(head_dim, dtype):
+    # The FlyDSL forward and backward are dispatched as a pair on archs CK is
+    # not built for, so check them together against the reference.
+    if not torch.version.hip:
+        pytest.skip("flydsl ops are ROCm-only")
+    _flydsl_bwd_case(head_dim, _plain_inputs, lambda out: (out**2).sum(), dtype=dtype)
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [48, 64])
+def test_backward_flydsl_gqa_broadcast_kv(head_dim):
+    # Stride-0 `.expand()` K/V (GQA) must stay correct with and without the
+    # head-dim padding path, which has to materialise them.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        k_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        v_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        leaves = [t.requires_grad_(True) for t in (q, k_small, v_small)]
+        return (
+            leaves,
+            leaves[0],
+            leaves[1].expand(-1, -1, H, -1),
+            leaves[2].expand(-1, -1, H, -1),
+        )
+
+    _flydsl_bwd_case(head_dim, make_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_transposed_head_axis():
+    # A head axis that is not flat relative to head_dim is copied, not declined.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q_t = torch.randn(B, H, N, head_dim, device=device, dtype=dtype)
+        k, v = (
+            torch.randn(B, N, H, head_dim, device=device, dtype=dtype) for _ in range(2)
+        )
+        leaves = [t.requires_grad_(True) for t in (q_t, k, v)]
+        return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
+
+    _flydsl_bwd_case(64, make_inputs, lambda out: (out**2).sum())
+
+
+def _ck_dropout_ops_usable(inp):
+    return (
+        not fmha.ck.FwOp.not_supported_reasons(inp)
+        and not fmha.ck.BwOp.not_supported_reasons(inp)
+        and hasattr(torch.ops.xformers, "_ck_rand_uniform")
+    )
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("seqlens", [(32, 32), (100, 70), (64, 256)])
+def test_dropout_mask_matches_ck(seqlens):
+    # The mask is CK's: same philox, counters and byte layout, so a forward and
+    # backward from different backends can share `Context.rng_state`.
+    if not torch.version.hip or not hasattr(torch.ops.xformers, "_ck_rand_uniform"):
+        pytest.skip("CK dropout oracle unavailable")
+    from mslk.attention.flydsl.fmha_dropout import philox_randval
+    from mslk.utils.device import is_gfx942, is_gfx950
+
+    if not (is_gfx942() or is_gfx950()):
+        pytest.skip("CK dropout oracle is built for gfx942/gfx950 only")
+    Mq, Mkv = seqlens
+    device = torch.device(torch._C._get_accelerator().type)
+    torch.cuda.manual_seed(1234)
+    gen = torch.cuda.default_generators[torch.cuda.current_device()]
+    for B, H in [(1, 1), (2, 3)]:  # the second call has a non-zero offset
+        seed, offset = gen.initial_seed(), gen.get_offset()
+        expected = torch.ops.xformers._ck_rand_uniform(
+            0.1, B, H, Mq, Mkv, torch.cuda.current_device()
+        )
+        got = philox_randval(seed, offset, B, H, Mq, Mkv, device)
+        assert torch.equal(got, expected), f"mismatch at B={B} H={H} offset={offset}"
+
+
+def _dropout_reference_grads(q, k, v, grad_out, keep, p, causal):
+    ql, kl, vl = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    S = q.shape[1]
+    scores = torch.einsum("bmhd,bnhd->bhmn", ql, kl) * q.shape[-1] ** -0.5
+    if causal:
+        tril = torch.ones(S, S, device=q.device, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~tril, float("-inf"))
+    probs = scores.softmax(-1) * keep.float() / (1.0 - p)
+    out = torch.einsum("bhmn,bnhd->bmhd", probs, vl)
+    out.backward(grad_out.float())
+    return out, ql.grad, kl.grad, vl.grad
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("p", [0.1, 0.5])
+@pytest.mark.parametrize("heads", [(4, 4), (8, 2)])
+def test_backward_flydsl_dropout(heads, p, causal):
+    if not torch.version.hip or not fmha.flydsl._is_flydsl_available():
+        pytest.skip("flydsl ops are ROCm-only")
+    from mslk.attention.flydsl.fmha_dropout import philox_keep_mask
+    from mslk.utils.device import is_gfx950
+
+    if not is_gfx950():
+        pytest.skip("the FlyDSL dropout backward is implemented for gfx950 only")
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    H, Hkv = heads
+    B, S, D = 2, 200, 64  # S is not a multiple of the 32x32 mask tile
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    grad_out = torch.randn_like(q)
+    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    kx, vx = (t.repeat_interleave(H // Hkv, dim=2) for t in (k, v))
+    inp = fmha.Inputs(q, kx, vx, attn_bias=bias, p=p)
+    assert not fmha.flydsl.FwOp.not_supported_reasons(inp)
+    assert not fmha.flydsl.BwOp.not_supported_reasons(inp)
+
+    out, ctx = fmha.flydsl.FwOp.apply(inp, needs_gradient=True)
+    seed, offset = ctx.rng_state.tolist()
+    grads = fmha.flydsl.BwOp.apply(ctx, inp, grad_out)
+
+    keep = philox_keep_mask(seed, offset, p, B, H, S, S, torch.device(device))
+    ref_out, ref_dq, ref_dk, ref_dv = _dropout_reference_grads(
+        q, kx, vx, grad_out, keep, p, causal
+    )
+    _assert_grad_close(out, ref_out, "flydslF dropout out")
+    for name, got, ref in (
+        ("dq", grads.dq, ref_dq),
+        ("dk", grads.dk, ref_dk),
+        ("dv", grads.dv, ref_dv),
+    ):
+        _assert_grad_close(got, ref, f"flydslB dropout {name}")
+
+    # A second call draws a fresh mask rather than replaying the first.
+    _, ctx2 = fmha.flydsl.FwOp.apply(inp, needs_gradient=True)
+    assert ctx2.rng_state.tolist() != ctx.rng_state.tolist()
+
+    # Either backend replays the same mask from the shared state.
+    if _ck_dropout_ops_usable(inp):
+        grads_ck = fmha.ck.BwOp.apply(ctx, inp, grad_out)
+        for name, got, ref in (
+            ("dq", grads.dq, grads_ck.dq),
+            ("dk", grads.dk, grads_ck.dk),
+            ("dv", grads.dv, grads_ck.dv),
+        ):
+            _assert_grad_close(got, ref, f"flydslB vs ck.BwOp dropout {name}")
+
+
+@cuda_or_mtia_only
+def test_flydsl_bwd_declines_dropout_on_varlen():
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    device = torch._C._get_accelerator().type
+    seqlens = [32, 64]
+    bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens(seqlens)
+    q = torch.randn(1, sum(seqlens), 2, 64, device=device, dtype=torch.bfloat16)
+    inp = fmha.Inputs(q, q.clone(), q.clone(), attn_bias=bias, p=0.1)
+    assert any("dropout" in r for r in fmha.flydsl.BwOp.not_supported_reasons(inp))
