@@ -540,12 +540,12 @@ def test_backward_flydsl_value_dim_dropout() -> None:
     _run_dropout_case((4, 4), 0.5, True, seqlens=(128, 128), dims=(80, 48), direct=True)
 
 
-def test_flydsl_bwd_declines_dropout_on_varlen() -> None:
+def test_flydsl_bwd_accepts_dropout_on_varlen() -> None:
     _require_gfx950_flydsl()
     device = torch._C._get_accelerator().type
     bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens([32, 64])
     query = torch.randn(1, 96, 2, 64, device=device, dtype=torch.bfloat16)
     inputs = fmha.Inputs(query, query.clone(), query.clone(), attn_bias=bias, p=0.1)
-    assert any(
+    assert not any(
         "dropout" in reason for reason in fmha.flydsl.BwOp.not_supported_reasons(inputs)
     )
