@@ -392,6 +392,7 @@ def _build_varlen_light(
     num_kv_splits: int = 1,
     head_dim_qk: Optional[int] = None,
     head_dim_v: Optional[int] = None,
+    has_dropout: bool = False,
 ):
     """Build a lightweight packed-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -416,6 +417,7 @@ def _build_varlen_light(
         window_left=window_left,
         gappy_kv=gappy_kv,
         num_kv_splits=num_kv_splits,
+        has_dropout=has_dropout,
     )
 
 
@@ -1264,6 +1266,9 @@ def _flydsl_flash_attn_paged(
     # Sliding window (exclusive left bound), forwarded to the generic (light)
     # paged kernel and pa_decode_swa.
     window_left: int = -1,
+    # Dropout (see flydsl_flash_attn_func); light kernel only.
+    dropout_p: float = 0.0,
+    dropout_seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Native paged-KV attention on the gfx950 dualwave kernel.
 
@@ -1419,11 +1424,11 @@ def _flydsl_flash_attn_paged(
             return empty_out, empty_lse
         return empty_out
 
-    # The decode kernels below build native head dims only; a masked head dim
-    # takes the generic kernel.
+    # The decode kernels below build native head dims only and do not apply
+    # dropout; a masked head dim or dropout takes the generic kernel.
     _swa_cfg = (
         None
-        if _masked_hd
+        if _masked_hd or dropout_seed is not None
         else _paged_swa_kernel_config(
             q,
             k,
@@ -1490,6 +1495,8 @@ def _flydsl_flash_attn_paged(
     if (
         _PAGED_GQA_PACK
         and not return_lse
+        # Packing remaps the q row the dropout mask is keyed on.
+        and dropout_seed is None
         and kv_seqstart is None
         and 1 <= Sq <= 64
         and _varlen_uniform_q
@@ -1595,6 +1602,8 @@ def _flydsl_flash_attn_paged(
         _gappy
         or _paged_window
         or _masked_hd
+        # Only the light kernel applies dropout.
+        or dropout_seed is not None
         or (
             _splitk_dtype_ok
             and (
@@ -1609,6 +1618,10 @@ def _flydsl_flash_attn_paged(
         )
     )
 
+    if dropout_seed is not None and requested_num_kv_splits > 1:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: paged dropout does not support split-K"
+        )
     if varlen and not _varlen_uniform_q and requested_num_kv_splits > 1:
         raise NotImplementedError(
             "flydsl_flash_attn_func: paged split-K requires uniform varlen Q"
@@ -1621,6 +1634,7 @@ def _flydsl_flash_attn_paged(
         and requested_num_kv_splits <= 1
         and _splitk_dtype_ok
         and not _gappy
+        and dropout_seed is None
     ):
         # Split-K is the lever on decode-shaped paged calls: each workgroup
         # walks its whole KV range as a serial chain of dependent loads, so
@@ -1677,6 +1691,9 @@ def _flydsl_flash_attn_paged(
         and not varlen
         and kv_seqstart is None
         and not return_lse
+        # The head-packed decode kernel does not apply dropout.
+        and dropout_seed is None
+        and dropout_seed is None
         and not vectorized
         and D in (64, 128)
         and dtype_str in ("bf16", "f16")
@@ -1825,6 +1842,7 @@ def _flydsl_flash_attn_paged(
                     pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
                     head_dim_qk=D,
                     head_dim_v=D,
+                    has_dropout=dropout_seed is not None,
                 )
             else:
                 exe = _build_paged(
@@ -1872,6 +1890,7 @@ def _flydsl_flash_attn_paged(
                 kwargs["cu_seqlens_kv"] = bounded_cu_seqlens_kv
             if kv_seqstart is not None:
                 kwargs["kv_seqstart"] = bounded_kv_seqstart
+            kwargs.update(_dropout_kwargs(dropout_p, dropout_seed))
             if cross or _paged_light_ok:
                 # The light kernel also bounds every request's length by it.
                 kwargs["seq_len_kv"] = skv
@@ -1966,6 +1985,7 @@ def _build_paged_light(
     pid_regs: bool = False,
     head_dim_qk: Optional[int] = None,
     head_dim_v: Optional[int] = None,
+    has_dropout: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -2007,6 +2027,7 @@ def _build_paged_light(
         paged_pid_regs=pid_regs,
         head_dim_qk=head_dim_qk,
         head_dim_v=head_dim_v,
+        has_dropout=has_dropout,
     )
 
 
@@ -2073,9 +2094,8 @@ def flydsl_flash_attn_func(
     bias: Optional[torch.Tensor] = None,
     # Top-left causal (kv_col <= q_row) vs default bottom-right; cross-length only.
     causal_top_left: bool = False,
-    # Dropout (dense f16/bf16 only): drop probability and the device int64[1]
-    # Philox seed (mslk.attention.flydsl.dropout_philox). The kernel draws the
-    # keep bits in-kernel; the caller applies the 1/(1-p) output scale.
+    # Dropout (f16/bf16): drop probability and device int64[1] Philox seed
+    # (dropout_philox). The caller applies the 1/(1-p) output scale.
     dropout_p: float = 0.0,
     dropout_seed: Optional[torch.Tensor] = None,
     # CUDA/HIP stream; defaults to the current stream for q.device.
@@ -2229,13 +2249,10 @@ def flydsl_flash_attn_func(
         raise ValueError(
             "flydsl_flash_attn_func: dropout_p and dropout_seed must be set together"
         )
-    if dropout_seed is not None:
-        _varlen_req = cu_seqlens_q is not None
-        if dtype_str == "fp8" or paged_kv or _varlen_req:
-            raise NotImplementedError(
-                "flydsl_flash_attn_func: dropout is only supported on the "
-                "dense f16/bf16 path (not fp8/paged/varlen)"
-            )
+    if dropout_seed is not None and dtype_str == "fp8":
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: dropout is only supported for f16/bf16"
+        )
     if paged_kv:
         return _flydsl_flash_attn_paged(
             q,
@@ -2255,6 +2272,8 @@ def flydsl_flash_attn_func(
             num_kv_splits=num_kv_splits,
             return_lse=return_lse,
             sm_scale=sm_scale,
+            dropout_p=dropout_p,
+            dropout_seed=dropout_seed,
             out=out,
             waves_per_eu=waves_per_eu,
             daz=daz,
@@ -2477,8 +2496,15 @@ def flydsl_flash_attn_func(
                     or kv_seqstart is not None
                     # Only the light kernel masks stored head dims.
                     or masked_hd
+                    # Only the light kernel applies dropout.
+                    or dropout_seed is not None
                 )
             )
+            if dropout_seed is not None and not _prefer_light:
+                raise NotImplementedError(
+                    "flydsl_flash_attn_func: varlen dropout needs the generic kernel "
+                    "(head_dim 64/128/256, f16/bf16)"
+                )
             if _prefer_light:
                 exe = _build_varlen_light(
                     num_heads=H,
@@ -2500,6 +2526,7 @@ def flydsl_flash_attn_func(
                     gappy_kv=kv_seqstart is not None,
                     head_dim_qk=Dqk,
                     head_dim_v=Dv,
+                    has_dropout=dropout_seed is not None,
                 )
             else:
                 exe = _build_varlen(
@@ -2722,6 +2749,7 @@ def flydsl_flash_attn_func(
                 kwargs["kv_seqstart"] = kv_seqstart
             if cross:
                 kwargs["seq_len_kv"] = int(max_seqlen_kv)
+            kwargs.update(_dropout_kwargs(dropout_p, dropout_seed))
             if debug_lazy:
                 exe(
                     q_flat,

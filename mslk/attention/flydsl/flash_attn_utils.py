@@ -4121,7 +4121,7 @@ class GenericSoftmaxHelper:
         # is 4-aligned, so one Philox call covers it.
         ctx = self.ctx
         traits = ctx.traits
-        assert not traits.KV_VECTORIZED, "dropout is dense-only"
+        assert not traits.KV_VECTORIZED, "dropout needs the linear KV layout"
         col_base, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
         for half, p_vals in ((0, p_vals_lo), (traits.K_SUB_N, p_vals_hi)):
             for g in range_constexpr(4):
