@@ -3232,6 +3232,10 @@ class MXFP4Tests(unittest.TestCase):
             (1, 256, 2048),  # small
             (250, 512, 2048),  # medium
             (250, 1024, 3584),  # large
+            # K not a multiple of the kernels' K tiles (128/256): the K tail
+            # must be masked rather than read past the end of each row.
+            (33, 160, 192),
+            (100, 1024, 2080),
         ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
