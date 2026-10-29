@@ -134,7 +134,7 @@ _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
 # Head dims the kernel builds natively; other dims in [1, 256] are zero-padded up to
 # the next value here (padded Q/K add 0 to QK; padded V columns are sliced off O).
-_SUPPORTED_HEAD_DIMS = (64, 128, 256)
+_SUPPORTED_HEAD_DIMS = (64, 96, 128, 256)
 
 
 def _pad_head_dim(d: int) -> int:
