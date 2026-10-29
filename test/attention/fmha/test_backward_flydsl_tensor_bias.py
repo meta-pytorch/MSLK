@@ -218,10 +218,11 @@ def test_flydsl_tensor_bias_without_dbias() -> None:
     _run_flydsl_tensor_bias_case(0.125, needs_dbias=False)
 
 
-def test_flydsl_causal_tensor_bias_tail() -> None:
+def test_flydsl_causal_tensor_bias_multi_bh_multi_n_tile() -> None:
     _run_flydsl_tensor_bias_case(
         0.125,
         key_len=100,
+        expand_bias=True,
         needs_dbias=False,
         causal=True,
     )

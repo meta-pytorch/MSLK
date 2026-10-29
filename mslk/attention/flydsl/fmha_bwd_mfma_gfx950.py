@@ -419,14 +419,18 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             dq_total_elems_idx = (
                 fx.Index(batch_size) * seq_M_idx * n_heads_idx * fx.Index(D)
             )
-        num_N_tiles = (seq_N_idx + BLOCK_N - 1) // BLOCK_N
         # Compact K/V and dK/dV tensors are indexed by KV heads; the grid is query
         # head based, but the output row pitch for dK/dV remains Hkv = H/heads_per_kv.
         n_kv_heads_idx = n_heads_idx // heads_per_kv
         bid_idx = fx.Index(bid)
-        n_bh_idx = bid_idx
-        n_tile = n_bh_idx % num_N_tiles
-        bh_idx = n_bh_idx // num_N_tiles
+        # n_tile-major dispatch: under causal masking the work per CTA shrinks as
+        # n_tile grows (later kv tiles skip more leading q tiles), so launching
+        # every (batch, head) of the heaviest n_tile first and then lighter ones
+        # approximates longest-processing-time-first scheduling and keeps the CUs
+        # balanced. The mapping stays a bijection onto (n_tile, batch, head).
+        num_bh_idx = fx.Index(batch_size) * n_heads_idx
+        n_tile = bid_idx // num_bh_idx
+        bh_idx = bid_idx % num_bh_idx
         # Per-query-head grid: blockIdx.y ranges over QUERY heads (num_head_q),
         # with K/V looked up via head_idx // heads_per_kv. This gives
         # B*H*num_N_tiles blocks.
