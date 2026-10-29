@@ -82,6 +82,7 @@ def _mxfp4_autotune_configs():
 
 
 @triton.autotune(configs=_mxfp4_autotune_configs(), key=["M", "N", "K"])
+@triton.heuristics({"EVEN_K": lambda args: args["K"] % args["BLOCK_K"] == 0})
 @triton.jit
 def _mxfp4_gemm_kernel(
     # Pointers
@@ -110,6 +111,7 @@ def _mxfp4_gemm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # K elements, must be multiple of 32 and of 2
     GROUP_M: tl.constexpr,  # L2-friendly super-group width along M
+    EVEN_K: tl.constexpr,  # K is a multiple of BLOCK_K, so no K tail to mask
 ):
     """MXFP4 × MXFP4 → BF16 via tl.dot_scaled.
 
@@ -148,11 +150,11 @@ def _mxfp4_gemm_kernel(
 
     # Clamp row/col indices used for *addressing* so out-of-range lanes (when
     # BLOCK_M/BLOCK_N don't divide M/N) read a valid in-bounds element instead
-    # of running off the end of the allocation. `tl.dot_scaled` needs full
-    # dense tiles (no masked load), so we over-read clamped-but-valid rows and
-    # discard them via the store mask below. Without this, large-K shapes whose
+    # of running off the end of the allocation. Those rows only feed outputs
+    # that the store mask below discards. Without this, large-K shapes whose
     # M isn't a multiple of BLOCK_M fault (the row stride pushes the over-read
-    # past mapped pages).
+    # past mapped pages). The K tail cannot be handled this way, because every
+    # K element feeds every output; it is masked instead (see the loop).
     safe_m = tl.minimum(offs_m, M - 1)
     safe_n = tl.minimum(offs_n, N - 1)
 
@@ -171,12 +173,32 @@ def _mxfp4_gemm_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     K_packed = K // 2
+    K_scales = K // 32
     for k_off_packed in range(0, K_packed, PACKED_BLOCK_K):
-        a_pack = tl.load(a_base + k_off_packed * stride_ak)
-        b_pack = tl.load(b_base + k_off_packed * stride_bk)
         scale_off = (k_off_packed * 2) // 32
-        a_scale = tl.load(as_base + scale_off * stride_ask)
-        b_scale = tl.load(bs_base + scale_off * stride_bsk)
+        if EVEN_K:
+            a_pack = tl.load(a_base + k_off_packed * stride_ak)
+            b_pack = tl.load(b_base + k_off_packed * stride_bk)
+            a_scale = tl.load(as_base + scale_off * stride_ask)
+            b_scale = tl.load(bs_base + scale_off * stride_bsk)
+        else:
+            # Past the end of K, data reads as FP4 zeros so it adds nothing;
+            # its scales read as 127 (2^0) because any finite scale will do,
+            # while 0xFF is E8M0's NaN.
+            k_in = offs_k_packed < K_packed - k_off_packed
+            s_in = offs_k_scale < K_scales - scale_off
+            a_pack = tl.load(
+                a_base + k_off_packed * stride_ak, mask=k_in[None, :], other=0
+            )
+            b_pack = tl.load(
+                b_base + k_off_packed * stride_bk, mask=k_in[:, None], other=0
+            )
+            a_scale = tl.load(
+                as_base + scale_off * stride_ask, mask=s_in[None, :], other=127
+            )
+            b_scale = tl.load(
+                bs_base + scale_off * stride_bsk, mask=s_in[None, :], other=127
+            )
         # Chain accumulation through dot_scaled (avoids a separate add).
         acc = tl.dot_scaled(
             a_pack,
