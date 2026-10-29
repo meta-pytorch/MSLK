@@ -36,7 +36,7 @@ from mslk.testing.device import (
     skipUnlessGfxArch,
     skipUnlessRocm,
 )
-from mslk.utils.device import compute_capability_in, supports_float8_fnuz
+from mslk.utils.device import compute_capability_in, is_gfx950, supports_float8_fnuz
 
 if torch.cuda.is_available():
     from mslk.gemm.flydsl.preshuffle_gemm import (
@@ -175,6 +175,9 @@ def _fp8_gemm_cases() -> list[tuple]:
         torch.version.cuda is not None and compute_capability_in(9, 9)
     ) or torch.version.hip is not None
     modes = ["rowwise"] + (["blockwise"] if blockwise_supported else [])
+    # The rowwise preshuffle ops, which FlyDSL serves on gfx950.
+    if torch.version.hip is not None and is_gfx950():
+        modes.append("rowwise_preshuffle")
 
     def case(
         M: int,
@@ -409,14 +412,22 @@ class FP8Tests(unittest.TestCase):
             else None
         )
 
-        if Mode == "rowwise":
+        if Mode in ("rowwise", "rowwise_preshuffle"):
 
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
                 xq, x_scale = quantize_fp8_row(x)
                 wq, w_scale = quantize_fp8_row(w)
-                if UseTriton and torch.version.cuda:
+                if Mode == "rowwise_preshuffle":
+                    from mslk.quantize.shuffle import preshuffle_b_mfma
+
+                    zq = torch.ops.mslk.f8f8bf16_rowwise_preshuffle(
+                        xq, preshuffle_b_mfma(wq), x_scale, w_scale
+                    )
+                    if bias is not None:
+                        zq += bias
+                elif UseTriton and torch.version.cuda:
                     zq = matmul_fp8_row(xq, wq, x_scale, w_scale)
                     if bias is not None:
                         zq += bias
@@ -4177,6 +4188,107 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
+    """Companion of the rowwise_preshuffle mode in ``test_gemm``: the f16 op,
+    shapes the wrapper zero-pads to the kernel's tiles, and the CK contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _quantized(self, M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        return xq, wq, x_scale, w_scale
+
+    @staticmethod
+    def _reference(
+        xq: torch.Tensor, wq: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return (xq.float() @ wq.float().T) * x_scale[..., None] * w_scale
+
+    @parameterized.expand(
+        [
+            (M, N, K, op, dtype)
+            # The first shape fits the kernel's tiles; the others (N % 64 != 0
+            # and/or K % 128 != 0) are valid for the preshuffle layout and get
+            # zero-padded to them.
+            for M, N, K in [(1, 4096, 4096), (33, 1040, 4160), (16, 4096, 4160)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
+                ("f8f8f16_rowwise_preshuffle", torch.float16),
+            ]
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(M, N, K)
+        out = getattr(torch.ops.mslk, op)(xq, preshuffle_b_mfma(wq), x_scale, w_scale)
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_padded_weight_follows_inplace_update(self) -> None:
+        # The padded weight is cached per weight tensor; an in-place update
+        # must not be served the stale copy.
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        op = torch.ops.mslk.f8f8bf16_rowwise_preshuffle
+        xq, wq, x_scale, w_scale = self._quantized(16, 1040, 4160)
+        wq_shuf = preshuffle_b_mfma(wq)
+        op(xq, wq_shuf, x_scale, w_scale)
+        _, wq2, _, w_scale2 = self._quantized(16, 1040, 4160)
+        wq_shuf.copy_(preshuffle_b_mfma(wq2))
+        out = op(xq, wq_shuf, x_scale, w_scale2)
+        ref = self._reference(xq, wq2, x_scale, w_scale2)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_rejects_what_ck_rejects(self) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        op = torch.ops.mslk.f8f8bf16_rowwise_preshuffle
+        xq, wq, x_scale, w_scale = self._quantized(16, 256, 512)
+        wq = preshuffle_b_mfma(wq)
+        bias = torch.zeros(256, dtype=torch.bfloat16, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            op(xq, wq, x_scale, w_scale, bias)
+        with self.assertRaisesRegex(RuntimeError, "use_fast_accum"):
+            op(xq, wq, x_scale, w_scale, None, False)
+        with self.assertRaisesRegex(RuntimeError, "float32"):
+            op(xq, wq, x_scale.bfloat16(), w_scale)
+        with self.assertRaisesRegex(RuntimeError, "N % 16"):
+            op(xq, wq[:40], x_scale, w_scale[:40])
+
+    def test_rejects_narrow_tile_n(self) -> None:
+        # tile_n < 64 launches but leaves most of the output unwritten.
+        xq, wq, x_scale, w_scale = self._quantized(16, 1024, 1024)
+        with self.assertRaisesRegex(ValueError, "multiple of 64"):
+            flydsl_preshuffle_gemm(
+                xq, flydsl_preshuffle(wq), x_scale, w_scale, tile_m=16, tile_n=32
+            )
+
+    def test_opcheck(self) -> None:
+        # Fake kernel vs real output on a 3D input. test_schema is left out: its
+        # mutation check multiplies the inputs, which float8_e4m3fn lacks.
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(128, 1024, 1024)
+        torch.library.opcheck(
+            torch.ops.mslk.f8f8bf16_rowwise_preshuffle,
+            (xq.view(2, 64, 1024), preshuffle_b_mfma(wq), x_scale.view(2, 64), w_scale),
+            test_utils=("test_faketensor",),
+        )
 
 
 @skipUnlessRocm()

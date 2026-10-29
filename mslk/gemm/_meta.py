@@ -540,16 +540,8 @@ if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_preshuffle"):
         bias: Optional[torch.Tensor] = None,
         use_fast_accum: bool = True,
     ) -> torch.Tensor:
-        x_dims = XQ.dim()
-        if x_dims == 2:
-            M = XQ.shape[0]
-            N = WQ.shape[0]
-            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-        else:
-            B = XQ.shape[0]
-            M = XQ.shape[1]
-            N = WQ.shape[0]
-            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+        # Any leading dims, like the kernels: output is XQ.shape[:-1] + (N,).
+        return XQ.new_empty((*XQ.shape[:-1], WQ.shape[0]), dtype=torch.bfloat16)
 
 
 if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
@@ -563,9 +555,7 @@ if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
         bias: Optional[torch.Tensor] = None,
         use_fast_accum: bool = True,
     ) -> torch.Tensor:
-        M = XQ.shape[0]
-        N = WQ.shape[0]
-        return torch.empty((M, N), dtype=torch.float16, device=XQ.device)
+        return XQ.new_empty((*XQ.shape[:-1], WQ.shape[0]), dtype=torch.float16)
 
 
 # ---------------------------------------------------------------------------

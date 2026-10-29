@@ -241,6 +241,42 @@ if torch.version.hip is not None:
                 _bf16bf16bf16_grouped_stacked_rocm
             )
 
+    if hasattr(torch.ops, "mslk") and hasattr(
+        torch.ops.mslk, "_f8f8bf16_rowwise_preshuffle_ck"
+    ):
+        # Selected the same way as the stacked BF16 op above: FlyDSL where it
+        # is opted into and supported (gfx950), else the CK kernels that
+        # gemm_ops.cpp binds under private names.
+        @functools.lru_cache(maxsize=None)
+        def _rowwise_preshuffle_impl(op: str) -> Callable[..., torch.Tensor]:
+            mod = _flydsl_gemm_module("preshuffle_gemm")
+            if mod is not None and mod.is_supported():
+                return getattr(mod, f"matmul_{op}")
+            return getattr(torch.ops.mslk, f"_{op}_ck")
+
+        def _rowwise_preshuffle_rocm(op: str) -> Callable[..., torch.Tensor]:
+            def _impl(
+                XQ: torch.Tensor,
+                WQ: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_scale: torch.Tensor,
+                bias: Optional[torch.Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> torch.Tensor:
+                return _rowwise_preshuffle_impl(op)(
+                    XQ, WQ, x_scale, w_scale, bias, use_fast_accum
+                )
+
+            return _impl
+
+        for _op in ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"):
+            try:
+                torch.library.impl(f"mslk::{_op}", "CUDA")(
+                    _rowwise_preshuffle_rocm(_op)
+                )
+            except RuntimeError:
+                pass  # already registered (e.g. module imported more than once)
+
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 
         @functools.lru_cache(maxsize=1)
