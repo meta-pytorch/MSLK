@@ -298,22 +298,6 @@ class FwOp(AttentionFwOpBase):
         elif isinstance(d.attn_bias, LowerTriangularFromBottomRightMask):
             if d.query.shape[1] > d.key.shape[1]:
                 reasons.append("LowerTriangularFromBottomRightMask requires Mq <= Mkv")
-        # Other dense masks are self-attention only (varlen/paged/gappy handle
-        # cross-length via their own paths).
-        elif not isinstance(
-            d.attn_bias,
-            _VARLEN_BIAS_TYPES
-            + _PADDED_GAPPY_BIAS_TYPES
-            + _PAGED_BIAS_TYPES
-            + _PAGED_GAPPY_TYPES,
-        ):
-            q_len = d.query.shape[1]
-            kv_len = d.key.shape[1]
-            if q_len != kv_len:
-                reasons.append(
-                    f"cross-attention Mq={q_len} != Mkv={kv_len} not supported "
-                    "(dense self-attention only)"
-                )
 
         # Dropout: dense self-attention only (the in-kernel mask is applied on the
         # generic dense path; varlen/paged/gappy dropout is not wired).
