@@ -273,11 +273,8 @@ class FwOp(AttentionFwOpBase):
             reasons.append("FlyDSL unavailable on this device/arch")
 
         K = d.query.shape[-1]
-        Kv = d.value.shape[-1]
         if not (1 <= K <= 256):
             reasons.append(f"query head_dim={K} out of range [1, 256]")
-        if Kv != K:
-            reasons.append("value head_dim must equal query head_dim")
 
         # Paged KV kernel fixes PAGE_SIZE 64 and D in {64, 128}; a larger physical
         # page_size (multiple of 64) is remapped to 64-row sub-pages in _apply_bmhk.
