@@ -76,29 +76,61 @@ file(GLOB_RECURSE mslk_cpp_source_files_hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip)
 
-# HIP FMHA sources - built separately for only the latest GPU architecture
+# HIP FMHA sources - built separately, for a restricted set of architectures,
 # to reduce build time and binary size
 file(GLOB_RECURSE mslk_hip_fmha_sources
   csrc/attention/ck/fmha/hip_fmha/*.cpp)
 
 ################################################################################
-# Build FMHA Static Library (gfx942 only, ROCm 7.x+)
+# Build FMHA Static Library (CK FMHA architectures only, ROCm 7.x+)
 ################################################################################
+
+# CK FMHA is built only for these architectures. It is built for the requested
+# architectures (PYTORCH_ROCM_ARCH) that appear here; the others get no FMHA
+# device code. If none of the requested architectures appear here, the library
+# is skipped rather than built for an architecture that was not requested.
+set(mslk_hip_fmha_supported_archs gfx942)
+
+set(mslk_hip_fmha_archs)
+set(mslk_hip_fmha_excluded_archs)
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  # PYTORCH_ROCM_ARCH may be separated by semicolons, spaces or commas
+  string(REGEX REPLACE "[ ,]+" ";" _requested_archs "${PYTORCH_ROCM_ARCH}")
+  foreach(_arch IN LISTS _requested_archs)
+    # Match on the processor name, ignoring target features such as :xnack-
+    string(REGEX REPLACE ":.*" "" _arch_name "${_arch}")
+    if(_arch_name IN_LIST mslk_hip_fmha_supported_archs)
+      list(APPEND mslk_hip_fmha_archs ${_arch})
+    else()
+      list(APPEND mslk_hip_fmha_excluded_archs ${_arch})
+    endif()
+  endforeach()
+endif()
 
 set(mslk_hip_fmha_built FALSE)
 if(NOT DEFINED ENV{MSLK_BUILD_HIP_FMHA} OR NOT "$ENV{MSLK_BUILD_HIP_FMHA}" STREQUAL "0")
-  if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM
+  if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM AND NOT mslk_hip_fmha_archs)
+    message("Skipping HIP FMHA build: none of the requested archs "
+      "(${PYTORCH_ROCM_ARCH}) is supported by CK FMHA "
+      "(${mslk_hip_fmha_supported_archs})")
+  elseif(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM
       AND mslk_hip_fmha_sources
       AND HIP_VERSION VERSION_GREATER_EQUAL "7.0")
-    # Build HIP flags for FMHA targeting only gfx942
+    # Replace the global arch list with the CK FMHA subset of it
     set(HIP_HCC_FLAGS_FMHA ${HIP_HCC_FLAGS})
     list(FILTER HIP_HCC_FLAGS_FMHA EXCLUDE REGEX "--offload-arch=")
+    foreach(_arch IN LISTS mslk_hip_fmha_archs)
+      list(APPEND HIP_HCC_FLAGS_FMHA --offload-arch=${_arch})
+    endforeach()
     list(APPEND HIP_HCC_FLAGS_FMHA
-      --offload-arch=gfx942
       -fPIC
       -DFMHA_LIMIT_MAX_HEADDIM_TO_256=1)
 
-    message("Building FMHA for arch: gfx942 (HIP_VERSION=${HIP_VERSION})")
+    message("Building FMHA for arch: ${mslk_hip_fmha_archs} (HIP_VERSION=${HIP_VERSION})")
+    if(mslk_hip_fmha_excluded_archs)
+      message("Not building FMHA for arch: ${mslk_hip_fmha_excluded_archs} "
+        "(not supported by CK FMHA)")
+    endif()
 
     # Exclude any pre-existing _hip.cpp files the glob may have picked up
     # from a prior hipify run, to avoid duplicate compilation targets.
