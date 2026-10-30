@@ -134,6 +134,12 @@ _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
 # Head dims the kernel builds natively; other dims in [1, 256] are zero-padded up to
 # the next value here (padded Q/K add 0 to QK; padded V columns are sliced off O).
+# 96 is NOT in this list despite CK supporting it natively: the generic kernel's
+# cooperative KV load, QK/PV GEMMs, Q loader, output store, and LDS swizzle all
+# assume head_dim divides evenly into warp-sized (64-thread) chunks. D=96 → 128
+# costs ~33% extra MFMA work (measured 50-150% wall-clock on MI350X including
+# padding and memory overhead). Adding 96 requires reworking these subsystems in
+# flash_attn_generic.py and flash_attn_utils.py.
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
 
 
