@@ -218,7 +218,6 @@ class FwOp(AttentionFwOpBase):
         96,
         128,  # 64x128 kernel
         256,  # 64x128 with accumulation in gmem
-        512,
     ]
 
     @classmethod
