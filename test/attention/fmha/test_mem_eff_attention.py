@@ -1181,6 +1181,23 @@ def test_flydsl_splitk_decoder(
     )
 
 
+@pytest.mark.parametrize(
+    "op",
+    [fmha.ck_splitk.FwOp, fmha.flydsl_splitk.FwOp],
+    ids=["ck_splitk", "flydsl_splitk"],
+)
+@pytest.mark.parametrize("num_groups", [1, 8])
+def test_splitk_decoder_declines_int32_kv(op, num_groups: int) -> None:
+    d = 128
+    q = torch.randn(1, 8, 16, d, dtype=torch.float16)
+    kv_shape = (1, 8 * 32, 16, d // 8 + num_groups)
+    k = torch.zeros(kv_shape, dtype=torch.int32)
+    v = torch.zeros(kv_shape, dtype=torch.int32)
+
+    reasons = op.not_supported_reasons(fmha.Inputs(q, k, v))
+    assert "quantized (int32) key/value not supported" in reasons
+
+
 @rocm_only
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("n_heads", [1, 16])
