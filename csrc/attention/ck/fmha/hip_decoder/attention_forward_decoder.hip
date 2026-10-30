@@ -8,7 +8,7 @@
 #include <ATen/Dispatch.h>
 #include <ATen/Functions.h>
 #include <ATen/Tensor.h>
-#include <c10/cuda/CUDAStream.h>
+#include <c10/hip/HIPStream.h>
 #include <torch/library.h>
 
 #include "ck_attention_forward_decoder.h"

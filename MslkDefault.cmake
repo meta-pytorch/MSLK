@@ -73,6 +73,7 @@ file(GLOB_RECURSE mslk_cpp_source_files_cuda
 
 # HIP-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_hip
+  csrc/attention/ck/fmha/hip_decoder/*.hip
   csrc/gemm/ck/*.hip
   csrc/gemm/ck/**/*.hip)
 

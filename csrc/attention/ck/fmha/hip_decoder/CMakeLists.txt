@@ -1,3 +1,10 @@
+# Standalone developer harness inherited from xformers, for building the
+# decoder as an executable (ATTN_FWD_DECODER_MAIN; attention_forward_splitk.hip
+# has no main(), so its target cannot link). It is NOT part of the MSLK build
+# -- the decoder ops are compiled from MslkDefault.cmake -- and its paths refer
+# to an xformers checkout at /xformers, so it does not work against this
+# repository as-is.
+
 cmake_minimum_required(VERSION 3.26)
 
 project(FMHADecoderMain LANGUAGES CXX HIP)
