@@ -84,10 +84,11 @@ from .utils.op_common import get_operator, register_operator
 
 # ============================ Forward op (flydslF) ============================
 # Wraps ``mslk.attention.flydsl.flydsl_flash_attn_func`` as a drop-in for
-# ``ck.FwOp``: bf16/f16, head_dim in [1, 256] (non-native dims zero-padded to
-# {64,128,256}), causal/non-causal self-attention, additive tensor bias,
-# sliding-window, varlen, padded/gappy keys, paged KV, all 18 attn_bias types,
-# BMHK and BMGHK. Gradients dispatch to the native BwOp below (or ck.BwOp).
+# ``ck.FwOp``: bf16/f16, head dims in [1, 256] (value may differ from query;
+# non-native dims masked in-kernel), causal/non-causal self-attention, additive
+# tensor bias, sliding-window, varlen, padded/gappy keys, paged KV, all 18
+# attn_bias types, BMHK and BMGHK. Gradients dispatch to the native BwOp below
+# (or ck.BwOp).
 
 # Causal mask types (LowerTriangularMaskWithTensorBias is causal + tensor bias).
 _CAUSAL_BIAS_TYPES = (
@@ -132,18 +133,6 @@ _BOTTOM_RIGHT_CAUSAL_TYPES = (
 # Varlen-local (windowed) top-left type; drives causal_top_left.
 _VARLEN_WINDOW_TOPLEFT_TYPES = (BlockDiagonalCausalLocalAttentionMask,)
 
-# Head dims the kernel builds natively; other dims in [1, 256] are zero-padded up to
-# the next value here (padded Q/K add 0 to QK; padded V columns are sliced off O).
-_SUPPORTED_HEAD_DIMS = (64, 128, 256)
-
-
-def _pad_head_dim(d: int) -> int:
-    """Smallest natively-buildable head dim >= d (one of _SUPPORTED_HEAD_DIMS)."""
-    for hd in _SUPPORTED_HEAD_DIMS:
-        if d <= hd:
-            return hd
-    return d
-
 
 def _pack_varlen_lse(lse: torch.Tensor, q_seqinfo: Any) -> torch.Tensor:
     """Padded per-batch LSE [B, H, max_seqlen_q] -> packed [1, H, total_q].
@@ -173,7 +162,8 @@ _PAGED_BIAS_TYPES = (
     PagedBlockDiagonalPaddedKeysMask,
     PagedBlockDiagonalCausalWithOffsetPaddedKeysMask,
 )
-_PAGED_HEAD_DIMS = (64, 128)
+# 96 runs masked at 128: the kernel reads Q and the cache at their own head dim.
+_PAGED_HEAD_DIMS = (64, 96, 128)
 # The generic paged kernel tiles KV at PAGE_SIZE == BLOCK_N == 64; paged-gappy
 # reshapes any physical page_size to 64-row sub-pages (see _apply_bmhk).
 _KERNEL_PAGE_SIZE = 64
@@ -209,7 +199,7 @@ class FwOp(AttentionFwOpBase):
     OPERATOR = staticmethod(_is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
-    # Any dim in [1, 256]; non-native dims are padded (see _pad_head_dim).
+    # Any dims in [1, 256]; non-native dims are masked in-kernel (see _apply_bmhk).
     SUPPORTED_MAX_K = 256
     SUPPORTED_MIN_K = 1
 
@@ -236,7 +226,7 @@ class FwOp(AttentionFwOpBase):
 
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     SUPPORTS_BMGHK = True
     SUPPORTS_PARTIAL = False
     # The kernel writes padded per-batch LSE [B, H, max_seqlen_q]; _apply_bmhk
@@ -256,7 +246,7 @@ class FwOp(AttentionFwOpBase):
         torch.bfloat16: 2e-2,
     }
 
-    # 96 is non-native, to exercise head-dim padding.
+    # 96 is non-native, to exercise in-kernel head-dim masking.
     _TEST_K: List[int] = [64, 96, 128, 256]
 
     @classmethod
@@ -270,8 +260,8 @@ class FwOp(AttentionFwOpBase):
         Kv = d.value.shape[-1]
         if not (1 <= K <= 256):
             reasons.append(f"query head_dim={K} out of range [1, 256]")
-        if Kv != K:
-            reasons.append("value head_dim must equal query head_dim")
+        if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
+            reasons.append("paged KV needs value head_dim == query head_dim")
 
         # Paged KV kernel fixes PAGE_SIZE 64 and D in {64, 128}; a larger physical
         # page_size (multiple of 64) is remapped to 64-row sub-pages in _apply_bmhk.
@@ -285,8 +275,8 @@ class FwOp(AttentionFwOpBase):
                 reasons.append(
                     f"paged head_dim={K} unsupported (kernel paged: {_PAGED_HEAD_DIMS})"
                 )
-        # Paged-gappy uses the generic paged kernel (per-row page lookup). D is
-        # padded to {64,128,256}; page_size must be a multiple of the kernel's 64.
+        # Paged-gappy uses the generic paged kernel (per-row page lookup), which
+        # masks non-native head dims; page_size must be a multiple of the kernel's 64.
         if isinstance(d.attn_bias, _PAGED_GAPPY_TYPES):
             if d.attn_bias.page_size % _KERNEL_PAGE_SIZE != 0:
                 reasons.append(
@@ -433,32 +423,39 @@ class FwOp(AttentionFwOpBase):
         bias = inp.attn_bias
         causal = isinstance(bias, _CAUSAL_BIAS_TYPES)
 
-        # Head-dim padding: non-native dims are zero-padded to the next of
-        # {64, 128, 256}. Paged KV is never padded (gated to native D upstream).
-        D_native = inp.query.shape[-1]
-        Dpad = _pad_head_dim(D_native)
-        needs_pad = Dpad != D_native
+        # Head dims: the kernel reads Q/K rows Dqk wide and V/O rows Dv wide and
+        # masks the columns up to its compute width, so nothing is copied, paged
+        # caches included. It moves whole dwords, so an odd dim gets one zero
+        # column (a copy).
+        Dqk = inp.query.shape[-1]
+        Dv = inp.value.shape[-1]
+        Dqk_pad, Dv_pad = Dqk + Dqk % 2, Dv + Dv % 2
 
-        def _pad_hd(t: torch.Tensor) -> torch.Tensor:
-            return torch.nn.functional.pad(t, (0, Dpad - D_native)) if needs_pad else t
+        def _pad_to(t: torch.Tensor, d: int) -> torch.Tensor:
+            return (
+                torch.nn.functional.pad(t, (0, d - t.shape[-1]))
+                if d != t.shape[-1]
+                else t
+            )
 
         kw: dict = {"causal": causal, "num_kv_heads": inp.key.shape[-2]}
 
-        # window_left = _window_size (xformers keeps kv > q - window_size).
+        # xformers keeps kv > q - window_size (window_size keys); window_left
+        # counts the keys before the query's own, as in flash-attention.
         if isinstance(bias, _WINDOW_BIAS_TYPES):
-            kw["window_left"] = int(bias._window_size)
+            kw["window_left"] = int(bias._window_size) - 1
 
         if isinstance(bias, torch.Tensor):
             kw["bias"] = bias
         elif isinstance(bias, LowerTriangularMaskWithTensorBias):
             kw["bias"] = bias._bias
 
-        # Dense/varlen fold sm_scale at build time; when padding, pin the native
-        # scale so the padded 1/sqrt(Dpad) does not change the result.
+        # Dense/varlen fold sm_scale at build time; when padding Q/K, pin the
+        # native scale so the padded 1/sqrt(Dqk_pad) does not change the result.
         if inp.scale is not None:
             kw["sm_scale"] = float(inp.scale)
-        elif needs_pad:
-            kw["sm_scale"] = 1.0 / math.sqrt(D_native)
+        elif Dqk_pad != Dqk:
+            kw["sm_scale"] = 1.0 / math.sqrt(Dqk)
 
         kw["return_lse"] = needs_gradient
 
@@ -481,14 +478,14 @@ class FwOp(AttentionFwOpBase):
             # (a constant factor, so it factors out of the per-(q,k) sum).
             kw["dropout_mask"] = keep.to(torch.uint8)
 
-        # Shared tail: pad the head dim, call, unpack LSE, slice padded columns off O,
-        # restore input shape (slice/reshape are no-ops when a path didn't pad).
+        # Shared tail: pad odd head dims, call, unpack LSE, slice padded columns
+        # off O, restore input shape (slice/reshape are no-ops without padding).
         def _run(q, k, v, pad=True):
             if pad:
-                q, k, v = _pad_hd(q), _pad_hd(k), _pad_hd(v)
+                q, k, v = _pad_to(q, Dqk_pad), _pad_to(k, Dqk_pad), _pad_to(v, Dv_pad)
             result = flydsl_flash_attn_func(q, k, v, **kw)
             out, lse = result if needs_gradient else (result, None)
-            out = out[..., :D_native].reshape(inp.query.shape)
+            out = out[..., :Dv].reshape(*inp.query.shape[:-1], Dv)
             if inp.p != 0.0:
                 # Inverted-dropout output scale (the uint8 mask carries no scale).
                 out = out * (1.0 / (1.0 - inp.p))
@@ -510,7 +507,8 @@ class FwOp(AttentionFwOpBase):
 
         if isinstance(bias, _PAGED_BIAS_TYPES):
             # Paged KV: Q packed [1, total_q, H, D], K/V the physical page cache.
-            # Drives the kernel's varlen+paged path. Native-D only, so pad=False.
+            # Drives the kernel's varlen+paged path. Head dims are even
+            # (_PAGED_HEAD_DIMS), so pad=False.
             H = inp.query.shape[-2]
             Hkv = inp.key.shape[-2]
             Dk = inp.key.shape[-1]
@@ -571,17 +569,17 @@ class FwOp(AttentionFwOpBase):
             H = inp.query.shape[-2]
             Hkv = inp.key.shape[-2]
             Dk = inp.key.shape[-1]
-            q = _pad_hd(inp.query.reshape(-1, H, Dk))
+            q = _pad_to(inp.query.reshape(-1, H, Dk), Dqk_pad)
             page_size = int(bias.page_size)
             # The generic paged kernel fixes PAGE_SIZE == BLOCK_N == 64. Reshape the
             # physical cache to 64-row sub-pages and expand block_table so each
             # logical page p maps to sub-pages [p*sub, p*sub+sub); this keeps the
-            # in-kernel per-row page lookup valid at any physical page_size. Head dim
-            # is zero-padded (last axis) like the other paths.
+            # in-kernel per-row page lookup valid at any physical page_size. An odd
+            # head dim gets one zero column, as on the other paths.
             sub = page_size // _KERNEL_PAGE_SIZE
-            k = _pad_hd(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
-            v = _pad_hd(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk))
-            # sm_scale (native, pinned above when padding) is folded by the generic
+            k = _pad_to(inp.key.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dqk_pad)
+            v = _pad_to(inp.value.reshape(-1, _KERNEL_PAGE_SIZE, Hkv, Dk), Dv_pad)
+            # sm_scale (pinned above for an odd head dim) is folded by the generic
             # paged kernel, so no Q pre-scale is needed.
             bt = bias.block_tables.to(torch.int32).to(q.device)
             bt64 = (
@@ -775,6 +773,9 @@ _dqdkdv_kernel_cache: dict = {}
 _gfx950_kernel_cache: dict = {}
 _preprocess_kernel_cache: dict = {}
 _convert_dq_kernel_cache: dict = {}
+# Compute head dims of the gfx950 backward; other head dims (e.g. 96, 224) run
+# masked at the next of these.
+_BWD_GFX950_HEAD_DIMS = (32, 64, 128, 160, 256)
 
 
 @torch.library.custom_op(
@@ -810,7 +811,13 @@ def _flydsl_bwd(
     # count) is `seqstart_q.shape[0] - 1`, NOT query.shape[0] (always 1 under
     # group-mode). Non-varlen: B == query.shape[0].
     varlen = seqstart_q is not None
-    H, D = query.shape[2], query.shape[3]
+    H = query.shape[2]
+    # Stored head dims; the gfx950 kernel computes at the smallest D in
+    # _BWD_GFX950_HEAD_DIMS that covers them and masks the rest.
+    Dqk, Dv = query.shape[3], value.shape[3]
+    D = Dqk
+    if "gfx950" in torch.cuda.get_device_properties(query.device).gcnArchName:
+        D = next(d for d in _BWD_GFX950_HEAD_DIMS if d >= max(Dqk, Dv))
     total_m = query.shape[1]  # real physical M extent (== sum_M_i under varlen)
     total_n = key.shape[1]  # real physical N extent (== sum_N_i under varlen)
     if varlen:
@@ -853,9 +860,9 @@ def _flydsl_bwd(
     K_4d = _as_i16(key)
     V_4d = _as_i16(value)
     dO_4d = _as_i16(grad)
-    q_stride_m = query.stride(1) // D
-    kv_stride_n = key.stride(1) // D
-    do_stride_m = grad.stride(1) // D
+    q_stride_m = query.stride(1) // Dqk
+    kv_stride_n = key.stride(1) // Dqk
+    do_stride_m = grad.stride(1) // Dv
 
     # `lse` is [B, H, M] float32 (non-varlen, B*H*M elements) or packed
     # [1, H, sum_M] under varlen (VARLEN_LSE_PACKED=True convention, H*
@@ -872,20 +879,20 @@ def _flydsl_bwd(
     LSE_2d = lse.contiguous().view(_lse_dvec_rows, 1)
     stream = torch.cuda.current_stream()
     # D_vec = rowsum(dO * O) per query row. Use the FlyDSL preprocess kernel
-    # when D is compatible (D%64==0), otherwise fall back to PyTorch ops.
-    _use_preprocess_kernel = D % 64 == 0
+    # when Dv is compatible (even), otherwise fall back to PyTorch ops.
+    _use_preprocess_kernel = Dv % 2 == 0
     if _use_preprocess_kernel:
         from mslk.attention.flydsl.fmha_bwd_preprocess import (
             compile_fmha_bwd_preprocess,
         )
 
         D_vec = torch.empty(_lse_dvec_rows, 1, device=device, dtype=torch.float32)
-        dO_2d = _as_i16(grad.contiguous()).view(_lse_dvec_rows, D)
-        O_2d = _as_i16(out.contiguous()).view(_lse_dvec_rows, D)
-        preprocess_key = (D, dtype_str)
+        dO_2d = _as_i16(grad.contiguous()).view(_lse_dvec_rows, Dv)
+        O_2d = _as_i16(out.contiguous()).view(_lse_dvec_rows, Dv)
+        preprocess_key = (Dv, dtype_str)
         compiled_preprocess = _preprocess_kernel_cache.get(preprocess_key)
         if compiled_preprocess is None:
-            launch_preprocess = compile_fmha_bwd_preprocess(D=D, dtype_str=dtype_str)
+            launch_preprocess = compile_fmha_bwd_preprocess(D=Dv, dtype_str=dtype_str)
             tmp_dvec = torch.empty_like(D_vec)
             compiled_preprocess = flyc.compile(
                 launch_preprocess, dO_2d, O_2d, tmp_dvec, _lse_dvec_rows, stream
@@ -912,6 +919,11 @@ def _flydsl_bwd(
 
     gpu_arch = torch.cuda.get_device_properties(device).gcnArchName
     _is_gfx950 = "gfx950" in gpu_arch
+    if (Dqk, Dv) != (D, D) and not _is_gfx950:
+        raise NotImplementedError(
+            "mslk_flydsl::fmha_bwd: value head dim != query head dim needs gfx950, "
+            f"not {gpu_arch}"
+        )
     # Varlen: pass the real seqstart tensors; non-varlen passes dummies
     # (unused since varlen=False at compile time -- see
     # compile_fmha_bwd_dvdk_mfma/compile_fmha_bwd_dqdkdv_mfma's `varlen` kwarg).
@@ -1010,6 +1022,8 @@ def _flydsl_bwd(
             has_bias,
             emit_dbias,
             window_left,
+            Dqk,
+            Dv,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1028,6 +1042,8 @@ def _flydsl_bwd(
                 ck_scope_dvdk=True,
                 has_bias=has_bias,
                 emit_dbias=emit_dbias,
+                D_QK=Dqk,
+                D_V=Dv,
             )
             # flyc.compile executes the kernel once (JIT warm run) -- dQ (and
             # dV/dK, always atomic-add under ck_scope_dvdk's per-query-head
@@ -1075,34 +1091,38 @@ def _flydsl_bwd(
         out_n = total_n if varlen else N
         # dQ convert: f32 accumulator -> output dtype. Use a dedicated
         # FlyDSL kernel to avoid PyTorch .to() kernel launch overhead.
-        dq_n_elems = alloc_m * H * D
-        from mslk.attention.flydsl.fmha_bwd_convert_dq import (
-            compile_fmha_bwd_convert_dq,
-        )
-
-        dq_converted = torch.empty(dq_n_elems, 1, device=device, dtype=dtype)
-        convert_key = dtype_str
-        compiled_convert = _convert_dq_kernel_cache.get(convert_key)
-        if compiled_convert is None:
-            launch_convert = compile_fmha_bwd_convert_dq(dtype_str=dtype_str)
-            tmp_dq_conv = torch.empty_like(dq_converted)
-            compiled_convert = flyc.compile(
-                launch_convert, dQ_out, tmp_dq_conv, dq_n_elems, stream
+        if Dqk != D:
+            # Strided cast of the stored columns; the convert kernel is flat-only.
+            dq = dQ_out.view(out_b, out_m, H, D)[..., :Dqk].to(dtype)
+        else:
+            dq_n_elems = alloc_m * H * D
+            from mslk.attention.flydsl.fmha_bwd_convert_dq import (
+                compile_fmha_bwd_convert_dq,
             )
-            _convert_dq_kernel_cache[convert_key] = compiled_convert
-        compiled_convert(dQ_out, dq_converted, dq_n_elems, stream)
-        dq = dq_converted.view(out_b, out_m, H, D)
+
+            dq_converted = torch.empty(dq_n_elems, 1, device=device, dtype=dtype)
+            convert_key = dtype_str
+            compiled_convert = _convert_dq_kernel_cache.get(convert_key)
+            if compiled_convert is None:
+                launch_convert = compile_fmha_bwd_convert_dq(dtype_str=dtype_str)
+                tmp_dq_conv = torch.empty_like(dq_converted)
+                compiled_convert = flyc.compile(
+                    launch_convert, dQ_out, tmp_dq_conv, dq_n_elems, stream
+                )
+                _convert_dq_kernel_cache[convert_key] = compiled_convert
+            compiled_convert(dQ_out, dq_converted, dq_n_elems, stream)
+            dq = dq_converted.view(out_b, out_m, H, D)
         # GQA-combine: dV/dK came back per-query-head ([B,N,H,D], H not Hkv).
         # Reduce across the heads_per_kv group and convert to output dtype.
         # heads_per_kv==1 (MHA/no GQA): sum over a size-1 axis, a no-op.
         dk = (
-            dK_out.view(out_b, out_n, H, D)
+            dK_out.view(out_b, out_n, H, D)[..., :Dqk]
             .unflatten(2, (H_kv, heads_per_kv))
             .sum(3)
             .to(dtype)
         )
         dv = (
-            dV_out.view(out_b, out_n, H, D)
+            dV_out.view(out_b, out_n, H, D)[..., :Dv]
             .unflatten(2, (H_kv, heads_per_kv))
             .sum(3)
             .to(dtype)
@@ -1446,14 +1466,13 @@ class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
-    # Kernel wave-tiling requires D a multiple of 32 (D=32/96 done via
-    # ceil-div wave assignment + out-of-range guards, see fmha_bwd_mfma.py's
-    # D_SUBS_PER_WAVE comment).
+    # Kernels tile D in multiples of 32; on gfx950 other dims (and Kv != K) are
+    # masked in-kernel, odd dims padded by one column.
     SUPPORTED_MAX_K = 256
-    SUPPORTED_MIN_K = 32
+    SUPPORTED_MIN_K = 1
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
-    SUPPORTS_DIFFERENT_VALUE_EMBED = False
+    SUPPORTS_DIFFERENT_VALUE_EMBED = True
     # GQA is supported via the plain 4D BMHK path (key/value with Hkv < Hq,
     # either a genuine (B,N,Hkv,D) tensor or a stride-0 `.expand()` broadcast
     # -- see _num_kv_heads/_uniform_row_pitch_reason), matching how
@@ -1514,11 +1533,20 @@ class BwOp(AttentionBwOpBase):
             reason = _uniform_row_pitch_reason(name, t, allow_broadcast_heads=True)
             if reason is not None:
                 reasons.append(reason)
-        # K and V share a single kv_stride_n kernel arg -- reject if they differ.
-        if d.key.stride(1) != d.value.stride(1):
-            reasons.append("key and value must share the same row pitch (stride(1))")
-        if d.query.shape[-1] % 32 != 0:
-            reasons.append("head_dim must be a multiple of 32")
+        # K and V share a single kv_stride_n kernel arg (in rows of their head dim).
+        K, Kv = d.query.shape[-1], d.value.shape[-1]
+        if d.key.stride(1) * Kv != d.value.stride(1) * K:
+            reasons.append("key and value must share the same row pitch in rows")
+        gpu_arch = (
+            torch.cuda.get_device_properties(d.query.device).gcnArchName
+            if d.query.device.type == "cuda"
+            else ""
+        )
+        if "gfx950" not in gpu_arch and (K % 32 != 0 or Kv != K):
+            reasons.append(
+                "head_dim must be a multiple of 32 and value head_dim == query "
+                f"head_dim on {gpu_arch}"
+            )
         # GQA: Hq must be a whole multiple of Hkv -- the kernel's
         # heads_per_kv = Hq // Hkv grid-regroup requires this.
         h_kv = _num_kv_heads(d.key)
@@ -1579,11 +1607,19 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
+        query, key, value, out = inp.query, inp.key, inp.value, ctx.out
+        K, Kv = query.shape[-1], value.shape[-1]
+        if K % 2 or Kv % 2:
+            # The kernel moves whole dwords: odd head dims get one zero column.
+            def _even(t: torch.Tensor) -> torch.Tensor:
+                return torch.nn.functional.pad(t, (0, t.shape[-1] % 2))
+
+            query, key, value, out, grad = map(_even, (query, key, value, out, grad))
         dq, dk, dv, db = cls.OPERATOR(
-            inp.query,
-            inp.key,
-            inp.value,
-            ctx.out,
+            query,
+            key,
+            value,
+            out,
             ctx.lse,
             grad,
             inp.scale_float,
@@ -1619,6 +1655,7 @@ class BwOp(AttentionBwOpBase):
         # autograd graph, no `ExpandBackward` reduction), this op's contract
         # is "correct after an `ExpandBackward` reduction", matching every
         # other op's broadcast-GQA contract.
+        dq, dk, dv = dq[..., :K], dk[..., :K], dv[..., :Kv]
         if dk.shape[2] != inp.key.shape[2]:
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
             dk = (dk / heads_per_kv).expand(inp.key.shape)

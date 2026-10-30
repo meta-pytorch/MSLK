@@ -23,7 +23,7 @@ import math as _math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, ReductionOp
+from flydsl.expr import arith, const_expr, range_constexpr, ReductionOp
 from mslk.attention.flydsl.fmha_bwd_mfma import dtype_to_elem_type, WARP_SIZE
 
 BLOCK_THREADS = 256  # threads per block
@@ -33,7 +33,7 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
     """Compile the D-vector preprocess kernel.
 
     Args:
-        D        : head dimension (must be multiple of 64)
+        D        : head dimension (even, <= 512)
         dtype_str: "bf16" or "f16"
 
     Returns:
@@ -41,10 +41,13 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
           dO_2d, O_2d : [n_rows, D]  int16 view of bf16/fp16  (2D, contiguous)
           D_out       : [n_rows, 1]  float32 (2D, one scalar per row)
     """
-    assert D % WARP_SIZE == 0, f"D={D} must be a multiple of WARP_SIZE={WARP_SIZE}"
+    assert D % 2 == 0, f"D={D} must be even"
 
     VEC_WIDTH = 8  # 128-bit / 16-bit = 8 elements
-    THREADS_PER_ROW = D // VEC_WIDTH  # 16 for D=128
+    # Power of two for the shuffle reduce; lanes past D contribute 0.
+    THREADS_PER_ROW = 1 << max(0, (-(-D // VEC_WIDTH) - 1).bit_length())
+    # Elements per load; pieces never straddle the row end.
+    PIECE = _math.gcd(VEC_WIDTH, D)
     ROWS_PER_BLOCK = BLOCK_THREADS // THREADS_PER_ROW  # 16 for D=128
 
     assert THREADS_PER_ROW <= WARP_SIZE, (
@@ -82,18 +85,26 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
             O_rsrc = _bops.create_buffer_resource(O)
             D_rsrc = _bops.create_buffer_resource(D_out)
 
-            flat_elem = row * D + col_thread * VEC_WIDTH
-            do_vec = _bops.buffer_load(
-                dO_rsrc, flat_elem, vec_width=VEC_WIDTH, dtype=elem_dtype
-            )
-            o_vec = _bops.buffer_load(
-                O_rsrc, flat_elem, vec_width=VEC_WIDTH, dtype=elem_dtype
-            )
-
-            do_f32 = Vec(do_vec).to(fx.Float32)
-            o_f32 = Vec(o_vec).to(fx.Float32)
-            prod = do_f32 * o_f32
-            acc = prod.reduce(ReductionOp.ADD, fastmath=fm)
+            full = THREADS_PER_ROW * VEC_WIDTH == D
+            acc = None
+            for p in range_constexpr(VEC_WIDTH // PIECE):
+                col = col_thread * VEC_WIDTH + p * PIECE
+                if const_expr(not full):
+                    # Masked-off pieces re-read the row start and are dropped.
+                    ok = col < fx.Index(D)
+                    col = ok.select(col, fx.Index(0))
+                flat_elem = row * D + col
+                do_vec = _bops.buffer_load(
+                    dO_rsrc, flat_elem, vec_width=PIECE, dtype=elem_dtype
+                )
+                o_vec = _bops.buffer_load(
+                    O_rsrc, flat_elem, vec_width=PIECE, dtype=elem_dtype
+                )
+                prod = Vec(do_vec).to(fx.Float32) * Vec(o_vec).to(fx.Float32)
+                part = prod.reduce(ReductionOp.ADD, fastmath=fm)
+                if const_expr(not full):
+                    part = ok.select(part, fx.Float32(0.0))
+                acc = part if acc is None else acc.addf(part, fastmath=fm)
 
             # Warp shuffle reduce across THREADS_PER_ROW lanes
             w = acc

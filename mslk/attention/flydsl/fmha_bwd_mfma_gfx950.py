@@ -105,6 +105,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
     has_bias: bool = False,
     emit_dbias: bool = False,
     window_left: int = -1,
+    D_QK: int | None = None,
+    D_V: int | None = None,
 ):
     """FUSED dQ + dV + dK in one N-tile-gridded kernel (gfx950/CDNA4 only),
     using the trload pipeline: Q/K/V/dO are loaded once and S/dP/P/dS are
@@ -170,12 +172,17 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             inputs; H (or Hkv for kv_stride_n) for contiguous BMHK.
           seqstart_q/seqstart_k : (varlen=True only) int32 [B_logical+1] cumulative
             offset tensors; M/N become max_seqlen_q/max_seqlen_k.
+          D_QK/D_V: stored Q/K and V/dO row widths (<= D, even; default D). Row
+            pitches are in units of these; missing columns read as zero.
     """
     import math as _pm
     import os as _os
 
+    D_QK = D if D_QK is None else D_QK
+    D_V = D if D_V is None else D_V
+    assert 0 < D_QK <= D and 0 < D_V <= D and D_QK % 2 == 0 and D_V % 2 == 0
     if scale is None:
-        scale = 1.0 / _pm.sqrt(D)
+        scale = 1.0 / _pm.sqrt(D_QK)
     # BLOCK_N must divide evenly into 32-row bands (the K/V prologue load's ceil-div
     # band-per-wave loop and GEMM4's WAVE_N_TILES both operate at 32-row granularity).
     # 128 and 192 are the two trload tile shapes (kN0=128 small-seqlen, kN0=192
@@ -642,11 +649,28 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             dv_store_rsrc = _bops.create_buffer_resource(dV)
             dk_store_rsrc = _bops.create_buffer_resource(dK)
 
-        def _load_global_vec_cv(rsrc, row_i32, col_offset_idx):
-            flat_elem = fx.Index(row_i32) * fx.Index(D) + col_offset_idx
-            return _bops.buffer_load(
-                rsrc, flat_elem, vec_width=MFMA_LK, dtype=elem_dtype
-            )
+        def _load_global_vec_cv(rsrc, row_i32, col_offset_idx, dim):
+            flat_elem = fx.Index(row_i32) * fx.Index(dim) + col_offset_idx
+            if const_expr(dim == D):
+                return _bops.buffer_load(
+                    rsrc, flat_elem, vec_width=MFMA_LK, dtype=elem_dtype
+                )
+            # Pieces past the stored dim read the row start and are zeroed.
+            piece = _pm.gcd(MFMA_LK, dim)
+            zero = Vec.filled(piece, 0.0, elem_dtype)
+            elems = []
+            for p in range_constexpr(MFMA_LK // piece):
+                ok = col_offset_idx + fx.Index(p * piece) < fx.Index(dim)
+                src = fx.Index(
+                    ok.select(
+                        flat_elem + fx.Index(p * piece), flat_elem - col_offset_idx
+                    )
+                )
+                v = _bops.buffer_load(rsrc, src, vec_width=piece, dtype=elem_dtype)
+                if const_expr(piece == MFMA_LK):
+                    return arith.select(ok, v, zero)
+                elems.extend(Vec(arith.select(ok, v, zero)))
+            return Vec.from_elements(elems, elem_dtype).ir_value()
 
         def _load_f32_row(buf, row_idx):
             row_sl = fx.slice(buf, (row_idx, None))
@@ -789,7 +813,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             if band_in_range:
                 for ks in range_constexpr(K_STEPS):
                     col_off = fx.Index(ks * MFMA_K) + lane_div_32 * MFMA_LK
-                    k_vec = _load_global_vec_cv(k_rsrc, kv_row_g_pre, col_off)
+                    k_vec = _load_global_vec_cv(k_rsrc, kv_row_g_pre, col_off, D_QK)
                     if const_expr(_use_ck_kswz):
                         # KPack-split + XOR write layout (0-residual both tiles):
                         #   off = (d//64)*(BLOCK_N*64) + n*64 + ((d%64)//8 ^ (n&7))*8 + (d%64)%8
@@ -810,7 +834,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                         Vec(k_vec).store(
                             lds_k, [n_local_k_row_band * LDS_K_STRIDE + col_off]
                         )
-                    v_vec = _load_global_vec_cv(v_rsrc, kv_row_g_pre, col_off)
+                    v_vec = _load_global_vec_cv(v_rsrc, kv_row_g_pre, col_off, D_V)
                     if const_expr(_use_v_swz):
                         # Swizzled lds_v write -- same XOR formula as K's swizzled write.
                         n_vw = n_local_k_row_band
@@ -1115,8 +1139,8 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
             do_row_g = _do_row(m_safe_ld, head_idx_p)
             col_off_ld = cv_i * fx.Index(MFMA_LK)
             return (
-                _load_global_vec_cv(q_rsrc, q_row_g, col_off_ld),
-                _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld),
+                _load_global_vec_cv(q_rsrc, q_row_g, col_off_ld, D_QK),
+                _load_global_vec_cv(do_rsrc, do_row_g, col_off_ld, D_V),
             )
 
         def _load_qdo_regs(head_idx_p, m_tile_idx):
