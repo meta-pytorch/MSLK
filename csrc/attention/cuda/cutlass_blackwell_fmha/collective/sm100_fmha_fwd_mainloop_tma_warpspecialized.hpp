@@ -835,6 +835,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ++pipeline_s_consumer_state;
   }
 
+  // A row with no unmasked keys has row_sum == 0 and O == 0; scaling by
+  // scale_output / 0 would turn that into 0 * inf = NaN.
+  CUTLASS_DEVICE static float
+  safe_output_scale(float scale_output, float row_sum) {
+    return row_sum == 0.f ? 0.f : scale_output / row_sum;
+  }
+
   template<class Stage, class TensorO>
   CUTLASS_DEVICE auto
   correction_epilogue(
@@ -1142,7 +1149,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()), typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), select<0,3>(problem_shape), epilogue.params.dLSE);
 
-    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+    correction_epilogue(safe_output_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _0{}, sO);
 
     if (epilogue.params.ptr_LSE != nullptr) {
       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
@@ -1178,7 +1185,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_o.consumer_wait(pipeline_o_consumer_state);
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
 
-    correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+    correction_epilogue(safe_output_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _1{}, sO);
 
     if (epilogue.params.ptr_LSE != nullptr) {
       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) + get<0>(TileShapeQK{});
