@@ -307,13 +307,18 @@ class FwOp(AttentionFwOpBase):
             + _PAGED_BIAS_TYPES
             + _PAGED_GAPPY_TYPES,
         ):
-            q_len = d.query.shape[1]
-            kv_len = d.key.shape[1]
-            if q_len != kv_len:
-                reasons.append(
-                    f"cross-attention Mq={q_len} != Mkv={kv_len} not supported "
-                    "(dense self-attention only)"
+            if d.query.shape[1] != d.key.shape[1]:
+                _has_bias = isinstance(
+                    d.attn_bias, (torch.Tensor, LowerTriangularMaskWithTensorBias)
                 )
+                if _has_bias:
+                    reasons.append(
+                        "cross-attention Mq != Mkv with additive bias not supported"
+                    )
+                if d.p != 0.0:
+                    reasons.append(
+                        "cross-attention Mq != Mkv with dropout not supported"
+                    )
 
         # Dropout: dense self-attention only (the in-kernel mask is applied on the
         # generic dense path; varlen/paged/gappy dropout is not wired).
@@ -628,8 +633,27 @@ class FwOp(AttentionFwOpBase):
                 kw["causal_top_left"] = True
             out, lse = _run(q, k, v)
         else:
-            # Dense self-attention.
-            out, lse = _run(inp.query, inp.key, inp.value)
+            Mq = inp.query.shape[1]
+            Mkv = inp.key.shape[1]
+            if Mq != Mkv:
+                # Dense cross-attention: the dense kernel does not support
+                # Mq != Mkv, so route through the varlen path with synthetic
+                # per-batch cu_seqlens.
+                B = inp.query.shape[0]
+                device = inp.query.device
+                q, k, v = _flatten_qkv()
+                cu_q = torch.arange(
+                    0, (B + 1) * Mq, Mq, device=device, dtype=torch.int32
+                )
+                cu_kv = torch.arange(
+                    0, (B + 1) * Mkv, Mkv, device=device, dtype=torch.int32
+                )
+                _set_varlen_kw(cu_q, cu_kv, Mq, Mkv, True)
+                if isinstance(bias, _TOP_LEFT_CAUSAL_TYPES):
+                    kw["causal_top_left"] = True
+                out, lse = _run(q, k, v)
+            else:
+                out, lse = _run(inp.query, inp.key, inp.value)
 
         # The kernel returns varlen LSE padded per-batch as [B, H, max_seqlen_q].
         # Repack it to the [1, H, total_q] packed layout (VARLEN_LSE_PACKED=True) so
