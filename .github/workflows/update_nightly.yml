@@ -1,0 +1,38 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+name: Update MSLK nightly branch
+
+on:
+  schedule:
+    - cron: 30 11 * * *
+  workflow_dispatch:
+
+concurrency:
+  group: update-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  update-nightly:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: main
+    - name: Create nightly commit
+      shell: bash
+      run: |
+        set -euxo pipefail
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config user.name "github-actions[bot]"
+        git fetch origin nightly
+        HEAD_COMMIT_HASH=$(git rev-parse HEAD)
+        NIGHTLY_DATE=$(date +"%Y-%m-%d")
+        NIGHTLY_RELEASE_COMMIT=$(git commit-tree -p FETCH_HEAD "HEAD^{tree}" \
+          -m "${NIGHTLY_DATE} nightly release (${HEAD_COMMIT_HASH})")
+        git push -f origin "${NIGHTLY_RELEASE_COMMIT}:nightly"
