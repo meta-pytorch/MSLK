@@ -34,7 +34,6 @@ Example:
     >>> buffer_ops.buffer_store(data, rsrc, offset)
 """
 
-import os
 from typing import Optional, Union
 
 from flydsl._mlir import ir
@@ -71,7 +70,9 @@ def _get_buffer_flags(arch=None):
       - OOB_SELECT=2 (no bounds checking, matching LLVM boundsCheck=false)
     """
     if arch is None:
-        arch = os.environ.get("FLYDSL_GPU_ARCH")
+        from flydsl.runtime.device import get_rocm_arch
+
+        arch = get_rocm_arch()
     flags = (7 << 12) | (4 << 15)
     if is_rdna_arch(arch):
         flags |= 1 << 24  # reserved bit, must be 1 on RDNA
