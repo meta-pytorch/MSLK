@@ -348,13 +348,16 @@ class FwOp(AttentionFwOpBase):
         if d.scale is not None and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("custom scale is not supported for native paged KV")
 
-        # Q/K/V must be last-dim contiguous and 16-byte aligned for the kernel's
-        # 128-bit vector loads (raw buffer-resource loads do not tolerate otherwise).
+        # Q/K/V must be last-dim contiguous.  Buffer-resource loads need only
+        # element alignment (4 bytes on GFX9+); the old 16-byte check was
+        # conservative and rejected valid packed-QKV slices at odd offsets.
         for _name, _t in (("query", d.query), ("key", d.key), ("value", d.value)):
             if _t.stride(-1) != 1:
                 reasons.append(f"{_name} last dim must be contiguous (stride==1)")
-            elif _t.data_ptr() % 16 != 0:
-                reasons.append(f"{_name} base pointer must be 16-byte aligned")
+            elif _t.data_ptr() % _t.element_size() != 0:
+                reasons.append(
+                    f"{_name} base pointer must be {_t.element_size()}-byte aligned"
+                )
 
         # Tensor bias must match the query dtype: the kernel loads bias bytes as the
         # query dtype, so an fp32 bias would be reinterpreted as bf16/f16.
