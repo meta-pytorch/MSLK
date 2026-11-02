@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <ATen/core/Tensor.h>
+#include <c10/hip/HIPException.h>
 #include <c10/hip/HIPStream.h>
 
 #ifdef HIPIFY_V2
@@ -167,7 +168,7 @@ void check_single_cta_group_count(
     const char* operation) {
   TORCH_CHECK(group_count > 0, operation, " requires at least one group.");
   hipFuncAttributes attributes;
-  C10_CUDA_CHECK(hipFuncGetAttributes(
+  C10_HIP_CHECK(hipFuncGetAttributes(
       &attributes, reinterpret_cast<const void*>(kernel)));
   TORCH_CHECK(
       group_count <= attributes.maxThreadsPerBlock,
@@ -550,7 +551,7 @@ void set_dynamic_kernel_args(
         N,
         K,
         group_count);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
   } else if (zeroing_output_tensor) {
     constexpr uint64_t kElementsPerChunk = 8;
     TORCH_CHECK(
@@ -985,7 +986,7 @@ at::Tensor f8f8bf16_rowwise_grouped_mm(
       K,
       G,
       inputType);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
 
   // For heuristics normalize the dynamic dimension by G so we can approximate the problem shape per group.
   if (inputType == GroupedGemmInputType::_2D3D ) {
