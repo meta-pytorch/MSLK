@@ -356,18 +356,8 @@ class FwOp(AttentionFwOpBase):
             elif _t.data_ptr() % 16 != 0:
                 reasons.append(f"{_name} base pointer must be 16-byte aligned")
 
-        # Tensor bias must match the query dtype: the kernel loads bias bytes as the
-        # query dtype, so an fp32 bias would be reinterpreted as bf16/f16.
-        _bias_t: Optional[torch.Tensor] = None
-        if isinstance(d.attn_bias, torch.Tensor):
-            _bias_t = d.attn_bias
-        elif isinstance(d.attn_bias, LowerTriangularMaskWithTensorBias):
-            _bias_t = d.attn_bias._bias
-        if _bias_t is not None and _bias_t.dtype != d.query.dtype:
-            reasons.append(
-                f"attn_bias dtype {_bias_t.dtype} must match query dtype "
-                f"{d.query.dtype}"
-            )
+        # Tensor bias dtype is cast to the query dtype in _apply_bmhk, so any
+        # floating-point bias is accepted (fp32 ALiBi slopes, hand-built masks).
 
         return reasons
 
@@ -457,9 +447,9 @@ class FwOp(AttentionFwOpBase):
             kw["window_left"] = int(bias._window_size)
 
         if isinstance(bias, torch.Tensor):
-            kw["bias"] = bias
+            kw["bias"] = bias.to(inp.query.dtype)
         elif isinstance(bias, LowerTriangularMaskWithTensorBias):
-            kw["bias"] = bias._bias
+            kw["bias"] = bias._bias.to(inp.query.dtype)
 
         # Dense/varlen fold sm_scale at build time; when padding, pin the native
         # scale so the padded 1/sqrt(Dpad) does not change the result.
