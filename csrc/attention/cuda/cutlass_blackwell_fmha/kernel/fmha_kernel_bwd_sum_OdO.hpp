@@ -152,7 +152,11 @@ struct FmhaKernelBwdSumOdO {
       if (threadIdx.x == 0) {
         *ptr_sum_OdO_bhq = params.sum_odo_scale * acc;
         if (params.ptr_scaled_lse) {
-          *ptr_scaled_lse_bhq = params.lse_scale * *ptr_lse_bhq;
+          // A row with no unmasked keys has LSE = -inf. lse_scale is negative,
+          // so the bwd kernel would rebuild P as exp2(-inf + inf) = NaN. Keep
+          // -inf so that P = exp2(-inf) = 0.
+          ElementAcc lse = *ptr_lse_bhq;
+          *ptr_scaled_lse_bhq = lse == -INFINITY ? lse : params.lse_scale * lse;
         }
       }
     }

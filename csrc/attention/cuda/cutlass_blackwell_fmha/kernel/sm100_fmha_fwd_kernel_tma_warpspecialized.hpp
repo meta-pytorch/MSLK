@@ -264,6 +264,26 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     }
   }
 
+  // The mainloop always consumes at least one KV tile, so a Q tile with no
+  // unmasked keys must skip it in every warp role and go through
+  // correction_empty instead. Besides seqlen_k == 0, this happens for
+  // bottom-right masks with seqlen_q > seqlen_k, and for local windows.
+  template<class BlkCoord, class LogicalProblemShape>
+  CUTLASS_DEVICE bool has_no_kv_tiles(
+      const Params &params, BlkCoord const& blk_coord,
+      LogicalProblemShape const& logical_problem_shape) {
+    if (get<1>(logical_problem_shape) == 0) {
+      return true;
+    }
+    if constexpr (IsMla) {
+      return false;
+    } else {
+      using Mask = typename CollectiveMainloop::Mask;
+      return Mask(params.mainloop.window_size_left, params.mainloop.window_size_right)
+          .get_trip_count(blk_coord, TileShape{}, logical_problem_shape) <= 0;
+    }
+  }
+
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
 #if (! defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && \
     ! defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) && ! defined(CUTLASS_ARCH_MMA_SM103F_ENABLED))
@@ -462,7 +482,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (has_no_kv_tiles(params, blk_coord, logical_problem_shape)) {
           continue;
         }
 
@@ -498,7 +518,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         has_valid = true;
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (has_no_kv_tiles(params, blk_coord, logical_problem_shape)) {
           mainloop.correction_empty(
             blk_coord,
             params.mainloop, logical_problem_shape,
@@ -556,7 +576,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           allocated = true;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (has_no_kv_tiles(params, blk_coord, logical_problem_shape)) {
           continue;
         }
 
@@ -592,7 +612,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           continue;
         }
 
-        if (get<1>(logical_problem_shape) == 0) {
+        if (has_no_kv_tiles(params, blk_coord, logical_problem_shape)) {
           continue;
         }
 
