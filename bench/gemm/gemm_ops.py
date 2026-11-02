@@ -26,7 +26,6 @@ if is_flydsl_available():
     )
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
 from mslk.quantize.shuffle import (
-    ck_preshuffle,
     int4_row_quantize_zp,
     pack_int4,
     preshuffle_b_mfma,
@@ -705,11 +704,12 @@ class FP8RowwisePreshuffle(FP8Rowwise):
 
     def preprocess(self, x, w):
         x, wq, w_scale = super().preprocess(x, w)
-        return x, ck_preshuffle(wq, 16), w_scale
+        # The ck_preshuffle(wq, 16) layout, but also takes gfx950's e4m3fn.
+        return x, preshuffle_b_mfma(wq), w_scale
 
     @property
     def supported_accelerators(self) -> set[Accelerator]:
-        return {Accelerator.AMD_GFX942}
+        return {Accelerator.AMD_GFX942, Accelerator.AMD_GFX950}
 
     @property
     def supported_gemm_types(self) -> set[GemmType]:
