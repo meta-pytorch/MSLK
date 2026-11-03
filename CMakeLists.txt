@@ -123,10 +123,18 @@ include(${CMAKEMODULES}/GpuCppLibrary.cmake)
 # Source Includes
 ################################################################################
 
+# On ROCm, csrc/ and include/ are HIPified in a copy under the build directory
+# so that generated files never land in the source tree
+if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
+  set(MSLK_SRC_DIR ${CMAKE_BINARY_DIR}/hipified)
+else()
+  set(MSLK_SRC_DIR ${MSLK})
+endif()
+
 set(mslk_include_directories
   # MSLK
-  ${MSLK}/include
-  ${MSLK}/csrc/attention/ck/fmha/hip_fmha
+  ${MSLK_SRC_DIR}/include
+  ${MSLK_SRC_DIR}/csrc/attention/ck/fmha/hip_fmha
   # PyTorch
   ${TORCH_INCLUDE_DIRS}
   # Third-party
@@ -164,39 +172,50 @@ endif()
 ################################################################################
 
 if(MSLK_BUILD_VARIANT STREQUAL BUILD_VARIANT_ROCM)
-  set(include_dirs_for_hipification
-    # All directories need to be included for headers to be properly HIPified
-    ${MSLK}/include
-    ${MSLK}/csrc)
+  # Re-run configure (and so re-copy and re-HIPify) whenever a file under
+  # csrc/ or include/ is edited, added or removed
+  file(GLOB_RECURSE mslk_src_files CONFIGURE_DEPENDS
+    ${MSLK}/csrc/* ${MSLK}/include/*)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mslk_src_files})
 
-  # HIPify all .CU and .CUH sources under the current directory (`/mslk`)
+  # file(COPY) preserves timestamps and skips unchanged files, so incremental
+  # builds only recompile what changed
+  file(COPY ${MSLK}/csrc ${MSLK}/include DESTINATION ${MSLK_SRC_DIR})
+
+  set(mslk_staged_src_files)
+  foreach(f IN LISTS mslk_src_files)
+    file(RELATIVE_PATH relative_path "${MSLK}" "${f}")
+    list(APPEND mslk_staged_src_files "${MSLK_SRC_DIR}/${relative_path}")
+  endforeach()
+
+  # HIPify all .CU and .CUH sources in the copy
   #
   # Note that .H sources are not automatically HIPified, so if they reference
   # CUDA-specific code, e.g. `#include <c10/cuda/CUDAStream.h>`, they will need
   # to be updated with `#ifdef USE_ROCM` guards.
-  #
-  # Exclude external/ - it contains vendored third-party submodules
-  # (composable_kernel, cutlass, googletest, hipify_torch) that are already
-  # HIP-native or CUDA-agnostic and must not be modified in-place.
   hipify(
     CUDA_SOURCE_DIR
-      ${PROJECT_SOURCE_DIR}
+      ${MSLK_SRC_DIR}
     HEADER_INCLUDE_DIR
-      ${include_dirs_for_hipification}
-    IGNORES
-      ${PROJECT_SOURCE_DIR}/external/*)
+      # All directories need to be included for headers to be properly HIPified
+      ${MSLK_SRC_DIR}/include
+      ${MSLK_SRC_DIR}/csrc)
+
+  # Keep only current sources and their HIPified counterparts, including headers.
+  get_hipified_list("${mslk_staged_src_files}" mslk_hipified_files)
+  file(GLOB_RECURSE mslk_staged_files
+    ${MSLK_SRC_DIR}/csrc/* ${MSLK_SRC_DIR}/include/*)
+  foreach(f IN LISTS mslk_staged_files)
+    if(NOT f IN_LIST mslk_staged_src_files AND NOT f IN_LIST mslk_hipified_files)
+      file(REMOVE "${f}")
+    endif()
+  endforeach()
 
   BLOCK_PRINT(
     "HIPify Sources"
     " "
     "CUDA_SOURCE_DIR:"
-    "${PROJECT_SOURCE_DIR}"
-    " "
-    "HEADER_INCLUDE_DIR:"
-    "${include_dirs_for_hipification}"
-    " "
-    "IGNORES:"
-    "${PROJECT_SOURCE_DIR}/external/*"
+    "${MSLK_SRC_DIR}"
   )
 endif()
 

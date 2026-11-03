@@ -9,14 +9,14 @@
 ################################################################################
 
 glob_files_nohip(mslk_cpp_source_files_cpu
-  csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cpp
-  csrc/conv/*.cpp
-  csrc/gemm/*.cpp
-  csrc/moe/*.cpp
-  csrc/attention/ck/fmha/*.cpp)
+  ${MSLK_SRC_DIR}/csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cpp
+  ${MSLK_SRC_DIR}/csrc/conv/*.cpp
+  ${MSLK_SRC_DIR}/csrc/gemm/*.cpp
+  ${MSLK_SRC_DIR}/csrc/moe/*.cpp
+  ${MSLK_SRC_DIR}/csrc/attention/ck/fmha/*.cpp)
 
 glob_files_nohip(mslk_cpp_source_files_gpu
-  csrc/moe/*.cu)
+  ${MSLK_SRC_DIR}/csrc/moe/*.cu)
 
 # Include FB-internal sources into the build
 if(BUILD_FB_CODE
@@ -63,23 +63,23 @@ endif()
 
 # CUDA-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_cuda
-  csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cu
-  csrc/conv/cutlass/*.cu
-  csrc/conv/cutlass/**/*.cu
-  csrc/gemm/cublas/*.cu
-  csrc/gemm/cublas/**/*.cu
-  csrc/gemm/cutlass/*.cu
-  csrc/gemm/cutlass/**/*.cu)
+  ${MSLK_SRC_DIR}/csrc/attention/cuda/cutlass_blackwell_fmha/blackwell_*.cu
+  ${MSLK_SRC_DIR}/csrc/conv/cutlass/*.cu
+  ${MSLK_SRC_DIR}/csrc/conv/cutlass/**/*.cu
+  ${MSLK_SRC_DIR}/csrc/gemm/cublas/*.cu
+  ${MSLK_SRC_DIR}/csrc/gemm/cublas/**/*.cu
+  ${MSLK_SRC_DIR}/csrc/gemm/cutlass/*.cu
+  ${MSLK_SRC_DIR}/csrc/gemm/cutlass/**/*.cu)
 
 # HIP-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_hip
-  csrc/gemm/ck/*.hip
-  csrc/gemm/ck/**/*.hip)
+  ${MSLK_SRC_DIR}/csrc/gemm/ck/*.hip
+  ${MSLK_SRC_DIR}/csrc/gemm/ck/**/*.hip)
 
 # HIP FMHA sources - built separately, for a restricted set of architectures,
 # to reduce build time and binary size
 file(GLOB_RECURSE mslk_hip_fmha_sources
-  csrc/attention/ck/fmha/hip_fmha/*.cpp)
+  ${MSLK_SRC_DIR}/csrc/attention/ck/fmha/hip_fmha/*.cpp)
 
 ################################################################################
 # Build FMHA Static Library (CK FMHA architectures only, ROCm 7.x+)
