@@ -991,6 +991,8 @@ def test_window_sized_splits_do_not_exceed_tile_or_configured_caps(monkeypatch):
 
 
 def _paged_window_reference(q, k, v, ctx, window):
+    """Bottom-right causal attention with a flash-attention window: each query
+    sees ``window`` keys before its own position plus that position."""
     _, seqlen_q, num_heads, head_dim = q.shape
     flat_k = k.reshape(-1, HKV, head_dim).float()[:ctx]
     flat_v = v.reshape(-1, HKV, head_dim).float()[:ctx]
@@ -1003,7 +1005,7 @@ def _paged_window_reference(q, k, v, ctx, window):
             scores = (q[0, row, head].float() @ flat_k[:, kv_head].T) / math.sqrt(
                 head_dim
             )
-            keep = (columns <= query_position) & (columns > query_position - window)
+            keep = (columns <= query_position) & (columns >= query_position - window)
             output[row, head] = (
                 scores.masked_fill(~keep, -math.inf).softmax(-1) @ flat_v[:, kv_head]
             )
@@ -1102,7 +1104,8 @@ def test_paged_window_reaches_light_builder(monkeypatch):
         max_seqlen_kv=2048,
         window_left=255,
     )
-    assert seen[-1]["window_left"] == 255
+    # The builder takes the exclusive bound, window_left + 1.
+    assert seen[-1]["window_left"] == 256
     assert seen[-1]["q_pack_qlen"] == 4
 
 

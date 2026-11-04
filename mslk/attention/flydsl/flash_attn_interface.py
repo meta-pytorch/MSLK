@@ -1940,7 +1940,8 @@ def flydsl_flash_attn_func(
     # When True, also return per-row log-sum-exp (natural log, sm_scale folded in,
     # shape [B, H, Sq]; varlen: [B, H, max_seqlen_q]). Not supported for fp8/paged KV.
     return_lse: bool = False,
-    # Sliding-window: keep KV in (q_row - window_left, q_row]; -1 disables.
+    # Sliding-window, flash-attention convention: keep KV in
+    # [q_row - window_left, q_row] (window_left + 1 keys); -1 disables.
     window_left: int = -1,
     # Softmax scale (None -> 1/sqrt(head_dim)); non-default forces the generic path.
     sm_scale: Optional[float] = None,
@@ -2060,6 +2061,8 @@ def flydsl_flash_attn_func(
                 "flydsl_flash_attn_func: sliding-window (window_left>=0) is not "
                 "supported for gappy paged KV (kv_seqstart)"
             )
+        # The kernels keep KV in (q_row - w, q_row], an exclusive left bound.
+        window_left += 1
     if sm_scale is not None:
         # fp8 and native paged hardcode 1/sqrt(head_dim); gappy paged uses the
         # generic kernel and folds sm_scale.

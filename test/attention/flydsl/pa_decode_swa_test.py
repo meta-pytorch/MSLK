@@ -42,7 +42,7 @@ def _reference(q, k, v, block_table, seqlen_k, window_left):
         qpos = n - Sq + torch.arange(Sq, device=q.device)
         mask = pos[None, :] <= qpos[:, None]
         if window_left >= 0:
-            mask &= pos[None, :] > qpos[:, None] - window_left
+            mask &= pos[None, :] >= qpos[:, None] - window_left
         s = torch.einsum("lhd,khd->hlk", q[b].float(), kk) / D**0.5
         s = s.masked_fill(~mask[None], float("-inf"))
         out[b] = torch.einsum("hlk,khd->lhd", s.softmax(-1), vv)
