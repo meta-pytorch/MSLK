@@ -19,7 +19,7 @@ pos = seqlen_kv - seqlen_q + i, matching the generic paged kernel.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional
+from typing import Any
 
 import flydsl.compiler as flyc  # pyre-ignore[21]
 import flydsl.expr as fx  # pyre-ignore[21]
@@ -37,6 +37,27 @@ from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
 from mslk.flydsl import buffer_ops, vector_ops as vector
 
+from ..split_arrival import (
+    ARRIVAL_COUNTERS,
+    arrival_workspace,
+    arrive,
+    counter_ptr,
+    CPOL_SC1,
+    reset_counter,
+)
+from .head_packed_common import (
+    finalize_smem,
+    FX_DTYPE as _FX_DTYPE,
+    load_q_frags,
+    LOG2E,
+    mfma_16x16x32,
+    MFMA_K_QK,
+    MFMA_M,
+    MFMA_N,
+    N_SUBTILE,
+    read_v_frag_tr,
+    TILE_N,
+)
 from .utils import (
     exp2_f32 as _exp2_fast,
     maxnumf as _mxf,
@@ -45,19 +66,59 @@ from .utils import (
     WARP_SIZE,
 )
 
-MFMA_M = 16  # (query token, head) pairs packed on the QK MFMA M-axis
-MFMA_N = 16  # tokens per QK sub-tile
-MFMA_K_QK = 32  # head-dim elements per QK MFMA
-TILE_N = 32  # tokens per tile (= PV MFMA K-dim)
-N_SUBTILE = TILE_N // MFMA_N
-LOG2E: float = 1.4426950408889634
-_FX_DTYPE = {"f16": fx.Float16, "bf16": fx.BFloat16}
+# Splits the last CTA merges in-kernel; more go to the reduce kernel.
+_MAX_INKERNEL_SPLITS = 8
+# Running max before any partial: finite, so (max - max) is never NaN.
+_EMPTY_MAX = -3.0e38
+
+
+def _f(x):  # pyre-ignore[2,3]
+    return fx.Float32(x)
+
+
+def _ex2(x):  # pyre-ignore[2,3]
+    """e^x."""
+    return _exp2_fast(
+        _f(arith.mulf(arith.unwrap(x), arith.constant(LOG2E, type=T.f32)))
+    )
+
+
+def _scale(vecs, sc):  # pyre-ignore[2,3]
+    sc4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(sc))
+    return [arith.mulf(v, sc4) for v in vecs]
+
+
+def _row_coords(row, hq_base, ratio, t_pack):  # pyre-ignore[2,3]
+    """(query token, query head) of a packed output row: M slot m = qtok * ratio
+    + head within each 16-row tile."""
+    m = row % fx.Int32(MFMA_M)
+    qtok = (row // fx.Int32(MFMA_M)) * fx.Int32(t_pack) + m // fx.Int32(ratio)
+    return qtok, hq_base + m % fx.Int32(ratio)
+
+
+def _store_normalized(acc, den, fx_dtype, rsrc, offset):  # pyre-ignore[2]
+    """Store acc / den (0 where den is 0) as one vector of fx_dtype."""
+    c_zero = arith.constant(0.0, type=T.f32)
+    c_one = arith.constant(1.0, type=T.f32)
+    safe = _f(arith.select(arith.unwrap(den) > c_zero, arith.unwrap(den), c_one))
+    vals = [
+        arith.truncf(
+            fx_dtype.ir_type,
+            vector.extract(v, static_position=[e], dynamic_position=[]),
+        )
+        for v in _scale(acc, rcp_f32(safe))
+        for e in range(4)
+    ]
+    buffer_ops.buffer_store(
+        fx.Vector.from_elements(vals, dtype=fx_dtype).ir_value(), rsrc, offset
+    )
 
 
 @functools.lru_cache(maxsize=64)
 def compile_pa_decode_swa(
     *,
     head_size: int,
+    num_kv_heads: int,
     kv_dtype_str: str,
     page_size: int,
     gqa_ratio: int,
@@ -65,7 +126,6 @@ def compile_pa_decode_swa(
     num_waves: int,
     num_splits: int = 1,
     merge_kernel: bool = False,
-    num_kv_heads: int = 0,
     arch: str = "",
 ) -> Any:  # pyre-ignore[3]
     if not arch:
@@ -81,7 +141,7 @@ def compile_pa_decode_swa(
     _SQ = seqlen_q
     _NW = num_waves
     _S = num_splits  # CTAs per (request, KV head); > 1 merges through `ws`
-    _HKV = num_kv_heads  # 0: taken from the kernel argument
+    _HKV = num_kv_heads
     # With merge_kernel the split partials are merged by the reduce kernel
     # instead of the last CTA to finish.
     _SEP = merge_kernel and num_splits > 1
@@ -91,11 +151,7 @@ def compile_pa_decode_swa(
     _FX_KV = _FX_DTYPE[kv_dtype_str]
     _QK_GRP = _HEAD // MFMA_K_QK
     _DN = _HEAD // MFMA_N
-    _mfma = (
-        rocdl.mfma_f32_16x16x32_bf16
-        if kv_dtype_str == "bf16"
-        else rocdl.mfma_f32_16x16x32_f16
-    )
+    _mfma = mfma_16x16x32(kv_dtype_str)
 
     # Per-wave LDS region: the loop's K and V tiles, later reused by that wave
     # for its merge partials (acc rows, then max and sum).
@@ -140,8 +196,6 @@ def compile_pa_decode_swa(
         stride_km: fx.Int32,  # token stride within a page
         stride_kh: fx.Int32,
         stride_btb: fx.Int32,
-        num_hq: fx.Int32,
-        num_hkv: fx.Int32,
         window_left: fx.Int32,
         softmax_scale: fx.Float32,
         ws_ptr: fx.Tensor,
@@ -157,15 +211,12 @@ def compile_pa_decode_swa(
         flat = fx.Int32(gpu.block_idx.x)
         split = flat % fx.Int32(_S)
         head_flat = flat // fx.Int32(_S)
-        # A build-time KV head count makes these shifts / multiplies rather
-        # than a division waiting on the kernel arguments.
-        _nkv = fx.Int32(_HKV) if const_expr(_HKV > 0) else num_hkv
-        hkv_abs = head_flat % _nkv
-        b_idx = head_flat // _nkv
+        # A build-time KV head count makes these shifts / multiplies.
+        hkv_abs = head_flat % fx.Int32(_HKV)
+        b_idx = head_flat // fx.Int32(_HKV)
         hq_base = hkv_abs * fx.Int32(_RATIO)
 
         c_zero = arith.constant(0.0, type=T.f32)
-        c_one = arith.constant(1.0, type=T.f32)
         c_neginf = arith.constant(float("-inf"), type=T.f32)
         zero_v4 = arith.constant_vector(0.0, T.vec(4, T.f32))
 
@@ -211,26 +262,10 @@ def compile_pa_decode_swa(
 
         # Q fragments, loop-invariant. M slot m = qtok * ratio + head.
         q_head = tok_lane % fx.Int32(_RATIO)
-        q_tok_local = tok_lane // fx.Int32(_RATIO)
         q_base_bh = b_idx * stride_qb + (hq_base + q_head) * stride_qh
-        q_frags = []
-        for t in range_constexpr(_M_TILES):
-            q_tok = q_tok_local + fx.Int32(t * _T_PACK)
-            q_tok = fx.Int32(
-                arith.select(q_tok < fx.Int32(_SQ), q_tok, fx.Int32(_SQ - 1))
-            )
-            frags = []
-            for g in range_constexpr(_QK_GRP):
-                q_off = (
-                    q_base_bh
-                    + q_tok * stride_qs
-                    + fx.Int32(g * MFMA_K_QK)
-                    + grp * fx.Int32(8)
-                )
-                frags.append(
-                    buffer_ops.buffer_load(q_rsrc, q_off, vec_width=8, dtype=_FX_KV)
-                )
-            q_frags.append(frags)
+        q_frags = load_q_frags(
+            q_rsrc, q_base_bh, stride_qs, tok_lane, grp, _RATIO, _SQ, _HEAD, _FX_KV
+        )
 
         kv_base = hkv_abs * stride_kh
 
@@ -290,7 +325,6 @@ def compile_pa_decode_swa(
             arith.mulf(arith.unwrap(softmax_scale), arith.constant(LOG2E, type=T.f32))
         )
         _v8h = T.vec(8, _FX_KV.ir_type)
-        _v4h = T.vec(4, _FX_KV.ir_type)
 
         def _row_bounds(t):
             """[begin, end) of keys this lane's query row may attend."""
@@ -463,20 +497,9 @@ def compile_pa_decode_swa(
                     + fx.Index(grp * fx.Int32(4 * 16))
                     + fx.Index(tok_lane) * fx.Index(4)
                 )
-                _vlo = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_lo * fx.Index(2)), address_space=3
-                    ),
-                ).result
-                _off_hi = _off_lo + fx.Index(MFMA_N * 16)
-                _vhi = rocdl.ds_read_tr16_b64(
-                    _v4h,
-                    buffer_ops.create_llvm_ptr(
-                        fx.Int64(_off_hi * fx.Index(2)), address_space=3
-                    ),
-                ).result
-                v_frag = vector.shuffle(_vlo, _vhi, [0, 1, 2, 3, 4, 5, 6, 7])
+                v_frag = read_v_frag_tr(
+                    _off_lo, _off_lo + fx.Index(MFMA_N * 16), _FX_KV
+                )
                 for t in range_constexpr(_M_TILES):
                     a4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(alphas[t]))
                     c_in = arith.mulf(acc[t][dpass], a4)
@@ -544,20 +567,14 @@ def compile_pa_decode_swa(
         _V = 8  # head-dim values per thread
         _SLOTS = _M16 * (_HEAD // _V)
         _NPASS = (_SLOTS + _BLOCK - 1) // _BLOCK
-        _v4f = T.vec(4, T.f32)
 
         def _out_coords(i):
             idx = tid + fx.Int32(i * _BLOCK)
             row = idx // fx.Int32(_HEAD // _V)
             d0 = (idx % fx.Int32(_HEAD // _V)) * fx.Int32(_V)
-            m = row % fx.Int32(MFMA_M)
-            qtok = (row // fx.Int32(MFMA_M)) * fx.Int32(_T_PACK) + m // fx.Int32(_RATIO)
-            head_abs = hq_base + m % fx.Int32(_RATIO)
-            ok = (idx < fx.Int32(_SLOTS)) & (qtok < fx.Int32(_SQ)) & (head_abs < num_hq)
+            qtok, head_abs = _row_coords(row, hq_base, _RATIO, _T_PACK)
+            ok = (idx < fx.Int32(_SLOTS)) & (qtok < fx.Int32(_SQ))
             return row, d0, qtok, head_abs, ok
-
-        def _f(x):
-            return fx.Float32(x)
 
         def _lse_merge(parts):
             """(max, sum, [numerator vec4] ) parts -> merged; max -inf is empty."""
@@ -584,7 +601,7 @@ def compile_pa_decode_swa(
                         arith.mulf(arith.unwrap(sc), arith.unwrap(pl)),
                     )
                 )
-                sc4 = vector.broadcast(_v4f, arith.unwrap(sc))
+                sc4 = vector.broadcast(T.vec(4, T.f32), arith.unwrap(sc))
                 num = [
                     arith.addf(n, arith.mulf(sc4, arith.unwrap(p)))
                     for n, p in zip(num, pn)
@@ -595,39 +612,25 @@ def compile_pa_decode_swa(
             return _f(fx.Vector.load(T.vec(1, T.f32), lds_f32, [fx.Index(idx)])[0])
 
         def _lds_v4(idx):
-            return fx.Vector.load(_v4f, lds_f32, [fx.Index(idx)])
+            return fx.Vector.load(T.vec(4, T.f32), lds_f32, [fx.Index(idx)])
 
         def _store_out(d0, qtok, head_abs, den, num):
-            safe = _f(
-                arith.select(arith.unwrap(den) > c_zero, arith.unwrap(den), c_one)
-            )
-            inv = vector.broadcast(_v4f, arith.unwrap(rcp_f32(safe)))
-            vals = []
-            for n in num:
-                o = arith.mulf(n, inv)
-                for e in range_constexpr(4):
-                    vals.append(
-                        arith.truncf(
-                            _FX_KV.ir_type,
-                            vector.extract(o, static_position=[e], dynamic_position=[]),
-                        )
-                    )
-            buffer_ops.buffer_store(
-                fx.Vector.from_elements(vals, dtype=_FX_KV).ir_value(),
+            _store_normalized(
+                num,
+                den,
+                _FX_KV,
                 out_rsrc,
                 b_idx * stride_qb + qtok * stride_qs + head_abs * stride_qh + d0,
             )
 
         if const_expr(_S > 1):
-            # Split CTAs hand their merged partial to whichever finishes last,
-            # using agent-coherent (SC1) stores/loads and a monotonic agent
-            # counter; the counter is reset by that CTA. (Or to the reduce
-            # kernel, which needs no coherence.)
-            _CPOL_SC1 = 0 if _SEP else 16
+            # Split CTAs hand their merged partial to whichever finishes last
+            # (see split_arrival), or to the reduce kernel, which needs no
+            # coherence.
+            _CPOL = 0 if _SEP else CPOL_SC1
             _PART = _M16 * (_HEAD + 2)
-            _COUNTERS = 1 << 16
             ws_rsrc = buffer_ops.create_buffer_resource(ws_ptr, max_size=True)
-            part0 = fx.Int32(_COUNTERS) + head_flat * fx.Int32(_S * _PART)
+            part0 = fx.Int32(ARRIVAL_COUNTERS) + head_flat * fx.Int32(_S * _PART)
             my_part = part0 + split * fx.Int32(_PART)
 
         for i in range_constexpr(_NPASS):
@@ -653,43 +656,26 @@ def compile_pa_decode_swa(
                             num[j],
                             ws_rsrc,
                             my_part + row * fx.Int32(_HEAD) + d0 + fx.Int32(4 * j),
-                            cache_modifier=_CPOL_SC1,
+                            cache_modifier=_CPOL,
                         )
                     if d0 == fx.Int32(0):
                         _mo = my_part + fx.Int32(_M16 * _HEAD) + row
                         buffer_ops.buffer_store(
-                            arith.unwrap(mx), ws_rsrc, _mo, cache_modifier=_CPOL_SC1
+                            arith.unwrap(mx), ws_rsrc, _mo, cache_modifier=_CPOL
                         )
                         buffer_ops.buffer_store(
                             arith.unwrap(den),
                             ws_rsrc,
                             _mo + fx.Int32(_M16),
-                            cache_modifier=_CPOL_SC1,
+                            cache_modifier=_CPOL,
                         )
 
         if const_expr(_S > 1 and not _SEP):
-            rocdl.s_waitcnt(0)
-            gpu.barrier()  # every thread's partial stores done; LDS reads done
             ws_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ws_ptr)))
-            counter_ptr = buffer_ops.create_llvm_ptr(
-                ws_i64 + fx.Int64(head_flat * fx.Int32(4)), address_space=1
-            )
-            flag_ptr = buffer_ops.create_llvm_ptr(fx.Int64(0), address_space=3)
-            if tid == fx.Int32(0):
-                old = fx.llvm.atomic_add(
-                    counter_ptr,
-                    fx.Int32(1),
-                    syncscope=rocdl.SyncScope.Agent,
-                    ordering=fx.AtomicOrdering.Monotonic,
-                )
-                last = (fx.Int32(old) == fx.Int32(_S - 1)).select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-                _llvm.StoreOp(arith.unwrap(last), flag_ptr)
-            gpu.barrier()
-            is_last = fx.Int32(
-                rocdl.readfirstlane(T.i32, _llvm.LoadOp(T.i32, flag_ptr).result)
-            )
+            counter = counter_ptr(ws_i64, head_flat)
+            leader = tid == fx.Int32(0)
+            # Every wave's merge reads are done, so LDS word 0 can carry the flag.
+            is_last = arrive(counter, 0, leader, _S)
             if is_last != fx.Int32(0):
                 for i in range_constexpr(_NPASS):
                     row, d0, qtok, head_abs, ok = _out_coords(i)
@@ -705,7 +691,7 @@ def compile_pa_decode_swa(
                                     off,
                                     vec_width=width,
                                     dtype=T.f32,
-                                    cache_modifier=_CPOL_SC1,
+                                    cache_modifier=CPOL_SC1,
                                 )
 
                             parts.append(
@@ -726,8 +712,8 @@ def compile_pa_decode_swa(
                             )
                         mx, den, num = _lse_merge(parts)
                         _store_out(d0, qtok, head_abs, den, num)
-                if tid == fx.Int32(0):
-                    _llvm.StoreOp(arith.unwrap(fx.Int32(0)), counter_ptr)
+                if leader:
+                    reset_counter(counter)
 
     return pa_decode_swa_kernel, alloc
 
@@ -740,7 +726,7 @@ def compile_pa_decode_swa_reduce(
     gqa_ratio: int,
     seqlen_q: int,
     num_splits: int,
-    num_kv_heads: int = 0,
+    num_kv_heads: int,
 ) -> Any:  # pyre-ignore[3]
     """Merge the num_splits partials that pa_decode_swa wrote with
     merge_kernel=True. One wave per (request, KV head, row): a lane owns 8
@@ -769,40 +755,24 @@ def compile_pa_decode_swa_reduce(
         stride_qb: fx.Int32,
         stride_qs: fx.Int32,
         stride_qh: fx.Int32,
-        num_hq: fx.Int32,
-        num_hkv: fx.Int32,
     ) -> None:
         lane = fx.Int32(gpu.thread_idx.x)
         blk = fx.Int32(gpu.block_idx.x)
         row = blk % fx.Int32(_M16)
         head_flat = blk // fx.Int32(_M16)
-        _nkv = fx.Int32(_HKV) if const_expr(_HKV > 0) else num_hkv
-        b_idx = head_flat // _nkv
-        m = row % fx.Int32(MFMA_M)
-        qtok = (row // fx.Int32(MFMA_M)) * fx.Int32(_T_PACK) + m // fx.Int32(_RATIO)
-        head_abs = (head_flat % _nkv) * fx.Int32(_RATIO) + m % fx.Int32(_RATIO)
+        b_idx = head_flat // fx.Int32(_HKV)
+        hq_base = (head_flat % fx.Int32(_HKV)) * fx.Int32(_RATIO)
+        qtok, head_abs = _row_coords(row, hq_base, _RATIO, _T_PACK)
         d0 = (lane % fx.Int32(_LANES)) * fx.Int32(_V)
         grp = lane // fx.Int32(_LANES)
         c_zero = arith.constant(0.0, type=T.f32)
-        c_one = arith.constant(1.0, type=T.f32)
-        c_empty = arith.constant(-3.0e38, type=T.f32)
-        c_log2e = arith.constant(LOG2E, type=T.f32)
+        c_empty = arith.constant(_EMPTY_MAX, type=T.f32)
         v4f = T.vec(4, T.f32)
         out_rsrc = buffer_ops.create_buffer_resource(out_ptr, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(ws_ptr, max_size=True)
-        part0 = fx.Int32(1 << 16) + head_flat * fx.Int32(_S * _PART)
+        part0 = fx.Int32(ARRIVAL_COUNTERS) + head_flat * fx.Int32(_S * _PART)
 
-        def _f(x):
-            return fx.Float32(x)
-
-        def _ex2(x):
-            return _exp2_fast(_f(arith.mulf(arith.unwrap(x), c_log2e)))
-
-        def _scale(vecs, sc):
-            sc4 = vector.broadcast(v4f, arith.unwrap(sc))
-            return [arith.mulf(v, sc4) for v in vecs]
-
-        if (qtok < fx.Int32(_SQ)) & (head_abs < num_hq):
+        if qtok < fx.Int32(_SQ):
             # Empty partials (max -inf) and a group's missing splits weigh 0;
             # the finite stand-in keeps (max - max) from becoming NaN.
             m_run = _f(c_empty)
@@ -894,20 +864,10 @@ def compile_pa_decode_swa_reduce(
                 ]
                 m_run = m_new
             if grp == fx.Int32(0):
-                safe = _f(
-                    arith.select(arith.unwrap(den) > c_zero, arith.unwrap(den), c_one)
-                )
-                o = _scale(acc, rcp_f32(safe))
-                vals = [
-                    arith.truncf(
-                        _FX_KV.ir_type,
-                        vector.extract(v, static_position=[e], dynamic_position=[]),
-                    )
-                    for v in o
-                    for e in range(4)
-                ]
-                buffer_ops.buffer_store(
-                    fx.Vector.from_elements(vals, dtype=_FX_KV).ir_value(),
+                _store_normalized(
+                    acc,
+                    den,
+                    _FX_KV,
                     out_rsrc,
                     b_idx * stride_qb + qtok * stride_qs + head_abs * stride_qh + d0,
                 )
@@ -969,21 +929,13 @@ def _make_swa_launcher(
         stride_km,
         stride_kh,
         stride_btb,
-        num_hq,
-        num_hkv,
         window_left,
         scale,
         ws_ptr,
         grid_x,
         stream: fx.Stream = default_stream,
     ):
-        from flydsl._mlir import ir as _ir
-        from flydsl.compiler.kernel_function import CompilationContext
-
-        _alloc.finalized = False
-        ctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(ctx.gpu_module_body):
-            _alloc.finalize()
+        finalize_smem(_alloc)
         kernel(
             out_ptr,
             q_ptr,
@@ -998,35 +950,18 @@ def _make_swa_launcher(
             stride_km,
             stride_kh,
             stride_btb,
-            num_hq,
-            num_hkv,
             window_left,
             scale,
             ws_ptr,
         ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
         if const_expr(reduce is not None):
-            reduce(
-                out_ptr, ws_ptr, stride_qb, stride_qs, stride_qh, num_hq, num_hkv
-            ).launch(
+            reduce(out_ptr, ws_ptr, stride_qb, stride_qs, stride_qh).launch(
                 grid=(grid_x // num_splits * m16, 1, 1),
                 block=(WARP_SIZE, 1, 1),
                 stream=stream,
             )
 
     return _launcher
-
-
-# (device, stream) -> persistent workspace whose leading counters stay zero.
-_WORKSPACES: dict = {}
-
-
-def _workspace(elems: int, device: torch.device, stream: Any) -> torch.Tensor:
-    key = (device, stream.cuda_stream)
-    buf = _WORKSPACES.get(key)
-    if buf is None or buf.numel() < elems:
-        buf = torch.zeros(elems, dtype=torch.float32, device=device)
-        _WORKSPACES[key] = buf
-    return buf
 
 
 def pa_decode_swa_supported(
@@ -1041,7 +976,6 @@ def pa_decode_swa_supported(
     kv_capacity: int = 0,
     num_waves: int = 1,
     num_splits: int = 1,
-    merge_kernel: Optional[bool] = None,
 ) -> bool:
     """Shapes pa_decode_swa_launch handles. Full attention (window_left < 0)
     needs kv_capacity, the most keys a request can hold."""
@@ -1053,10 +987,10 @@ def pa_decode_swa_supported(
     # Pages one CTA's keys can touch (its share only with the reduce kernel):
     # one page id per lane.
     tiles = -(-(keys + TILE_N) // TILE_N)
-    if merge_kernel is None:
-        merge_kernel = num_splits > 8
     cta_tiles = (
-        -(-tiles // (num_splits * num_waves)) * num_waves if merge_kernel else tiles
+        -(-tiles // (num_splits * num_waves)) * num_waves
+        if num_splits > _MAX_INKERNEL_SPLITS
+        else tiles
     )
     pages = -(-cta_tiles * TILE_N // page_size) + 1
     return (
@@ -1081,12 +1015,11 @@ def pa_decode_swa_launch(
     out: torch.Tensor,
     num_waves: int = 8,
     num_splits: int = 1,
-    merge_kernel: Optional[bool] = None,
 ) -> torch.Tensor:
     """Sliding-window (or, with window_left < 0, full) paged decode. q/out are
     [B, Sq, H_q, D]; k/v are [num_pages, page_size, H_kv, D]; block_table is
     [B, pages] int32. Splits are merged by the last CTA to finish, or by a
-    reduce kernel (merge_kernel, default for more than 8 splits)."""
+    reduce kernel past _MAX_INKERNEL_SPLITS."""
     from mslk.flydsl.jit import run_compiled
 
     B, Sq, H_q, D = q.shape
@@ -1094,8 +1027,7 @@ def pa_decode_swa_launch(
     assert k.numel() < 2**31 and v.numel() < 2**31, "32-bit KV offsets"
     assert out.stride() == q.stride()
     kv_str = {torch.float16: "f16", torch.bfloat16: "bf16"}[k.dtype]
-    if merge_kernel is None:
-        merge_kernel = num_splits > 8
+    merge_kernel = num_splits > _MAX_INKERNEL_SPLITS
     launcher = _make_swa_launcher(
         D,
         kv_str,
@@ -1108,10 +1040,10 @@ def pa_decode_swa_launch(
         H_kv,
     )
     if num_splits > 1:
-        assert B * H_kv <= 1 << 16
+        assert B * H_kv <= ARRIVAL_COUNTERS
         m16 = -(-Sq // (MFMA_M // (H_q // H_kv))) * MFMA_M
-        ws = _workspace(
-            (1 << 16) + B * H_kv * num_splits * m16 * (D + 2),
+        ws = arrival_workspace(
+            B * H_kv * num_splits * m16 * (D + 2),
             q.device,
             torch.cuda.current_stream(),
         )
@@ -1135,8 +1067,6 @@ def pa_decode_swa_launch(
         ks[1],
         ks[2],
         block_table.stride(0),
-        H_q,
-        H_kv,
         int(window_left) if window_left >= 0 else 1 << 30,
         float(softmax_scale),
         ws,

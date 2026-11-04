@@ -40,8 +40,6 @@ from .flash_attn_utils import (
     combine_lanes_per_row,
     COMBINE_PREFETCH,
     combine_rows_per_block,
-    DualwaveSplitKCombineContext,
-    DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
     GenericFusedSplitKCombine,
     GenericGemmHelper,
@@ -51,6 +49,7 @@ from .flash_attn_utils import (
     GenericQLoader,
     GenericSoftmaxHelper,
     GenericStoreHelper,
+    run_splitk_combine,
     scf_if_dispatch,
     wait_lds_copies,
 )
@@ -412,19 +411,7 @@ def build_flash_attn_func_module_primary(
             and not traits.ENABLE_PREFETCH_3BUF
             and traits.N_SUBTILES == 1
         )
-        # Next K tile is loaded into registers during the softmax, then lands in
-        # the single LDS K buffer. No second K buffer. Not the DMA double-buffer
-        # path: that copy is issued while the current tile is still live.
-        _pipe_paged_k = (
-            traits.PAGED_K_PREFETCH
-            and not traits.GAPPY_KV
-            and not traits.KV_NEEDS_GUARD
-            and not traits.KV_VECTORIZED
-            and not traits.ENABLE_DMA
-            and not traits.ENABLE_PREFETCH_3BUF
-            and traits.N_SUBTILES == 1
-            and not _pipe_k
-        )
+        _pipe_paged_k = traits.PAGED_K_PREFETCH
         # 16-byte global loads per K tile (VEC_WIDTH bf16 / 8): the V wait's count.
         _k_prefetch_inflight = traits.NUM_BATCHES_KV * (traits.VEC_WIDTH // 8)
         init_args = [ctx.c_neg_inf, ctx.c_zero_f]
@@ -865,52 +852,20 @@ def build_flash_attn_func_module_primary(
         seq_len: fx.Int32,
         stride_q_n: fx.Int32,
     ):
-        c_ctx = DualwaveSplitKCombineContext(
-            traits, O, Workspace, batch_size, seq_len, stride_q_n, LSE=LSE
+        # seq_len is the exact packed-row count, so the in-bounds test also
+        # excludes every ceil-div padding row before stride-packed addressing.
+        run_splitk_combine(
+            traits,
+            O,
+            Workspace,
+            LSE,
+            batch_size,
+            seq_len,
+            stride_q_n,
+            COMBINE_ROWS_PER_BLOCK,
+            COMBINE_LANES_PER_ROW,
+            packed_rows=_COMBINE_ROWS,
         )
-        c_ctx.init_types_and_constants()
-        c_ctx.init_runtime_indices()
-        if const_expr(_COMBINE_ROWS > 0):
-            # Packed rows are q_len * group, fixed per build: constant divisors.
-            c_ctx.seq_len_v = fx.Index(_COMBINE_ROWS)
-        c_ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
-        # ceil-div grid can spawn rows past the last valid (batch, head, seq) row when
-        # seq_len is not a multiple of COMBINE_ROWS_PER_BLOCK; those overflow threads
-        # decode batch_idx >= batch_size. Clamp their row into range so workspace/O
-        # descriptors stay in-bounds, then drop their stores below (the real owner of
-        # the clamped row writes the correct value).
-        total_rows = (
-            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * c_ctx.seq_len_v
-        )
-        c_ctx.row_in_bounds = c_ctx.row < total_rows
-        c_ctx.row = (c_ctx.row_in_bounds).select(c_ctx.row, fx.Index(0))
-        heads_per_batch = c_ctx.seq_len_v * traits.NUM_HEADS_Q
-        c_ctx.batch_idx = c_ctx.row // heads_per_batch
-        _rem = c_ctx.row % heads_per_batch
-        c_ctx.q_head_idx = _rem // c_ctx.seq_len_v
-        c_ctx.seq_idx = _rem % c_ctx.seq_len_v
-        c_ctx.init_workspace()
-        c_ctx.init_descriptors()
-
-        combine = DualwaveSplitKCombineHelper(c_ctx)
-        # Each split group reduces its own share against its own max, then the
-        # groups are merged across the wave.
-        m_max = combine.reduce_m_max()
-        m_max = combine.merge_m_max(m_max)
-        acc, den = combine.accumulate_splits(m_max)
-        den, acc = combine.merge_split_groups(den, acc)
-        o_pack = combine.pack_output(acc, den)
-        # Every group ends up with the merged result; one of them stores it.
-        # seq_len is the exact packed-row count, so row_in_bounds also excludes
-        # every ceil-div padding row before stride-packed output addressing.
-        _owns_store = c_ctx.row_in_bounds & (c_ctx.sgrp == fx.Index(0))
-
-        def _store_in_bounds():
-            combine.store_output(o_pack)
-            if const_expr(traits.RETURN_LSE):
-                combine.store_lse(m_max, den)
-
-        scf_if_dispatch(_owns_store, _store_in_bounds)
 
     @flyc.jit
     def launch_flash_attn_generic(
