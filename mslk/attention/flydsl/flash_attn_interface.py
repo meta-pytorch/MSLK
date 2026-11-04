@@ -771,23 +771,63 @@ def _paged_occupancy_topup(
     return max(splits, want)
 
 
+# FLYDSL_PAGED_WIDE_SPLIT_CAP=0 disables the cap below.
+_PAGED_WIDE_SPLIT_CAP = os.getenv("FLYDSL_PAGED_WIDE_SPLIT_CAP", "1") == "1"
+
+
+def _paged_wide_tile_split_cap(
+    splits: int,
+    num_batches: int,
+    num_heads: int,
+    seqlen_q: int,
+    kv_tiles: int,
+    head_dim: int,
+    gqa_packed: bool,
+) -> int:
+    """Cap the split count for multi-token (> 32 row) full-attention tiles.
+
+    Targets ~512 workgroups in flight at D=128 and ~2048 at D=64, with >= 4 KV
+    tiles per split. Only ever lowers the chain-length sizing.
+    """
+    rows = seqlen_q
+    if not _PAGED_WIDE_SPLIT_CAP or rows <= 32:
+        return splits
+    grid = num_batches * num_heads * -(-rows // _paged_block_m(gqa_packed, rows))
+    target = 512 if head_dim >= 128 else 2048
+    want = max(target / max(grid, 1), 1)
+    lo = 1 << (int(want).bit_length() - 1)
+    by_grid = lo * 2 if want / lo > 1.414 else lo
+    by_chain = 1 << (max(kv_tiles // 4, 1).bit_length() - 1)
+    return min(splits, max(8, min(by_grid, by_chain)))
+
+
 # FLYDSL_PAGED_NARROW_TILE=0/1 overrides the choice below.
 _PAGED_NARROW_TILE = os.getenv("FLYDSL_PAGED_NARROW_TILE", "")
 
 
 def _paged_narrow_tile(
-    rows: int, window_left: int, q_len: int, kv_len: int, num_kv_splits: int
+    rows: int,
+    window_left: int,
+    q_len: int,
+    kv_len: int,
+    num_kv_splits: int,
+    head_dim: int,
+    groups: int,
 ) -> bool:
     """Use a 32-row, single-wave Q tile instead of the 64-row default.
 
     With <= 32 packed rows the 64-row tile's second wave is all padding; halving
     the tile lets more workgroups share a CU. Only used for long KV walks, since
-    a single wave issues each tile's loads alone.
+    a single wave issues each tile's loads alone. A single-token D=128 decode of
+    one request (``groups`` = batch x KV heads) keeps the 64-row tile for wave
+    split-K over KV columns.
     """
     if rows > 32:
         return False
     if _PAGED_NARROW_TILE in ("0", "1"):
         return _PAGED_NARROW_TILE == "1"
+    if window_left < 0 and q_len == 1 and head_dim >= 128 and groups <= 4:
+        return False
     span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
     tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
     return -(-tiles // max(num_kv_splits, 1)) >= 16
@@ -829,6 +869,99 @@ def _paged_k_prefetch(
         else _PAGED_K_PREFETCH_MIN_ITERS_D128
     )
     return -(-tiles // max(num_kv_splits, 1)) >= need
+
+
+# FLYDSL_PAGED_SWA_KERNEL=0/1 overrides the choice below.
+_PAGED_SWA_KERNEL = os.getenv("FLYDSL_PAGED_SWA_KERNEL", "")
+
+
+def _paged_swa_kernel_config(
+    q,
+    k,
+    causal,
+    window_left,
+    return_lse,
+    varlen,
+    vectorized,
+    kv_seqstart,
+    seqlen_k,
+    block_table,
+    out,
+    num_kv_splits=0,
+):
+    """(num_waves, num_splits) to run a paged decode on pa_decode_swa, or None.
+
+    Each CTA streams its slice of the keys through one CU. Windowed decodes use
+    it once the (request, KV head) groups, split as needed, fill the GPU;
+    full-attention decodes over a few groups split each group across the GPU.
+    Other shapes stay on the generic split-K kernel.
+    """
+    if (
+        _PAGED_SWA_KERNEL == "0"
+        or varlen
+        or vectorized
+        or not causal
+        or return_lse
+        or kv_seqstart is not None
+        or seqlen_k is None
+        or block_table is None
+        or q.dim() != 4
+        or seqlen_k.dtype != torch.int32
+        or not seqlen_k.is_contiguous()
+        or block_table.dtype != torch.int32
+        or not block_table.is_contiguous()
+        or (out is not None and out.stride() != q.stride())
+    ):
+        return None
+    from .decode.pa_decode_swa import pa_decode_swa_supported
+
+    B, Sq, H, D = q.shape
+    H_kv = k.shape[2]
+    if H_kv == 0 or H % H_kv or 16 % (H // H_kv):
+        return None
+    groups = B * H_kv
+    m_tiles = -(-Sq // (16 // (H // H_kv)))
+    # Splits bring the grid to about one CTA per CU.
+    splits = max(1, min(8, 256 // groups))
+    cfg = None
+    if _PAGED_SWA_KERNEL == "1":
+        cfg = (4, 1)
+    elif window_left < 0:
+        # Full attention over a few requests and moderate contexts (left to
+        # the generic kernel when the caller sets the split count): the CTAs
+        # of a (request, KV head) split its keys, merged by the reduce kernel.
+        keys = block_table.shape[1] * k.shape[1]
+        if num_kv_splits > 1 or groups * keys > 1 << 18:
+            cfg = None
+        elif m_tiles == 1:
+            cfg = (2, max(16, splits))
+        elif m_tiles == 2 and D == 64:
+            cfg = (4, max(16, splits))
+    elif m_tiles == 1:
+        if D == 128:
+            # Below 64 groups, 16 splits each merged by the reduce kernel.
+            cfg = (4, 1) if groups >= 256 else (2, splits if groups >= 64 else 16)
+        elif D == 64 and groups >= 32:
+            if groups >= 256:
+                cfg = (2, 1)
+            else:
+                cfg = (4, 1) if groups >= 128 else (4, splits)
+    elif groups >= (32 if D == 64 else 64):
+        cfg = (4, splits)
+    if cfg is None or not pa_decode_swa_supported(
+        head_dim=D,
+        num_heads=H,
+        num_kv_heads=H_kv,
+        seqlen_q=Sq,
+        page_size=k.shape[1],
+        window_left=window_left,
+        dtype=q.dtype,
+        kv_capacity=block_table.shape[1] * k.shape[1],
+        num_waves=cfg[0],
+        num_splits=cfg[1],
+    ):
+        return None
+    return cfg
 
 
 # FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
@@ -1078,6 +1211,38 @@ def _flydsl_flash_attn_paged(
             )
 
     varlen = cu_seqlens_q is not None
+    _swa_cfg = _paged_swa_kernel_config(
+        q,
+        k,
+        causal,
+        window_left,
+        return_lse,
+        varlen,
+        vectorized,
+        kv_seqstart,
+        seqlen_k,
+        block_table,
+        out,
+        num_kv_splits,
+    )
+    if _swa_cfg is not None:
+        from .decode.pa_decode_swa import pa_decode_swa_launch
+
+        if out is None:
+            out = torch.empty_like(q)
+        with torch.cuda.device(q.device.index):
+            return pa_decode_swa_launch(
+                q,
+                k,
+                v,
+                block_table,
+                seqlen_k,
+                window_left,
+                sm_scale if sm_scale is not None else q.shape[-1] ** -0.5,
+                out,
+                num_waves=_swa_cfg[0],
+                num_splits=_swa_cfg[1],
+            )
     # Dense paged callers hand us a per-request `seqlen_k` but the launch only
     # ever forwarded the batch maximum, so every request was masked to that
     # maximum and any shorter one read stale cache. Feed the kernel the real
@@ -1350,6 +1515,16 @@ def _flydsl_flash_attn_paged(
         num_kv_splits = _paged_occupancy_topup(
             num_kv_splits, B, H, Sq, span, D, _gqa_packed
         )
+        if not _paged_window:
+            num_kv_splits = _paged_wide_tile_split_cap(
+                num_kv_splits,
+                B,
+                H,
+                Sq,
+                -(-skv // _PAGED_BLOCK_N_OUT),
+                D,
+                _gqa_packed,
+            )
     elif requested_num_kv_splits <= 1:
         num_kv_splits = 1
     else:
@@ -1477,7 +1652,13 @@ def _flydsl_flash_attn_paged(
                 )
             _paged_bm = _paged_block_m(_gqa_packed, Sq)
             if _paged_narrow_tile(
-                Sq, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+                Sq,
+                window_left,
+                _gqa_qlen if _gqa_packed else Sq,
+                skv,
+                num_kv_splits,
+                D,
+                B * H,
             ):
                 _paged_bm = 32
             fused_combine = _paged_light_ok and _paged_fused_combine(
@@ -1598,6 +1779,8 @@ def _flydsl_flash_attn_paged(
                 kwargs["cu_seqlens_q"] = _uniform_cu_seqlens(B, Sq, str(q.device))
             elif _dense_kv_lens:
                 kwargs["cu_seqlens_kv"] = bounded_seqlen_k
+            # Stride-packed builds compile the row count (q_len * group) in.
+            assert not (_gqa_stride_packed and causal) or Sq == _gqa_qlen * _gqa_group
             exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
             if o_flat.data_ptr() != out.data_ptr():
                 out.copy_(o_flat.view_as(out))

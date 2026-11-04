@@ -849,6 +849,11 @@ def build_flash_attn_func_module_primary(
     COMBINE_ROWS_PER_BLOCK = (
         combine_rows_per_block(traits.HEAD_DIM, COMBINE_BLOCK) if traits.SPLITK else 1
     )
+    _COMBINE_ROWS = (
+        traits.Q_PACK_QLEN * traits.Q_PACK_GROUP
+        if traits.Q_PACK_QLEN > 0 and traits.Q_PACK_GROUP > 0
+        else 0
+    )
 
     @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
     def flash_attn_generic_combine_kernel(
@@ -864,6 +869,9 @@ def build_flash_attn_func_module_primary(
         )
         c_ctx.init_types_and_constants()
         c_ctx.init_runtime_indices()
+        if const_expr(_COMBINE_ROWS > 0):
+            # Packed rows are q_len * group, fixed per build: constant divisors.
+            c_ctx.seq_len_v = fx.Index(_COMBINE_ROWS)
         c_ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
         # ceil-div grid can spawn rows past the last valid (batch, head, seq) row when
         # seq_len is not a multiple of COMBINE_ROWS_PER_BLOCK; those overflow threads
@@ -871,7 +879,7 @@ def build_flash_attn_func_module_primary(
         # descriptors stay in-bounds, then drop their stores below (the real owner of
         # the clamped row writes the correct value).
         total_rows = (
-            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * fx.Index(seq_len)
+            fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * c_ctx.seq_len_v
         )
         c_ctx.row_in_bounds = c_ctx.row < total_rows
         c_ctx.row = (c_ctx.row_in_bounds).select(c_ctx.row, fx.Index(0))
