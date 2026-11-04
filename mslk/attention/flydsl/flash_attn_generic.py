@@ -43,6 +43,7 @@ from .flash_attn_utils import (
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
     GenericFlashAttnContext,
+    GenericFusedSplitKCombine,
     GenericGemmHelper,
     GenericKvGmemToLdsLoader,
     GenericKvLdsToVgprLoader,
@@ -89,6 +90,8 @@ def build_flash_attn_func_module_primary(
     paged_kv_dma=False,
     paged_k_prefetch=False,
     high_concurrency=False,
+    fused_combine=False,
+    paged_pid_regs=False,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
@@ -274,6 +277,8 @@ def build_flash_attn_func_module_primary(
         paged_kv_dma=paged_kv_dma,
         paged_k_prefetch=paged_k_prefetch,
         high_concurrency=high_concurrency,
+        fused_combine=fused_combine,
+        paged_pid_regs=paged_pid_regs,
     )
     _flash_attn_generic_cache_tag = (traits.cache_tag, COMBINE_PREFETCH)
 
@@ -387,6 +392,8 @@ def build_flash_attn_func_module_primary(
         ctx.init_kv_bounds()
         kv_upper = ctx.kv_upper
         kv_lower = ctx.kv_lower
+        if const_expr(traits.PAGED_PID_REGS):
+            kv_gmem_to_lds.page_ids.preload(kv_lower)
 
         # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
         # (K vecs if pipelined), (page id if paged K prefetch)]
@@ -817,6 +824,9 @@ def build_flash_attn_func_module_primary(
             # Split-K writes an unnormalized-then-reweighted partial to the workspace;
             # the combine kernel merges splits into the final O + LSE.
             store_helper.store_splitk_partial(loop_results, ctx.q_row)
+            if const_expr(traits.FUSED_COMBINE):
+                # No combine kernel: the last split to finish merges in place.
+                GenericFusedSplitKCombine(ctx).run()
         else:
             # Normalize and store O (128-bit buffer_store_dwordx4).
             store_helper.finalize_o(loop_results)
@@ -980,7 +990,7 @@ def build_flash_attn_func_module_primary(
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
-        if const_expr(traits.SPLITK):
+        if const_expr(traits.SPLITK and not traits.FUSED_COMBINE):
             # ceil-div: seq_len need not be a multiple of COMBINE_ROWS_PER_BLOCK
             # (generic supports arbitrary seq_len). Overflow rows in the last block
             # are dropped by the in-bounds guard inside the combine kernel.
