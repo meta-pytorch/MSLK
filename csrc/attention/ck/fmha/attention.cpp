@@ -25,6 +25,9 @@ TORCH_LIBRARY_FRAGMENT(xformers, m) {
   // Schemas for ops whose implementations live in hip_fmha/ are registered
   // there, alongside their TORCH_LIBRARY_IMPL, so that they are absent from
   // builds where hip_fmha is not compiled (e.g. MSLK_BUILD_HIP_FMHA=0).
+  // The decoder ops below are different: their implementations in
+  // hip_decoder/ are compiled into the main library on every ROCm build, so
+  // their schemas are registered unconditionally here.
   m.def(TORCH_SELECTIVE_SCHEMA(
       "xformers::efficient_attention_forward_decoder_ck(Tensor query, "
       "Tensor key, Tensor value, Tensor? seq_positions, float scale) -> Tensor"));
