@@ -242,6 +242,13 @@ def compile_pa_decode_swa(
                 arith.unwrap(fx.Int32(pid_reg)),
                 arith.unwrap(tile_start // fx.Int32(_PAGE) - page0),
             )
+            # A wave with an empty range still issues its first load; its slot
+            # may lie past the request's pages (e.g. -1 padding), so read page 0.
+            page = fx.Int32(
+                arith.select(
+                    tile_start < w_end, arith.unwrap(fx.Int32(page)), fx.Int32(0)
+                )
+            )
             org = (
                 kv_base
                 + (tile_start % fx.Int32(_PAGE)) * stride_km
