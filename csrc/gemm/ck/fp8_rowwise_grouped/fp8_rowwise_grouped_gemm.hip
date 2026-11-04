@@ -551,7 +551,7 @@ void set_dynamic_kernel_args(
         N,
         K,
         group_count);
-    C10_HIP_KERNEL_LAUNCH_CHECK();
+    C10_HIP_CHECK(hipGetLastError());
   } else if (zeroing_output_tensor) {
     constexpr uint64_t kElementsPerChunk = 8;
     TORCH_CHECK(
@@ -986,7 +986,7 @@ at::Tensor f8f8bf16_rowwise_grouped_mm(
       K,
       G,
       inputType);
-  C10_HIP_KERNEL_LAUNCH_CHECK();
+  C10_HIP_CHECK(hipGetLastError());
 
   // For heuristics normalize the dynamic dimension by G so we can approximate the problem shape per group.
   if (inputType == GroupedGemmInputType::_2D3D ) {
