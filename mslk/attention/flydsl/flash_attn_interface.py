@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F  # noqa: F401  (imported for callers' convenience)
 
 # Re-export so callers only need to import from this module.
-from .flash_attn_utils import dualwave_splitk_workspace_elems
+from .flash_attn_utils import dualwave_splitk_workspace_elems, FUSED_COMBINE_COUNTERS
 
 __all__ = ["flydsl_flash_attn_func", "dualwave_splitk_workspace_elems"]
 
@@ -771,6 +771,28 @@ def _paged_occupancy_topup(
     return max(splits, want)
 
 
+# FLYDSL_PAGED_NARROW_TILE=0/1 overrides the choice below.
+_PAGED_NARROW_TILE = os.getenv("FLYDSL_PAGED_NARROW_TILE", "")
+
+
+def _paged_narrow_tile(
+    rows: int, window_left: int, q_len: int, kv_len: int, num_kv_splits: int
+) -> bool:
+    """Use a 32-row, single-wave Q tile instead of the 64-row default.
+
+    With <= 32 packed rows the 64-row tile's second wave is all padding; halving
+    the tile lets more workgroups share a CU. Only used for long KV walks, since
+    a single wave issues each tile's loads alone.
+    """
+    if rows > 32:
+        return False
+    if _PAGED_NARROW_TILE in ("0", "1"):
+        return _PAGED_NARROW_TILE == "1"
+    span = min(kv_len, window_left + q_len) if window_left >= 0 else kv_len
+    tiles = -(-max(span, 1) // _PAGED_BLOCK_N_OUT)
+    return -(-tiles // max(num_kv_splits, 1)) >= 16
+
+
 # Minimum KV tiles per workgroup for paged K double buffering.
 _PAGED_KV_DMA_MIN_ITERS = int(os.getenv("FLYDSL_PAGED_KV_DMA_MIN_ITERS", "63"))
 
@@ -807,6 +829,65 @@ def _paged_k_prefetch(
         else _PAGED_K_PREFETCH_MIN_ITERS_D128
     )
     return -(-tiles // max(num_kv_splits, 1)) >= need
+
+
+# FLYDSL_PAGED_PID_REGS=0/1 overrides the choice below.
+_PAGED_PID_REGS = os.getenv("FLYDSL_PAGED_PID_REGS", "")
+
+
+def _paged_pid_regs(max_pages_per_split: int) -> bool:
+    """Hold a split's page ids in registers, one tile per lane, when they fit.
+
+    Not used with K prefetch, which already loads each page id a tile early.
+    """
+    if _PAGED_PID_REGS in ("0", "1"):
+        return _PAGED_PID_REGS == "1" and max_pages_per_split + 1 <= 64
+    return max_pages_per_split + 1 <= 64
+
+
+# FLYDSL_PAGED_FUSED_COMBINE=0/1 overrides the choice below.
+_PAGED_FUSED_COMBINE = os.getenv("FLYDSL_PAGED_FUSED_COMBINE", "")
+
+
+def _paged_fused_combine(
+    splitk: bool,
+    return_lse: bool,
+    workgroups_x: int,
+    num_kv_splits: int,
+    head_dim: int,
+    tile_rows: int,
+) -> bool:
+    """Merge split-K partials in the attention kernel instead of a combine kernel.
+
+    The merge runs in the last workgroup to finish, so it is only used when there
+    are many tiles and few splits per tile to merge.
+    """
+    if not splitk or return_lse or workgroups_x > FUSED_COMBINE_COUNTERS:
+        return False
+    if _PAGED_FUSED_COMBINE in ("0", "1"):
+        return _PAGED_FUSED_COMBINE == "1"
+    return (
+        num_kv_splits <= 8 and workgroups_x >= 64 and (head_dim <= 64 or tile_rows <= 8)
+    )
+
+
+# (device, stream) -> persistent fused split-K workspace; see _fused_workspace.
+_FUSED_WORKSPACES: dict = {}
+
+
+def _fused_workspace(elems: int, device: torch.device, stream) -> torch.Tensor:
+    """Workspace whose leading arrival counters are zero before every launch."""
+    key = (device, stream.cuda_stream)
+    need = FUSED_COMBINE_COUNTERS + elems
+    buf = _FUSED_WORKSPACES.get(key)
+    if buf is None or buf.numel() < need:
+        buf = torch.empty(need, dtype=torch.float32, device=device)
+        _FUSED_WORKSPACES[key] = buf
+    # A failed or cancelled launch may leave counters nonzero. Reset on the
+    # launch stream so reuse is ordered after prior work and remains capturable.
+    with torch.cuda.stream(stream):
+        buf[:FUSED_COMBINE_COUNTERS].zero_()
+    return buf
 
 
 # Streaming tile of the head-packed decode kernel
@@ -1394,6 +1475,22 @@ def _flydsl_flash_attn_paged(
                     "flydsl_flash_attn_func: return_lse for native paged KV is only "
                     "supported on the generic (short-seq / gfx942) path"
                 )
+            _paged_bm = _paged_block_m(_gqa_packed, Sq)
+            if _paged_narrow_tile(
+                Sq, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            ):
+                _paged_bm = 32
+            fused_combine = _paged_light_ok and _paged_fused_combine(
+                splitk,
+                return_lse,
+                B * H * (-(-Sq // _paged_bm)),
+                int(num_kv_splits),
+                D,
+                min(Sq, _paged_bm),
+            )
+            _k_prefetch = _paged_k_prefetch(
+                D, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            )
             if _paged_light_ok:
                 exe = _build_paged_light(
                     num_heads=H,
@@ -1422,23 +1519,13 @@ def _flydsl_flash_attn_paged(
                         _WAVE_SPLITK_MIN_BATCH > 0 and B >= _WAVE_SPLITK_MIN_BATCH
                     ),
                     kv_lens=_dense_kv_lens,
-                    block_m=_paged_block_m(_gqa_packed, Sq),
-                    kv_dma=_paged_kv_dma(
-                        _paged_block_m(_gqa_packed, Sq),
-                        D,
-                        window_left,
-                        skv,
-                        num_kv_splits,
-                    ),
-                    k_prefetch=_paged_k_prefetch(
-                        D,
-                        window_left,
-                        _gqa_qlen if _gqa_packed else Sq,
-                        skv,
-                        num_kv_splits,
-                    ),
+                    block_m=_paged_bm,
+                    kv_dma=_paged_kv_dma(_paged_bm, D, window_left, skv, num_kv_splits),
+                    k_prefetch=_k_prefetch,
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
+                    fused_combine=fused_combine,
+                    pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
                 )
             else:
                 exe = _build_paged(
@@ -1499,7 +1586,12 @@ def _flydsl_flash_attn_paged(
                 ws_elems = dualwave_splitk_workspace_elems(
                     B, H, Sq, int(num_kv_splits), head_dim=D
                 )
-                workspace = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
+                if fused_combine:
+                    workspace = _fused_workspace(ws_elems, q.device, launch_stream)
+                else:
+                    workspace = torch.empty(
+                        ws_elems, dtype=torch.float32, device=q.device
+                    )
                 kwargs["workspace"] = workspace
             if _dw_kv_lens:
                 kwargs["cu_seqlens_kv"] = _paged_kv_cumsum(bounded_seqlen_k)
@@ -1572,6 +1664,8 @@ def _build_paged_light(
     kv_dma: bool = False,
     k_prefetch: bool = False,
     high_concurrency: bool = False,
+    fused_combine: bool = False,
+    pid_regs: bool = False,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1609,6 +1703,8 @@ def _build_paged_light(
         num_kv_splits=num_kv_splits,
         paged_kv_dma=kv_dma,
         paged_k_prefetch=k_prefetch,
+        fused_combine=fused_combine,
+        paged_pid_regs=pid_regs,
     )
 
 
