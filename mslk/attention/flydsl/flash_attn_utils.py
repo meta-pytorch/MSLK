@@ -897,21 +897,37 @@ ASYNC_LDS = os.getenv("FLYDSL_FLASH_ATTN_ASYNC_LDS", "0") == "1"
 COMBINE_PREFETCH = int(os.getenv("FLYDSL_COMBINE_PREFETCH", "8"))
 
 
+def _async_lds():
+    """ASYNC_LDS, on the architecture that has the async copy (CDNA4)."""
+    from flydsl.runtime.device import get_rocm_arch
+
+    return ASYNC_LDS and get_rocm_arch().startswith("gfx950")
+
+
 def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
     """Issue one global->LDS copy, async when enabled (see ASYNC_LDS)."""
-    if ASYNC_LDS:
-        return rocdl.raw_ptr_buffer_load_async_lds(
-            rsrc, lds_ptr, size, voffset, soffset, offset, aux=aux
+    if _async_lds():
+        op = rocdl.raw_ptr_buffer_load_async_lds(
+            as_mlir_value(rsrc),
+            as_mlir_value(lds_ptr),
+            as_mlir_value(fx.Int32(size)),
+            as_mlir_value(fx.Int32(voffset)),
+            as_mlir_value(fx.Int32(soffset)),
+            as_mlir_value(fx.Int32(offset)),
+            aux=ir.IntegerAttr.get(T.i32, int(aux)),
         )
+        # Async copies complete in marks, one per copy.
+        rocdl.asyncmark()
+        return op
     return rocdl.raw_ptr_buffer_load_lds(
         rsrc, lds_ptr, size, voffset, soffset, offset, aux
     )
 
 
 def wait_lds_copies(count=0):
-    """Wait for outstanding global->LDS copies on the right counter."""
-    if ASYNC_LDS:
-        rocdl.s_wait_asynccnt(count)
+    """Wait until at most ``count`` global->LDS copies are outstanding."""
+    if _async_lds():
+        rocdl.wait_asyncmark(count)
     else:
         rocdl.s_waitcnt(count)
 
@@ -1580,6 +1596,8 @@ def _make_flash_attn_generic_traits(
     enable_prefetch_3buf = (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
     )
+    if fused_combine and return_lse:
+        raise ValueError("the fused split-K combine does not produce LSE")
     has_lds_load_b128 = not gpu_arch.startswith("gfx942")
     enable_gfx942_dma = gpu_arch.startswith("gfx942") and (
         os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_GFX942_DMA", "0") == "1"
@@ -7261,11 +7279,15 @@ class GenericFusedSplitKCombine:
         if const_expr(traits.Q_PACK_QLEN > 0 and _q_pack_group(traits) > 0):
             rows = min(rows, traits.Q_PACK_QLEN * _q_pack_group(traits))
         for p in range_constexpr((rows + rows_per_pass - 1) // rows_per_pass):
-            row = ctx.q_start + fx.Index(p * rows_per_pass) + slot
+            local = fx.Index(p * rows_per_pass) + slot
+            row = ctx.q_start + local
+            # Only this tile's rows: a thread past the last full row group, or a
+            # row past the tile, would merge a neighbouring tile's partials.
+            in_tile = (slot < fx.Index(rows_per_pass)) & (local < fx.Index(rows))
 
             @flyc.jit
             def _merge_row_if_valid():
-                if row < seq_len_v:
+                if (row < seq_len_v) & in_tile:
                     self._merge_row(row, col, rsrcs)
 
             _merge_row_if_valid()

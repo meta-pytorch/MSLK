@@ -1172,8 +1172,11 @@ def _count_hp_calls(monkeypatch):
     pin -- so they select it explicitly rather than depending on which
     mechanism happens to win.
     """
+    from flydsl.runtime.device import get_rocm_arch
     from mslk.attention.flydsl.decode import pa_decode_dense
 
+    if not get_rocm_arch().startswith("gfx950"):
+        pytest.skip("the head-packed decode route is gfx950-only")
     monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
     calls = []
     real = pa_decode_dense.pa_decode_paged_launch
@@ -1213,14 +1216,17 @@ def calls_groups(calls):
     return calls[0].get("query_groups", 1)
 
 
-def test_head_packed_matches_dualwave_at_sq1(monkeypatch):
-    """The two kernels must agree; the head-packed one is the faster path."""
+def test_head_packed_matches_generic_at_sq1(monkeypatch):
+    """The head-packed decode kernel must agree with the generic kernel."""
 
+    calls = _count_hp_calls(monkeypatch)
     args = _paged_inputs(2, 1, 32768, 64)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
     ref = _run_single_pass(monkeypatch, *args)
+    assert calls == []
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
+    assert len(calls) == 1
     assert got.shape == ref.shape
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
@@ -1339,19 +1345,22 @@ def test_head_packed_floor_does_not_reject_shallow_tiling(monkeypatch):
 
 
 @pytest.mark.parametrize("Sq,D", [(2, 64), (4, 64), (4, 128)])
-def test_head_packed_matches_dualwave_multi_token(monkeypatch, Sq, D):
-    """Packed (qtok, head) rows must agree with the dualwave path.
+def test_head_packed_matches_generic_multi_token(monkeypatch, Sq, D):
+    """Packed (qtok, head) rows must agree with the generic kernel.
 
     This is the check on the per-query-token causal bound: the kernel applies
     `min(t_end, t_full - Sq + qtok + 1)` itself, so a wrong bound shows up here
     as a mismatch on the earlier query rows only.
     """
 
+    calls = _count_hp_calls(monkeypatch)
     args = _paged_inputs(2, Sq, 32768, D)
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", True)
     ref = _run_single_pass(monkeypatch, *args)
+    assert calls == []
     monkeypatch.setattr(fai, "_DISABLE_PAGED_DECODE_HP", False)
     got = _run(*args, 0)
+    assert len(calls) == 1
     assert got.shape == ref.shape == (2, Sq, H, D)
     torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
@@ -1776,16 +1785,19 @@ def test_head_packed_kill_switch(monkeypatch):
     assert calls == []
 
 
-def test_head_packed_exceeds_dualwave_page_table_cap():
+def test_head_packed_exceeds_dualwave_page_table_cap(monkeypatch):
     """The dualwave path caps at 2048 pages/split (131072 tokens at page 64).
 
     The decode kernel reads the block table straight from memory, so it has no
-    such window -- this context would raise on the old path.
+    such window and runs this context.
     """
+    calls = _count_hp_calls(monkeypatch)
     ctx = 262144
-    out = _run(*_paged_inputs(1, 1, ctx, 64), 0)
-    assert out.shape == (1, 1, H, 64)
-    assert torch.isfinite(out).all()
+    q, k, v, block_table, seqlen_k = _paged_inputs(1, 1, ctx, 64)
+    out = _run(q, k, v, block_table, seqlen_k, 0)
+    assert len(calls) == 1
+    ref = _paged_reference(q, k, v, block_table, seqlen_k, causal=True)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
 
 
 def test_query_grouping_clamps_empty_prefix(monkeypatch):
