@@ -23,8 +23,10 @@ _INSTALL_HINT: str = (
     "Install it with `pip install flydsl`."
 )
 
-# Minimum FlyDSL release the MSLK kernels are written against. Keep in sync
-# with ``ci/flydsl_version.txt`` (the version setup.py pins for OSS installs).
+# Minimum FlyDSL release the MSLK kernels are written against. This is a floor,
+# not the pin: ``ci/flydsl_version.txt`` holds the exact version setup.py pins
+# for OSS installs, which follows aiter's FlyDSL pin and may be newer. Raise
+# this only when the kernels start using APIs from a newer release.
 # Older releases are missing APIs the kernels use (e.g. ``flydsl.expr.Pointer``
 # and ``flydsl.compiler.protocol.extract_to_ir_values``) and fail at compile
 # time rather than at import, so callers must gate on the version explicitly.

@@ -7,6 +7,7 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
+import contextlib
 import os
 import unittest
 from typing import Optional, Union
@@ -15,11 +16,14 @@ import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
+from mslk.aiter.common import is_aiter_available
+from mslk.aiter.routing import force_backend
 from mslk.flydsl.common import (
     flydsl_version,
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
 )
+from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
@@ -28,7 +32,7 @@ from mslk.quantize.triton.fp4_quantize import (
     triton_quantize_mx4_unpack,
     triton_quantize_nvfp4,
 )
-from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
+from mslk.quantize.triton.fp4_utils import dequantize_mx4_unswizzled, global_scale_nvfp4
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -3220,6 +3224,14 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
+# Shapes that f4f4bf16's tuning table routes to aiter on gfx950, so that the
+# op's tests cover aiter's kernel as well as MSLK's.
+_F4F4BF16_AITER_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (1, 7168, 2048),
+    (33, 3072, 1536),
+)
+
+
 @skipUnlessGfxArch("gfx950")
 @skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
@@ -3229,26 +3241,65 @@ class MXFP4Tests(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (1, 256, 2048),  # small
-            (250, 512, 2048),  # medium
-            (250, 1024, 3584),  # large
-            # K not a multiple of the kernels' K tiles (128/256): the K tail
-            # must be masked rather than read past the end of each row.
-            (33, 160, 192),
-            (100, 1024, 2080),
+            (*shape, backend)
+            for shape in (
+                (1, 256, 2048),  # small
+                (250, 512, 2048),  # medium
+                (250, 1024, 3584),  # large
+                (4096, 1024, 2048),  # large M
+                # K not a multiple of the kernels' K tiles (128/256): the K tail
+                # must be masked rather than read past the end of each row.
+                (33, 160, 192),
+                (100, 1024, 2080),
+                *_F4F4BF16_AITER_SHAPES,
+                (1000, 7168, 2048),  # in the tuning table, routed to MSLK
+            )
+            # "default" uses the op's routing on ROCm, which sends the shapes in
+            # its tuning table to aiter or MSLK's kernel; "mslk" forces MSLK's
+            # kernel, the fallback, on every shape.
+            for backend in ("default", "mslk")
         ]
     )
-    def test_gemm(self, M: int, N: int, K: int) -> None:
-        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+    def test_gemm(self, M: int, N: int, K: int, backend: str) -> None:
+        # On ROCm the reference is the product of the dequantized inputs, which
+        # the kernels match up to summation order and BF16 rounding, so the
+        # tolerance is tight; unit-scale inputs keep outputs far above atol at
+        # every K, so a wrong or partial result fails.
+        rocm = torch.version.hip is not None
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device)
+        if not rocm:
+            A, B = A * 0.1, B * 0.01
 
         aq, a_scale = triton_quantize_mx4_unpack(A)
         bq, b_scale = triton_quantize_mx4_unpack(B)
 
-        out_mxfp4 = torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale)
-        out_bf16 = A @ B.t()
+        with (
+            force_backend(F4F4BF16_OP, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            out_mxfp4 = torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale)
 
-        torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
+        if rocm:
+            ref = dequantize_mx4_unswizzled(aq, a_scale) @ (
+                dequantize_mx4_unswizzled(bq, b_scale).T
+            )
+            torch.testing.assert_close(out_mxfp4.float(), ref, atol=1e-2, rtol=1e-2)
+        else:
+            torch.testing.assert_close(out_mxfp4, A @ B.t(), atol=8.0e-2, rtol=8.0e-2)
+        if (
+            backend == "default"
+            and (M, N, K) in _F4F4BF16_AITER_SHAPES
+            and torch.version.hip is not None
+            and is_aiter_available()
+        ):
+            self.assertEqual(
+                F4F4BF16_ROUTING.backend_for(aq, bq, a_scale, b_scale),
+                "aiter",
+                "the tuning table no longer routes this shape to aiter; replace "
+                "it in _F4F4BF16_AITER_SHAPES with one it does",
+            )
 
     @parameterized.expand(
         [
