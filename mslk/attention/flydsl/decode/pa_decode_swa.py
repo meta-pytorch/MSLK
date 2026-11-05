@@ -19,7 +19,7 @@ pos = seqlen_kv - seqlen_q + i, matching the generic paged kernel.
 from __future__ import annotations
 
 import functools
-from typing import Any
+from typing import Any, Optional
 
 import flydsl.compiler as flyc  # pyre-ignore[21]
 import flydsl.expr as fx  # pyre-ignore[21]
@@ -196,6 +196,7 @@ def compile_pa_decode_swa(
         stride_km: fx.Int32,  # token stride within a page
         stride_kh: fx.Int32,
         stride_btb: fx.Int32,
+        kv_bound: fx.Int32,
         window_left: fx.Int32,
         softmax_scale: fx.Float32,
         ws_ptr: fx.Tensor,
@@ -228,7 +229,9 @@ def compile_pa_decode_swa(
         bt_rsrc = buffer_ops.create_buffer_resource(bt_ptr, max_size=False)
 
         seq_len = buffer_ops.buffer_load(seq_rsrc, b_idx, vec_width=1, dtype=T.i32)
+        # A negative length attends to nothing; none reaches past kv_bound.
         t_full = fx.Int32(arith.select(seq_len > fx.Int32(0), seq_len, fx.Int32(0)))
+        t_full = fx.Int32(arith.select(t_full < kv_bound, t_full, kv_bound))
         # Keys any row of this CTA can see: from the first row's window start
         # (aligned down to a tile) to the end of the sequence.
         lo = t_full - fx.Int32(_SQ - 1) - window_left
@@ -929,6 +932,7 @@ def _make_swa_launcher(
         stride_km,
         stride_kh,
         stride_btb,
+        kv_bound,
         window_left,
         scale,
         ws_ptr,
@@ -950,6 +954,7 @@ def _make_swa_launcher(
             stride_km,
             stride_kh,
             stride_btb,
+            kv_bound,
             window_left,
             scale,
             ws_ptr,
@@ -964,6 +969,12 @@ def _make_swa_launcher(
     return _launcher
 
 
+def kv_span_elems(t: torch.Tensor) -> int:
+    """Elements addressed from t's base pointer, so a strided view of a larger
+    cache counts everything it can reach."""
+    return 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
+
+
 def pa_decode_swa_supported(
     *,
     head_dim: int,
@@ -976,9 +987,11 @@ def pa_decode_swa_supported(
     kv_capacity: int = 0,
     num_waves: int = 1,
     num_splits: int = 1,
+    kv_span: int = 0,
 ) -> bool:
     """Shapes pa_decode_swa_launch handles. Full attention (window_left < 0)
-    needs kv_capacity, the most keys a request can hold."""
+    needs kv_capacity, the most keys a request can hold. kv_span is the larger
+    of kv_span_elems(k) and kv_span_elems(v): KV offsets are 32-bit."""
     ratio = num_heads // num_kv_heads if num_kv_heads else 0
     if not (ratio and num_heads % num_kv_heads == 0 and MFMA_M % ratio == 0):
         return False
@@ -998,6 +1011,9 @@ def pa_decode_swa_supported(
         and dtype in (torch.float16, torch.bfloat16)
         and head_dim in (64, 128)
         and keys > 0
+        and num_waves >= 1
+        and num_splits >= 1
+        and kv_span < 2**31
         and page_size % TILE_N == 0
         and pages <= WARP_SIZE
         and -(-seqlen_q // t_pack) <= 2
@@ -1015,17 +1031,22 @@ def pa_decode_swa_launch(
     out: torch.Tensor,
     num_waves: int = 8,
     num_splits: int = 1,
+    max_seqlen_kv: Optional[int] = None,
 ) -> torch.Tensor:
     """Sliding-window (or, with window_left < 0, full) paged decode. q/out are
     [B, Sq, H_q, D]; k/v are [num_pages, page_size, H_kv, D]; block_table is
-    [B, pages] int32. Splits are merged by the last CTA to finish, or by a
-    reduce kernel past _MAX_INKERNEL_SPLITS."""
+    [B, pages] int32 and seqlen_k [B] int32, each length clamped to [0,
+    max_seqlen_kv] (default: the block table's capacity). Splits are merged
+    by the last CTA to finish, or by a reduce kernel past
+    _MAX_INKERNEL_SPLITS."""
     from mslk.flydsl.jit import run_compiled
 
     B, Sq, H_q, D = q.shape
     _, page_size, H_kv, _ = k.shape
-    assert k.numel() < 2**31 and v.numel() < 2**31, "32-bit KV offsets"
-    assert out.stride() == q.stride()
+    if max(kv_span_elems(k), kv_span_elems(v)) >= 2**31:
+        raise ValueError("pa_decode_swa_launch: KV cache exceeds 32-bit offsets")
+    if out.stride() != q.stride():
+        raise ValueError("pa_decode_swa_launch: out must have q's strides")
     kv_str = {torch.float16: "f16", torch.bfloat16: "bf16"}[k.dtype]
     merge_kernel = num_splits > _MAX_INKERNEL_SPLITS
     launcher = _make_swa_launcher(
@@ -1067,6 +1088,9 @@ def pa_decode_swa_launch(
         ks[1],
         ks[2],
         block_table.stride(0),
+        int(max_seqlen_kv)
+        if max_seqlen_kv is not None
+        else block_table.shape[1] * page_size,
         int(window_left) if window_left >= 0 else 1 << 30,
         float(softmax_scale),
         ws,

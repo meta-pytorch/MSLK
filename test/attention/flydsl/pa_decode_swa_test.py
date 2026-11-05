@@ -11,7 +11,7 @@ import pytest
 import torch
 from mslk.attention.flydsl import flydsl_flash_attn_func
 from mslk.flydsl.common import is_flydsl_available
-from paged_reference import paged_reference, spy
+from paged_reference import paged_reference, run_on_busy_side_stream, spy
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_flydsl_available(),
@@ -130,18 +130,8 @@ def test_paged_decode_launches_on_the_given_stream(monkeypatch, route):
 
     ref = run()  # also compiles, so the timed call below only launches
     torch.cuda.synchronize()
-    side = torch.cuda.Stream()
-    torch.cuda._sleep(1 << 31)  # hold the current stream busy
-    got = run(stream=side)
-    with torch.cuda.stream(side):
-        # Copied on ``side`` right behind the launch: a kernel queued on the
-        # busy current stream instead has not run yet.
-        snapshot = got.clone()
-    side.synchronize()
-    still_busy = not torch.cuda.current_stream().query()
-    torch.cuda.synchronize()
-    assert still_busy, "the current stream finished first; the test proves nothing"
-    torch.testing.assert_close(snapshot, ref, atol=0, rtol=0)
+    got = run_on_busy_side_stream(lambda side: run(stream=side))
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("window_left", [2047, -1])
@@ -178,3 +168,58 @@ def test_paged_decode_ignores_block_table_padding(window_left):
     ref = paged_reference(q, k, v, block_table, seqlen_k, True, window_left)
     err = (out.float() - ref).abs().max().item()
     assert err < 2e-2 * max(1.0, ref.abs().max().item()), err
+
+
+@pytest.mark.parametrize(
+    "B,ctx,window_left",
+    [
+        (16, 4096, 2047),  # windowed, in-kernel merge
+        (4, 4096, 2047),  # windowed, reduce-kernel merge
+        (1, 32768, -1),  # full attention, reduce-kernel merge
+    ],
+)
+def test_pa_decode_swa_cuda_graph_replays_new_lengths(monkeypatch, B, ctx, window_left):
+    """A captured split decode replays correctly with new per-request lengths:
+    the split merge must not keep state from the capture or an earlier replay."""
+    if not _gfx950():
+        pytest.skip("pa_decode_swa is gfx950-only")
+    from mslk.attention.flydsl.decode import pa_decode_swa as mod
+
+    used = spy(monkeypatch, mod, "pa_decode_swa_launch")
+    torch.manual_seed(0)
+    D, pages = 128, ctx // PAGE
+    q = torch.randn(B, 1, H, D, device="cuda", dtype=torch.bfloat16) * 4
+    k = torch.randn(B * pages, PAGE, HKV, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    block_table = torch.randperm(B * pages, device="cuda", dtype=torch.int32).view(
+        B, pages
+    )
+    seqlen_k = torch.full((B,), ctx, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    def step():
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            num_kv_heads=HKV,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            kv_cache_layout="linear",
+            max_seqlen_kv=ctx,
+            window_left=window_left,
+            out=out,
+        )
+
+    step()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    assert used and used[-1]["num_splits"] > 1
+    for lengths in ([ctx // 2 + 7] * B, [max(1, ctx - 33 * b) for b in range(B)]):
+        seqlen_k.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = paged_reference(q, k, v, block_table, seqlen_k, True, window_left)
+        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)

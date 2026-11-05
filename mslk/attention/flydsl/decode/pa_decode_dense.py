@@ -226,11 +226,7 @@ def pa_decode_paged_launch(
                 q[:, g * span : (g + 1) * span],
                 k_cache,
                 v_cache,
-                (
-                    None
-                    if seqlen_k is None
-                    else (seqlen_k - (Sq - (g + 1) * span)).clamp_min(0)
-                ),
+                None if seqlen_k is None else seqlen_k - (Sq - (g + 1) * span),
                 softmax_scale,
                 split_k,
                 output_dtype,
