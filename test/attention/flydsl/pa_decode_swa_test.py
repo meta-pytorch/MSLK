@@ -11,6 +11,7 @@ import pytest
 import torch
 from mslk.attention.flydsl import flydsl_flash_attn_func
 from mslk.flydsl.common import is_flydsl_available
+from paged_reference import paged_reference, spy
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_flydsl_available(),
@@ -25,28 +26,6 @@ def _gfx950() -> bool:
     from flydsl.runtime.device import get_rocm_arch
 
     return get_rocm_arch().startswith("gfx950")
-
-
-def _reference(q, k, v, block_table, seqlen_k, window_left):
-    B, Sq, _, D = q.shape
-    g = H // HKV
-    out = torch.zeros(B, Sq, H, D, device=q.device)
-    for b in range(B):
-        n = int(seqlen_k[b])
-        pages = -(-n // PAGE)
-        kk = k[block_table[b, :pages].long()].reshape(-1, HKV, D)[:n].float()
-        vv = v[block_table[b, :pages].long()].reshape(-1, HKV, D)[:n].float()
-        kk = kk.repeat_interleave(g, dim=1)
-        vv = vv.repeat_interleave(g, dim=1)
-        pos = torch.arange(n, device=q.device)
-        qpos = n - Sq + torch.arange(Sq, device=q.device)
-        mask = pos[None, :] <= qpos[:, None]
-        if window_left >= 0:
-            mask &= pos[None, :] >= qpos[:, None] - window_left
-        s = torch.einsum("lhd,khd->hlk", q[b].float(), kk) / D**0.5
-        s = s.masked_fill(~mask[None], float("-inf"))
-        out[b] = torch.einsum("hlk,khd->lhd", s.softmax(-1), vv)
-    return out
 
 
 @pytest.mark.parametrize(
@@ -67,13 +46,7 @@ def test_pa_decode_swa_routes(monkeypatch, B, Sq, D, ctx, window_left):
         pytest.skip("pa_decode_swa is gfx950-only")
     from mslk.attention.flydsl.decode import pa_decode_swa as mod
 
-    used = []
-    real = mod.pa_decode_swa_launch
-    monkeypatch.setattr(
-        mod,
-        "pa_decode_swa_launch",
-        lambda *a, **kw: (used.append(kw), real(*a, **kw))[1],
-    )
+    used = spy(monkeypatch, mod, "pa_decode_swa_launch")
     torch.manual_seed(0)
     pages = ctx // PAGE
     # A peaky softmax, so a key read from the wrong page changes the output.
@@ -107,7 +80,7 @@ def test_pa_decode_swa_routes(monkeypatch, B, Sq, D, ctx, window_left):
 
     out = run().clone()
     assert used, "expected the pa_decode_swa route"
-    ref = _reference(q, k, v, block_table, seqlen_k, window_left)
+    ref = paged_reference(q, k, v, block_table, seqlen_k, True, window_left)
     err = (out.float().reshape(ref.shape) - ref).abs().max().item()
     assert err < 2e-2 * max(1.0, ref.abs().max().item()), err
     # Split merges reset their arrival counters: a second call matches.
@@ -124,7 +97,7 @@ def test_paged_decode_launches_on_the_given_stream(monkeypatch, route):
     from mslk.attention.flydsl import flash_attn_interface as fai
 
     if route != "pa_decode_swa":
-        monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", "0")
+        monkeypatch.setattr(fai, "_PAGED_SWA_KERNEL", False)
     if route == "head_packed":
         monkeypatch.setattr(fai, "_PAGED_GQA_PACK", False)
     if route == "generic":
@@ -202,6 +175,6 @@ def test_paged_decode_ignores_block_table_padding(window_left):
         max_seqlen_kv=ctx,
         window_left=window_left,
     )
-    ref = _reference(q, k, v, block_table, seqlen_k, window_left)
+    ref = paged_reference(q, k, v, block_table, seqlen_k, True, window_left)
     err = (out.float() - ref).abs().max().item()
     assert err < 2e-2 * max(1.0, ref.abs().max().item()), err

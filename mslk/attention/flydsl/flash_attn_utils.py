@@ -35,6 +35,13 @@ from flydsl.utils.smem_allocator import SmemPtr
 from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
+from .split_arrival import (
+    ARRIVAL_COUNTERS,
+    arrive,
+    counter_ptr,
+    CPOL_SC1,
+    reset_counter,
+)
 
 _LOG2E = host_math.log2(host_math.e)
 # s_waitcnt bitfield encoding
@@ -893,6 +900,8 @@ def _vec_v_src_elem(traits, d, wave_id_uni, lane_in_warp, kv_head_idx):
 # the vmcnt-tracked `buffer_load ... lds`. Same operands, different completion
 # counter, so the swap is mechanical; opt-in until it is proven on this kernel.
 ASYNC_LDS = os.getenv("FLYDSL_FLASH_ATTN_ASYNC_LDS", "0") == "1"
+# Head dim from which wave split-K pays at any concurrency.
+WAVE_SPLITK_MIN_D = 128
 # Split-K combine: O-partial loads issued per chunk before being consumed.
 COMBINE_PREFETCH = int(os.getenv("FLYDSL_COMBINE_PREFETCH", "8"))
 
@@ -1617,15 +1626,7 @@ def _make_flash_attn_generic_traits(
             and kv_cache_layout == "linear"
             and not gappy_kv
         )
-        # FLYDSL_PAGED_KV_DMA=0/1 overrides the caller's choice.
-        forced = os.getenv("FLYDSL_PAGED_KV_DMA", "")
-        want = forced == "1" if forced in ("0", "1") else (enable_dma or paged_kv_dma)
-        enable_dma = paged_dma_ok and want
-    # FLYDSL_PAGED_K_PREFETCH=0/1 overrides the caller's choice.
-    forced_pf = os.getenv("FLYDSL_PAGED_K_PREFETCH", "")
-    if forced_pf in ("0", "1"):
-        paged_k_prefetch = forced_pf == "1"
-    paged_k_prefetch = paged and paged_k_prefetch and not enable_dma
+        enable_dma = paged_dma_ok and (enable_dma or paged_kv_dma)
     enable_gfx942_kv_gpfetch = (
         gpu_arch.startswith("gfx942")
         and not enable_prefetch_3buf
@@ -1641,13 +1642,12 @@ def _make_flash_attn_generic_traits(
     #
     # Limited to packed-GQA decode over a full (unwindowed) context. The merge
     # costs two barriers and an LDS round trip per workgroup, and below
-    # FLYDSL_WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
+    # WAVE_SPLITK_MIN_D there is not enough MFMA per tile to absorb it
     # outright -- there it only pays at high concurrency. Whether a given call
     # clears that bar turns on batch, which this builder cannot see:
     # num_kv_splits does not stand in for it, because the batches that win and
     # the batches that lose share a split count. The caller resolves it and
     # passes the answer as `high_concurrency`.
-    _wsk_min_d = int(os.getenv("FLYDSL_WAVE_SPLITK_MIN_D", "128"))
     enable_wave_splitk = (
         int(num_kv_splits) > 1
         and q_pack_group > 0
@@ -1657,11 +1657,12 @@ def _make_flash_attn_generic_traits(
         # tile exactly; a single-wave (narrow) tile would drop half its keys.
         and num_waves * k_sub_n == block_n
         and window_left < 0
-        and (head_dim >= _wsk_min_d or high_concurrency)
+        and (head_dim >= WAVE_SPLITK_MIN_D or high_concurrency)
         and not enable_gfx942_kv_gpfetch
         and not enable_dma
-        and os.getenv("FLYDSL_FLASH_ATTN_FUNC_WAVE_SPLITK", "1") == "1"
     )
+    # Bias and dropout gather both column halves; paged inputs reject them.
+    assert not (enable_wave_splitk and (has_bias or has_dropout))
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")
         and enable_dma
@@ -1744,6 +1745,19 @@ def _make_flash_attn_generic_traits(
         assert block_n % rows_per_batch_load == 0
         num_batches_kv = block_n // rows_per_batch_load
         kv_needs_guard = False
+    # The next K tile is loaded into registers during the softmax and lands in
+    # the single LDS K buffer, so only the plain single-buffer K path takes it.
+    paged_k_prefetch = (
+        paged
+        and paged_k_prefetch
+        and not gappy_kv
+        and not kv_needs_guard
+        and not kv_vectorized
+        and not enable_dma
+        and not enable_prefetch_3buf
+        and not enable_gfx942_kv_gpfetch
+        and n_subtiles == 1
+    )
 
     v_perm_tr_env = os.getenv("FLYDSL_FLASH_ATTN_FUNC_V_PERM_TR", "1") == "1"
     v_perm_tr = (
@@ -2578,9 +2592,7 @@ class GenericFlashAttnContext:
                 # Fused split-K: the arrival counters lead the workspace and the
                 # partials follow them (see GenericFusedSplitKCombine).
                 self.ws_counter_base_i64 = self.ws_base_i64
-                self.ws_base_i64 = self.ws_base_i64 + fx.Int64(
-                    FUSED_COMBINE_COUNTERS * 4
-                )
+                self.ws_base_i64 = self.ws_base_i64 + fx.Int64(ARRIVAL_COUNTERS * 4)
             self.ws_opart_per_split_elems = (
                 fx.Index(traits.NUM_HEADS_Q)
                 * self.seq_len_v
@@ -2983,6 +2995,13 @@ class GenericPageIdLoader:
             return fx.Index(fx.Int32(self._pid_from_regs(tile_start)))
         return self.consume_page_id(self.issue_page_id(tile_start))
 
+    def clamped_page_id(self, tile_start):
+        """page_id, kept within the block-table row for tiles past the end."""
+        if const_expr(self.ctx.traits.PAGED_PID_REGS):
+            # The preload is clamped already.
+            return self.page_id(tile_start)
+        return self._bt_load(tile_start // fx.Index(self.ctx.traits.PAGE_SIZE))
+
     def _bt_load(self, tile_idx):
         # Load block_table[batch, tile_idx], clamped to the row width so prefetch /
         # tail tiles that index past a sequence's pages stay in a valid page (those
@@ -3101,6 +3120,13 @@ class GenericKvGmemToLdsLoader:
             return self.page_ids.gappy_tile_pages(self.ctx.kv_seq_start + tile_start)
         return self.page_ids.page_id(tile_start)
 
+    def _kv_row_idx(self, pid, tile_start, row_in_tile):
+        """KV row of `row_in_tile` in the tile at `tile_start` (`pid` is its
+        page id, or None when not paged)."""
+        if const_expr(self.ctx.traits.PAGED):
+            return self._paged_row_idx(pid, tile_start, row_in_tile)
+        return self.row_clamp(tile_start + row_in_tile)
+
     def _paged_row_idx(self, pid, tile_start, row_total):
         # Physical KV row for a paged load. Normal paged: row_idx = pid*PAGE_SIZE +
         # row. Gappy paged: resolve the row's page from the cached 2-page tile window.
@@ -3123,10 +3149,7 @@ class GenericKvGmemToLdsLoader:
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
-            else:
-                row_idx = self.row_clamp(tile_start + row + row_offset)
+            row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
                     g_idx = self.global_idx(row_idx, col)
@@ -3169,14 +3192,9 @@ class GenericKvGmemToLdsLoader:
             pid = self._tile_page_id(tile_start)
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(
-                    pid, tile_start, ctx.load_row_in_batch + row_offset
-                )
-            else:
-                row_idx = self.row_clamp(
-                    tile_start + ctx.load_row_in_batch + row_offset
-                )
+            row_idx = self._kv_row_idx(
+                pid, tile_start, ctx.load_row_in_batch + row_offset
+            )
             vecs.append(
                 self.load_f16xN(ctx.k_ptr, self.global_idx(row_idx, ctx.load_col_base))
             )
@@ -3226,14 +3244,10 @@ class GenericKvGmemToLdsLoader:
         row = ctx.load_row_in_batch
         col = ctx.load_col_base
         v_base = self.v_buf_base(buf_id)
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
+        pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, row + row_offset)
-            else:
-                row_idx = self.row_clamp(tile_start + row + row_offset)
+            row_idx = self._kv_row_idx(pid, tile_start, row + row_offset)
             if const_expr(traits.KV_NEEDS_GUARD):
                 if row < fx.Index(traits.BLOCK_N):
                     g_idx = self.global_idx(row_idx, col)
@@ -3278,14 +3292,9 @@ class GenericKvGmemToLdsLoader:
         vecs = []
         for batch in range_constexpr(traits.NUM_BATCHES_KV):
             row_offset = batch * traits.ROWS_PER_BATCH_LOAD
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(
-                    pid, tile_start, ctx.load_row_in_batch + row_offset
-                )
-            else:
-                row_idx = self.row_clamp(
-                    tile_start + ctx.load_row_in_batch + row_offset
-                )
+            row_idx = self._kv_row_idx(
+                pid, tile_start, ctx.load_row_in_batch + row_offset
+            )
             vecs.append(
                 self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.load_col_base))
             )
@@ -3325,13 +3334,9 @@ class GenericKvGmemToLdsLoader:
         ctx = self.ctx
         traits = ctx.traits
         vecs = []
-        if const_expr(traits.PAGED):
-            pid = self._tile_page_id(tile_start)
+        pid = self._tile_page_id(tile_start) if traits.PAGED else None
         for r in range_constexpr(ctx.vp_rows_per_thread):
-            if const_expr(traits.PAGED):
-                row_idx = self._paged_row_idx(pid, tile_start, ctx.vp_row_base + r)
-            else:
-                row_idx = self.row_clamp(tile_start + ctx.vp_row_base + r)
+            row_idx = self._kv_row_idx(pid, tile_start, ctx.vp_row_base + r)
             vecs.append(
                 self.load_f16xN(ctx.v_ptr, self.global_idx(row_idx, ctx.vp_col_base))
             )
@@ -3501,7 +3506,7 @@ class GenericKvGmemToLdsLoader:
         if const_expr(paged_base is not None):
             # One tile is one page. Clamped: an empty split's prologue reads past
             # the last page.
-            pid = self.page_ids._bt_load(tile_start // fx.Index(traits.PAGE_SIZE))
+            pid = self.page_ids.clamped_page_id(tile_start)
             rsrc = buffer_ops.create_buffer_resource_from_addr(
                 as_mlir_value(paged_base + fx.Int64(pid) * self._dma_page_bytes),
                 num_records_bytes=as_mlir_value(self._dma_page_bytes),
@@ -3911,8 +3916,7 @@ class GenericSoftmaxHelper:
         # QK*scale + bias; -inf propagates.
         ctx = self.ctx
         traits = ctx.traits
-        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
-        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
+        col_base_i32, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
         # The bounded plane resource (init_bias) zero-fills OOB rows (q_row>=Sq) in
         # hardware, so no index clamp is needed; a within-row kv overrun reads a
         # neighboring in-bounds value that is masked to -inf afterward.
@@ -3925,12 +3929,9 @@ class GenericSoftmaxHelper:
             off_lo = (row_base_i32 + kv_col) * eb
             b_lo = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_lo)
             s_raw_lo[r] = _fadd(s_raw_lo[r], _fmul(b_lo, inv, ctx.fm_fast), ctx.fm_fast)
-            if const_expr(not half_only):
-                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-                b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
-                s_raw_hi[r] = _fadd(
-                    s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast
-                )
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            b_hi = _bf16_buffer_load_f32(ctx, ctx.bias_rsrc, off_hi)
+            s_raw_hi[r] = _fadd(s_raw_hi[r], _fmul(b_hi, inv, ctx.fm_fast), ctx.fm_fast)
         return s_raw_lo, s_raw_hi
 
     def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
@@ -3939,8 +3940,7 @@ class GenericSoftmaxHelper:
         # after online_softmax. The 1/(1-p) scale is applied to the output.
         ctx = self.ctx
         traits = ctx.traits
-        half_only = const_expr(traits.ENABLE_WAVE_SPLITK)
-        col_base_i32, moff = self._kv_mask_lane_off(self._half_kv_start(kv_start))
+        col_base_i32, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
         # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
         # lanes are already zero post-softmax, so no index clamp is needed.
         row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
@@ -3953,10 +3953,9 @@ class GenericSoftmaxHelper:
             # caller (constant factor, so it factors out of the per-(q,k) sum).
             m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
             p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
-            if const_expr(not half_only):
-                off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-                m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
-                p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
+            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
+            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
+            p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
         return p_vals_lo, p_vals_hi
 
     def apply_kv_mask(self, s_raw_lo, s_raw_hi, kv_start):
@@ -7181,27 +7180,76 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         _ws_store_f32(lse_val, store_idx, lse_rsrc)
 
 
-# Arrival counters at the head of a fused split-K workspace; bounds grid.x.
-FUSED_COMBINE_COUNTERS = 1 << 16
-# gfx94x/gfx950 SC1 cache-policy bit: an agent-scope coherent access. Stores
-# write through the per-XCD L2 and loads do not hit a stale L2 line, so the
-# fused split-K hands partials across XCDs without agent-scope fences (which
-# would write back / invalidate the whole L2 per workgroup).
-_CPOL_SC1 = 16
+def run_splitk_combine(
+    traits,
+    O,  # noqa: E741
+    workspace,
+    LSE,
+    batch_size,
+    seq_len,
+    stride_q_n,
+    rows_per_block,
+    lanes_per_row,
+    packed_rows=0,
+):
+    """Body of a split-K combine kernel: merge each row's split partials into O
+    (and the LSE when the build returns it).
+
+    ``packed_rows`` > 0 fixes the per-head row count at build time (packed GQA
+    rows are q_len * group), turning the row decode into constant divisions.
+    """
+    ctx = DualwaveSplitKCombineContext(
+        traits, O, workspace, batch_size, seq_len, stride_q_n, LSE=LSE
+    )
+    ctx.init_types_and_constants()
+    ctx.init_runtime_indices()
+    if const_expr(packed_rows > 0):
+        ctx.seq_len_v = fx.Index(packed_rows)
+    ctx.init_thread_mapping(rows_per_block, lanes_per_row)
+    # A ceil-div grid spawns rows past the last (batch, head, seq) row. Clamp
+    # them into range so the workspace/O descriptors stay in bounds, then drop
+    # their stores (the real owner of the clamped row writes it).
+    total_rows = fx.Index(batch_size) * fx.Index(traits.NUM_HEADS_Q) * ctx.seq_len_v
+    ctx.row_in_bounds = ctx.row < total_rows
+    ctx.row = ctx.row_in_bounds.select(ctx.row, fx.Index(0))
+    heads_per_batch = ctx.seq_len_v * traits.NUM_HEADS_Q
+    ctx.batch_idx = ctx.row // heads_per_batch
+    rem = ctx.row % heads_per_batch
+    ctx.q_head_idx = rem // ctx.seq_len_v
+    ctx.seq_idx = rem % ctx.seq_len_v
+    ctx.init_workspace()
+    ctx.init_descriptors()
+
+    combine = DualwaveSplitKCombineHelper(ctx)
+    # Each split group reduces its own share against its own max, then the
+    # groups are merged across the wave.
+    m_max = combine.reduce_m_max()
+    m_max = combine.merge_m_max(m_max)
+    acc, den = combine.accumulate_splits(m_max)
+    den, acc = combine.merge_split_groups(den, acc)
+    o_pack = combine.pack_output(acc, den)
+
+    # Every split group holds the merged result; one of them stores it.
+    def _store():
+        combine.store_output(o_pack)
+        if const_expr(traits.RETURN_LSE):
+            combine.store_lse(m_max, den)
+
+    scf_if_dispatch(ctx.row_in_bounds & (ctx.sgrp == fx.Index(0)), _store)
 
 
 def _splitk_store_cpol(traits):
     """Cache policy for split-K partial stores (agent-coherent when fused)."""
-    return _CPOL_SC1 if traits.FUSED_COMBINE else 0
+    return CPOL_SC1 if traits.FUSED_COMBINE else 0
 
 
 class GenericFusedSplitKCombine:
     """Split-K merge done inside the attention kernel by the last split to finish.
 
     Every split publishes its partial and counts itself in on a per-tile counter
-    at the head of the workspace; the split that completes the count merges all
-    partials in split order (deterministic, one online log-sum-exp pass), writes
-    O and resets the counter to zero for the next call.
+    at the head of the workspace (see split_arrival); the split that completes
+    the count merges all partials in split order (deterministic, one online
+    log-sum-exp pass) and writes O.
     """
 
     # Splits whose loads are issued together before being consumed.
@@ -7210,51 +7258,19 @@ class GenericFusedSplitKCombine:
     def __init__(self, ctx):
         self.ctx = ctx
 
-    def _counter_ptr(self):
-        ctx = self.ctx
-        addr = ctx.ws_counter_base_i64 + fx.Int64(ctx.block_id * fx.Index(4))
-        return buffer_ops.create_llvm_ptr(addr, address_space=1)
-
     def run(self):
         ctx = self.ctx
-        traits = ctx.traits
-        counter_ptr = self._counter_ptr()
+        counter = counter_ptr(ctx.ws_counter_base_i64, ctx.block_id)
+        leader = ctx.tid == fx.Index(0)
         # The KV tiles are consumed, so the start of their LDS can carry the flag.
-        flag_ptr = buffer_ops.create_llvm_ptr(
-            fx.Int64(ctx.lds_kv_offset), address_space=3
-        )
-        # The partials were stored agent-coherent (SC1); once every thread's
-        # stores have completed, the split may count itself in.
-        rocdl.s_waitcnt(0)
-        gpu.barrier()
-        tid = ctx.tid
-
-        @flyc.jit
-        def _arrive():
-            if tid == fx.Index(0):
-                old = fx.llvm.atomic_add(
-                    counter_ptr,
-                    fx.Int32(1),
-                    syncscope=rocdl.SyncScope.Agent,
-                    ordering=fx.AtomicOrdering.Monotonic,
-                )
-                last = (fx.Int32(old) == fx.Int32(traits.NUM_KV_SPLITS - 1)).select(
-                    fx.Int32(1), fx.Int32(0)
-                )
-                llvm.StoreOp(as_mlir_value(last), flag_ptr)
-
-        _arrive()
-        gpu.barrier()
-        is_last = fx.Int32(
-            rocdl.readfirstlane(T.i32, llvm.LoadOp(T.i32, flag_ptr).result)
-        )
+        is_last = arrive(counter, ctx.lds_kv_offset, leader, ctx.traits.NUM_KV_SPLITS)
 
         @flyc.jit
         def _merge_if_last():
             if is_last != fx.Int32(0):
                 self._merge()
-                if tid == fx.Index(0):
-                    llvm.StoreOp(as_mlir_value(fx.Int32(0)), counter_ptr)
+                if leader:
+                    reset_counter(counter)
 
         _merge_if_last()
 
@@ -7326,21 +7342,21 @@ class GenericFusedSplitKCombine:
                     ml_idx,
                     vec_width=1,
                     dtype=T.f32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 l_i = buffer_ops.buffer_load(
                     lrow_rsrc,
                     ml_idx,
                     vec_width=1,
                     dtype=T.f32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 o_raw = buffer_ops.buffer_load(
                     opart_rsrc,
                     as_mlir_value(fx.Int32(z * ctx.ws_opart_per_split_elems + local_o)),
                     vec_width=n // 2,
                     dtype=T.i32,
-                    cache_modifier=_CPOL_SC1,
+                    cache_modifier=CPOL_SC1,
                 )
                 loaded.append((m_i, l_i, o_raw))
             for m_i, l_i, o_raw in loaded:
