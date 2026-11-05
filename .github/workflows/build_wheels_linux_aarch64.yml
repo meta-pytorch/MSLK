@@ -18,9 +18,14 @@ on:
     schedule:
       - cron: 30 12 * * *
     workflow_dispatch:
+      inputs:
+        publish:
+          description: Upload wheels from the selected branch to the nightly index
+          type: boolean
+          default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -28,6 +33,20 @@ permissions:
   contents: read
 
 jobs:
+  source-commit:
+    if: ${{ github.repository_owner == 'meta-pytorch' }}
+    runs-on: ubuntu-latest
+    steps:
+    - name: Record source commit
+      env:
+        PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+      run: |
+        {
+          echo "### Source commit"
+          echo "[\`${GITHUB_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})"
+          echo "ref \`${GITHUB_REF_NAME}\`, event \`${GITHUB_EVENT_NAME}\`, publish \`${PUBLISH}\`"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
   generate-matrix:
     if: ${{ github.repository_owner == 'meta-pytorch' }}
     uses: pytorch/test-infra/.github/workflows/generate_binary_build_matrix.yml@main
@@ -51,6 +70,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: meta-pytorch/MSLK
+        ref: ${{ github.sha }}
     - name: Filter Generated Built Matrix
       id: filter
       env:
@@ -82,7 +102,7 @@ jobs:
     uses: pytorch/test-infra/.github/workflows/build_wheels_linux.yml@main
     with:
       repository: ${{ matrix.repository }}
-      ref: ${{ github.event_name == 'schedule' && 'nightly' || '' }}
+      ref: ${{ github.sha }}
       test-infra-repository: pytorch/test-infra
       test-infra-ref: main
       build-matrix: ${{ needs.filter-matrix.outputs.matrix }}
@@ -92,7 +112,7 @@ jobs:
       build-target: default
       env-var-script: ${{ matrix.env-var-script }}
       smoke-test-script: ${{ matrix.smoke-test-script }}
-      trigger-event: ${{ github.event_name }}
+      trigger-event: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish) && 'schedule' || github.event_name }}
       architecture: aarch64
       setup-miniconda: false
       timeout: 210
