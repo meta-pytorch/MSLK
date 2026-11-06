@@ -486,3 +486,323 @@ def test_backward_flydsl_block_diagonal_causal_local_and_unwindowed(head_dim):
                 atol=fmha.flydsl.BwOp.ERROR_ATOL[dtype],
                 rtol=fmha.flydsl.BwOp.ERROR_RTOL[dtype],
             )
+
+
+@cuda_or_mtia_only
+def test_dispatch_bw_falls_back_to_flydsl_on_arch_ck_is_not_built_for(monkeypatch):
+    if not torch.version.hip:
+        pytest.skip("ROCm dispatch list")
+    if not fmha.flydsl._is_flydsl_available():
+        pytest.skip("FlyDSL unavailable on this device/arch")
+    from mslk.attention.fmha.dispatch import _dispatch_bw
+
+    device = torch._C._get_accelerator().type
+    query, key, value, attn_bias = create_tensors(
+        *(fmha.flydsl.BwOp, device, torch.bfloat16, type(None), 1, 128, 128, 4, 64, 64),
+        attn_bias_requires_grad=False,
+        fmt="BMHK",
+    )
+    inp = fmha.Inputs(query, key, value, attn_bias)
+
+    # An arch outside CK's build set makes it decline, so the next op is chosen.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", {"gfx_not_this_one"})
+    reasons = fmha.ck.BwOp.not_supported_reasons(inp)
+    assert any("gfx arch" in r for r in reasons), reasons
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.flydsl.BwOp
+
+    # With the real arch set on CK, CK stays preferred wherever it is built.
+    monkeypatch.setattr(fmha.ck.BwOp, "SUPPORTED_GFX_ARCHS", None)
+    assert _dispatch_bw(inp, varlen_lse_packed=None) is fmha.ck.BwOp
+
+
+def _assert_grad_close(got, ref, msg, rel_tol=3e-2):
+    """Max error relative to the reference's largest entry. The harness's
+    absolute tolerances are loose enough to hide O(10%) gradient errors."""
+    assert got.shape == ref.shape, f"{msg}: shape {got.shape} != {ref.shape}"
+    rel = (got.float() - ref.float()).abs().max() / ref.float().abs().max()
+    assert rel < rel_tol, f"{msg}: max relative error {rel.item():.3e} >= {rel_tol}"
+
+
+def _flydsl_bwd_case(head_dim, make_inputs, make_grad_loss, dtype=torch.bfloat16):
+    """Runs flydsl.FwOp/BwOp against the reference for inputs `make_inputs`
+    builds as (leaf tensors, q, k, v) and a loss built by `make_grad_loss`."""
+    device = torch._C._get_accelerator().type
+    torch.manual_seed(0)
+    leaves, query, key, value = make_inputs(device, dtype, head_dim)
+    out = fmha.memory_efficient_attention(
+        query, key, value, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    make_grad_loss(out).backward()
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+
+    out_ref = ref_attention_for_test(query, key, value, None)
+    make_grad_loss(out_ref).backward()
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+def _plain_inputs(device, dtype, head_dim):
+    shape = (2, 96, 4, head_dim)
+    leaves = [
+        torch.randn(shape, device=device, dtype=dtype).requires_grad_(True)
+        for _ in range(3)
+    ]
+    return leaves, *leaves
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [16, 48, 80, 112, 200])
+def test_backward_flydsl_head_dim_not_multiple_of_32(head_dim):
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    _flydsl_bwd_case(head_dim, _plain_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_broadcast_grad():
+    # `out.sum().backward()` hands the op a stride-0 expanded grad.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    _flydsl_bwd_case(64, _plain_inputs, lambda out: out.sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_key_value_row_pitch_differs():
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        # key is a view into a wider buffer (row pitch 2*H*D), value is dense.
+        key_buf = torch.randn(B, N, 2 * H, head_dim, device=device, dtype=dtype)
+        value = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        leaves = [t.requires_grad_(True) for t in (q, key_buf, value)]
+        return leaves, leaves[0], leaves[1][:, :, :H], leaves[2]
+
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves, query, key, value = make_inputs(device, dtype, 64)
+    assert key.stride(1) != value.stride(1)
+    out = fmha.memory_efficient_attention(
+        query, key, value, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    ref = ref_attention_for_test(query, key, value, None)
+    ref.backward(grad_out)
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+@cuda_or_mtia_only
+def test_flydsl_fwd_declines_dropout_with_gradients():
+    if not torch.version.hip:
+        pytest.skip("flydsl.FwOp is ROCm-only")
+    device = torch._C._get_accelerator().type
+    q = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    def dropout_reasons(requires_grad):
+        inp = fmha.Inputs(
+            q.clone().requires_grad_(requires_grad),
+            k.clone().requires_grad_(requires_grad),
+            v.clone().requires_grad_(requires_grad),
+            p=0.1,
+        )
+        return [
+            r for r in fmha.flydsl.FwOp.not_supported_reasons(inp) if "dropout" in r
+        ]
+
+    assert dropout_reasons(requires_grad=True)
+    assert not dropout_reasons(requires_grad=False)
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [32, 64, 96, 128, 192, 256])
+def test_backward_flydsl_fwd_bwd_pair(head_dim, dtype):
+    # The FlyDSL forward and backward are dispatched as a pair on archs CK is
+    # not built for, so check them together against the reference.
+    if not torch.version.hip:
+        pytest.skip("flydsl ops are ROCm-only")
+    _flydsl_bwd_case(head_dim, _plain_inputs, lambda out: (out**2).sum(), dtype=dtype)
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("head_dim", [48, 64])
+def test_backward_flydsl_gqa_broadcast_kv(head_dim):
+    # Stride-0 `.expand()` K/V (GQA) must stay correct with and without the
+    # head-dim padding path, which has to materialise them.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q = torch.randn(B, N, H, head_dim, device=device, dtype=dtype)
+        k_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        v_small = torch.randn(B, N, 1, head_dim, device=device, dtype=dtype)
+        leaves = [t.requires_grad_(True) for t in (q, k_small, v_small)]
+        return (
+            leaves,
+            leaves[0],
+            leaves[1].expand(-1, -1, H, -1),
+            leaves[2].expand(-1, -1, H, -1),
+        )
+
+    _flydsl_bwd_case(head_dim, make_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+def test_backward_flydsl_transposed_head_axis():
+    # A head axis that is not flat relative to head_dim is copied, not declined.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+
+    def make_inputs(device, dtype, head_dim):
+        B, N, H = 2, 96, 4
+        q_t = torch.randn(B, H, N, head_dim, device=device, dtype=dtype)
+        k, v = (
+            torch.randn(B, N, H, head_dim, device=device, dtype=dtype) for _ in range(2)
+        )
+        leaves = [t.requires_grad_(True) for t in (q_t, k, v)]
+        return leaves, leaves[0].transpose(1, 2), leaves[1], leaves[2]
+
+    _flydsl_bwd_case(64, make_inputs, lambda out: (out**2).sum())
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("heads", [(32, 32), (32, 8)])
+def test_backward_flydsl_deterministic(heads):
+    if not torch.version.hip or not fmha.flydsl._is_flydsl_available():
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    from mslk.utils.device import is_gfx950
+
+    if not is_gfx950():
+        pytest.skip("deterministic FlyDSL backward is implemented for gfx950 only")
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    H, Hkv = heads
+    # Large enough that the atomic path measurably differs run to run.
+    B, S, D = 1, 4096, 128
+    torch.manual_seed(0)
+    q = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    v = torch.randn(B, S, Hkv, D, device=device, dtype=dtype)
+    grad_out = torch.randn(B, S, H, D, device=device, dtype=dtype)
+    bias = fmha.attn_bias.LowerTriangularMask()
+
+    def run():
+        leaves = [t.clone().requires_grad_(True) for t in (q, k, v)]
+        kk = leaves[1].repeat_interleave(H // Hkv, dim=2)
+        vv = leaves[2].repeat_interleave(H // Hkv, dim=2)
+        torch.use_deterministic_algorithms(True)
+        try:
+            out = fmha.memory_efficient_attention(
+                leaves[0],
+                kk,
+                vv,
+                attn_bias=bias,
+                op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp),
+            )
+            out.backward(grad_out)
+        finally:
+            torch.use_deterministic_algorithms(False)
+        return [leaf.grad for leaf in leaves], leaves
+
+    first, leaves = run()
+    for _ in range(3):
+        again, _ = run()
+        for name, a, b in zip(("dq", "dk", "dv"), first, again):
+            assert torch.equal(a, b), f"{name} differs between identical runs"
+
+    leaves_ref = [t.clone().requires_grad_(True) for t in (q, k, v)]
+    out_ref = ref_attention_for_test(
+        leaves_ref[0],
+        leaves_ref[1].repeat_interleave(H // Hkv, dim=2),
+        leaves_ref[2].repeat_interleave(H // Hkv, dim=2),
+        bias,
+    )
+    out_ref.backward(grad_out)
+    for name, got, ref in zip(("dq", "dk", "dv"), first, leaves_ref):
+        _assert_grad_close(
+            got.float(), ref.grad.float(), f"flydslB deterministic:{name}"
+        )
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("window", [8, 33, 200])
+@pytest.mark.parametrize("seqlens", [(128, 128), (64, 256), (100, 333)])
+def test_backward_flydsl_bottom_right_local_attention(seqlens, window):
+    # The window is measured from the bottom-right diagonal, so it only differs
+    # from the top-left one when Mq != Mkv.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    Mq, Mkv = seqlens
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves = [
+        torch.randn(2, n, 4, 64, device=device, dtype=dtype).requires_grad_(True)
+        for n in (Mq, Mkv, Mkv)
+    ]
+    bias = fmha.attn_bias.LowerTriangularFromBottomRightLocalAttentionMask(window)
+    out = fmha.memory_efficient_attention(
+        *leaves, attn_bias=bias, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    grad_out = torch.randn_like(out)
+    out.backward(grad_out)
+    grads = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    ref = ref_attention_for_test(*leaves, bias)
+    ref.backward(grad_out)
+    for name, grad, leaf in zip(("query", "key", "value"), grads, leaves):
+        _assert_grad_close(grad.float(), leaf.grad.float(), f"flydslB:{name}")
+
+
+@cuda_or_mtia_only
+@pytest.mark.parametrize("dims", [(192, 128), (64, 128), (128, 96), (80, 48)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_backward_flydsl_value_head_dim_differs(dims, causal):
+    # q/k and v/dO contract over different dims (e.g. MLA's 192/128). The
+    # forward is computed with torch so only the backward is under test.
+    if not torch.version.hip:
+        pytest.skip("flydsl.BwOp is ROCm-only")
+    qk_dim, v_dim = dims
+    B, S, H = 2, 128, 4
+    device = torch._C._get_accelerator().type
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    leaves = [
+        torch.randn(B, S, H, d, device=device, dtype=dtype).requires_grad_(True)
+        for d in (qk_dim, qk_dim, v_dim)
+    ]
+    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    q, k, v = leaves
+    scale = qk_dim**-0.5
+    with torch.no_grad():
+        scores = torch.einsum("bmhd,bnhd->bhmn", q.float(), k.float()) * scale
+        if causal:
+            mask = torch.ones(S, S, device=device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        out = torch.einsum("bhmn,bnhd->bmhd", scores.softmax(-1), v.float()).to(dtype)
+    grad_out = torch.randn_like(out)
+    inp = fmha.Inputs(q, k, v, attn_bias=bias, scale=scale)
+    assert not fmha.flydsl.BwOp.not_supported_reasons(inp)
+    grads = fmha.flydsl.BwOp.apply(fmha.Context(lse=lse, out=out), inp, grad_out)
+
+    ref = ref_attention_for_test(q, k, v, bias, scale=scale)
+    ref.backward(grad_out)
+    for name, got, leaf in zip(
+        ("dq", "dk", "dv"), (grads.dq, grads.dk, grads.dv), leaves
+    ):
+        assert got.shape == leaf.shape
+        _assert_grad_close(got.float(), leaf.grad.float(), f"flydslB value dim:{name}")
