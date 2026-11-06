@@ -12,8 +12,6 @@ import torch
 from . import (
     attn_bias,
     ck,
-    ck_decoder,
-    ck_splitk,
     cute_blackwell,
     cute_hopper,
     cutlass,
@@ -59,8 +57,6 @@ MemoryEfficientAttentionCutlassFwdFlashBwOp = (cutlass.FwOp, flash.BwOp)
 MemoryEfficientAttentionFlashAttentionOp = (flash.FwOp, flash.BwOp)
 MemoryEfficientAttentionFlashMtiaAttentionOp = (flash_mtia.FwOp, flash_mtia.BwOp)
 MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
-MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
-MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
 MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
@@ -992,7 +988,6 @@ __all__ = [
     "MemoryEfficientAttentionCkOp",
     "MemoryEfficientAttentionFlyDSLDecoderOp",
     "MemoryEfficientAttentionSplitKFlyDSLOp",
-    "MemoryEfficientAttentionCkDecoderOp",
     "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
