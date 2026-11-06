@@ -31,23 +31,57 @@ ARRIVAL_COUNTERS = 1 << 16
 # invalidate the whole L2 per workgroup).
 CPOL_SC1 = 16
 
-# (device, stream) -> persistent workspace whose counters are zero between calls.
+# (device, stream) -> [workspace, used by a captured graph]. The counters are
+# zero between calls: every launch resets the ones it used.
 _WORKSPACES: dict = {}
-# Workspaces replaced by a larger one. A CUDA graph may have captured their
-# address, so they are never freed.
-_RETIRED: list = []
+# Workspaces a captured graph still addresses, kept alive for its replays.
+_GRAPH_HELD: list = []
+# device -> stream that zeroes workspaces created during graph capture.
+_ZEROING_STREAMS: dict = {}
+
+
+def _zeroed(numel: int, device: torch.device) -> torch.Tensor:
+    """fp32 zeros. Under graph capture the whole buffer is zeroed right away on
+    a side stream, so other graphs that share it do not depend on this one
+    having run; this graph also clears the counters itself, which orders its
+    own first replay after the zeroing. (Waiting on the side stream instead
+    would add a node every replay pays for, and an event cannot be queried
+    during capture; a later graph is captured and instantiated long after the
+    side stream's memset was queued.)"""
+    buf = torch.empty(numel, dtype=torch.float32, device=device)
+    if not torch.cuda.is_current_stream_capturing():
+        buf.zero_()
+        return buf
+    side = _ZEROING_STREAMS.get(device)
+    if side is None:
+        side = _ZEROING_STREAMS[device] = torch.cuda.Stream(device)
+    with torch.cuda.stream(side):
+        buf.zero_()
+    buf[:ARRIVAL_COUNTERS].zero_()
+    return buf
 
 
 def arrival_workspace(elems: int, device: torch.device, stream: Any) -> torch.Tensor:
-    """fp32 workspace with counters zeroed before every launch."""
+    """fp32 workspace of ARRIVAL_COUNTERS zeroed counters followed by `elems`.
+
+    Buffers are per stream so concurrent streams never share counters, and
+    grow geometrically so a slowly growing batch does not reallocate per call.
+    A buffer a captured graph used is kept alive when outgrown. Graphs captured
+    on one stream share its workspace, so they must not replay concurrently.
+    """
     key = (device, stream.cuda_stream)
     need = ARRIVAL_COUNTERS + elems
-    buf = _WORKSPACES.get(key)
-    if buf is None or buf.numel() < need:
-        if buf is not None:
-            _RETIRED.append(buf)
-        buf = torch.empty(need, dtype=torch.float32, device=device)
-        _WORKSPACES[key] = buf
+    capturing = torch.cuda.is_current_stream_capturing()
+    entry = _WORKSPACES.get(key)
+    if entry is not None and entry[0].numel() >= need:
+        entry[1] = entry[1] or capturing
+        buf = entry[0]
+    else:
+        if entry is not None and entry[1]:
+            _GRAPH_HELD.append(entry[0])
+        size = max(need, 2 * entry[0].numel()) if entry is not None else need
+        buf = _zeroed(size, device)
+        _WORKSPACES[key] = [buf, capturing]
     # A failed or cancelled launch may leave counters nonzero. Reset on the
     # launch stream so reuse is ordered after prior work and remains capturable.
     with torch.cuda.stream(stream):

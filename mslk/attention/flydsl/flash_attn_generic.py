@@ -1248,9 +1248,11 @@ def build_flash_attn_func_module_primary(
 
     _launch = _wrap_pad_mask_dispatch(_launch)
 
-    if block_m is None:
-        return _guard_seqlen(_launch)
-    return _launch
+    launcher = _guard_seqlen(_launch) if block_m is None else _launch
+    # The resolved traits, so callers and tests can see which features a build
+    # actually has (the builder may decline what was asked for).
+    launcher.traits = traits
+    return launcher
 
 
 build_flash_attn_func_module = build_flash_attn_func_module_primary

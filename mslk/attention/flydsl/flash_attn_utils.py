@@ -934,7 +934,11 @@ def _buffer_load_to_lds(rsrc, lds_ptr, size, voffset, soffset, offset, aux):
 
 
 def wait_lds_copies(count=0):
-    """Wait until at most ``count`` global->LDS copies are outstanding."""
+    """Wait for outstanding global->LDS copies.
+
+    On the async path ``count`` is how many copies may stay in flight; on the
+    vmcnt path it is the raw ``s_waitcnt`` immediate, where 0 waits for all.
+    """
     if _async_lds():
         rocdl.wait_asyncmark(count)
     else:
@@ -2681,10 +2685,12 @@ class GenericFlashAttnContext:
             else:
                 self.seqlen_kv_b = self.seq_len_kv_v
         if const_expr(traits.PAGED and not traits.GAPPY_KV):
-            # Clamp the caller's paged length to [0, seq_len_kv].
-            n = fx.Int32(self.seqlen_kv_b)
-            bound = fx.Int32(self.seq_len_kv_v)
-            n = (n > fx.Int32(0)).select(n, fx.Int32(0))
+            # Paged lengths arrive as the caller gave them: a negative length
+            # attends to nothing and none reaches past the launch bound.
+            # Signed 64-bit: a cu_seqlens_kv difference can exceed int32.
+            n = fx.Int64(self.seqlen_kv_b)
+            bound = fx.Int64(self.seq_len_kv_v)
+            n = (n > fx.Int64(0)).select(n, fx.Int64(0))
             self.seqlen_kv_b = fx.Index((n < bound).select(n, bound))
 
     def init_kv_batch_pointers(self):
