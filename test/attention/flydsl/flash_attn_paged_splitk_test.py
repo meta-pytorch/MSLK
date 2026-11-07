@@ -790,6 +790,8 @@ def test_arrival_workspace_first_allocated_during_capture(monkeypatch):
             out = call(args)
         graphs.append((graph, out, args))
     for graph, out, (q, k, v, block_table, seqlen_k) in reversed(graphs):
+        for workspace, _ in split_arrival._WORKSPACES.values():
+            workspace.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         ref = paged_reference(q, k, v, block_table, seqlen_k, True)

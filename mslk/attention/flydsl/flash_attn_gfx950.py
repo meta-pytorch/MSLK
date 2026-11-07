@@ -240,9 +240,9 @@ def build_flash_attn_dualwave_swp_module(
             _sched_barrier(0)
             _s_barrier()
 
-            # Load this wave's Q rows and pre-scale by the 1/sqrt(D) softmax
+            # Load this wave's Q rows unscaled; the softmax helper applies the
+            # 1/sqrt(D) * log2(e) scale to the fp32 scores.
             q_all_bf16 = q_loader.load_all()
-            q_all_scaled_bf16 = q_loader.scale_all(q_all_bf16)
 
             # Pipeline ahead: prefetch K tile1 (buf1) + V tile0 (buf0) as background
             if const_expr(traits.PAGED):
@@ -270,7 +270,7 @@ def build_flash_attn_dualwave_swp_module(
             # Prologue scores + first softmax pass for KV tile 0
             if const_expr(traits.PAGED):
                 pro_pageid_2_lds = page_ids.load_page_id_lds(page_ids.split_tile(2))
-            v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_0 = gemm_helper.qk(v_k, q_all_bf16)
             _sched_barrier(0)
 
             if const_expr(traits.CAUSAL):
@@ -353,7 +353,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 1 computes MMA0, finishes v_p_0 softmax, updates l_row, and casts P.
                 if const_expr(traits.PAGED):
                     c2_pageid_lds = page_ids.load_page_id_lds(j_idx)
-                v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+                v_s_1 = gemm_helper.qk(v_k, q_all_bf16)
                 v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_0)
                 v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -440,7 +440,7 @@ def build_flash_attn_dualwave_swp_module(
                 # Cluster 5 mirrors C1: MMA0, finish v_p_1 softmax, update l_row, and cast P.
                 if const_expr(traits.PAGED):
                     _c6_kpid_lds = page_ids.load_page_id_lds(j_idx + 1)
-                v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+                v_s_0 = gemm_helper.qk(v_k, q_all_bf16)
                 v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
                 l_row = softmax_helper.reduce_sum(l_row, v_p_1)
                 v_p_1 = softmax_helper.cast_p(v_p_1)
@@ -539,7 +539,7 @@ def build_flash_attn_dualwave_swp_module(
             # Epilogue C1 (compute): MMA0 -> v_s_1; finish v_p_0 softmax (like C1).
             if const_expr(traits.PAGED):
                 ec2_pageid_lds = page_ids.load_page_id_lds(max_m1)
-            v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_1 = gemm_helper.qk(v_k, q_all_bf16)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)
             v_p_0 = softmax_helper.cast_p(v_p_0)
@@ -616,7 +616,7 @@ def build_flash_attn_dualwave_swp_module(
             _dualwave_sync_barrier()
 
             # Epilogue C5 computes MMA0, folds rescale_e3 into l_row, and finishes v_p_1 softmax.
-            v_s_0 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_0 = gemm_helper.qk(v_k, q_all_bf16)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e3)
             v_p_1 = softmax_helper.exp2(v_p_1, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_1)
@@ -681,7 +681,7 @@ def build_flash_attn_dualwave_swp_module(
             _dualwave_sync_barrier()
 
             # Epilogue C9 computes the last-tile MMA0, folds rescale_e7 into l_row, and finishes v_p_0.
-            v_s_1 = gemm_helper.qk(v_k, q_all_scaled_bf16)
+            v_s_1 = gemm_helper.qk(v_k, q_all_bf16)
             l_row = softmax_helper.apply_l_rescale(l_row, rescale_e7)
             v_p_0 = softmax_helper.exp2(v_p_0, 16, 16)
             l_row = softmax_helper.reduce_sum(l_row, v_p_0)

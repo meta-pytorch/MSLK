@@ -34,7 +34,6 @@ Example:
     >>> buffer_ops.buffer_store(data, rsrc, offset)
 """
 
-import os
 from typing import Optional, Union
 
 from flydsl._mlir import ir
