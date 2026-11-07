@@ -293,8 +293,11 @@ def _dispatch_bw(
         if _get_use_fa3():
             priority_list_ops = [flash3.BwOp] + priority_list_ops
     else:
+        # Order is a preference: ck.BwOp declines archs it has no device image
+        # for (SUPPORTED_GFX_ARCHS), which is when flydsl.BwOp is reached.
         priority_list_ops: List[Type[AttentionBwOpBase]] = [
             ck.BwOp,
+            flydsl.BwOp,
         ]
 
     # NOTE: If we have a variable seqlen `attn_bias`, we need to get a BW pass
