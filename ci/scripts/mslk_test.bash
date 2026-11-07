@@ -119,6 +119,7 @@ __configure_mslk_test_cuda () {
     ./gemm/triton/*.py
     ./moe/*.py
   )
+  export explicitly_enabled_tests=()
 }
 
 __configure_mslk_test_rocm () {
@@ -156,6 +157,9 @@ __configure_mslk_test_rocm () {
     ./moe/*.py
     ./quantize/fp8_quantize_test.py
   )
+  export explicitly_enabled_tests=(
+    ./attention/fmha/flydsl_backward_gfx950_test.py
+  )
 }
 
 __set_feature_flags () {
@@ -188,6 +192,13 @@ __setup_mslk_test () {
   else
     echo "[TEST] MSLK variant is ${mslk_build_variant}; configuring for CUDA-based testing ..."
     __configure_mslk_test_cuda
+  fi
+
+  echo "[TEST] Explicitly enabled test files:"
+  if [ "${#explicitly_enabled_tests[@]}" -eq 0 ]; then
+    echo "[TEST]   (none)"
+  else
+    printf '[TEST]   %s\n' "${explicitly_enabled_tests[@]}"
   fi
 
   if [[ $MACHINE_NAME == 'aarch64' ]]; then
@@ -254,7 +265,17 @@ __run_mslk_tests_in_directory () {
   for test_file in $all_test_files; do
     # Check if test_file matches any ignored glob pattern
     skip=false
+    explicitly_enabled=false
+    for enabled_test in "${explicitly_enabled_tests[@]}"; do
+      if [[ "$test_file" == "$enabled_test" ]]; then
+        explicitly_enabled=true
+        break
+      fi
+    done
     for pattern in "${ignored_tests[@]}"; do
+      if [[ "$explicitly_enabled" == true ]]; then
+        break
+      fi
       # shellcheck disable=SC2053
       if [[ "$test_file" == $pattern ]]; then
         skip=true
