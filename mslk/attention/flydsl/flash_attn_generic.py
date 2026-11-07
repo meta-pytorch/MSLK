@@ -91,12 +91,19 @@ def build_flash_attn_func_module_primary(
     high_concurrency=False,
     fused_combine=False,
     paged_pid_regs=False,
+    head_dim_qk=None,
+    head_dim_v=None,
 ):
     """Build a generic f16/bf16 flash-attention launcher.
 
     ``num_heads`` is the Q/O head count. For GQA/MQA, pass a smaller
     ``num_kv_heads``; each group of ``num_heads // num_kv_heads`` Q heads shares
     one K/V head. Dense launches accept any positive ``seq_len``.
+
+    ``head_dim`` is the compute width. Q/K rows may be stored ``head_dim_qk``
+    wide and V/O rows ``head_dim_v`` wide (both even and <= head_dim): the
+    missing columns read as zero and are never written. The default scale is
+    1/sqrt(head_dim_qk).
     """
     gpu_arch = get_hip_arch()
 
@@ -145,6 +152,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launcher_m256 = build_flash_attn_func_module_primary(
             num_heads,
@@ -174,6 +183,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _bs_threshold = (
             2048 * num_heads if gpu_arch.startswith("gfx942") else 4096 * num_heads
@@ -278,6 +289,8 @@ def build_flash_attn_func_module_primary(
         high_concurrency=high_concurrency,
         fused_combine=fused_combine,
         paged_pid_regs=paged_pid_regs,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
     )
     # Threads per combine block; a block is the unit of CU assignment, so this
     # sets how many workgroups the combine launches. One wave per block spreads
@@ -312,7 +325,7 @@ def build_flash_attn_func_module_primary(
         return _guarded
 
     if sm_scale is None:
-        sm_scale = 1.0 / host_math.sqrt(head_dim)
+        sm_scale = 1.0 / host_math.sqrt(traits.HEAD_DIM_QK)
 
     allocator = SmemAllocator(
         None,
@@ -1040,7 +1053,7 @@ def build_flash_attn_func_module_primary(
         bias_t = bias if bias is not None else Out
         drop_t = dropout if dropout is not None else Out
         skv = seq_len if seq_len_kv is None else seq_len_kv
-        sqn = traits.STRIDE_TOKEN_Q if stride_q_n is None else stride_q_n
+        sqn = traits.STRIDE_TOKEN_O if stride_q_n is None else stride_q_n
         stream_arg = fx.Stream(stream)
 
         tensor_args = (Q, K, V, Out, lse_t, ws_t, cq, ck, kvs, bt, bias_t, drop_t)
@@ -1152,7 +1165,7 @@ def build_flash_attn_func_module_primary(
                 batch_size,
                 seq_len,
                 skv,
-                traits.STRIDE_TOKEN_Q,
+                traits.STRIDE_TOKEN_O,
                 bias_t,
                 0,
                 0,
@@ -1205,6 +1218,8 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
         _launch_mask = build_flash_attn_func_module_primary(
             num_heads,
@@ -1234,10 +1249,19 @@ def build_flash_attn_func_module_primary(
             has_dropout=has_dropout,
             gappy_kv=gappy_kv,
             num_kv_splits=num_kv_splits,
+            head_dim_qk=head_dim_qk,
+            head_dim_v=head_dim_v,
         )
 
         def _pad_dispatch(*args, **kwargs):
+            # The mask being skipped bounds KV columns, so the KV length decides.
+            # seq_len is the Q length; a cross-length launch passes seq_len_kv.
             S_int = _extract_seq_len(args, kwargs)
+            if kwargs.get("seq_len_kv") is not None:
+                try:
+                    S_int = int(kwargs["seq_len_kv"])
+                except (TypeError, ValueError):
+                    S_int = None
             if S_int is not None and S_int % 64 == 0:
                 return _launch_skip(*args, **kwargs)
             return _launch_mask(*args, **kwargs)

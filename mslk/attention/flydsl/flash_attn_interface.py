@@ -54,6 +54,17 @@ _DTYPE_MAP = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float8_e4m3fn:
 
 # Short varlen/paged cases use the lightweight generic path.
 _VARLEN_LIGHT_MAX_SEQ = 256
+# Head dims the generic kernel builds; others compute at the next of these with
+# the missing columns masked in-kernel.
+_GENERIC_HEAD_DIMS = (64, 128, 256)
+
+
+def _run_head_dim(d: int) -> int:
+    """The head dim a call with stored head dim ``d`` computes at: the smallest of
+    _GENERIC_HEAD_DIMS >= d, or 0 when ``d`` is above them all."""
+    return next((hd for hd in _GENERIC_HEAD_DIMS if hd >= d), 0)
+
+
 _DENSE_LIGHT_CU_FALLBACK = 256
 _DENSE_DUALWAVE_MIN_SEQ = 256
 _DENSE_DUALWAVE_LARGE_BATCH = 8
@@ -130,6 +141,11 @@ def _dense_generic_tile(
 
 # Generic split-K uses BLOCK_M=64, so the "mtile" (Q rows per workgroup) is 64.
 _GENERIC_SPLITK_BLOCK_M = 64
+# Cross length splits once the KV walk pays for the combine launch.
+_CROSS_SPLITK_MIN_KV = 2048
+# Dropout splits under the same floor, except at D>=128, where the keep-mask
+# gather makes each KV tile dear enough to pay from ~1000 keys.
+_DROPOUT_SPLITK_MIN_KV = 1000
 
 
 def _generic_splitk_list(i: int) -> int:
@@ -212,6 +228,9 @@ def _build_dense(
     has_bias: bool = False,
     has_dropout: bool = False,
     num_kv_splits: int = 1,
+    causal_top_left: bool = False,
+    head_dim_qk: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ):
     """Build (and cache) one dense generic launcher variant."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -219,6 +238,8 @@ def _build_dense(
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
         causal=causal,
         dtype_str=dtype_str,
         num_kv_heads=num_kv_heads,
@@ -234,6 +255,7 @@ def _build_dense(
         has_bias=has_bias,
         has_dropout=has_dropout,
         num_kv_splits=num_kv_splits,
+        causal_top_left=causal_top_left,
     )
 
 
@@ -358,6 +380,8 @@ def _build_varlen_light(
     sm_scale: Optional[float] = None,
     gappy_kv: bool = False,
     num_kv_splits: int = 1,
+    head_dim_qk: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ):
     """Build a lightweight packed-varlen launcher for short attention."""
     from .flash_attn_generic import build_flash_attn_func_module
@@ -365,6 +389,8 @@ def _build_varlen_light(
     return build_flash_attn_func_module(
         num_heads=num_heads,
         head_dim=head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
         causal=causal,
         dtype_str=dtype_str,
         sm_scale=sm_scale,
@@ -1305,6 +1331,20 @@ def _flydsl_flash_attn_paged(
                 f"flydsl_flash_attn_func: paged dense q must be 4D [B,Sq,H,D], got {q.dim()}D"
             )
         B, Sq, H, D = q.shape
+    # A non-native head dim runs the generic kernel at the next native one (D_run),
+    # which reads Q/K/V at their stored width D -- the cache in place -- and masks
+    # the missing columns.
+    _masked_hd = D not in _GENERIC_HEAD_DIMS
+    D_run = _run_head_dim(D)
+    if _masked_hd and (D % 2 or not D_run):
+        raise ValueError(
+            f"flydsl_flash_attn_func: head_dim ({D}) must be even and <= 256"
+        )
+    if vectorized and _masked_hd:
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: vectorized paged KV supports head_dim 64 or 128 "
+            f"only, got {D}"
+        )
 
     _validate_paged_metadata("block_table", block_table, q.device, 2, B)
     if seqlen_k is not None:
@@ -1369,20 +1409,26 @@ def _flydsl_flash_attn_paged(
             return empty_out, empty_lse
         return empty_out
 
-    _swa_cfg = _paged_swa_kernel_config(
-        q,
-        k,
-        v,
-        causal,
-        window_left,
-        return_lse,
-        varlen,
-        vectorized,
-        kv_seqstart,
-        seqlen_k,
-        block_table,
-        out,
-        requested_num_kv_splits,
+    # The decode kernels below build native head dims only; a masked head dim
+    # takes the generic kernel.
+    _swa_cfg = (
+        None
+        if _masked_hd
+        else _paged_swa_kernel_config(
+            q,
+            k,
+            v,
+            causal,
+            window_left,
+            return_lse,
+            varlen,
+            vectorized,
+            kv_seqstart,
+            seqlen_k,
+            block_table,
+            out,
+            requested_num_kv_splits,
+        )
     )
     if _swa_cfg is not None:
         from .decode.pa_decode_swa import pa_decode_swa_launch
@@ -1513,7 +1559,7 @@ def _flydsl_flash_attn_paged(
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports page_size={_PAGED_PAGE_SIZE} only, got {page_size}"
         )
-    if D not in (64, 128) and not _gappy:
+    if D_run not in (64, 128) and not _gappy:
         raise NotImplementedError(
             f"flydsl_flash_attn_func: native paged KV supports head_dim=64 or 128, got {D}"
         )
@@ -1534,10 +1580,11 @@ def _flydsl_flash_attn_paged(
     # non-causal keeps the faster dualwave kernel. Decided here (rather than at the
     # launch site) because split-K sizing depends on which kernel runs.
     _arch = _gpu_arch(q.device)
-    _splitk_dtype_ok = D in (64, 128) and dtype_str in ("bf16", "f16")
+    _splitk_dtype_ok = D_run in (64, 128) and dtype_str in ("bf16", "f16")
     _paged_light_ok = (
         _gappy
         or _paged_window
+        or _masked_hd
         or (
             _splitk_dtype_ok
             and (
@@ -1575,7 +1622,7 @@ def _flydsl_flash_attn_paged(
             Sq,
             _gqa_qlen if _gqa_packed else Sq,
             skv,
-            D,
+            D_run,
             page_size,
             window_left,
             _gqa_packed,
@@ -1601,7 +1648,7 @@ def _flydsl_flash_attn_paged(
             f"got seq_len={Sq}"
         )
     if splitk:
-        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
+        _validate_splitk_workspace_descriptor(H, Sq, D_run, int(num_kv_splits))
 
     # Per-batch KV lengths differ in general → bottom-right cross-length masking. Varlen
     # paged always uses cross masking (per-batch seqlen_q/seqlen_kv come from cu_seqlens).
@@ -1613,6 +1660,7 @@ def _flydsl_flash_attn_paged(
     if (
         not _DISABLE_PAGED_DECODE_HP
         and not _paged_window
+        and not _masked_hd
         and (causal or Sq == 1)
         # Generic GQA packing removes the same fan-out and takes precedence.
         and not _gqa_packed
@@ -1715,7 +1763,7 @@ def _flydsl_flash_attn_paged(
                 _gqa_qlen if _gqa_packed else Sq,
                 skv,
                 num_kv_splits,
-                D,
+                D_run,
                 B * H,
             ):
                 _paged_bm = 32
@@ -1724,17 +1772,18 @@ def _flydsl_flash_attn_paged(
                 return_lse,
                 B * H * (-(-Sq // _paged_bm)),
                 int(num_kv_splits),
-                D,
+                D_run,
                 min(Sq, _paged_bm),
             )
-            _k_prefetch = _paged_k_prefetch(
-                D, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
+            # A masked build reads K/V through the cooperative loads only.
+            _k_prefetch = not _masked_hd and _paged_k_prefetch(
+                D_run, window_left, _gqa_qlen if _gqa_packed else Sq, skv, num_kv_splits
             )
             if _paged_light_ok:
                 exe = _build_paged_light(
                     num_heads=H,
                     num_kv_heads=num_kv_heads,
-                    head_dim=D,
+                    head_dim=D_run,
                     causal=causal,
                     dtype_str=dtype_str,
                     cross_seqlen=cross,
@@ -1755,12 +1804,17 @@ def _flydsl_flash_attn_paged(
                     ),
                     kv_lens=_dense_kv_lens,
                     block_m=_paged_bm,
-                    kv_dma=_paged_kv_dma(_paged_bm, D, window_left, skv, num_kv_splits),
+                    kv_dma=not _masked_hd
+                    and _paged_kv_dma(
+                        _paged_bm, D_run, window_left, skv, num_kv_splits
+                    ),
                     k_prefetch=_k_prefetch,
                     window_left=window_left,
                     num_kv_splits=int(num_kv_splits),
                     fused_combine=fused_combine,
                     pid_regs=_paged_pid_regs(max_pages_per_split) and not _k_prefetch,
+                    head_dim_qk=D,
+                    head_dim_v=D,
                 )
             else:
                 exe = _build_paged(
@@ -1820,7 +1874,7 @@ def _flydsl_flash_attn_paged(
                 kwargs["lse"] = lse
             if splitk:
                 ws_elems = dualwave_splitk_workspace_elems(
-                    B, H, Sq, int(num_kv_splits), head_dim=D
+                    B, H, Sq, int(num_kv_splits), head_dim=D_run
                 )
                 if fused_combine:
                     workspace = arrival_workspace(ws_elems, q.device, launch_stream)
@@ -1900,6 +1954,8 @@ def _build_paged_light(
     high_concurrency: bool = False,
     fused_combine: bool = False,
     pid_regs: bool = False,
+    head_dim_qk: Optional[int] = None,
+    head_dim_v: Optional[int] = None,
 ):
     """Build a lightweight paged-varlen launcher for short attention.
 
@@ -1939,6 +1995,8 @@ def _build_paged_light(
         paged_k_prefetch=k_prefetch,
         fused_combine=fused_combine,
         paged_pid_regs=pid_regs,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
     )
 
 
@@ -1994,7 +2052,10 @@ def flydsl_flash_attn_func(
     # shape [B, H, Sq]; varlen: [B, H, max_seqlen_q]). Not supported for fp8/paged KV.
     return_lse: bool = False,
     # Sliding-window, flash-attention convention: keep KV in
-    # [q_row - window_left, q_row] (window_left + 1 keys); -1 disables.
+    # [q_row - window_left, q_row] (window_left + 1 keys); -1 disables. Non-causal
+    # (dense/varlen) keeps only the left bound: KV >= q_row - window_left, i.e.
+    # flash-attention's window_size=(window_left, -1). Rows are bottom-right
+    # aligned (q_row counts from seqlen_kv - seqlen_q).
     window_left: int = -1,
     # Softmax scale (None -> 1/sqrt(head_dim)); non-default forces the generic path.
     sm_scale: Optional[float] = None,
@@ -2002,8 +2063,8 @@ def flydsl_flash_attn_func(
     bias: Optional[torch.Tensor] = None,
     # Top-left causal (kv_col <= q_row) vs default bottom-right; cross-length only.
     causal_top_left: bool = False,
-    # Dropout mask broadcastable to [B, H, Sq, Skv]; 0 or 1/(1-p), applied to post-
-    # softmax P.
+    # Same-device uint8 keep mask broadcastable to [B, H, Sq, Skv], applied to
+    # post-softmax P. The caller applies inverse keep-probability scaling.
     dropout_mask: Optional[torch.Tensor] = None,
     # CUDA/HIP stream; defaults to the current stream for q.device.
     stream: Optional[torch.cuda.Stream] = None,
@@ -2015,7 +2076,8 @@ def flydsl_flash_attn_func(
            Varlen: ``[total_q, H, D]`` (packed, cu_seqlens_q required).
         k: Key tensor. Dense: ``[B, Skv, Hkv, D]``.
            Varlen: ``[total_kv, Hkv, D]``.
-        v: Value tensor, same shape as k.
+        v: Value tensor, same shape as k except possibly the head dim (non-paged
+           f16/bf16; both head dims even and <= 256).
            Paged KV cache (future ABI): physical K/V cache tensors. Supported
            ``kv_cache_layout`` values:
            - ``linear``: 4D paged K/V, ``[NumBlocks, PageSize, NumKVHeads, HeadDim]``.
@@ -2044,6 +2106,8 @@ def flydsl_flash_attn_func(
             except the dense non-paged path, which applies its own occupancy
             heuristic. ``>1`` forces that many splits (gfx950 only, D=64/128,
             bf16/f16; the dense non-paged path additionally requires seq>=384).
+            Dense calls with a window, custom sm_scale, bias, dropout or cross
+            length run the forced count on the generic kernel's split-K.
             Negative values are invalid.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales required
             for dense fp8 e4m3fn inputs.
@@ -2061,10 +2125,14 @@ def flydsl_flash_attn_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        Output tensor with the same shape as q (dtype bf16 for fp8 inputs,
+        Output tensor shaped like q with v's head dim (dtype bf16 for fp8 inputs,
         otherwise the same dtype as q). When ``return_lse=True``, returns a
         ``(out, lse)`` tuple instead, where ``lse`` is float32 ``[B, H, Sq]``
         (varlen: ``[B, H, max_seqlen_q]``; padded rows undefined).
+
+    Head dims 64, 128 and 256 run natively. Other even head dims up to 256 run
+    on the generic kernel at the next of those, which masks the missing columns
+    in-kernel: nothing is copied, and paged KV caches are read in place.
     """
     # ── validation ──────────────────────────────────────────────────────────
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
@@ -2076,6 +2144,12 @@ def flydsl_flash_attn_func(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError(
             f"flydsl_flash_attn_func: q/k/v must share dtype; got {q.dtype}/{k.dtype}/{v.dtype}"
+        )
+
+    if num_kv_splits < 0:
+        raise ValueError(
+            "flydsl_flash_attn_func: num_kv_splits must be nonnegative, "
+            f"got {num_kv_splits}"
         )
 
     dtype_str = _dtype_str(q)
@@ -2131,6 +2205,8 @@ def flydsl_flash_attn_func(
                 "dense/varlen f16/bf16 paths (fp8/paged hardcode 1/sqrt(head_dim))"
             )
     if bias is not None:
+        if bias.device != q.device or bias.dtype != q.dtype:
+            raise ValueError("bias must have the query device and dtype")
         _varlen_req = cu_seqlens_q is not None
         if dtype_str == "fp8" or paged_kv or _varlen_req:
             raise NotImplementedError(
@@ -2138,6 +2214,8 @@ def flydsl_flash_attn_func(
                 "dense f16/bf16 path (not fp8/paged/varlen)"
             )
     if dropout_mask is not None:
+        if dropout_mask.device != q.device or dropout_mask.dtype != torch.uint8:
+            raise ValueError("dropout_mask must be uint8 on the query device")
         _varlen_req = cu_seqlens_q is not None
         if dtype_str == "fp8" or paged_kv or _varlen_req:
             raise NotImplementedError(
@@ -2183,6 +2261,13 @@ def flydsl_flash_attn_func(
         num_kv_splits = 1
 
     if dtype_str == "fp8":
+        # _build_dense_fp8 compiles a D=128 kernel whatever the input: D=64 reads
+        # and writes past each row, D=256 drops half of it.
+        if q.shape[-1] != 128:
+            raise NotImplementedError(
+                "flydsl_flash_attn_func: fp8 flash_attn supports head_dim=128 only, "
+                f"got {q.shape[-1]}"
+            )
         if varlen:
             raise NotImplementedError(
                 "flydsl_flash_attn_func: fp8 flash_attn does not support varlen"
@@ -2269,15 +2354,36 @@ def flydsl_flash_attn_func(
         raise ValueError(
             f"flydsl_flash_attn_func: num_heads ({H}) must be divisible by num_kv_heads ({num_kv_heads})"
         )
-    if D < 64 or D % 32 != 0:
+    # Stored head dims: Q/K rows are Dqk wide, V/O rows Dv wide. The kernels
+    # build D = 64/128/256; for anything else (or Dv != Dqk) the generic kernel
+    # computes at the next of those and masks the missing columns in-kernel.
+    Dqk = D
+    Dv = int(v.shape[-1])
+    if int(k.shape[-1]) != Dqk:
         raise ValueError(
-            f"flydsl_flash_attn_func: head_dim ({D}) must be >= 64 and a multiple of 32"
+            f"flydsl_flash_attn_func: k head_dim ({k.shape[-1]}) must match q ({Dqk})"
         )
+    masked_hd = Dv != Dqk or D not in _GENERIC_HEAD_DIMS
+    if masked_hd:
+        D = _run_head_dim(max(Dqk, Dv))
+        if not D or Dqk <= 0 or Dv <= 0 or Dqk % 2 or Dv % 2:
+            raise ValueError(
+                f"flydsl_flash_attn_func: head dims (qk={Dqk}, v={Dv}) must be "
+                "positive, even and <= 256"
+            )
+        if dtype_str == "fp8" or num_kv_splits > 1 or debug_counts is not None:
+            raise NotImplementedError(
+                f"flydsl_flash_attn_func: head dims (qk={Dqk}, v={Dv}) need the "
+                "generic f16/bf16 kernel (no fp8, explicit split-K or debug_counts)"
+            )
 
     splitk = num_kv_splits > 1
     # generic_splitk is chosen internally per-shape (below); it uses the generic
     # BLOCK_M=64 kernel + dense combine, distinct from the dualwave `splitk` above.
     generic_splitk = False
+    # An explicit split count the dualwave split-K cannot honour (see below) runs
+    # on the generic split-K instead.
+    _forced_generic_splits = 0
 
     # ── split-K eligibility guard (SKIP analogous to run_splitk_config) ────
     if splitk:
@@ -2286,10 +2392,30 @@ def flydsl_flash_attn_func(
                 f"flydsl_flash_attn_func: split-K requires D=64/128, dtype bf16/f16, seq_len>=384; "
                 f"got D={D}, dtype={dtype_str}, seq_len={Sq}"
             )
-        ws_elems = dualwave_splitk_workspace_elems(
-            B, H, Sq, int(num_kv_splits), head_dim=D
-        )
-        _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
+        # The dualwave split-K launcher is built and launched without any of
+        # these, so they would be silently dropped (cross length: wrong result).
+        _dropped = [
+            name
+            for name, on in (
+                ("window_left", window_left >= 0),
+                ("sm_scale", sm_scale is not None),
+                ("bias", bias is not None),
+                ("dropout_mask", dropout_mask is not None),
+                ("seq_len_q != seq_len_kv", cross),
+            )
+            if on
+        ]
+        if _dropped:
+            # The generic kernel's split-K applies every one of these (its combine
+            # is exact for them), so run the requested count there.
+            _forced_generic_splits = int(num_kv_splits)
+            _validate_splitk_workspace_descriptor(H, Sq, D, _forced_generic_splits)
+            splitk = False
+        else:
+            ws_elems = dualwave_splitk_workspace_elems(
+                B, H, Sq, int(num_kv_splits), head_dim=D
+            )
+            _validate_splitk_workspace_descriptor(H, Sq, D, int(num_kv_splits))
 
     # ── build (cached) ──────────────────────────────────────────────────────
     debug_lazy = debug_counts is not None
@@ -2335,6 +2461,8 @@ def flydsl_flash_attn_func(
                     or Sq <= _VARLEN_LIGHT_MAX_SEQ
                     # Gappy KV is only implemented on the generic (light) path.
                     or kv_seqstart is not None
+                    # Only the light kernel masks stored head dims.
+                    or masked_hd
                 )
             )
             if _prefer_light:
@@ -2356,6 +2484,8 @@ def flydsl_flash_attn_func(
                     window_left=window_left,
                     sm_scale=sm_scale,
                     gappy_kv=kv_seqstart is not None,
+                    head_dim_qk=Dqk,
+                    head_dim_v=Dv,
                 )
             else:
                 exe = _build_varlen(
@@ -2408,8 +2538,12 @@ def flydsl_flash_attn_func(
                 _custom_scale = sm_scale is not None
                 _has_bias = bias is not None
                 _has_dropout = dropout_mask is not None
+                # Top-left only differs from the default bottom-right alignment
+                # when the lengths differ; keep self-attention on one build.
+                _top_left = causal and cross and causal_top_left
                 if (
-                    not _windowed
+                    not masked_hd
+                    and not _windowed
                     and not _custom_scale
                     and not _has_bias
                     and not _has_dropout
@@ -2436,12 +2570,19 @@ def flydsl_flash_attn_func(
                     )
                 else:
                     # Generic split-K for short-q dense self-attention that underfills
-                    # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Dropout
-                    # disables it (matches CK); bias/window/scale compose fine.
-                    _gen_splits = 1
+                    # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Bias,
+                    # window, scale and dropout compose: dropout is an explicit keep
+                    # mask indexed by absolute KV column, applied after l/LSE (no
+                    # philox offsets to split, unlike CK), so the combine is exact.
+                    _gen_splits = _forced_generic_splits or 1
+                    _split_min_kv = 0
+                    if _has_dropout and D >= 128:
+                        _split_min_kv = _DROPOUT_SPLITK_MIN_KV
+                    elif _has_dropout or cross:
+                        _split_min_kv = _CROSS_SPLITK_MIN_KV
                     if (
-                        not _has_dropout
-                        and not cross
+                        not _forced_generic_splits
+                        and Skv >= _split_min_kv
                         and D in (64, 128, 256)
                         and dtype_str in ("bf16", "f16")
                     ):
@@ -2473,6 +2614,9 @@ def flydsl_flash_attn_func(
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
                             num_kv_splits=_gen_splits,
+                            causal_top_left=_top_left,
+                            head_dim_qk=Dqk,
+                            head_dim_v=Dv,
                         )
                     else:
                         block_m, flat_work_group_size, path_tag = _dense_generic_tile(
@@ -2495,12 +2639,20 @@ def flydsl_flash_attn_func(
                             sm_scale=sm_scale,
                             has_bias=_has_bias,
                             has_dropout=_has_dropout,
+                            causal_top_left=_top_left,
+                            head_dim_qk=Dqk,
+                            head_dim_v=Dv,
                         )
 
         # ── allocate output ─────────────────────────────────────────────────
         if out is None:
             out_dtype = torch.bfloat16 if dtype_str == "fp8" else q.dtype
-            out = torch.empty(q.shape, dtype=out_dtype, device=q.device)
+            out = torch.empty((*q.shape[:-1], Dv), dtype=out_dtype, device=q.device)
+        elif out.shape[-1] != Dv:
+            raise ValueError(
+                f"flydsl_flash_attn_func: output head_dim must be {Dv}, "
+                f"got {out.shape[-1]}"
+            )
         elif dtype_str == "fp8" and out.dtype != torch.bfloat16:
             raise ValueError(
                 f"flydsl_flash_attn_func: fp8 output must be bf16, got {out.dtype}"
@@ -2591,7 +2743,7 @@ def flydsl_flash_attn_func(
                     bias_stride_q=int(bias_e.stride(2)),
                 )
             if dropout_mask is not None:
-                # Same ABI as bias: unit kv stride, broadcast to [B, H, Sq, Skv].
+                # Unit kv stride, broadcast to [B, H, Sq, Skv].
                 drop_e = dropout_mask.contiguous().expand(B, H, Sq, Skv)
                 assert drop_e.stride(3) == 1, "dropout kv axis must be unit-stride"
                 kwargs.update(
@@ -2601,7 +2753,7 @@ def flydsl_flash_attn_func(
                     dropout_stride_q=int(drop_e.stride(2)),
                 )
             if generic_splitk:
-                # Dense combine writes O in [B, Sq, H, D] layout (stride_q_n = H*D).
+                # Dense combine writes O in [B, Sq, H, Dv] layout (stride_q_n = H*Dv).
                 _ws = torch.empty(
                     dualwave_splitk_workspace_elems(
                         B, H, Sq, int(num_kv_splits), head_dim=D
@@ -2610,7 +2762,7 @@ def flydsl_flash_attn_func(
                     device=q.device,
                 )
                 kwargs["workspace"] = _ws
-                kwargs["stride_q_n"] = H * D
+                kwargs["stride_q_n"] = H * Dv
             exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
 
     return (out, lse) if return_lse else out
