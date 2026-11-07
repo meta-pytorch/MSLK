@@ -9,7 +9,7 @@
 Each split stores its partial with agent-coherent (SC1) stores, then counts
 itself in on a per-tile counter at the head of a persistent workspace. The
 split that completes the count merges every partial and resets the counter to
-zero for the next call, so the counters never need clearing on the host.
+zero for the next call.
 """
 
 from typing import Any
@@ -36,29 +36,6 @@ CPOL_SC1 = 16
 _WORKSPACES: dict = {}
 # Workspaces a captured graph still addresses, kept alive for its replays.
 _GRAPH_HELD: list = []
-# device -> stream that zeroes workspaces created during graph capture.
-_ZEROING_STREAMS: dict = {}
-
-
-def _zeroed(numel: int, device: torch.device) -> torch.Tensor:
-    """fp32 zeros. Under graph capture the whole buffer is zeroed right away on
-    a side stream, so other graphs that share it do not depend on this one
-    having run; this graph also clears the counters itself, which orders its
-    own first replay after the zeroing. (Waiting on the side stream instead
-    would add a node every replay pays for, and an event cannot be queried
-    during capture; a later graph is captured and instantiated long after the
-    side stream's memset was queued.)"""
-    buf = torch.empty(numel, dtype=torch.float32, device=device)
-    if not torch.cuda.is_current_stream_capturing():
-        buf.zero_()
-        return buf
-    side = _ZEROING_STREAMS.get(device)
-    if side is None:
-        side = _ZEROING_STREAMS[device] = torch.cuda.Stream(device)
-    with torch.cuda.stream(side):
-        buf.zero_()
-    buf[:ARRIVAL_COUNTERS].zero_()
-    return buf
 
 
 def arrival_workspace(elems: int, device: torch.device, stream: Any) -> torch.Tensor:
@@ -71,20 +48,20 @@ def arrival_workspace(elems: int, device: torch.device, stream: Any) -> torch.Te
     """
     key = (device, stream.cuda_stream)
     need = ARRIVAL_COUNTERS + elems
-    capturing = torch.cuda.is_current_stream_capturing()
-    entry = _WORKSPACES.get(key)
-    if entry is not None and entry[0].numel() >= need:
-        entry[1] = entry[1] or capturing
-        buf = entry[0]
-    else:
-        if entry is not None and entry[1]:
-            _GRAPH_HELD.append(entry[0])
-        size = max(need, 2 * entry[0].numel()) if entry is not None else need
-        buf = _zeroed(size, device)
-        _WORKSPACES[key] = [buf, capturing]
-    # A failed or cancelled launch may leave counters nonzero. Reset on the
-    # launch stream so reuse is ordered after prior work and remains capturable.
     with torch.cuda.stream(stream):
+        capturing = torch.cuda.is_current_stream_capturing()
+        entry = _WORKSPACES.get(key)
+        if entry is not None and entry[0].numel() >= need:
+            entry[1] = entry[1] or capturing
+            buf = entry[0]
+        else:
+            if entry is not None and entry[1]:
+                _GRAPH_HELD.append(entry[0])
+            size = max(need, 2 * entry[0].numel()) if entry is not None else need
+            buf = torch.empty(size, dtype=torch.float32, device=device)
+            _WORKSPACES[key] = [buf, capturing]
+        # A failed or cancelled launch may leave counters nonzero. Reset on the
+        # launch stream so reuse is ordered after prior work and remains capturable.
         buf[:ARRIVAL_COUNTERS].zero_()
     return buf
 
