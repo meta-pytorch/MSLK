@@ -71,6 +71,9 @@ def _add_device_columns(sample: Any, device: torch.device) -> None:
 def _report_dispatch(name: str, op: Any, inp: Inputs) -> None:
     """Report an auto-dispatched operator.
 
+    Reporting is skipped while Dynamo is tracing. The reporter performs Python
+    introspection and Scuba I/O that cannot be captured in a compiled graph.
+
     Outside Meta infrastructure `rfe.scubadata` is absent, so the first guard
     below returns before any work is done.
 
