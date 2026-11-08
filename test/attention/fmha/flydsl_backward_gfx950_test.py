@@ -225,3 +225,129 @@ def test_backward_flydsl_padded_gqa() -> None:
         )
 
     _run_backward_case(48, make_inputs, lambda output: (output**2).sum())
+
+
+@pytest.mark.parametrize("heads", [(32, 32), (32, 8)])
+def test_backward_flydsl_deterministic(heads: tuple[int, int]) -> None:
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    torch.manual_seed(0)
+    query_heads, kv_heads = heads
+    query = torch.randn(1, 4096, query_heads, 128, device=device, dtype=torch.bfloat16)
+    key = torch.randn(1, 4096, kv_heads, 128, device=device, dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    grad = torch.randn_like(query)
+    bias = fmha.attn_bias.LowerTriangularMask()
+
+    def run() -> list[torch.Tensor]:
+        leaves = [tensor.clone().requires_grad_(True) for tensor in (query, key, value)]
+        output = fmha.memory_efficient_attention(
+            leaves[0],
+            leaves[1].repeat_interleave(query_heads // kv_heads, dim=2),
+            leaves[2].repeat_interleave(query_heads // kv_heads, dim=2),
+            attn_bias=bias,
+            op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp),
+        )
+        output.backward(grad)
+        gradients = []
+        for leaf in leaves:
+            assert leaf.grad is not None
+            gradients.append(leaf.grad)
+        return gradients
+
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        first = run()
+        for _ in range(3):
+            for name, actual, expected in zip(("dq", "dk", "dv"), run(), first):
+                assert torch.equal(actual, expected), f"{name} differs between runs"
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+    leaves = [tensor.clone().requires_grad_(True) for tensor in (query, key, value)]
+    reference = ref_attention_for_test(
+        leaves[0],
+        leaves[1].repeat_interleave(query_heads // kv_heads, dim=2),
+        leaves[2].repeat_interleave(query_heads // kv_heads, dim=2),
+        bias,
+    )
+    reference.backward(grad)
+    for name, actual, leaf in zip(("dq", "dk", "dv"), first, leaves):
+        assert leaf.grad is not None
+        _assert_grad_close(actual, leaf.grad, f"deterministic:{name}")
+
+
+@pytest.mark.parametrize(
+    "seqlens,window", [((64, 256), 8), ((100, 333), 33), ((64, 256), 200)]
+)
+def test_backward_flydsl_bottom_right_local_attention(
+    seqlens: tuple[int, int], window: int
+) -> None:
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    torch.manual_seed(0)
+    query_length, key_length = seqlens
+    leaves = [
+        torch.randn(
+            2, length, 4, 64, device=device, dtype=torch.bfloat16
+        ).requires_grad_(True)
+        for length in (query_length, key_length, key_length)
+    ]
+    bias = fmha.attn_bias.LowerTriangularFromBottomRightLocalAttentionMask(window)
+    output = fmha.memory_efficient_attention(
+        *leaves, attn_bias=bias, op=(fmha.flydsl.FwOp, fmha.flydsl.BwOp)
+    )
+    grad = torch.randn_like(output)
+    output.backward(grad)
+    gradients = [leaf.grad for leaf in leaves]
+    for leaf in leaves:
+        leaf.grad = None
+    reference = ref_attention_for_test(*leaves, bias)
+    reference.backward(grad)
+    for name, actual, leaf in zip(("dq", "dk", "dv"), gradients, leaves):
+        assert actual is not None
+        assert leaf.grad is not None
+        _assert_grad_close(actual, leaf.grad, f"bottom-right window:{name}")
+
+
+@pytest.mark.parametrize(
+    "dims,causal", [((192, 128), True), ((64, 128), False), ((80, 48), True)]
+)
+def test_backward_flydsl_value_head_dim_differs(
+    dims: tuple[int, int], causal: bool
+) -> None:
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    torch.manual_seed(0)
+    query_dim, value_dim = dims
+    leaves = [
+        torch.randn(2, 128, 4, dim, device=device, dtype=torch.bfloat16).requires_grad_(
+            True
+        )
+        for dim in (query_dim, query_dim, value_dim)
+    ]
+    query, key, value = leaves
+    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    scale = query_dim**-0.5
+    with torch.no_grad():
+        scores = torch.einsum("bmhd,bnhd->bhmn", query.float(), key.float()) * scale
+        if causal:
+            mask = torch.ones(128, 128, device=device, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        output = torch.einsum("bhmn,bnhd->bmhd", scores.softmax(-1), value.float()).to(
+            query.dtype
+        )
+    grad = torch.randn_like(output)
+    inputs = fmha.Inputs(query, key, value, attn_bias=bias, scale=scale)
+    assert not fmha.flydsl.BwOp.not_supported_reasons(inputs)
+    gradients = fmha.flydsl.BwOp.apply(fmha.Context(lse=lse, out=output), inputs, grad)
+    reference = ref_attention_for_test(query, key, value, bias, scale=scale)
+    reference.backward(grad)
+    for name, actual, leaf in zip(
+        ("dq", "dk", "dv"), (gradients.dq, gradients.dk, gradients.dv), leaves
+    ):
+        assert leaf.grad is not None
+        _assert_grad_close(actual, leaf.grad, f"value dimension:{name}")

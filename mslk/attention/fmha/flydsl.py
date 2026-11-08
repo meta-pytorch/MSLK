@@ -47,15 +47,13 @@ negative-path test in `test_backward.py`):
   `SUPPORTED_ATTN_BIAS_TYPES` not listing them (falls through to the base
   class's `type(d.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES` check).
   Revisit if a backward caller for paged/gappy attention appears.
-- Bottom-right local attention (`LowerTriangularFromBottomRightLocalAttentionMask`):
-  the window term uses the top-left diagonal, so it cannot be combined with
-  bottom-right alignment. Rejected via `SUPPORTED_ATTN_BIAS_TYPES` omission.
 """
 
 import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
+from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
     BlockDiagonalCausalFromBottomRightMask,
@@ -725,9 +723,9 @@ def _with_kernel_layout(
     return t if reason is None else t.contiguous()
 
 
-def _pad_head_dim_to_32(t: torch.Tensor) -> torch.Tensor:
-    """Zero-pad the last dim up to a multiple of 32 (the kernel's wave tiling)."""
-    pad = -t.shape[-1] % 32
+def _pad_last_dim(t: torch.Tensor, size: int) -> torch.Tensor:
+    """Zero-pad the last dim of `t` up to `size`."""
+    pad = size - t.shape[-1]
     return torch.nn.functional.pad(t, (0, pad)) if pad else t
 
 
@@ -1001,9 +999,8 @@ def _flydsl_bwd(
     # is untouched below -- this kernel hard-asserts gfx950). The kernel
     # writes dV/dK PER QUERY HEAD, uncompacted (`ck_scope_dvdk=True`), and the
     # GQA-combine reduction happens HERE, outside the kernel, via
-    # `.unflatten().sum()` -- see the reduce below. dQ stays atomic-add
-    # (`deterministic=False`); the deterministic branch is not yet the
-    # default for any caller.
+    # `.unflatten().sum()` -- see the reduce below. dQ is atomic-add unless
+    # torch.use_deterministic_algorithms is set (see `deterministic` below).
     if _is_gfx950:
         from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
             compile_fmha_bwd_dqdkdv_mfma_gfx950,
@@ -1012,6 +1009,16 @@ def _flydsl_bwd(
 
         BLOCK_M_CK, BLOCK_N_CK = gfx950_tile_defaults(D, N, gpu_arch)
         n_M_tiles = (M + BLOCK_M_CK - 1) // BLOCK_M_CK
+        # Under torch.use_deterministic_algorithms the kernel stores each N-tile's
+        # dQ partial into its own slot of a [num_N_tiles, B*M*H*D] workspace
+        # instead of atomic-adding into one buffer; the slots are summed below in
+        # a fixed order. dK/dV have a single writer per element either way.
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        num_dq_splits = (N + BLOCK_N_CK - 1) // BLOCK_N_CK if deterministic else 1
+        if deterministic:
+            dQ_out = torch.zeros(
+                num_dq_splits * alloc_m * H * D, 1, device=device, dtype=torch.float32
+            )
         # dV/dK per-query-head (uncompacted [B,N,H,D]) under ck_scope_dvdk --
         # see compile_fmha_bwd_dqdkdv_mfma_gfx950's own docstring/kwarg doc.
         dV_out = torch.zeros(alloc_n * H * D, 1, device=device, dtype=torch.float32)
@@ -1060,6 +1067,7 @@ def _flydsl_bwd(
             window_left,
             Dqk,
             Dv,
+            deterministic,
         )
         compiled_gfx950 = _gfx950_kernel_cache.get(gfx950_key)
         if compiled_gfx950 is None:
@@ -1074,7 +1082,7 @@ def _flydsl_bwd(
                 varlen=varlen,
                 window_left=window_left,
                 gpu_arch=gpu_arch,
-                deterministic=False,
+                deterministic=deterministic,
                 ck_scope_dvdk=True,
                 has_bias=has_bias,
                 emit_dbias=emit_dbias,
@@ -1125,13 +1133,15 @@ def _flydsl_bwd(
         out_b = 1 if varlen else B
         out_m = total_m if varlen else M
         out_n = total_n if varlen else N
-        # dQ convert: f32 accumulator -> output dtype. Use a dedicated
-        # FlyDSL kernel to avoid PyTorch .to() kernel launch overhead.
-        if Dqk != D:
-            # Strided cast of the stored columns; the convert kernel is flat-only.
-            dq = dQ_out.view(out_b, out_m, H, D)[..., :Dqk].to(dtype)
+        dq_n_elems = alloc_m * H * D
+        if deterministic:
+            dQ_acc = dQ_out.view(num_dq_splits, dq_n_elems).sum(0).view(-1, 1)
         else:
-            dq_n_elems = alloc_m * H * D
+            dQ_acc = dQ_out
+        if Dqk != D:
+            # The flat conversion kernel cannot cast only the stored columns.
+            dq = dQ_acc.view(out_b, out_m, H, D)[..., :Dqk].to(dtype)
+        else:
             from mslk.attention.flydsl.fmha_bwd_convert_dq import (
                 compile_fmha_bwd_convert_dq,
             )
@@ -1143,10 +1153,10 @@ def _flydsl_bwd(
                 launch_convert = compile_fmha_bwd_convert_dq(dtype_str=dtype_str)
                 tmp_dq_conv = torch.empty_like(dq_converted)
                 compiled_convert = flyc.compile(
-                    launch_convert, dQ_out, tmp_dq_conv, dq_n_elems, stream
+                    launch_convert, dQ_acc, tmp_dq_conv, dq_n_elems, stream
                 )
                 _convert_dq_kernel_cache[convert_key] = compiled_convert
-            compiled_convert(dQ_out, dq_converted, dq_n_elems, stream)
+            compiled_convert(dQ_acc, dq_converted, dq_n_elems, stream)
             dq = dq_converted.view(out_b, out_m, H, D)
         # GQA-combine: dV/dK came back per-query-head ([B,N,H,D], H not Hkv).
         # Reduce across the heads_per_kv group and convert to output dtype.
@@ -1510,16 +1520,11 @@ class BwOp(AttentionBwOpBase):
     # unrelated case (true 5D BMGHK tensors) that this kernel does not
     # implement -- stays False.
     SUPPORTS_BMGHK = False
-    # False since the internal dispatch switched to the fused dqdkdv kernel:
-    # dQ (always) and dV/dK (when M_SPLIT>1, the gfx950 default) are
-    # atomic-add, unlike the old split dvdk+dq path's pure
-    # register-accumulate-then-store. The D=256/gfx942 fallback (the
-    # split path, kept only because dqdkdv structurally can't fit there) IS
-    # deterministic, but this flag is a single class-level value covering
-    # every shape -- conservatively False for the whole op rather than
-    # per-shape-conditional, since AttentionBwOpBase.not_supported_reasons()
-    # checks this BEFORE the op knows which internal path a given D will take.
-    IS_DETERMINISTIC = False
+    # gfx950 honours torch.use_deterministic_algorithms: dQ goes through the
+    # kernel's per-N-tile workspace and a fixed-order reduction instead of
+    # atomics (see `_flydsl_bwd`). Other archs have no such path, so
+    # `not_supported_reasons` declines them while the mode is on.
+    IS_DETERMINISTIC = True
     # db is emitted by the gfx950 fused kernel as the unscaled dS; broadcast
     # bias is rejected in not_supported_reasons, so no reduction is involved.
     SUPPORTS_ATTN_BIAS_GRAD = True
@@ -1534,8 +1539,8 @@ class BwOp(AttentionBwOpBase):
     # (never seqstart-global), which already implements per-block causal
     # masking correctly given per-batch tiling -- confirmed via
     # CASES_VARLEN_CAUSAL in test_fmha_bwd_{dvdk,dq}_mfma.py. NOT other
-    # Bottom-right is the tri-state's second mode. The bottom-right LOCAL
-    # types stay out: the window term still uses the top-left diagonal.
+    # Bottom-right is the tri-state's second mode; its window term is measured
+    # from the bottom-right diagonal (see _window_keep).
     SUPPORTED_ATTN_BIAS_TYPES = (
         type(None),
         torch.Tensor,
@@ -1547,8 +1552,10 @@ class BwOp(AttentionBwOpBase):
         # Bottom-right alignment, dense and per-block.
         LowerTriangularFromBottomRightMask,
         BlockDiagonalCausalFromBottomRightMask,
+        # Bottom-right alignment + sliding window.
+        LowerTriangularFromBottomRightLocalAttentionMask,
     )
-    _TEST_K: List[int] = [32, 64, 96, 128, 256]
+    _TEST_K: List[int] = [32, 48, 64, 96, 128, 256]
     NAME = "flydslB"
 
     @classmethod
@@ -1556,14 +1563,11 @@ class BwOp(AttentionBwOpBase):
         reasons = super(BwOp, cls).not_supported_reasons(d)
         if not _is_flydsl_available():
             reasons.append("FlyDSL unavailable on this device/arch")
-        K, Kv = d.query.shape[-1], d.value.shape[-1]
-        gpu_arch = (
-            torch.cuda.get_device_properties(d.query.device).gcnArchName
-            if d.query.device.type == "cuda"
-            else ""
-        )
-        if "gfx950" not in gpu_arch and Kv != K:
-            reasons.append(f"value head_dim must equal query head_dim on {gpu_arch}")
+        if torch.are_deterministic_algorithms_enabled() and not is_gfx950():
+            reasons.append(
+                "deterministic backward is implemented for gfx950 only, but "
+                "`torch.use_deterministic_algorithms` is set"
+            )
         # GQA: Hq must be a whole multiple of Hkv -- the kernel's
         # heads_per_kv = Hq // Hkv grid-regroup requires this.
         h_kv = _num_kv_heads(d.key)
@@ -1629,14 +1633,18 @@ class BwOp(AttentionBwOpBase):
         gpu_arch = torch.cuda.get_device_properties(query.device).gcnArchName
         if "gfx950" in gpu_arch:
             if K % 2 or Kv % 2:
-                # The kernel moves whole dwords, so odd widths need one zero column.
                 query, key, value, out, grad = (
                     torch.nn.functional.pad(t, (0, t.shape[-1] % 2))
                     for t in (query, key, value, out, grad)
                 )
-        elif K % 32:
-            query, key, value, out, grad = (
-                _pad_head_dim_to_32(t) for t in (query, key, value, out, grad)
+        else:
+            kernel_dim = -(-max(K, Kv) // 32) * 32
+            query, key = (
+                _pad_last_dim(query, kernel_dim),
+                _pad_last_dim(key, kernel_dim),
+            )
+            value, out, grad = (
+                _pad_last_dim(t, kernel_dim) for t in (value, out, grad)
             )
         query = _with_kernel_layout(query)
         key = _with_kernel_layout(key, allow_broadcast_heads=True)
