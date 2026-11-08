@@ -66,6 +66,16 @@ WARP_SIZE = get_warp_size()  # 64 on CDNA3/CDNA4
 _LOG2E = _math.log2(_math.e)
 
 
+def _window_keep(causal_mode, window_left, n_row_abs, m_row_abs, seqlen_q, seqlen_k):
+    """Sliding-window term: keep kv > q - window_size, measured from the diagonal
+    the causal mode pins. Bottom-right shifts it by seqlen_k - seqlen_q; the
+    additive form avoids an unsigned index wrap.
+    """
+    if causal_mode == CAUSAL_BOTTOM_RIGHT:
+        return n_row_abs + window_left + seqlen_q > m_row_abs + seqlen_k
+    return n_row_abs + window_left > m_row_abs
+
+
 def _softmax_p(s_val, neg_log2e_lse, log2e_scale, valid, fm):
     """P = exp2(log2e*scale*S - log2e*LSE), masked to 0 outside valid.
 
@@ -595,9 +605,14 @@ def compile_fmha_bwd_dvdk_mfma(
                                 n_row_abs + this_seqlen_q <= m_row_abs + this_seqlen_k
                             )
                         if const_expr(window_left >= 0):
-                            # Sliding window: keep kv > q - window_size, the
-                            # xformers convention the forward already uses.
-                            valid_mn = valid_mn & (n_row_abs + window_left > m_row_abs)
+                            valid_mn = valid_mn & _window_keep(
+                                causal_mode,
+                                window_left,
+                                n_row_abs,
+                                m_row_abs,
+                                this_seqlen_q,
+                                this_seqlen_k,
+                            )
                         neg_log2e_lse = fx.Float32(
                             arith.mulf(
                                 _raw(lse_val), _raw(fx.Float32(-_LOG2E)), fastmath=fm
@@ -1312,9 +1327,14 @@ def compile_fmha_bwd_dq_mfma(
                             n_row_abs + this_seqlen_q <= m_row_abss[r] + this_seqlen_k
                         )
                     if const_expr(window_left >= 0):
-                        # Sliding window: keep kv > q - window_size, the
-                        # xformers convention the forward already uses.
-                        valid_mn = valid_mn & (n_row_abs + window_left > m_row_abss[r])
+                        valid_mn = valid_mn & _window_keep(
+                            causal_mode,
+                            window_left,
+                            n_row_abs,
+                            m_row_abss[r],
+                            this_seqlen_q,
+                            this_seqlen_k,
+                        )
                     p_val = _softmax_p(
                         s_val, neg_log2e_lse_vals[r], log2e_scale_cst, valid_mn, fm
                     )
@@ -2172,10 +2192,13 @@ def compile_fmha_bwd_dqdkdv_mfma(
                                     <= m_row_abs + this_seqlen_k
                                 )
                             if const_expr(window_left >= 0):
-                                # Sliding window: keep kv > q - window_size, the
-                                # xformers convention the forward already uses.
-                                valid_mn = valid_mn & (
-                                    n_row_abs + window_left > m_row_abs
+                                valid_mn = valid_mn & _window_keep(
+                                    causal_mode,
+                                    window_left,
+                                    n_row_abs,
+                                    m_row_abs,
+                                    this_seqlen_q,
+                                    this_seqlen_k,
                                 )
                             neg_log2e_lse = fx.Float32(
                                 arith.mulf(
