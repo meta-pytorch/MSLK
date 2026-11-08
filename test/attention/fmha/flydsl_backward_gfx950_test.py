@@ -9,6 +9,11 @@ from collections.abc import Callable
 import pytest
 import torch
 from mslk.attention import fmha
+from mslk.attention.flydsl.fmha_dropout import (
+    philox_keep_mask,
+    philox_offset_increment,
+    philox_randval,
+)
 from mslk.utils.device import is_gfx950
 
 from .case_generation import create_tensors
@@ -95,29 +100,6 @@ def test_default_backward_dispatch_falls_back_to_flydsl_on_gfx950() -> None:
     assert query.grad is not None
     assert key.grad is not None
     assert value.grad is not None
-
-
-def test_flydsl_forward_declines_dropout_with_gradients() -> None:
-    _require_gfx950_flydsl()
-    device = torch._C._get_accelerator().type
-    query = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
-    key, value = torch.randn_like(query), torch.randn_like(query)
-
-    def dropout_reasons(requires_grad: bool) -> list[str]:
-        inputs = fmha.Inputs(
-            query.clone().requires_grad_(requires_grad),
-            key.clone().requires_grad_(requires_grad),
-            value.clone().requires_grad_(requires_grad),
-            p=0.1,
-        )
-        return [
-            reason
-            for reason in fmha.flydsl.FwOp.not_supported_reasons(inputs)
-            if "dropout" in reason
-        ]
-
-    assert dropout_reasons(requires_grad=True)
-    assert not dropout_reasons(requires_grad=False)
 
 
 def test_backward_flydsl_head_dim_192() -> None:
@@ -351,3 +333,260 @@ def test_backward_flydsl_value_head_dim_differs(
     ):
         assert leaf.grad is not None
         _assert_grad_close(actual, leaf.grad, f"value dimension:{name}")
+
+
+def _dropout_reference_grads(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    grad: torch.Tensor,
+    keep: torch.Tensor | None,
+    p: float,
+    valid: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = [
+        tensor.detach().float().requires_grad_(True) for tensor in (query, key, value)
+    ]
+    group = q.shape[2] // k.shape[2]
+    scores = (
+        torch.einsum("bmhd,bnhd->bhmn", q, k.repeat_interleave(group, dim=2))
+        * q.shape[-1] ** -0.5
+    )
+    if valid is not None:
+        scores = scores.masked_fill(~valid, float("-inf"))
+    lse = torch.logsumexp(scores, dim=-1)
+    probabilities = scores.softmax(-1)
+    if keep is not None:
+        probabilities = probabilities * keep.float() / (1.0 - p)
+    output = torch.einsum(
+        "bhmn,bnhd->bmhd", probabilities, v.repeat_interleave(group, dim=2)
+    )
+    output.backward(grad.float())
+    assert q.grad is not None
+    assert k.grad is not None
+    assert v.grad is not None
+    return output.detach(), lse.detach(), q.grad, k.grad, v.grad
+
+
+def _dropout_inputs(
+    heads: tuple[int, int],
+    seqlens: tuple[int, int],
+    dims: tuple[int, int],
+    causal: bool,
+    window: int | None,
+) -> tuple[fmha.Inputs, torch.Tensor, torch.Tensor | None]:
+    device = torch.device(torch._C._get_accelerator().type)
+    query_heads, kv_heads = heads
+    query_length, key_length = seqlens
+    query_dim, value_dim = dims
+    query = torch.randn(
+        2, query_length, query_heads, query_dim, device=device, dtype=torch.bfloat16
+    ).requires_grad_(True)
+    key = torch.randn(
+        2, key_length, kv_heads, query_dim, device=device, dtype=torch.bfloat16
+    ).requires_grad_(True)
+    value = torch.randn(
+        2, key_length, kv_heads, value_dim, device=device, dtype=torch.bfloat16
+    ).requires_grad_(True)
+    grad = torch.randn(
+        2, query_length, query_heads, value_dim, device=device, dtype=torch.bfloat16
+    )
+    if window is not None:
+        bias = fmha.attn_bias.LowerTriangularFromBottomRightLocalAttentionMask(window)
+    else:
+        bias = fmha.attn_bias.LowerTriangularMask() if causal else None
+    valid = None
+    if causal or window is not None:
+        row = torch.arange(query_length, device=device)[:, None]
+        column = torch.arange(key_length, device=device)[None, :]
+        diagonal = row + key_length - query_length if window is not None else row
+        valid = column <= diagonal
+        if window is not None:
+            valid = valid & (column > diagonal - window)
+    return fmha.Inputs(query, key, value, attn_bias=bias), grad, valid
+
+
+def _check_dropout_forward(
+    inputs: fmha.Inputs,
+    reference: torch.Tensor,
+    lse: torch.Tensor,
+    direct: bool,
+) -> fmha.Context:
+    generator = torch.cuda.default_generators[torch.cuda.current_device()]
+    seed, offset = generator.initial_seed(), generator.get_offset()
+    shape = (
+        inputs.query.shape[0],
+        inputs.query.shape[2],
+        inputs.query.shape[1],
+        inputs.key.shape[1],
+    )
+    increment = ((philox_offset_increment(*shape) + 3) // 4) * 4 if inputs.p else 0
+    if direct:
+        context = fmha.Context(lse=lse, out=reference.to(inputs.query.dtype))
+        if inputs.p:
+            saved_seed, saved_offset = fmha.flydsl._reserve_philox_state(
+                inputs.query.device, *shape
+            )
+            context.rng_state = torch.tensor(
+                [saved_seed, saved_offset], dtype=torch.int64, device="cpu"
+            )
+    else:
+        assert not fmha.flydsl.FwOp.not_supported_reasons(inputs)
+        _, context = fmha.flydsl.FwOp.apply(inputs, needs_gradient=True)
+        assert context is not None
+    assert generator.get_offset() == offset + increment
+    if inputs.p:
+        state = context.rng_state
+        assert state is not None
+        assert state.dtype == torch.int64 and state.device.type == "cpu"
+        assert state.shape == (2,)
+        signed_seed = seed - (1 << 64) if seed >= (1 << 63) else seed
+        assert state.tolist() == [signed_seed, offset]
+    return context
+
+
+def _check_dropout_backward(
+    context: fmha.Context,
+    inputs: fmha.Inputs,
+    grad: torch.Tensor,
+    reference: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    repeats: int,
+) -> None:
+    generator = torch.cuda.default_generators[torch.cuda.current_device()]
+    first = None
+    for _ in range(repeats):
+        offset = generator.get_offset()
+        gradients = fmha.flydsl.BwOp.apply(context, inputs, grad)
+        assert generator.get_offset() == offset
+        actual = (gradients.dq, gradients.dk, gradients.dv)
+        for name, got, expected in zip(("dq", "dk", "dv"), actual, reference):
+            _assert_grad_close(got, expected, f"dropout:{name}")
+        if first is not None:
+            for got, previous in zip(actual, first):
+                assert torch.equal(got, previous), (
+                    "deterministic dropout gradients differ"
+                )
+        first = actual
+
+
+def _run_dropout_case(
+    heads: tuple[int, int],
+    p: float,
+    causal: bool,
+    seqlens: tuple[int, int] = (200, 200),
+    dims: tuple[int, int] = (64, 64),
+    window: int | None = None,
+    direct: bool = False,
+    repeats: int = 1,
+) -> None:
+    _require_gfx950_flydsl()
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(0)
+        inputs, grad, valid = _dropout_inputs(heads, seqlens, dims, causal, window)
+        inputs.p = p
+        assert not fmha.flydsl.BwOp.not_supported_reasons(inputs)
+        torch.cuda.manual_seed((1 << 63) + 1234)
+        generator = torch.cuda.default_generators[torch.cuda.current_device()]
+        seed, offset = generator.initial_seed(), generator.get_offset()
+        keep = (
+            philox_keep_mask(
+                seed, offset, p, 2, heads[0], *seqlens, inputs.query.device
+            )
+            if p
+            else None
+        )
+        output, lse, dq, dk, dv = _dropout_reference_grads(
+            inputs.query, inputs.key, inputs.value, grad, keep, p, valid
+        )
+        context = _check_dropout_forward(inputs, output, lse, direct)
+        _assert_grad_close(context.out, output, "dropout:output")
+        _check_dropout_backward(context, inputs, grad, (dq, dk, dv), repeats)
+        if p and not direct:
+            next_context = _check_dropout_forward(inputs, output, lse, False)
+            assert next_context.rng_state is not None
+            assert context.rng_state is not None
+            assert next_context.rng_state.tolist() != context.rng_state.tolist()
+            _check_dropout_backward(context, inputs, grad, (dq, dk, dv), 1)
+
+
+@pytest.mark.parametrize("heads,p,causal", [((4, 4), 0.1, False), ((8, 2), 0.5, True)])
+def test_backward_flydsl_dropout(
+    heads: tuple[int, int], p: float, causal: bool
+) -> None:
+    _run_dropout_case(heads, p, causal)
+
+
+def test_backward_flydsl_deterministic_dropout_cache() -> None:
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        for deterministic, p in [
+            (False, 0.0),
+            (False, 0.1),
+            (True, 0.1),
+            (True, 0.5),
+            (False, 0.0),
+        ]:
+            torch.use_deterministic_algorithms(deterministic)
+            _run_dropout_case(
+                (4, 1),
+                p,
+                True,
+                seqlens=(513, 513),
+                dims=(128, 128),
+                repeats=4 if deterministic and p == 0.1 else 1,
+            )
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def test_backward_flydsl_window_dropout() -> None:
+    _run_dropout_case((4, 4), 0.1, True, seqlens=(100, 333), window=33, direct=True)
+
+
+def test_backward_flydsl_value_dim_dropout() -> None:
+    _run_dropout_case((4, 4), 0.5, True, seqlens=(128, 128), dims=(80, 48), direct=True)
+
+
+@pytest.mark.parametrize("seqlens", [(32, 32), (100, 70), (64, 256)])
+def test_dropout_mask_matches_ck(seqlens: tuple[int, int]) -> None:
+    _require_gfx950_flydsl()
+    if not hasattr(torch.ops.xformers, "_ck_rand_uniform"):
+        pytest.skip("CK dropout byte oracle unavailable")
+    device = torch.device(torch._C._get_accelerator().type)
+    query_length, key_length = seqlens
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.cuda.manual_seed(1234)
+        generator = torch.cuda.default_generators[torch.cuda.current_device()]
+        for batch, heads in [(1, 1), (2, 3)]:
+            seed, offset = generator.initial_seed(), generator.get_offset()
+            expected = torch.ops.xformers._ck_rand_uniform(
+                0.1, batch, heads, query_length, key_length, torch.cuda.current_device()
+            )
+            actual = philox_randval(
+                seed, offset, batch, heads, query_length, key_length, device
+            )
+            assert torch.equal(actual, expected), f"RNG bytes differ at offset={offset}"
+            increment = (
+                (philox_offset_increment(batch, heads, query_length, key_length) + 3)
+                // 4
+            ) * 4
+            assert generator.get_offset() == offset + increment
+            for p in (0.1, 0.5):
+                keep = philox_keep_mask(
+                    seed, offset, p, batch, heads, query_length, key_length, device
+                )
+                assert torch.equal(
+                    keep, (expected <= int((1 - p) * 255)).to(torch.uint8)
+                )
+
+
+def test_flydsl_bwd_declines_dropout_on_varlen() -> None:
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens([32, 64])
+    query = torch.randn(1, 96, 2, 64, device=device, dtype=torch.bfloat16)
+    inputs = fmha.Inputs(query, query.clone(), query.clone(), attn_bias=bias, p=0.1)
+    assert any(
+        "dropout" in reason for reason in fmha.flydsl.BwOp.not_supported_reasons(inputs)
+    )
