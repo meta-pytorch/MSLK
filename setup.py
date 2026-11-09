@@ -23,6 +23,17 @@ from setuptools.command.install import install as PipInstall
 
 _PYTHON_ONLY = os.environ.get("MSLK_PYTHON_ONLY", "0") == "1"
 
+
+def _read_pin(path: str) -> str:
+    """A version pin file's contents with all whitespace removed, exactly as CI
+    reads it (``tr -d '[:space:]'``), so that both always agree on the pin."""
+    with open(path, encoding="utf-8") as f:
+        version = "".join(f.read().split())
+    if not version:
+        raise ValueError(f"{path} holds no version")
+    return version
+
+
 # Single source of truth for the FlyDSL pin, shared with CI.
 _FLYDSL_VERSION_FILE = os.path.join(
     os.path.dirname(os.path.realpath(__file__)), "ci", "flydsl_version.txt"
@@ -30,8 +41,18 @@ _FLYDSL_VERSION_FILE = os.path.join(
 
 
 def _flydsl_version() -> str:
-    with open(_FLYDSL_VERSION_FILE, encoding="utf-8") as f:
-        return f.read().strip()
+    return _read_pin(_FLYDSL_VERSION_FILE)
+
+
+# The one aiter build MSLK is tested against, shared with CI. It lives inside
+# the package because the runtime reads it too.
+_AITER_VERSION_FILE = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "mslk", "aiter", "aiter_version.txt"
+)
+
+
+def _aiter_version() -> str:
+    return _read_pin(_AITER_VERSION_FILE)
 
 
 if _PYTHON_ONLY:
@@ -739,6 +760,22 @@ def main(argv: List[str]) -> None:
         "flash3": ["flash-attn-3"],
     }
 
+    is_rocm = (
+        build.variant() if not _PYTHON_ONLY else _detect_build_variant()
+    ) == "rocm"
+
+    # aiter is optional and ROCm-only; ops fall back to MSLK's own kernels
+    # without it. Its builds are published per commit outside PyPI, so install
+    # with:
+    # pip install mslk[aiter] ... --find-links https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/
+    # aiter pins FlyDSL exactly, so ci/flydsl_version.txt must match the FlyDSL
+    # version this aiter build requires.
+    # "==" is exact here because the pin has a local label (+g<sha>...). Do not
+    # use "===": followed by the extra's marker it makes the whole package's
+    # metadata unparsable for pip < 24.1, even when the extra is not requested.
+    if is_rocm:
+        extras_require["aiter"] = [f"amd-aiter=={_aiter_version()}"]
+
     packages = setuptools.find_packages()
 
     # When building with FB code in python-only mode, include fb/ packages
@@ -769,20 +806,22 @@ def main(argv: List[str]) -> None:
         packages=packages,
         # Ship the prebuilt FlyDSL AOT cache (populated at build time) so it
         # is available at runtime; absent when AOT is not run.
-        package_data={"mslk.flydsl": ["aot_artifacts/*"]},
+        package_data={
+            "mslk.flydsl": ["aot_artifacts/*"],
+            "mslk.aiter": ["aiter_version.txt"],
+        },
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the
             # release version of torch, which is not what we want for the
             # nightly and test packages
             "numpy",
         ]
-        # FlyDSL is a mandatory ROCm-only backend.
-        + (
-            [f"flydsl=={_flydsl_version()}"]
-            if (build.variant() if not _PYTHON_ONLY else _detect_build_variant())
-            == "rocm"
-            else []
-        ),
+        # FlyDSL is a mandatory ROCm-only backend. The pin uses "===" because
+        # "==" also accepts local builds such as 0.4.0+20261016.5ce3fbe: the
+        # folder aiter is installed from (see the aiter extra) also holds FlyDSL
+        # nightlies versioned that way, and pip would prefer the newest one over
+        # the release MSLK is tested with and builds its AOT cache for.
+        + ([f"flydsl==={_flydsl_version()}"] if is_rocm else []),
         extras_require=extras_require,
         # PyPI package information
         classifiers=[

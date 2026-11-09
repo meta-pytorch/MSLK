@@ -17,6 +17,7 @@ utils_scripts=(
     utils_pytorch.bash
     utils_triton.bash
     utils_flydsl.bash
+    utils_aiter.bash
     mslk_external_repos.bash
     mslk_build.bash
     mslk_install.bash
