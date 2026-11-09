@@ -730,8 +730,8 @@ class FP8RowwisePreshuffleFlyDSL(FP8Rowwise):
         self.fast_accum = True
 
     def preprocess(self, x, w):
-        xq, wq, x_scale, w_scale = super().preprocess(x, w)
-        return xq, flydsl_preshuffle(wq), x_scale, w_scale
+        x, wq, w_scale = super().preprocess(x, w)
+        return x, flydsl_preshuffle(wq), w_scale
 
     def compute(self, xq, wq, x_scale, w_scale):
         return flydsl_preshuffle_gemm(xq, wq, x_scale, w_scale)
