@@ -1072,7 +1072,10 @@ def test_decoder_ck(
 
 @rocm_only
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
-@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
+# (8, 32) MQA/GQA at padding 4096: gfx950 coop CTAs walk several 64-token tiles.
+@pytest.mark.parametrize(
+    "bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8), (8, 32)]
+)
 @pytest.mark.parametrize("padding", [32, 4096])
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 def test_decoder_flydsl(
