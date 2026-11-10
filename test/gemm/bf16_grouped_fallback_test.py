@@ -9,7 +9,9 @@ import unittest
 
 import mslk.gemm  # noqa: F401
 import torch
-from mslk.testing.device import skipUnlessRocm
+from mslk.testing.device import skipUnlessGfxArch, skipUnlessRocm
+from mslk.utils.device import is_gfx950
+from parameterized import parameterized
 
 
 @skipUnlessRocm()
@@ -44,3 +46,28 @@ class BF16GroupedFallbackTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "K must be divisible by 64"):
             torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+class RowwisePreshuffleFallbackTest(unittest.TestCase):
+    @parameterized.expand(
+        [
+            ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
+            ("f8f8f16_rowwise_preshuffle", torch.float16),
+        ]
+    )
+    def test_falls_back_to_ck_without_flydsl(self, op: str, dtype: torch.dtype) -> None:
+        self.assertIsNone(importlib.util.find_spec("flydsl"))
+        device = torch.accelerator.current_accelerator()
+        fp8_dtype = torch.float8_e4m3fn if is_gfx950() else torch.float8_e4m3fnuz
+        xq = torch.ones((16, 1024), dtype=torch.bfloat16, device=device).to(fp8_dtype)
+        wq = torch.ones((512, 1024), dtype=torch.bfloat16, device=device).to(fp8_dtype)
+        x_scale = torch.full((16,), 0.25, dtype=torch.float32, device=device)
+        w_scale = torch.full((512,), 0.125, dtype=torch.float32, device=device)
+
+        actual = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+
+        expected = torch.full((16, 512), 32.0, dtype=dtype, device=device)
+        self.assertEqual(actual.dtype, dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
