@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
 # pyre-ignore-all-errors[56]
 
 import os
 import unittest
+from math import prod
 from typing import Optional, Union
 
 import mslk.gemm  # noqa: F401
@@ -36,7 +36,7 @@ from mslk.testing.device import (
     skipUnlessGfxArch,
     skipUnlessRocm,
 )
-from mslk.utils.device import compute_capability_in, supports_float8_fnuz
+from mslk.utils.device import compute_capability_in, gfx_arch_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
     from mslk.gemm.flydsl.preshuffle_gemm import (
@@ -175,6 +175,8 @@ def _fp8_gemm_cases() -> list[tuple]:
         torch.version.cuda is not None and compute_capability_in(9, 9)
     ) or torch.version.hip is not None
     modes = ["rowwise"] + (["blockwise"] if blockwise_supported else [])
+    if torch.version.hip is not None and gfx_arch_in(("gfx942", "gfx950")):
+        modes.append("rowwise_preshuffle")
 
     def case(
         M: int,
@@ -266,9 +268,10 @@ class ExportCompileTests(unittest.TestCase):
             def forward(self, xq: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
                 M, K = xq.shape
                 N, _ = wq.shape
-                row_scale = torch.randn(M).cuda()
-                col_scale = torch.randn(N).cuda()
-                block_scale = torch.randn(M // 128, K // 128).cuda()
+                # Citrine C3: construct scales directly on the GPU.
+                row_scale = torch.randn(M, device="cuda")
+                col_scale = torch.randn(N, device="cuda")
+                block_scale = torch.randn(M // 128, K // 128, device="cuda")
                 _ = torch.ops.mslk.f8f8bf16_blockwise(xq, wq, block_scale, block_scale)
                 o = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, row_scale, col_scale)
                 return o
@@ -409,14 +412,22 @@ class FP8Tests(unittest.TestCase):
             else None
         )
 
-        if Mode == "rowwise":
+        if Mode in ("rowwise", "rowwise_preshuffle"):
 
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
             ) -> torch.Tensor:
                 xq, x_scale = quantize_fp8_row(x)
                 wq, w_scale = quantize_fp8_row(w)
-                if UseTriton and torch.version.cuda:
+                if Mode == "rowwise_preshuffle":
+                    from mslk.quantize.shuffle import preshuffle_b_mfma
+
+                    zq = torch.ops.mslk.f8f8bf16_rowwise_preshuffle(
+                        xq, preshuffle_b_mfma(wq), x_scale, w_scale
+                    )
+                    if bias is not None:
+                        zq += bias
+                elif UseTriton and torch.version.cuda:
                     zq = matmul_fp8_row(xq, wq, x_scale, w_scale)
                     if bias is not None:
                         zq += bias
@@ -4181,6 +4192,230 @@ class FlyDSLPreshuffleBatchedGemmTest(unittest.TestCase):
 
         ref = torch.bmm(x, w.transpose(1, 2)).to(torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
+    """Companion of the rowwise_preshuffle mode in ``test_gemm``: the f16 op,
+    shapes the wrapper zero-pads to the kernel's tiles, and the CK contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _quantized(self, M: int, N: int, K: int) -> tuple[torch.Tensor, ...]:
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        return xq, wq, x_scale, w_scale
+
+    @staticmethod
+    def _reference(
+        xq: torch.Tensor, wq: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return (xq.float() @ wq.float().T) * x_scale[..., None] * w_scale
+
+    @parameterized.expand(
+        [
+            (M, N, K, op, dtype)
+            # The first shape fits the kernel's tiles; the others (N % 64 != 0
+            # and/or K % 128 != 0) are valid for the preshuffle layout and get
+            # zero-padded to them.
+            for M, N, K in [(1, 4096, 4096), (33, 1040, 4160), (16, 4096, 4160)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
+                ("f8f8f16_rowwise_preshuffle", torch.float16),
+            ]
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(M, N, K)
+        out = getattr(torch.ops.mslk, op)(xq, preshuffle_b_mfma(wq), x_scale, w_scale)
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_padded_weight_follows_inplace_update(self) -> None:
+        # The padded weight is cached per weight tensor; an in-place update
+        # must not be served the stale copy.
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        op = torch.ops.mslk.f8f8bf16_rowwise_preshuffle
+        xq, wq, x_scale, w_scale = self._quantized(16, 1040, 4160)
+        wq_shuf = preshuffle_b_mfma(wq)
+        op(xq, wq_shuf, x_scale, w_scale)
+        _, wq2, _, w_scale2 = self._quantized(16, 1040, 4160)
+        wq_shuf.copy_(preshuffle_b_mfma(wq2))
+        out = op(xq, wq_shuf, x_scale, w_scale2)
+        ref = self._reference(xq, wq2, x_scale, w_scale2)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    @parameterized.expand(
+        [
+            (shape, n, op, dtype)
+            for shape, n in [
+                ((0, 256), 64),
+                ((2, 0, 3, 256), 64),
+                ((3, 256), 0),
+                ((3, 0), 64),
+            ]
+            for op, dtype in [
+                ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
+                ("f8f8f16_rowwise_preshuffle", torch.float16),
+            ]
+        ]
+    )
+    def test_empty_dimensions(
+        self, shape: tuple[int, ...], n: int, op: str, dtype: torch.dtype
+    ) -> None:
+        xq = torch.empty(shape, dtype=fp8_e4m3, device=self.device)
+        wq = torch.empty((n, shape[-1]), dtype=fp8_e4m3, device=self.device)
+        x_scale = torch.ones(shape[:-1], dtype=torch.float32, device=self.device)
+        w_scale = torch.ones(n, dtype=torch.float32, device=self.device)
+
+        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+
+        self.assertEqual(out.shape, (*shape[:-1], n))
+        self.assertEqual(out.dtype, dtype)
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+    @parameterized.expand(
+        [
+            (leading_shape, op, dtype)
+            for leading_shape in [(), (2, 3, 5)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise_preshuffle", torch.bfloat16),
+                ("f8f8f16_rowwise_preshuffle", torch.float16),
+            ]
+        ]
+    )
+    def test_leading_dimensions(
+        self, leading_shape: tuple[int, ...], op: str, dtype: torch.dtype
+    ) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(prod(leading_shape), 80, 192)
+        xq = xq.view(*leading_shape, 192)
+        x_scale = x_scale.reshape(leading_shape)
+        inputs = (xq, preshuffle_b_mfma(wq), x_scale, w_scale)
+
+        out = getattr(torch.ops.mslk, op)(*inputs)
+
+        self.assertEqual(out.shape, (*leading_shape, 80))
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        torch.library.opcheck(
+            getattr(torch.ops.mslk, op), inputs, test_utils=("test_faketensor",)
+        )
+
+    @parameterized.expand(
+        [("f8f8bf16_rowwise_preshuffle",), ("f8f8f16_rowwise_preshuffle",)]
+    )
+    def test_padded_inference_weight_follows_update(self, op: str) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        with torch.inference_mode():
+            xq, wq, x_scale, w_scale = self._quantized(16, 80, 192)
+            shuffled = preshuffle_b_mfma(wq)
+            getattr(torch.ops.mslk, op)(xq, shuffled, x_scale, w_scale)
+            updated = torch.ones(wq.shape, dtype=torch.bfloat16, device=self.device).to(
+                wq.dtype
+            )
+            shuffled.copy_(preshuffle_b_mfma(updated))
+
+            out = getattr(torch.ops.mslk, op)(xq, shuffled, x_scale, w_scale)
+
+            ref = self._reference(xq, updated, x_scale, w_scale)
+            torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    @parameterized.expand(
+        [("f8f8bf16_rowwise_preshuffle",), ("f8f8f16_rowwise_preshuffle",)]
+    )
+    def test_rejects_invalid_input_and_scales(self, op: str) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(16, 256, 512)
+        wq = preshuffle_b_mfma(wq)
+        invalid_inputs = [
+            (xq, wq, x_scale[:-1], w_scale, "scale"),
+            (xq, wq, x_scale, w_scale[:-1], "scale"),
+            (xq, wq, x_scale.cpu(), w_scale, "device"),
+            (xq, wq, x_scale, w_scale.cpu(), "device"),
+            (xq.float(), wq.float(), x_scale, w_scale, "dtype|FP8|float8"),
+            (xq.new_empty(()), wq, x_scale, w_scale, "XQ"),
+            (xq, wq.reshape(-1), x_scale, w_scale, "WQ"),
+            (xq[:, :256].contiguous(), wq, x_scale, w_scale, "K mismatch"),
+        ]
+        for x, w, xs, ws, error in invalid_inputs:
+            with self.subTest(error=error, x_shape=x.shape, w_shape=w.shape):
+                with self.assertRaisesRegex(RuntimeError, error):
+                    getattr(torch.ops.mslk, op)(x, w, xs, ws)
+
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
+    def test_uses_input_device_when_current_device_differs(self) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(16, 256, 512)
+        shuffled = preshuffle_b_mfma(wq)
+        other = (xq.device.index + 1) % torch.cuda.device_count()
+        with torch.cuda.device(other):
+            out = torch.ops.mslk.f8f8bf16_rowwise_preshuffle(
+                xq, shuffled, x_scale, w_scale
+            )
+            self.assertEqual(torch.cuda.current_device(), other)
+
+        self.assertEqual(out.device, xq.device)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        with self.assertRaisesRegex(RuntimeError, "device"):
+            torch.ops.mslk.f8f8bf16_rowwise_preshuffle(
+                xq, shuffled, x_scale.to(f"cuda:{other}"), w_scale
+            )
+
+    def test_rejects_what_ck_rejects(self) -> None:
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        op = torch.ops.mslk.f8f8bf16_rowwise_preshuffle
+        xq, wq, x_scale, w_scale = self._quantized(16, 256, 512)
+        wq = preshuffle_b_mfma(wq)
+        bias = torch.zeros(256, dtype=torch.bfloat16, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            op(xq, wq, x_scale, w_scale, bias)
+        with self.assertRaisesRegex(RuntimeError, "use_fast_accum"):
+            op(xq, wq, x_scale, w_scale, None, False)
+        with self.assertRaisesRegex(RuntimeError, "float32"):
+            op(xq, wq, x_scale.bfloat16(), w_scale)
+        with self.assertRaisesRegex(RuntimeError, "N % 16"):
+            op(xq, wq[:40], x_scale, w_scale[:40])
+
+    def test_rejects_narrow_tile_n(self) -> None:
+        # tile_n < 64 launches but leaves most of the output unwritten.
+        xq, wq, x_scale, w_scale = self._quantized(16, 1024, 1024)
+        with self.assertRaisesRegex(ValueError, "multiple of 64"):
+            flydsl_preshuffle_gemm(
+                xq, flydsl_preshuffle(wq), x_scale, w_scale, tile_m=16, tile_n=32
+            )
+
+    def test_opcheck(self) -> None:
+        # Fake kernel vs real output on a 3D input. test_schema is left out: its
+        # mutation check multiplies the inputs, which float8_e4m3fn lacks.
+        from mslk.quantize.shuffle import preshuffle_b_mfma
+
+        xq, wq, x_scale, w_scale = self._quantized(128, 1024, 1024)
+        torch.library.opcheck(
+            torch.ops.mslk.f8f8bf16_rowwise_preshuffle,
+            (xq.view(2, 64, 1024), preshuffle_b_mfma(wq), x_scale.view(2, 64), w_scale),
+            test_utils=("test_faketensor",),
+        )
 
 
 @skipUnlessRocm()
