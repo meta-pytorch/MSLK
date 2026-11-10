@@ -63,11 +63,6 @@ setup_miniconda () {
   print_exec "${conda_install_prefix}/bin/conda" init bash
   print_exec . ~/.bashrc
 
-  # ~/.bashrc returns early in non-interactive shells, so it cannot be relied on to put this conda on PATH
-  echo "[SETUP] Exporting Miniconda variables ..."
-  export PATH="${conda_install_prefix}/bin:${PATH}"
-  export CONDA="${conda_install_prefix}"
-
   # https://medium.com/data-tyro/resolving-the-conda-libmamba-issue-and-environment-activation-trouble-9f911a6106a4
   # https://www.reddit.com/r/learnpython/comments/160kjz9/how_do_i_get_anaconda_to_work_the_way_i_want_it_to/
   # https://stackoverflow.com/questions/77617946/solve-conda-libmamba-solver-libarchive-so-19-error-after-updating-conda-to-23
@@ -88,6 +83,10 @@ setup_miniconda () {
   print_exec conda info
 
   # These variables will be exported outside
+  echo "[SETUP] Exporting Miniconda variables ..."
+  export PATH="${conda_install_prefix}/bin:${PATH}"
+  export CONDA="${conda_install_prefix}"
+
   if [ -f "${GITHUB_PATH}" ]; then
     echo "[SETUP] Saving Miniconda variables to ${GITHUB_PATH} ..."
     echo "${conda_install_prefix}/bin" >> "${GITHUB_PATH}"
