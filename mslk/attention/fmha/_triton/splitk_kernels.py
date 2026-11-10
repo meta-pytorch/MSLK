@@ -1020,7 +1020,7 @@ def _unpack_fp8_tensor(
     offsets = tl.arange(0, PACKED_PER_VAL) * 8
 
     # Extract 8-bit values by right-shifting and masking
-    unpacked_values = x_[:, :, None, :] >> offsets
+    unpacked_values = x_[:, :, None] >> offsets
     unpacked_values = tl.reshape(
         unpacked_values, (BLOCK_N, BLOCK_DMODEL_PACKED * PACKED_PER_VAL)
     )
@@ -1125,7 +1125,7 @@ def dequantize_k_hip(
     BLOCK_DMODEL_PACKED: tl.constexpr = x_.shape[0]
     offsets = tl.arange(0, PACKED_PER_VAL) * (32 // PACKED_PER_VAL)
     quant_offset = (
-        x_[:, None, :, :] >> offsets[:, None]
+        x_[:, None, :] >> offsets[:, None]
     )  # (BLOCK_N, D // PACKED_PER_VAL, PACKED_PER_VAL)
 
     quant_offset = tl.reshape(
@@ -1177,7 +1177,7 @@ def dequantize(
     BLOCK_DMODEL_PACKED: tl.constexpr = x_.shape[1]
     offsets = tl.arange(0, PACKED_PER_VAL) * (32 // PACKED_PER_VAL)
     quant_offset = (
-        x_[:, :, None, :] >> offsets
+        x_[:, :, None] >> offsets
     )  # (BLOCK_N, D // PACKED_PER_VAL, PACKED_PER_VAL)
 
     quant_offset = tl.reshape(
