@@ -239,7 +239,6 @@ def _dispatch_fw_priority_list(
                 and parallelism_BH < 64
                 and not torch.mtia.is_available()
             ):
-                # priority_list_ops.appendleft(ck_splitk.FwOp)
                 # pyrefly: ignore [bad-argument-type]
                 priority_list_ops.remove(triton_splitk.FwOp)
                 # pyrefly: ignore [bad-argument-type]
