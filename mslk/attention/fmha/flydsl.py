@@ -190,8 +190,8 @@ class FwOp(AttentionFwOpBase):
     OPERATOR = staticmethod(_is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
-    # Any dims in [1, 256]; non-native dims are masked in-kernel (see _apply_bmhk).
-    SUPPORTED_MAX_K = 256
+    # [1, 256] via generic/dualwave; (256, 512] via small-attention kernel on gfx950.
+    SUPPORTED_MAX_K = 512
     SUPPORTED_MIN_K = 1
 
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
@@ -238,7 +238,7 @@ class FwOp(AttentionFwOpBase):
     }
 
     # 96 is non-native, to exercise in-kernel head-dim masking.
-    _TEST_K: List[int] = [64, 96, 128, 256]
+    _TEST_K: List[int] = [64, 96, 128, 256, 512]
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
@@ -249,8 +249,10 @@ class FwOp(AttentionFwOpBase):
 
         K = d.query.shape[-1]
         Kv = d.value.shape[-1]
-        if not (1 <= K <= 256):
-            reasons.append(f"query head_dim={K} out of range [1, 256]")
+        if not (1 <= K <= 512):
+            reasons.append(f"query head_dim={K} out of range [1, 512]")
+        if max(K, d.value.shape[-1]) > 256:
+            reasons.extend(_small_attn_input_reasons(d))
         if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
             reasons.append("paged KV needs value head_dim == query head_dim")
 
@@ -288,7 +290,7 @@ class FwOp(AttentionFwOpBase):
             + _PAGED_BIAS_TYPES
             + _PAGED_GAPPY_TYPES,
         ):
-            if d.query.shape[1] != d.key.shape[1]:
+            if d.query.shape[1] != d.key.shape[1] and K <= 256:
                 _has_bias = isinstance(
                     d.attn_bias, (torch.Tensor, LowerTriangularMaskWithTensorBias)
                 )
@@ -348,6 +350,21 @@ class FwOp(AttentionFwOpBase):
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         if type(inp.attn_bias) not in cls.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
+        if inp.query.ndim == 4:
+            D = inp.query.shape[-1]
+            if max(D, inp.value.shape[-1]) > 256:
+                reasons = _small_attn_input_reasons(inp)
+                if reasons:
+                    raise NotImplementedError("; ".join(reasons))
+                out, lse = cls._apply_small_attn_fwd(inp, needs_gradient)
+                ctx: Optional[Context] = None
+                if needs_gradient:
+                    if lse is None:
+                        raise RuntimeError(
+                            "FlyDSL forward did not return LSE for backward"
+                        )
+                    ctx = Context(lse=lse, out=out, op_bw=None)
+                return out, ctx
         if inp.query.ndim == 5:
             return cls._apply_bmghk(inp, needs_gradient)
         if inp.query.ndim != 4:
@@ -611,6 +628,9 @@ class FwOp(AttentionFwOpBase):
             ):
                 kw["causal_top_left"] = True
             out, lse = _run(q, k, v)
+        elif Dqk > 256 and _is_small_attn(Dqk, inp.query.shape[1], inp.key.shape[1]):
+            # Small-attention forward for D>256 with tiny sequences (gfx950 only).
+            out, lse = cls._apply_small_attn_fwd(inp, needs_gradient)
         else:
             Mq = inp.query.shape[1]
             Mkv = inp.key.shape[1]
@@ -660,6 +680,96 @@ class FwOp(AttentionFwOpBase):
             if rng_state is not None:
                 ctx.rng_state = rng_state
         return out, ctx
+
+    # --------------------------------------------------------- small-attn fwd
+    @classmethod
+    def _apply_small_attn_fwd(
+        cls, inp: Inputs, needs_gradient: bool
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward via the small-attention kernel for D>256 on gfx950.
+
+        Calls the module-level compiled kernel directly, bypassing
+        torch.library.custom_op dispatch overhead.
+        """
+        from mslk.attention.flydsl.fmha_small_attn import (
+            _pad32,
+            _small_attn_fwd_compiled,
+            compile_fmha_small_attn_fwd,
+        )
+
+        B, Sq, H, D = inp.query.shape
+        Skv = inp.key.shape[1]
+        dtype = inp.query.dtype
+        device = inp.query.device
+
+        scale_val = float(inp.scale) if inp.scale is not None else 1.0 / math.sqrt(D)
+
+        bias = inp.attn_bias
+        if isinstance(bias, _TOP_LEFT_CAUSAL_TYPES):
+            causal_mode = CAUSAL_TOP_LEFT
+        elif isinstance(bias, _BOTTOM_RIGHT_CAUSAL_TYPES):
+            causal_mode = CAUSAL_BOTTOM_RIGHT
+        else:
+            causal_mode = CAUSAL_NONE
+
+        MAX_LQ = _pad32(Sq)
+        MAX_LKV = _pad32(Skv)
+        dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
+        stream = torch.cuda.current_stream(device)
+
+        fwd_key = (
+            D,
+            dtype_str,
+            scale_val,
+            causal_mode,
+            MAX_LQ,
+            MAX_LKV,
+            dtype_str,
+            device.index,
+        )
+        compiled = _small_attn_fwd_compiled.get(fwd_key)
+
+        Q_i16 = inp.query.contiguous().view(torch.int16)
+        K_i16 = inp.key.contiguous().view(torch.int16)
+        V_i16 = inp.value.contiguous().view(torch.int16)
+
+        lse_buf = torch.empty(B, H, Sq, dtype=torch.float32, device=device)
+        lse = lse_buf if needs_gradient else None
+        O_buf = torch.empty(B * Sq * H * D, dtype=dtype, device=device)
+
+        if compiled is None:
+            import flydsl.compiler as flyc
+
+            launch = compile_fmha_small_attn_fwd(
+                D=D,
+                dtype_str=dtype_str,
+                scale=scale_val,
+                causal_mode=causal_mode,
+                MAX_LQ=MAX_LQ,
+                MAX_LKV=MAX_LKV,
+                output_dtype_str=dtype_str,
+            )
+            tmp_o = torch.empty_like(O_buf)
+            tmp_lse = torch.empty_like(lse_buf)
+            compiled = flyc.compile(
+                launch,
+                Q_i16,
+                K_i16,
+                V_i16,
+                tmp_o,
+                tmp_lse,
+                B,
+                Sq,
+                Skv,
+                H,
+                stream,
+            )
+            _small_attn_fwd_compiled[fwd_key] = compiled
+
+        compiled(Q_i16, K_i16, V_i16, O_buf, lse_buf, B, Sq, Skv, H, stream)
+
+        out = O_buf.view(B, Sq, H, D)
+        return out, lse
 
 
 def _reserve_philox_state(device: torch.device, B: int, H: int, Mq: int, Mkv: int):
@@ -799,7 +909,58 @@ _preprocess_kernel_cache: dict = {}
 _convert_dq_kernel_cache: dict = {}
 # Compute head dims of the gfx950 backward; other head dims (e.g. 96, 224) run
 # masked at the next of these.
-_BWD_GFX950_HEAD_DIMS = (32, 64, 128, 160, 256)
+_BWD_GFX950_HEAD_DIMS = (32, 64, 128, 160, 256, 512)
+_small_attn_bwd_cache: dict = {}
+
+
+def _is_small_attn(D: int, Lq: int, Lkv: int) -> bool:
+    """Whether padded Q/K/V/dO with bank padding fit in gfx950 LDS."""
+    if not (256 < D <= 512 and D % 32 == 0 and Lq > 0 and Lkv > 0):
+        return False
+    padded_q = ((Lq + 31) // 32) * 32
+    padded_kv = ((Lkv + 31) // 32) * 32
+    return (2 * padded_q + 2 * padded_kv) * (D + 8) * 2 <= 160 * 1024
+
+
+def _small_attn_input_reasons(d: Inputs) -> List[str]:
+    reasons = []
+    if d.query.device.type != "cuda" or "gfx950" not in getattr(
+        torch.cuda.get_device_properties(d.query.device), "gcnArchName", ""
+    ):
+        reasons.append("small-attention requires gfx950 on the query device")
+    if any(t.ndim != 4 for t in (d.query, d.key, d.value)):
+        reasons.append("small-attention requires dense BMHK inputs")
+        return reasons
+    if d.query.dtype not in (torch.float16, torch.bfloat16) or any(
+        t.dtype != d.query.dtype for t in (d.key, d.value)
+    ):
+        reasons.append("small-attention requires matching float16 or bfloat16 inputs")
+    if any(t.device != d.query.device for t in (d.key, d.value)):
+        reasons.append("small-attention requires inputs on the same device")
+    if d.key.shape[0] != d.query.shape[0] or d.value.shape[:2] != d.key.shape[:2]:
+        reasons.append("small-attention requires matching batch and key/value lengths")
+    D, Lq, Lkv = d.query.shape[-1], d.query.shape[1], d.key.shape[1]
+    if not _is_small_attn(D, Lq, Lkv):
+        reasons.append(
+            "small-attention head dimension or padded LDS budget unsupported"
+        )
+    if d.key.shape[-1] != D or d.value.shape[-1] != D:
+        reasons.append(
+            "small-attention requires matching query/key/value head dimensions"
+        )
+    if d.query.shape[2] != _num_kv_heads(d.key) or d.query.shape[2] != _num_kv_heads(
+        d.value
+    ):
+        reasons.append("small-attention requires matching query/key/value head counts")
+    if type(d.attn_bias) not in (
+        type(None),
+        LowerTriangularMask,
+        LowerTriangularFromBottomRightMask,
+    ):
+        reasons.append("small-attention supports only no bias or dense causal masks")
+    if d.p != 0.0:
+        reasons.append("small-attention does not support dropout")
+    return reasons
 
 
 @torch.library.custom_op(
@@ -842,7 +1003,10 @@ def _flydsl_bwd(
     # _BWD_GFX950_HEAD_DIMS that covers them and masks the rest.
     Dqk, Dv = query.shape[3], value.shape[3]
     D = Dqk
-    if "gfx950" in torch.cuda.get_device_properties(query.device).gcnArchName:
+    if (
+        max(Dqk, Dv) <= 256
+        and "gfx950" in torch.cuda.get_device_properties(query.device).gcnArchName
+    ):
         D = next(d for d in _BWD_GFX950_HEAD_DIMS if d >= max(Dqk, Dv))
     total_m = query.shape[1]  # real physical M extent (== sum_M_i under varlen)
     total_n = key.shape[1]  # real physical N extent (== sum_N_i under varlen)
@@ -855,6 +1019,24 @@ def _flydsl_bwd(
         B, M = query.shape[0], query.shape[1]
         N = total_n
     device = query.device
+    if max(Dqk, Dv) > 256:
+        small_inp = Inputs(query=query, key=key, value=value)
+        reasons = _small_attn_input_reasons(small_inp)
+        if (
+            varlen
+            or attn_bias is not None
+            or dropout_mask is not None
+            or dropout_p != 0.0
+            or window_left != -1
+        ):
+            reasons.append(
+                "small-attention backward requires dense inputs "
+                "without bias, dropout or window"
+            )
+        if causal_mode not in (CAUSAL_NONE, CAUSAL_TOP_LEFT, CAUSAL_BOTTOM_RIGHT):
+            reasons.append("small-attention backward requires a supported causal mode")
+        if reasons:
+            raise NotImplementedError("; ".join(reasons))
     dtype = query.dtype
     dtype_str = "bf16" if dtype == torch.bfloat16 else "f16"
 
@@ -1009,6 +1191,85 @@ def _flydsl_bwd(
     # `.unflatten().sum()` -- see the reduce below. dQ is atomic-add unless
     # torch.use_deterministic_algorithms is set (see `deterministic` below).
     if _is_gfx950:
+        # Small-attention path: D>256, tiny sequences (entire Q+K+V+dO fits in LDS).
+        if _is_small_attn(D, M, N):
+            from mslk.attention.flydsl.fmha_small_attn import (
+                _pad32,
+                compile_fmha_small_attn_bwd,
+            )
+
+            MAX_LQ = _pad32(M)
+            MAX_LKV = _pad32(N)
+            small_bwd_key = (
+                D,
+                dtype_str,
+                scale,
+                causal_mode,
+                MAX_LQ,
+                MAX_LKV,
+            )
+            small_bwd_key += (device.index,)
+            Q_4d, K_4d, V_4d, dO_4d = (
+                t.contiguous() for t in (Q_4d, K_4d, V_4d, dO_4d)
+            )
+            compiled_small_bwd = _small_attn_bwd_cache.get(small_bwd_key)
+            small_bwd_args = (
+                Q_4d,
+                K_4d,
+                V_4d,
+                dO_4d,
+                dV_out,
+                dK_out,
+                dQ_out,
+                LSE_2d,
+                D_vec,
+                B,
+                M,
+                N,
+                H,
+                stream,
+            )
+            if compiled_small_bwd is None:
+                launch_small_bwd = compile_fmha_small_attn_bwd(
+                    D=D,
+                    dtype_str=dtype_str,
+                    scale=scale,
+                    causal_mode=causal_mode,
+                    MAX_LQ=MAX_LQ,
+                    MAX_LKV=MAX_LKV,
+                )
+                tmp_dV = torch.zeros_like(dV_out)
+                tmp_dK = torch.zeros_like(dK_out)
+                tmp_dQ = torch.zeros_like(dQ_out)
+                args_compile = (
+                    Q_4d,
+                    K_4d,
+                    V_4d,
+                    dO_4d,
+                    tmp_dV,
+                    tmp_dK,
+                    tmp_dQ,
+                    LSE_2d,
+                    D_vec,
+                    B,
+                    M,
+                    N,
+                    H,
+                    stream,
+                )
+                compiled_small_bwd = flyc.compile(launch_small_bwd, *args_compile)
+                _small_attn_bwd_cache[small_bwd_key] = compiled_small_bwd
+            compiled_small_bwd(*small_bwd_args)
+
+            out_b = 1 if varlen else B
+            out_m = total_m if varlen else M
+            out_n = total_n if varlen else N
+            dq = dQ_out.view(out_b, out_m, H, D)[..., :Dqk].to(dtype)
+            dk = dK_out.view(out_b, out_n, H_kv, D)[..., :Dqk].to(dtype)
+            dv = dV_out.view(out_b, out_n, H_kv, D)[..., :Dv].to(dtype)
+            db = dQ_out.new_empty((0,))
+            return dq, dk, dv, db
+
         from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
             compile_fmha_bwd_dqdkdv_mfma_gfx950,
             gfx950_tile_defaults,
@@ -1158,7 +1419,6 @@ def _flydsl_bwd(
         else:
             dQ_acc = dQ_out
         if Dqk != D:
-            # The flat conversion kernel cannot cast only the stored columns.
             dq = dQ_acc.view(out_b, out_m, H, D)[..., :Dqk].to(dtype)
         else:
             from mslk.attention.flydsl.fmha_bwd_convert_dq import (
@@ -1527,9 +1787,10 @@ class BwOp(AttentionBwOpBase):
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
-    # gfx950 masks head dimensions in-kernel; odd widths are padded to even.
-    # Other architectures use matching head widths padded to a multiple of 32.
-    SUPPORTED_MAX_K = 256
+    # Kernels tile D in multiples of 32; on gfx950 other dims (and Kv != K) are
+    # masked in-kernel, odd dims padded by one column. D>256 uses the small-
+    # attention kernel (gfx950 only, small sequence lengths).
+    SUPPORTED_MAX_K = 512
     SUPPORTED_MIN_K = 1
     # The mask is regenerated from the forward's philox state (see
     # fmha_dropout.py), so this backward pairs with either FlyDSL's or CK's forward.
@@ -1578,12 +1839,15 @@ class BwOp(AttentionBwOpBase):
         # Bottom-right alignment + sliding window.
         LowerTriangularFromBottomRightLocalAttentionMask,
     )
-    _TEST_K: List[int] = [32, 48, 64, 96, 128, 256]
+    _TEST_K: List[int] = [32, 48, 64, 96, 128, 256, 512]
     NAME = "flydslB"
 
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(BwOp, cls).not_supported_reasons(d)
+        K = d.query.shape[-1]
+        if max(K, d.value.shape[-1]) > 256:
+            reasons.extend(_small_attn_input_reasons(d))
         if not _is_flydsl_available():
             reasons.append("FlyDSL unavailable on this device/arch")
         if torch.are_deterministic_algorithms_enabled() and not is_gfx950():
@@ -1687,7 +1951,6 @@ class BwOp(AttentionBwOpBase):
         value = _with_kernel_layout(value, allow_broadcast_heads=True)
         out = _with_kernel_layout(out)
         grad = _with_kernel_layout(grad)
-        # K and V share kv_stride_n in rows, rather than raw element strides.
         if key.stride(1) * value.shape[-1] != value.stride(1) * key.shape[-1]:
             key, value = key.contiguous(), value.contiguous()
         dropout_mask = None
@@ -1753,7 +2016,6 @@ class BwOp(AttentionBwOpBase):
         # autograd graph, no `ExpandBackward` reduction), this op's contract
         # is "correct after an `ExpandBackward` reduction", matching every
         # other op's broadcast-GQA contract.
-        # db has shape (B, H, M, N), independent of head-dimension padding.
         dq, dk, dv = dq[..., :K], dk[..., :K], dv[..., :Kv]
         if dk.shape[2] != inp.key.shape[2]:
             heads_per_kv = inp.key.shape[2] // dk.shape[2]
