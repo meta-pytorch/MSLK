@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 from mslk.flydsl.common import is_flydsl_available, require_flydsl
@@ -46,6 +46,8 @@ class FwOp(AttentionFwOpBase):
     # Python callable rather than a torch.ops handle (cf. flydsl.FwOp).
     OPERATOR = staticmethod(is_flydsl_available)
     SUPPORTED_DEVICES = {"cuda"}
+    # Wave64 MFMA kernels: CDNA3/CDNA4 only (FlyDSL itself also loads on RDNA).
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES = {
         torch.half,
         torch.bfloat16,

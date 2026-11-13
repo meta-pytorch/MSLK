@@ -1219,6 +1219,38 @@ def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
 
 
 @rocm_only
+@pytest.mark.parametrize("op", [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp])
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx90a"])
+def test_flydsl_decode_declines_unsupported_arch(op, arch: str, monkeypatch) -> None:
+    q = torch.randn(1, 4, 1, 8, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 4 * 256, 1, 1, 128, dtype=torch.bfloat16, device="cuda")
+    k = k.expand(1, 4 * 256, 1, 8, 128)
+    bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * 4,
+        kv_padding=256,
+        kv_seqlen=[256] * 4,
+        device=torch.device("cuda"),
+    )
+    inp = fmha.Inputs(q, k, k, attn_bias=bias)
+
+    def has_arch_reason() -> bool:
+        return any("requires gfx arch" in r for r in op.not_supported_reasons(inp))
+
+    import mslk.attention.fmha.common as fmha_common
+    import mslk.utils.device as device_utils
+
+    module = sys.modules[op.__module__]
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: True)
+    for archname in ["gfx942:sramecc+:xnack-", "gfx950:sramecc+:xnack-"]:
+        monkeypatch.setattr(device_utils, "get_gfx_arch_name", lambda a=archname: a)
+        monkeypatch.setattr(fmha_common, "get_gfx_arch_name", lambda a=archname: a)
+        assert not has_arch_reason(), archname
+    monkeypatch.setattr(device_utils, "get_gfx_arch_name", lambda: arch)
+    monkeypatch.setattr(fmha_common, "get_gfx_arch_name", lambda: arch)
+    assert has_arch_reason()
+
+
+@rocm_only
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 @pytest.mark.parametrize("n_heads", [1, 16])
 @pytest.mark.parametrize("kv_heads", [1, 2], ids=lambda x: f"kvh{x}")
