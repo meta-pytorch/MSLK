@@ -549,3 +549,31 @@ def test_flydsl_bwd_accepts_dropout_on_varlen() -> None:
     assert not any(
         "dropout" in reason for reason in fmha.flydsl.BwOp.not_supported_reasons(inputs)
     )
+
+
+@pytest.mark.parametrize("p,with_seed", [(0.1, False), (0.0, True)])
+def test_flydsl_bwd_rejects_unpaired_dropout_args(p: float, with_seed: bool) -> None:
+    # Without both, the kernel would silently skip dropout.
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    query = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
+    lse = torch.zeros(1, 2, 64, device=device, dtype=torch.float32)
+    seed = draw_dropout_seed(query.device) if with_seed else None
+    with pytest.raises(ValueError, match="dropout_p and dropout_seed"):
+        fmha.flydsl.BwOp.OPERATOR(
+            query,
+            query,
+            query,
+            query,
+            lse,
+            query,
+            0.125,
+            0,
+            None,
+            None,
+            None,
+            False,
+            -1,
+            seed,
+            p,
+        )
