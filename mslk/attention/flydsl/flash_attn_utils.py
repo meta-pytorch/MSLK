@@ -1763,7 +1763,9 @@ def _make_flash_attn_generic_traits(
         and not enable_gfx942_kv_gpfetch
         and not enable_dma
     )
-    # Bias and dropout gather both column halves; paged inputs reject them.
+    # Bias and dropout need both column halves. Wave split-K is only enabled
+    # with paged GQA packing, which paged inputs never combine with them: paged
+    # rejects bias, and paged dropout disables GQA packing.
     assert not (enable_wave_splitk and (has_bias or has_dropout))
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")

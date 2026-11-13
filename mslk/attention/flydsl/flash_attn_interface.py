@@ -144,8 +144,10 @@ def _dense_generic_tile(
 _GENERIC_SPLITK_BLOCK_M = 64
 # Cross length splits once the KV walk pays for the combine launch.
 _CROSS_SPLITK_MIN_KV = 2048
-# Dropout splits under the same floor, except at D>=128, where the keep-mask
-# gather makes each KV tile dear enough to pay from ~1000 keys.
+# Dropout splits under the same floor, except at D>=128, where the per-tile
+# dropout work pays for splitting from ~1000 keys. This was tuned when dropout
+# gathered a materialized keep mask; with in-kernel Philox it may need
+# re-measuring.
 _DROPOUT_SPLITK_MIN_KV = 1000
 
 
@@ -1693,7 +1695,6 @@ def _flydsl_flash_attn_paged(
         and not return_lse
         # The head-packed decode kernel does not apply dropout.
         and dropout_seed is None
-        and dropout_seed is None
         and not vectorized
         and D in (64, 128)
         and dtype_str in ("bf16", "f16")
@@ -2618,9 +2619,10 @@ def flydsl_flash_attn_func(
                 else:
                     # Generic split-K for short-q dense self-attention that underfills
                     # the GPU: BLOCK_M=64, gated by CK's occupancy heuristic. Bias,
-                    # window, scale and dropout compose: dropout is an explicit keep
-                    # mask indexed by absolute KV column, applied after l/LSE (no
-                    # philox offsets to split, unlike CK), so the combine is exact.
+                    # window, scale and dropout compose: the in-kernel Philox keep
+                    # bits are keyed by absolute (q row, KV column) and applied
+                    # after l/LSE (no philox offsets to split, unlike CK), so the
+                    # combine is exact.
                     _gen_splits = _forced_generic_splits or 1
                     _split_min_kv = 0
                     if _has_dropout and D >= 128:
