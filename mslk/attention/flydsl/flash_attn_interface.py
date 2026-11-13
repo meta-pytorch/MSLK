@@ -2253,6 +2253,12 @@ def flydsl_flash_attn_func(
         raise NotImplementedError(
             "flydsl_flash_attn_func: dropout is only supported for f16/bf16"
         )
+    if dropout_seed is not None and paged_kv and kv_cache_layout == "vectorized":
+        # The kernel's apply_dropout asserts the linear KV layout.
+        raise NotImplementedError(
+            "flydsl_flash_attn_func: dropout is not supported with the vectorized "
+            "paged KV layout"
+        )
     if paged_kv:
         return _flydsl_flash_attn_paged(
             q,
