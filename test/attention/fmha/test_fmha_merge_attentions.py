@@ -604,6 +604,15 @@ def test_merge_attentions_flydsl(bias_type, D: int, dtype: torch.dtype) -> None:
             q, k, v, bias, op=op
         )
         assert not attn_chunk.isnan().any()
+        # Rows of a sequence with no keys in this chunk: out == 0, lse == -inf.
+        q_start = 0
+        for n_q, kk in zip(q_lens, keys):
+            if kk.shape[0] == 0:
+                assert (attn_chunk[0, q_start : q_start + n_q] == 0).all()
+                assert (lse_chunk[0, :, q_start : q_start + n_q] == -math.inf).all()
+            else:
+                assert lse_chunk[0, :, q_start : q_start + n_q].isfinite().all()
+            q_start += n_q
         attn_split.append(attn_chunk)
         lse_split.append(lse_chunk)
     attn_out, lse_out = fmha.merge_attentions(
@@ -626,6 +635,38 @@ def test_merge_attentions_flydsl(bias_type, D: int, dtype: torch.dtype) -> None:
     assert_allclose(lse_out, lse_ref_t, atol=1e-3, rtol=1e-4)
     assert_allclose(
         attn_out, attn_ref_t, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize("use_dispatch", [False, True], ids=["flydsl", "op_none"])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_partial_flydsl_dense(D: int, dtype: torch.dtype, use_dispatch: bool) -> None:
+    op = fmha.flydsl.FwOp
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+    torch.manual_seed(0)
+    B, Mq, Mkv, H = 2, 37, 100, 4
+    q = torch.randn([B, Mq, H, D], device="cuda", dtype=dtype)
+    k = torch.randn([B, Mkv, H, D], device="cuda", dtype=dtype)
+    v = torch.randn([B, Mkv, H, D], device="cuda", dtype=dtype)
+    if use_dispatch:
+        # Without CK, op=None must dispatch partial attention to FlyDSL.
+        inp = fmha.Inputs(q, k, v, is_partial=True)
+        if fmha.ck.FwOp.not_supported_reasons(inp):
+            assert fmha.dispatch._dispatch_fw(inp, False) is op
+    attn, lse = fmha.memory_efficient_attention_partial(
+        q, k, v, op=None if use_dispatch else op
+    )
+    assert attn.dtype == dtype
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) / math.sqrt(D)
+    attn_ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.float())
+    lse_ref = scores.logsumexp(-1)
+    assert_allclose(lse.float(), lse_ref, atol=1e-3, rtol=1e-4)
+    assert_allclose(
+        attn.float(), attn_ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
     )
 
 
