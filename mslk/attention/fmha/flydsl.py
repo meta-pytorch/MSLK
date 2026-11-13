@@ -426,8 +426,8 @@ class FwOp(AttentionFwOpBase):
         out = out.unflatten(2, (G, Hq))
         if ctx is not None:
             # Update the existing context in place so dropout rng_state (and any
-            # other fields) survive; rebuilding a Context would drop rng_state and
-            # break ck.BwOp for 5-D dropout inputs.
+            # other fields) survive; flydsl.BwOp needs that seed to regenerate the
+            # forward's dropout mask for 5-D inputs.
             ctx.lse = ctx.lse.unflatten(1, (G, Hq))
             ctx.out = out
         return out, ctx
