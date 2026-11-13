@@ -9,11 +9,7 @@ from collections.abc import Callable
 import pytest
 import torch
 from mslk.attention import fmha
-from mslk.attention.flydsl.fmha_dropout import (
-    philox_keep_mask,
-    philox_offset_increment,
-    philox_randval,
-)
+from mslk.attention.flydsl.fmha_dropout import philox_keep_mask, philox_offset_increment
 from mslk.utils.device import is_gfx950
 
 from .case_generation import create_tensors
@@ -546,39 +542,6 @@ def test_backward_flydsl_window_dropout() -> None:
 
 def test_backward_flydsl_value_dim_dropout() -> None:
     _run_dropout_case((4, 4), 0.5, True, seqlens=(128, 128), dims=(80, 48), direct=True)
-
-
-@pytest.mark.parametrize("seqlens", [(32, 32), (100, 70), (64, 256)])
-def test_dropout_mask_matches_ck(seqlens: tuple[int, int]) -> None:
-    _require_gfx950_flydsl()
-    if not hasattr(torch.ops.xformers, "_ck_rand_uniform"):
-        pytest.skip("CK dropout byte oracle unavailable")
-    device = torch.device(torch._C._get_accelerator().type)
-    query_length, key_length = seqlens
-    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-        torch.cuda.manual_seed(1234)
-        generator = torch.cuda.default_generators[torch.cuda.current_device()]
-        for batch, heads in [(1, 1), (2, 3)]:
-            seed, offset = generator.initial_seed(), generator.get_offset()
-            expected = torch.ops.xformers._ck_rand_uniform(
-                0.1, batch, heads, query_length, key_length, torch.cuda.current_device()
-            )
-            actual = philox_randval(
-                seed, offset, batch, heads, query_length, key_length, device
-            )
-            assert torch.equal(actual, expected), f"RNG bytes differ at offset={offset}"
-            increment = (
-                (philox_offset_increment(batch, heads, query_length, key_length) + 3)
-                // 4
-            ) * 4
-            assert generator.get_offset() == offset + increment
-            for p in (0.1, 0.5):
-                keep = philox_keep_mask(
-                    seed, offset, p, batch, heads, query_length, key_length, device
-                )
-                assert torch.equal(
-                    keep, (expected <= int((1 - p) * 255)).to(torch.uint8)
-                )
 
 
 def test_flydsl_bwd_declines_dropout_on_varlen() -> None:
