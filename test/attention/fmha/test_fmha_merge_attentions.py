@@ -19,11 +19,13 @@ from mslk.attention.fmha.merge_training import (
     merge_attentions_autograd,
     Partial,
 )
+from mslk.flydsl.common import is_flydsl_available
 
 from .utils import (
     assert_allclose,
     cuda_only,
     disable_on_rocm,
+    rocm_only,
     sm80_or_better_only,
     UNSUPPORTED_OP_PASSES,
 )
@@ -532,6 +534,174 @@ def _merge_attentions_ref(attn_split, lse_split):
         lse_out = lse_out.squeeze(1)
 
     return attn_out, lse_out
+
+
+def _flydsl_kv_chunk(
+    bias_type: Type[fmha.attn_bias.AttentionBias],
+    q_lens: List[int],
+    keys: List[torch.Tensor],
+    values: List[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, fmha.attn_bias.AttentionBias]:
+    """Lays out per-sequence keys/values [len_i, H, D] in the bias's KV format."""
+    kv_lens = [k.shape[0] for k in keys]
+    H, D = keys[0].shape[1:]
+    if bias_type is fmha.attn_bias.BlockDiagonalMask:
+        k, v = torch.cat(keys)[None], torch.cat(values)[None]
+        return k, v, bias_type.from_seqlens(q_lens, kv_lens)
+    if bias_type is fmha.attn_bias.BlockDiagonalGappyKeysMask:
+        starts = [0]
+        for n in kv_lens:
+            starts.append(starts[-1] + n + 11)  # leave a gap between sequences
+    else:  # padded keys
+        padding = max(kv_lens)
+        starts = [i * padding for i in range(len(kv_lens) + 1)]
+    k = keys[0].new_zeros([1, starts[-1], H, D])
+    v = torch.zeros_like(k)
+    for start, kk, vv in zip(starts, keys, values):
+        k[0, start : start + kk.shape[0]] = kk
+        v[0, start : start + vv.shape[0]] = vv
+    if bias_type is fmha.attn_bias.BlockDiagonalGappyKeysMask:
+        return k, v, bias_type.from_seqlens(q_lens, starts, kv_lens)
+    return k, v, bias_type.from_seqlens(q_lens, padding, kv_lens)
+
+
+@rocm_only
+@pytest.mark.parametrize(
+    "bias_type",
+    [
+        fmha.attn_bias.BlockDiagonalMask,
+        fmha.attn_bias.BlockDiagonalPaddedKeysMask,
+        fmha.attn_bias.BlockDiagonalGappyKeysMask,
+        fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask,
+    ],
+    ids=lambda b: b.__name__,
+)
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_merge_attentions_flydsl(bias_type, D: int, dtype: torch.dtype) -> None:
+    op = fmha.flydsl.FwOp
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+    torch.manual_seed(0)
+    H = 4
+    # Each chunk leaves one sequence empty: out=0 / lse=-inf, ignored by the merge.
+    kv_lens_a, kv_lens_b = [37, 0, 130], [0, 64, 5]
+    causal = bias_type is fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask
+    # One query per sequence under causal-with-offset, so it sees every key.
+    q_lens = [1, 1, 1] if causal else [3, 64, 17]
+
+    def rand(n: int) -> torch.Tensor:
+        return torch.randn([n, H, D], device="cuda", dtype=dtype)
+
+    q = rand(sum(q_lens))[None]
+    keys_a, keys_b = [rand(n) for n in kv_lens_a], [rand(n) for n in kv_lens_b]
+    values_a, values_b = [rand(n) for n in kv_lens_a], [rand(n) for n in kv_lens_b]
+
+    attn_split, lse_split = [], []
+    for keys, values in ((keys_a, values_a), (keys_b, values_b)):
+        k, v, bias = _flydsl_kv_chunk(bias_type, q_lens, keys, values)
+        attn_chunk, lse_chunk = fmha.memory_efficient_attention_partial(
+            q, k, v, bias, op=op
+        )
+        assert not attn_chunk.isnan().any()
+        # Rows of a sequence with no keys in this chunk: out == 0, lse == -inf.
+        q_start = 0
+        for n_q, kk in zip(q_lens, keys):
+            if kk.shape[0] == 0:
+                assert (attn_chunk[0, q_start : q_start + n_q] == 0).all()
+                assert (lse_chunk[0, :, q_start : q_start + n_q] == -math.inf).all()
+            else:
+                assert lse_chunk[0, :, q_start : q_start + n_q].isfinite().all()
+            q_start += n_q
+        attn_split.append(attn_chunk)
+        lse_split.append(lse_chunk)
+    attn_out, lse_out = fmha.merge_attentions(
+        attn_split, lse_split, output_dtype=torch.float32
+    )
+
+    attn_ref, lse_ref, q_start = [], [], 0
+    for i, n_q in enumerate(q_lens):
+        k = torch.cat([keys_a[i], keys_b[i]]).float()
+        v = torch.cat([values_a[i], values_b[i]]).float()
+        scores = torch.einsum("qhd,khd->hqk", q[0, q_start : q_start + n_q].float(), k)
+        scores = scores / math.sqrt(D)
+        attn_ref.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), v))
+        lse_ref.append(scores.logsumexp(-1))
+        q_start += n_q
+    attn_ref_t = torch.cat(attn_ref)[None]
+    lse_ref_t = torch.cat(lse_ref, dim=1)[None]
+
+    assert lse_out is not None
+    assert_allclose(lse_out, lse_ref_t, atol=1e-3, rtol=1e-4)
+    assert_allclose(
+        attn_out, attn_ref_t, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+    )
+
+
+@rocm_only
+@pytest.mark.parametrize("use_dispatch", [False, True], ids=["flydsl", "op_none"])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_partial_flydsl_dense(D: int, dtype: torch.dtype, use_dispatch: bool) -> None:
+    op = fmha.flydsl.FwOp
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+    torch.manual_seed(0)
+    B, Mq, Mkv, H = 2, 37, 100, 4
+    q = torch.randn([B, Mq, H, D], device="cuda", dtype=dtype)
+    k = torch.randn([B, Mkv, H, D], device="cuda", dtype=dtype)
+    v = torch.randn([B, Mkv, H, D], device="cuda", dtype=dtype)
+    if use_dispatch:
+        # Without CK, op=None must dispatch partial attention to FlyDSL.
+        inp = fmha.Inputs(q, k, v, is_partial=True)
+        if fmha.ck.FwOp.not_supported_reasons(inp):
+            assert fmha.dispatch._dispatch_fw(inp, False) is op
+    attn, lse = fmha.memory_efficient_attention_partial(
+        q, k, v, op=None if use_dispatch else op
+    )
+    assert attn.dtype == dtype
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) / math.sqrt(D)
+    attn_ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.float())
+    lse_ref = scores.logsumexp(-1)
+    assert_allclose(lse.float(), lse_ref, atol=1e-3, rtol=1e-4)
+    assert_allclose(
+        attn.float(), attn_ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+    )
+
+
+@rocm_only
+def test_partial_flydsl_declines_native_paged() -> None:
+    q = torch.randn([1, 2, 4, 128], device="cuda", dtype=torch.bfloat16)
+    k = torch.randn([1, 128, 4, 128], device="cuda", dtype=torch.bfloat16)
+    block_tables = torch.arange(2, device="cuda", dtype=torch.int32).view(2, 1)
+    bias = fmha.attn_bias.BlockDiagonalPaddedKeysMask.from_seqlens(
+        [1, 1], 64, [64, 30]
+    ).make_paged(block_tables, 64, fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask)
+    inp = fmha.Inputs(q, k, k, attn_bias=bias, is_partial=True)
+    assert (
+        "partial attention is not supported on native paged KV "
+        "(not every native paged route returns LSE)"
+    ) in (fmha.flydsl.FwOp.not_supported_reasons(inp))
+
+
+@rocm_only
+@pytest.mark.parametrize("bmghk", [False, True], ids=["BMHK", "BMGHK"])
+def test_partial_empty_keys(bmghk: bool) -> None:
+    q = torch.randn([2, 3, 4, 64], device="cuda", dtype=torch.bfloat16)
+    k = torch.randn([2, 0, 4, 64], device="cuda", dtype=torch.bfloat16)
+    if bmghk:
+        q = q[:, :, None].expand(2, 3, 2, 4, 64)
+        k = k[:, :, None].expand(2, 0, 2, 4, 64)
+    for is_partial in (False, True):
+        inp = fmha.Inputs(q, k, k, is_partial=is_partial)
+        assert "key sequence length must be > 0" in (
+            fmha.flydsl.FwOp.not_supported_reasons(inp)
+        )
+    out, lse = fmha.memory_efficient_attention_partial(q, k, k)
+    assert out.shape == q.shape
+    assert (out == 0).all()
+    assert (lse == -math.inf).all()
 
 
 @sm80_or_better_only

@@ -219,7 +219,7 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = True
     SUPPORTS_BMGHK = True
-    SUPPORTS_PARTIAL = False
+    SUPPORTS_PARTIAL = True
     # The kernel writes padded per-batch LSE [B, H, max_seqlen_q]; _apply_bmhk
     # repacks varlen LSE to [1, H, total_q] so this matches BwOp/ck.BwOp (True).
     VARLEN_LSE_PACKED = True
@@ -253,6 +253,10 @@ class FwOp(AttentionFwOpBase):
             reasons.append(f"query head_dim={K} out of range [1, 512]")
         if max(K, d.value.shape[-1]) > 256:
             reasons.extend(_small_attn_input_reasons(d))
+        # Empty KV (BMHK/BMGHK: dim 1 is the key sequence) cannot be launched;
+        # decline so dispatch falls through to an op that returns out=0/lse=-inf.
+        if d.key.shape[1] == 0:
+            reasons.append("key sequence length must be > 0")
         if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
             reasons.append("paged KV needs value head_dim == query head_dim")
 
@@ -322,6 +326,14 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
+        # Partial attention needs the LSE. Most native paged routes return it, but
+        # the bf16 dualwave paged route (non-causal, Sq > 256 on gfx950) does not,
+        # so decline all native paged KV for partial attention.
+        if d.is_partial and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
+            reasons.append(
+                "partial attention is not supported on native paged KV "
+                "(not every native paged route returns LSE)"
+            )
 
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
         # ignored (only gappy paged folds sm_scale).
