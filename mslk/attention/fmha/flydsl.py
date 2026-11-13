@@ -326,10 +326,13 @@ class FwOp(AttentionFwOpBase):
         )
         if _needs_grad and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append("native paged KV does not support gradients (no backward)")
-        # Partial attention needs the LSE, which native paged cannot emit.
+        # Partial attention needs the LSE. Most native paged routes return it, but
+        # the bf16 dualwave paged route (non-causal, Sq > 256 on gfx950) does not,
+        # so decline all native paged KV for partial attention.
         if d.is_partial and isinstance(d.attn_bias, _PAGED_BIAS_TYPES):
             reasons.append(
-                "native paged KV does not support partial attention (no LSE)"
+                "partial attention is not supported on native paged KV "
+                "(not every native paged route returns LSE)"
             )
 
         # Non-gappy paged KV hardcodes 1/sqrt(head_dim); a custom scale is silently
