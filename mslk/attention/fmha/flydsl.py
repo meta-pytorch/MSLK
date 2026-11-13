@@ -1146,6 +1146,10 @@ def _flydsl_bwd(
     _dummy_bias = torch.zeros(1, device=device, dtype=dtype)
     _bias_arg = attn_bias if has_bias else _dummy_bias
     # Dropout: regenerate the forward's keep bits from its seed (rng_state).
+    if (dropout_p != 0.0) != (dropout_seed is not None):
+        raise ValueError(
+            "mslk_flydsl::fmha_bwd: dropout_p and dropout_seed must be set together"
+        )
     has_dropout = dropout_seed is not None
     if has_dropout and not _is_gfx950:
         raise NotImplementedError(
