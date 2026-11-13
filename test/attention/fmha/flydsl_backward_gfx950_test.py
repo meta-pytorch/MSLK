@@ -9,11 +9,7 @@ from collections.abc import Callable
 import pytest
 import torch
 from mslk.attention import fmha
-from mslk.attention.flydsl.fmha_dropout import (
-    philox_keep_mask,
-    philox_offset_increment,
-    philox_randval,
-)
+from mslk.attention.flydsl.dropout_philox import draw_dropout_seed, reference_keep_mask
 from mslk.utils.device import is_gfx950
 
 from .case_generation import create_tensors
@@ -406,43 +402,40 @@ def _dropout_inputs(
     return fmha.Inputs(query, key, value, attn_bias=bias), grad, valid
 
 
-def _check_dropout_forward(
-    inputs: fmha.Inputs,
-    reference: torch.Tensor,
-    lse: torch.Tensor,
-    direct: bool,
-) -> fmha.Context:
-    generator = torch.cuda.default_generators[torch.cuda.current_device()]
-    seed, offset = generator.initial_seed(), generator.get_offset()
-    shape = (
+def _dropout_forward(inputs: fmha.Inputs, direct: bool) -> fmha.Context:
+    """Context for the backward: from FwOp, or (direct) a hand-made one whose
+    out/lse are filled in by the caller from the reference."""
+    if direct:
+        context = fmha.Context(lse=None, out=None)
+        if inputs.p:
+            context.rng_state = draw_dropout_seed(inputs.query.device)
+        return context
+    assert not fmha.flydsl.FwOp.not_supported_reasons(inputs)
+    _, context = fmha.flydsl.FwOp.apply(inputs, needs_gradient=True)
+    assert context is not None
+    if inputs.p:
+        # The keep bits are a function of this device seed; only flydsl.BwOp
+        # regenerates them, so the forward pins it.
+        state = context.rng_state
+        assert state is not None
+        assert state.dtype == torch.int64 and state.shape == (1,)
+        assert state.device == inputs.query.device
+        assert context.op_bw is fmha.flydsl.BwOp
+    return context
+
+
+def _keep_mask(context: fmha.Context, inputs: fmha.Inputs) -> torch.Tensor | None:
+    if not inputs.p:
+        return None
+    return reference_keep_mask(
+        int(context.rng_state.item()),
+        inputs.p,
         inputs.query.shape[0],
         inputs.query.shape[2],
         inputs.query.shape[1],
         inputs.key.shape[1],
+        inputs.query.device,
     )
-    increment = ((philox_offset_increment(*shape) + 3) // 4) * 4 if inputs.p else 0
-    if direct:
-        context = fmha.Context(lse=lse, out=reference.to(inputs.query.dtype))
-        if inputs.p:
-            saved_seed, saved_offset = fmha.flydsl._reserve_philox_state(
-                inputs.query.device, *shape
-            )
-            context.rng_state = torch.tensor(
-                [saved_seed, saved_offset], dtype=torch.int64, device="cpu"
-            )
-    else:
-        assert not fmha.flydsl.FwOp.not_supported_reasons(inputs)
-        _, context = fmha.flydsl.FwOp.apply(inputs, needs_gradient=True)
-        assert context is not None
-    assert generator.get_offset() == offset + increment
-    if inputs.p:
-        state = context.rng_state
-        assert state is not None
-        assert state.dtype == torch.int64 and state.device.type == "cpu"
-        assert state.shape == (2,)
-        signed_seed = seed - (1 << 64) if seed >= (1 << 63) else seed
-        assert state.tolist() == [signed_seed, offset]
-    return context
 
 
 def _check_dropout_backward(
@@ -485,27 +478,26 @@ def _run_dropout_case(
         inputs, grad, valid = _dropout_inputs(heads, seqlens, dims, causal, window)
         inputs.p = p
         assert not fmha.flydsl.BwOp.not_supported_reasons(inputs)
-        torch.cuda.manual_seed((1 << 63) + 1234)
-        generator = torch.cuda.default_generators[torch.cuda.current_device()]
-        seed, offset = generator.initial_seed(), generator.get_offset()
-        keep = (
-            philox_keep_mask(
-                seed, offset, p, 2, heads[0], *seqlens, inputs.query.device
-            )
-            if p
-            else None
-        )
+        context = _dropout_forward(inputs, direct)
         output, lse, dq, dk, dv = _dropout_reference_grads(
-            inputs.query, inputs.key, inputs.value, grad, keep, p, valid
+            inputs.query,
+            inputs.key,
+            inputs.value,
+            grad,
+            _keep_mask(context, inputs),
+            p,
+            valid,
         )
-        context = _check_dropout_forward(inputs, output, lse, direct)
+        if direct:
+            context.lse = lse
+            context.out = output.to(inputs.query.dtype)
         _assert_grad_close(context.out, output, "dropout:output")
         _check_dropout_backward(context, inputs, grad, (dq, dk, dv), repeats)
         if p and not direct:
-            next_context = _check_dropout_forward(inputs, output, lse, False)
-            assert next_context.rng_state is not None
-            assert context.rng_state is not None
-            assert next_context.rng_state.tolist() != context.rng_state.tolist()
+            # Each call draws a fresh seed; the first context's backward still
+            # regenerates its own mask.
+            next_context = _dropout_forward(inputs, False)
+            assert not torch.equal(next_context.rng_state, context.rng_state)
             _check_dropout_backward(context, inputs, grad, (dq, dk, dv), 1)
 
 
@@ -548,45 +540,40 @@ def test_backward_flydsl_value_dim_dropout() -> None:
     _run_dropout_case((4, 4), 0.5, True, seqlens=(128, 128), dims=(80, 48), direct=True)
 
 
-@pytest.mark.parametrize("seqlens", [(32, 32), (100, 70), (64, 256)])
-def test_dropout_mask_matches_ck(seqlens: tuple[int, int]) -> None:
-    _require_gfx950_flydsl()
-    if not hasattr(torch.ops.xformers, "_ck_rand_uniform"):
-        pytest.skip("CK dropout byte oracle unavailable")
-    device = torch.device(torch._C._get_accelerator().type)
-    query_length, key_length = seqlens
-    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-        torch.cuda.manual_seed(1234)
-        generator = torch.cuda.default_generators[torch.cuda.current_device()]
-        for batch, heads in [(1, 1), (2, 3)]:
-            seed, offset = generator.initial_seed(), generator.get_offset()
-            expected = torch.ops.xformers._ck_rand_uniform(
-                0.1, batch, heads, query_length, key_length, torch.cuda.current_device()
-            )
-            actual = philox_randval(
-                seed, offset, batch, heads, query_length, key_length, device
-            )
-            assert torch.equal(actual, expected), f"RNG bytes differ at offset={offset}"
-            increment = (
-                (philox_offset_increment(batch, heads, query_length, key_length) + 3)
-                // 4
-            ) * 4
-            assert generator.get_offset() == offset + increment
-            for p in (0.1, 0.5):
-                keep = philox_keep_mask(
-                    seed, offset, p, batch, heads, query_length, key_length, device
-                )
-                assert torch.equal(
-                    keep, (expected <= int((1 - p) * 255)).to(torch.uint8)
-                )
-
-
-def test_flydsl_bwd_declines_dropout_on_varlen() -> None:
+def test_flydsl_bwd_accepts_dropout_on_varlen() -> None:
     _require_gfx950_flydsl()
     device = torch._C._get_accelerator().type
     bias = fmha.attn_bias.BlockDiagonalMask.from_seqlens([32, 64])
     query = torch.randn(1, 96, 2, 64, device=device, dtype=torch.bfloat16)
     inputs = fmha.Inputs(query, query.clone(), query.clone(), attn_bias=bias, p=0.1)
-    assert any(
+    assert not any(
         "dropout" in reason for reason in fmha.flydsl.BwOp.not_supported_reasons(inputs)
     )
+
+
+@pytest.mark.parametrize("p,with_seed", [(0.1, False), (0.0, True)])
+def test_flydsl_bwd_rejects_unpaired_dropout_args(p: float, with_seed: bool) -> None:
+    # Without both, the kernel would silently skip dropout.
+    _require_gfx950_flydsl()
+    device = torch._C._get_accelerator().type
+    query = torch.randn(1, 64, 2, 64, device=device, dtype=torch.bfloat16)
+    lse = torch.zeros(1, 2, 64, device=device, dtype=torch.float32)
+    seed = draw_dropout_seed(query.device) if with_seed else None
+    with pytest.raises(ValueError, match="dropout_p and dropout_seed"):
+        fmha.flydsl.BwOp.OPERATOR(
+            query,
+            query,
+            query,
+            query,
+            lse,
+            query,
+            0.125,
+            0,
+            None,
+            None,
+            None,
+            False,
+            -1,
+            seed,
+            p,
+        )

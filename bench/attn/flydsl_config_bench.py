@@ -19,6 +19,7 @@ from typing import Any
 import flydsl.compiler as flyc
 import torch
 from mslk.attention.flydsl import flydsl_flash_attn_func
+from mslk.attention.flydsl.dropout_philox import draw_dropout_seed, reference_keep_mask
 from mslk.attention.flydsl.fmha_bwd_mfma_gfx950 import (
     compile_fmha_bwd_dqdkdv_mfma_gfx950,
     gfx950_tile_defaults,
@@ -28,6 +29,9 @@ from mslk.attention.flydsl.fmha_bwd_preprocess import compile_fmha_bwd_preproces
 
 BenchmarkOutput = torch.Tensor | tuple[torch.Tensor, ...]
 BenchmarkCallable = Callable[[], BenchmarkOutput]
+
+# Drop probability for the dropout configs.
+_DROPOUT_P = 0.5
 
 
 def config(name: str, **overrides: Any) -> dict[str, Any]:
@@ -334,18 +338,21 @@ def forward_case(
         if cfg["bias"]
         else None
     )
-    dropout = (
-        torch.randint(
-            0,
-            2,
-            (cfg["batch"], cfg["heads"], cfg["query_length"], cfg["kv_length"]),
-            device="cuda",
-            dtype=torch.uint8,
+    dropout = None
+    if cfg["dropout"]:
+        # The kernel draws keep bits from the seed; the reference rebuilds them.
+        seed = draw_dropout_seed(torch.device("cuda"))
+        dropout = reference_keep_mask(
+            int(seed.item()),
+            _DROPOUT_P,
+            cfg["batch"],
+            cfg["heads"],
+            cfg["query_length"],
+            cfg["kv_length"],
+            torch.device("cuda"),
         )
-        if cfg["dropout"]
-        else None
-    )
-    kwargs.update(bias=bias, dropout_mask=dropout)
+        kwargs.update(dropout_p=_DROPOUT_P, dropout_seed=seed)
+    kwargs.update(bias=bias)
     q_ref = q.float() * cfg["logit_scale"] if cfg["dtype"] == "fp8" else q
     expected, _ = reference(q_ref, k, v, cfg, bias, dropout)
     if cfg["dtype"] == "fp8":
