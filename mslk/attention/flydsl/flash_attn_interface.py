@@ -144,11 +144,12 @@ def _dense_generic_tile(
 _GENERIC_SPLITK_BLOCK_M = 64
 # Cross length splits once the KV walk pays for the combine launch.
 _CROSS_SPLITK_MIN_KV = 2048
-# Dropout splits under the same floor, except at D>=128, where the per-tile
-# dropout work pays for splitting from ~1000 keys. This was tuned when dropout
-# gathered a materialized keep mask; with in-kernel Philox it may need
-# re-measuring.
-_DROPOUT_SPLITK_MIN_KV = 1000
+# Dropout splits from fewer keys at every D: the in-kernel Philox work per KV
+# tile makes the single pass slower, so splitting pays earlier. Re-measured for
+# in-kernel Philox on MI350X (bf16, p=0.3, Sq 16..256, B*H 8..128, D 64/128/256,
+# causal and not): with the router's split count, splitting is break-even
+# (0.91-1.18x) at 256 keys, 0.99-1.62x at 512 and 1.03-1.85x from 768 up.
+_DROPOUT_SPLITK_MIN_KV = 768
 
 
 def _generic_splitk_list(i: int) -> int:
@@ -2625,9 +2626,9 @@ def flydsl_flash_attn_func(
                     # combine is exact.
                     _gen_splits = _forced_generic_splits or 1
                     _split_min_kv = 0
-                    if _has_dropout and D >= 128:
+                    if _has_dropout:
                         _split_min_kv = _DROPOUT_SPLITK_MIN_KV
-                    elif _has_dropout or cross:
+                    elif cross:
                         _split_min_kv = _CROSS_SPLITK_MIN_KV
                     if (
                         not _forced_generic_splits
