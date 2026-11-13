@@ -1912,6 +1912,14 @@ class BwOp(AttentionBwOpBase):
             if isinstance(inp.attn_bias, _WINDOW_BIAS_TYPES)
             else -1
         )
+        if inp.p != 0.0 and not _is_flydsl_dropout_seed(
+            ctx.rng_state, inp.query.device
+        ):
+            # CK (and other backends) keep a different rng_state; reinterpreting
+            # it would silently draw another mask.
+            raise NotImplementedError(
+                "flydsl.BwOp dropout needs the rng_state of a flydsl.FwOp forward"
+            )
         query, key, value, out = inp.query, inp.key, inp.value, ctx.out
         K, Kv = query.shape[-1], value.shape[-1]
         gpu_arch = torch.cuda.get_device_properties(query.device).gcnArchName
@@ -1937,12 +1945,6 @@ class BwOp(AttentionBwOpBase):
         grad = _with_kernel_layout(grad)
         if key.stride(1) * value.shape[-1] != value.stride(1) * key.shape[-1]:
             key, value = key.contiguous(), value.contiguous()
-        if inp.p != 0.0 and not _is_flydsl_dropout_seed(ctx.rng_state, query.device):
-            # CK (and other backends) keep a different rng_state; reinterpreting
-            # it would silently draw another mask.
-            raise NotImplementedError(
-                "flydsl.BwOp dropout needs the rng_state of a flydsl.FwOp forward"
-            )
         dq, dk, dv, db = cls.OPERATOR(
             query,
             key,
