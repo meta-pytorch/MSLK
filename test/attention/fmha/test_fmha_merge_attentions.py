@@ -643,6 +643,25 @@ def test_partial_flydsl_declines_native_paged() -> None:
     )
 
 
+@rocm_only
+@pytest.mark.parametrize("bmghk", [False, True], ids=["BMHK", "BMGHK"])
+def test_partial_empty_keys(bmghk: bool) -> None:
+    q = torch.randn([2, 3, 4, 64], device="cuda", dtype=torch.bfloat16)
+    k = torch.randn([2, 0, 4, 64], device="cuda", dtype=torch.bfloat16)
+    if bmghk:
+        q = q[:, :, None].expand(2, 3, 2, 4, 64)
+        k = k[:, :, None].expand(2, 0, 2, 4, 64)
+    for is_partial in (False, True):
+        inp = fmha.Inputs(q, k, k, is_partial=is_partial)
+        assert "key sequence length must be > 0" in (
+            fmha.flydsl.FwOp.not_supported_reasons(inp)
+        )
+    out, lse = fmha.memory_efficient_attention_partial(q, k, k)
+    assert out.shape == q.shape
+    assert (out == 0).all()
+    assert (lse == -math.inf).all()
+
+
 @sm80_or_better_only
 def test_merge_attention_with_compile() -> None:
     op = fmha.flash3.FwOp
