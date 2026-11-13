@@ -79,15 +79,6 @@ def dropout_random_words(key, bh, row, col):
     )
 
 
-def select_word(words, col):
-    """In-kernel: word col % 4 of a dropout_random_words result."""
-    i = col % DROPOUT_COLS_PER_CALL
-    word = words[0]
-    for w in range(1, DROPOUT_COLS_PER_CALL):
-        word = (i == fx.Index(w)).select(words[w], word)
-    return word
-
-
 def keep_flag(word, threshold):
     """In-kernel: 1.0 if the element survives dropout, else 0.0 (Float32)."""
     keep = word >= fx.Uint32(threshold)

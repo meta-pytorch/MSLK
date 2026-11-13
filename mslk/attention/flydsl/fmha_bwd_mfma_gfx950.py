@@ -18,10 +18,9 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from mslk.attention.flydsl.dropout_philox import (
+    DROPOUT_COLS_PER_CALL,
     dropout_random_words,
-    keep_flag,
     load_dropout_key,
-    select_word,
 )
 from mslk.attention.flydsl.fmha_bwd_mfma import (
     _ds_read_tr_v4,
@@ -611,6 +610,35 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         if const_expr(has_dropout):
             drop_key = load_dropout_key(Dropout)
             drop_bh = batch_idx * n_heads_idx + head_idx
+            lane_mod_4 = fx.Index(lane % 4)
+            lane_mod_4_i32 = fx.Int32(lane_mod_4)
+
+            def _quad_or(bits, quad_perm):
+                moved = rocdl.update_dpp(
+                    fx.Int32.ir_type, _raw(bits), _raw(bits), quad_perm, 0xF, 0xF, False
+                )
+                return bits | fx.Int32(moved)
+
+            def _dropout_quad_keep_bits(n_col, m_row_q):
+                # In the epilogue a lane owns one column n and rows m0 + r, r < 4;
+                # the 4 lanes of a quad own the 4 columns of one Philox call (n is
+                # 4-aligned per quad) and the same rows. So lane q runs Philox
+                # only for row m0 + q, sets bit 4*q + j for column j, and an OR
+                # across the quad gives every lane the 4x4 keep bits. Returns
+                # them shifted so that bit 4*r is this lane's (row r) keep bit.
+                words = dropout_random_words(
+                    drop_key, drop_bh, fx.Index(m_row_q), fx.Index(n_col)
+                )
+                bits = fx.Int32(0)
+                for j in range_constexpr(DROPOUT_COLS_PER_CALL):
+                    bits = bits | (words[j] >= fx.Uint32(dropout_threshold)).select(
+                        fx.Int32(1 << j), fx.Int32(0)
+                    )
+                bits = bits << (lane_mod_4_i32 * fx.Int32(4))
+                bits = _quad_or(bits, 0xB1)  # quad_perm [1, 0, 3, 2]
+                bits = _quad_or(bits, 0x4E)  # quad_perm [2, 3, 0, 1]
+                return bits >> lane_mod_4_i32
+
         # dL/dBias is dL/dS_total, i.e. the UNSCALED dS below -- scale belongs only to
         # the dQ/dK GEMMs. One writer per element, so no atomics and no reduction.
         if const_expr(emit_dbias):
@@ -1564,6 +1592,15 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                         [] if const_expr(_use_ds_writer_wide) else None
                                     )
                                     ds_wide_base_off = None
+                                    if const_expr(has_dropout and _epi_do_p):
+                                        drop_bits = _dropout_quad_keep_bits(
+                                            n_row_abs,
+                                            lane_div_16 * 4
+                                            + lane_mod_4
+                                            + m_half * 16
+                                            + (m_sub * 32)
+                                            + m_start,
+                                        )
                                     for r in range_constexpr(4):
                                         m_within = lane_div_16 * 4 + r + m_half * 16
                                         if const_expr(_epi_do_p):
@@ -1671,19 +1708,12 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
                                             # P, and dP is masked the same way below.
                                             p_dv_val = p_val
                                             if const_expr(has_dropout):
-                                                n_idx = fx.Index(n_row_abs)
-                                                words = dropout_random_words(
-                                                    drop_key,
-                                                    drop_bh,
-                                                    fx.Index(m_row_abs),
-                                                    n_idx,
-                                                )
-                                                keep = keep_flag(
-                                                    select_word(words, n_idx),
-                                                    dropout_threshold,
-                                                )
-                                                # Inverted-dropout scale folded into the keep bit.
-                                                keep_scale = _mulf(keep, dropout_rp, fm)
+                                                # Bit 4*r: keep for (row r, this column).
+                                                # Inverted-dropout scale folded in.
+                                                keep_scale = (
+                                                    (drop_bits & fx.Int32(1 << (4 * r)))
+                                                    != fx.Int32(0)
+                                                ).select(dropout_rp, fx.Float32(0.0))
                                                 _epi_keeps[(n_grp, m_half, r)] = (
                                                     keep_scale
                                                 )
