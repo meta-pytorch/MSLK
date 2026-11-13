@@ -1201,7 +1201,9 @@ def test_splitk_decoder_declines_int32_kv(op, num_groups: int) -> None:
 
 @pytest.mark.parametrize("op", [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp])
 def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # torch.device, not str: attn_bias compares against torch.device("cpu") and
+    # would otherwise take the pin_memory path, which needs a GPU.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     q = torch.randn(1, 4, 1, 8, 128, dtype=torch.bfloat16, device=device)
     k = torch.randn(1, 4 * 256, 1, 1, 128, dtype=torch.bfloat16, device=device)
     k = k.expand(1, 4 * 256, 1, 8, 128)
@@ -1215,7 +1217,11 @@ def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
     monkeypatch.setattr(module, "is_flydsl_available", lambda: False)
     assert reason in op.not_supported_reasons(inp)
     monkeypatch.setattr(module, "is_flydsl_available", lambda: True)
-    assert reason not in op.not_supported_reasons(inp)
+    reasons = op.not_supported_reasons(inp)
+    assert reason not in reasons
+    # Availability must follow FlyDSL, not a (possibly unbuilt) CK operator.
+    assert op.is_available()
+    assert "operator wasn't built" not in reasons
 
 
 @rocm_only
