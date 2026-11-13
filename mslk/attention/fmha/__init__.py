@@ -24,6 +24,7 @@ from . import (
     flydsl,
     flydsl_decoder,
     flydsl_splitk,
+    rocm_aiter as aiter,
     triton_splitk,
 )
 from .attn_bias import (
@@ -62,6 +63,7 @@ MemoryEfficientAttentionCkOp = (ck.FwOp, ck.BwOp)
 MemoryEfficientAttentionCkDecoderOp = (ck_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKCkOp = (ck_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionFlyDSLOp = (flydsl.FwOp, flydsl.BwOp)
+MemoryEfficientAttentionAiterOp = (aiter.FwOp, aiter.BwOp)
 MemoryEfficientAttentionFlyDSLDecoderOp = (flydsl_decoder.FwOp, ck.BwOp)
 MemoryEfficientAttentionSplitKFlyDSLOp = (flydsl_splitk.FwOp, ck.BwOp)
 MemoryEfficientAttentionCuteFlashAttentionOp = (
@@ -968,6 +970,8 @@ ALL_FW_OPS: List[Type[AttentionFwOpBase]] = [
     flydsl.FwOp,
     triton_splitk.FwOp,
 ]
+if torch.version.hip:
+    ALL_FW_OPS.append(aiter.FwOp)
 
 ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
     cutlass.BwOp if torch.version.cuda else ck.BwOp,
@@ -978,6 +982,7 @@ ALL_BW_OPS: List[Type[AttentionBwOpBase]] = [
 ]
 if torch.version.hip:
     ALL_BW_OPS.append(flydsl.BwOp)
+    ALL_BW_OPS.append(aiter.BwOp)
 
 __all__ = [
     "AttentionBias",
@@ -993,6 +998,7 @@ __all__ = [
     "MemoryEfficientAttentionFlyDSLDecoderOp",
     "MemoryEfficientAttentionSplitKFlyDSLOp",
     "MemoryEfficientAttentionCkDecoderOp",
+    "MemoryEfficientAttentionAiterOp",
     "MemoryEfficientAttentionFlyDSLOp",
     "ALL_FW_OPS",
     "ALL_BW_OPS",
