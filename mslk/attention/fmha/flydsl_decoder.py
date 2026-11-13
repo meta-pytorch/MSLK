@@ -48,6 +48,8 @@ class FwOp(AttentionFwOpBase):
     # Python callable rather than a torch.ops handle (cf. flydsl.FwOp).
     OPERATOR = staticmethod(is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
+    # Wave64 MFMA kernels: CDNA3/CDNA4 only (FlyDSL itself also loads on RDNA).
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     # pyrefly: ignore [bad-override-mutable-attribute]
     SUPPORTED_MAX_K: int = 256
