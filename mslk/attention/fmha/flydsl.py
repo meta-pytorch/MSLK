@@ -253,6 +253,10 @@ class FwOp(AttentionFwOpBase):
             reasons.append(f"query head_dim={K} out of range [1, 512]")
         if max(K, d.value.shape[-1]) > 256:
             reasons.extend(_small_attn_input_reasons(d))
+        # Empty KV (BMHK/BMGHK: dim 1 is the key sequence) cannot be launched;
+        # decline so dispatch falls through to an op that returns out=0/lse=-inf.
+        if d.key.shape[1] == 0:
+            reasons.append("key sequence length must be > 0")
         if Kv != K and isinstance(d.attn_bias, _PAGED_BIAS_TYPES + _PAGED_GAPPY_TYPES):
             reasons.append("paged KV needs value head_dim == query head_dim")
 
