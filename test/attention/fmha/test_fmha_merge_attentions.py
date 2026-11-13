@@ -679,9 +679,10 @@ def test_partial_flydsl_declines_native_paged() -> None:
         [1, 1], 64, [64, 30]
     ).make_paged(block_tables, 64, fmha.attn_bias.PagedBlockDiagonalPaddedKeysMask)
     inp = fmha.Inputs(q, k, k, attn_bias=bias, is_partial=True)
-    assert "native paged KV does not support partial attention (no LSE)" in (
-        fmha.flydsl.FwOp.not_supported_reasons(inp)
-    )
+    assert (
+        "partial attention is not supported on native paged KV "
+        "(not every native paged route returns LSE)"
+    ) in (fmha.flydsl.FwOp.not_supported_reasons(inp))
 
 
 @rocm_only
