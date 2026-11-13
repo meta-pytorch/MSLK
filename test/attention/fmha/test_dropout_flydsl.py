@@ -342,3 +342,31 @@ def test_dropout_training_varlen_flydsl(mask, dtype):
     ):
         err = float((got.detach().float() - want.detach()).norm() / want.norm())
         assert err < tol, f"{name}: relative L2 {err:.3e} exceeds {tol}"
+
+
+@rocm_only
+def test_dropout_vectorized_paged_kv_rejected_flydsl():
+    # The kernel applies dropout only with the linear paged KV layout.
+    from mslk.attention.flydsl.dropout_philox import draw_dropout_seed
+    from mslk.attention.flydsl.flash_attn_interface import flydsl_flash_attn_func
+
+    pages, page, H, D, dtype = 4, 64, 2, 128, torch.bfloat16
+    q = torch.randn(2, 1, H, D, device="cuda", dtype=dtype)
+    vs = 16 // q.element_size()
+    k = torch.randn(pages, H, D // vs, page, vs, device="cuda", dtype=dtype)
+    v = torch.randn(pages, H, page // vs, D, vs, device="cuda", dtype=dtype)
+    block_table = torch.arange(pages, device="cuda", dtype=torch.int32).view(2, 2)
+    seqlen_k = torch.full((2,), 2 * page, device="cuda", dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="vectorized"):
+        flydsl_flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            max_seqlen_kv=2 * page,
+            kv_cache_layout="vectorized",
+            dropout_p=0.3,
+            dropout_seed=draw_dropout_seed(q.device),
+        )
