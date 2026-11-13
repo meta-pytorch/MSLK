@@ -9,7 +9,7 @@ from collections.abc import Callable
 import pytest
 import torch
 from mslk.attention import fmha
-from mslk.attention.flydsl.fmha_dropout import philox_keep_mask, philox_offset_increment
+from mslk.attention.flydsl.dropout_philox import philox_keep_mask, philox_offset_increment
 from mslk.utils.device import is_gfx950
 
 from .case_generation import create_tensors
