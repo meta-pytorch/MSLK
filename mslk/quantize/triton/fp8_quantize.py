@@ -1303,6 +1303,11 @@ def triton_quantize_fp8_tensor(
 
     # Output tensor matches shape of a but is contiguous.
     a_fp8 = torch.empty_like(a, dtype=pt_dtype)
+    # The kernel reads a and writes a_fp8 at the same flat offsets, so a must
+    # have the same dense layout as a_fp8. Views that skip elements, such as
+    # a[:, :n], do not, so copy them first.
+    if a.stride() != a_fp8.stride():
+        a = a.clone()
 
     with torch.cuda.device(a.device.index):
         _kernel_quantize_fp8_tensor[(num_sms,)](
