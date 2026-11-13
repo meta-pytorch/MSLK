@@ -49,7 +49,10 @@ import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
 import torch
-from mslk.attention.flydsl.fmha_dropout import philox_keep_mask, philox_offset_increment
+from mslk.attention.flydsl.dropout_philox import (
+    philox_keep_mask,
+    philox_offset_increment,
+)
 from mslk.utils.device import is_gfx950
 
 from .attn_bias import (
@@ -1800,7 +1803,7 @@ class BwOp(AttentionBwOpBase):
     SUPPORTED_MAX_K = 512
     SUPPORTED_MIN_K = 1
     # The mask is regenerated from the forward's philox state (see
-    # fmha_dropout.py), so this backward pairs with either FlyDSL's or CK's forward.
+    # dropout_philox.py), so this backward pairs with either FlyDSL's or CK's forward.
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = True
