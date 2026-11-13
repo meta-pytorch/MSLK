@@ -80,7 +80,7 @@ class FwOp(AttentionFwOpBase):
         check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
         check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
         if not is_flydsl_available():
-            reasons.append("FlyDSL is not available for this GPU architecture")
+            reasons.append("FlyDSL unavailable on this device/arch")
 
         q_len = d.query.shape[1]
         if isinstance(d.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):

@@ -1211,7 +1211,7 @@ def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
         q_seqlen=[1] * 4, kv_padding=256, kv_seqlen=[256] * 4, device=device
     )
     inp = fmha.Inputs(q, k, k, attn_bias=bias)
-    reason = "FlyDSL is not available for this GPU architecture"
+    reason = "FlyDSL unavailable on this device/arch"
 
     module = sys.modules[op.__module__]
     monkeypatch.setattr(module, "is_flydsl_available", lambda: False)

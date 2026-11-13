@@ -66,7 +66,7 @@ class FwOp(AttentionFwOpBase):
     def not_supported_reasons(cls, d: Inputs) -> List[str]:  # noqa: C901
         reasons = super(FwOp, cls).not_supported_reasons(d)
         if not is_flydsl_available():
-            reasons.append("FlyDSL is not available for this GPU architecture")
+            reasons.append("FlyDSL unavailable on this device/arch")
 
         attn_bias = d.attn_bias
         if isinstance(attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):
