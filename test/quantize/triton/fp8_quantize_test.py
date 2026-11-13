@@ -21,6 +21,7 @@ if torch.cuda.is_available():
         quantize_fp8_group,
         quantize_fp8_row,
         quantize_fp8_row_meta,
+        quantize_fp8_tensor,
         scale_fp8_row,
     )
 
@@ -285,6 +286,22 @@ class TestFp8Quantize(unittest.TestCase):
         # take more than one iteration of the kernel's column loop.
         for shape in [(4, 513), (3, 1000), (2, 1025)]:
             _test_scale_fp8_row(shape, torch.device("cuda"))
+
+    def test_quantize_fp8_tensor_non_contiguous(self) -> None:
+        a = torch.randn(256, 256, dtype=torch.bfloat16, device="cuda")
+        # Large values that only the full tensor contains, so reading elements
+        # outside a view changes the scale.
+        a[:, 128:] *= 100
+        for view in [a[:, :128], a[::2], a[1::2, 64:192], a.t()[:100]]:
+            a_fp8, a_scale = quantize_fp8_tensor(view)
+            ref_fp8, ref_scale = quantize_fp8_tensor(view.contiguous())
+            self.assertEqual(a_fp8.shape, view.shape)
+            amax = view.abs().max().to(torch.float)
+            torch.testing.assert_close(a_scale, amax / torch.finfo(a_fp8.dtype).max)
+            torch.testing.assert_close(a_scale, ref_scale, atol=0, rtol=0)
+            torch.testing.assert_close(
+                a_fp8.to(torch.float), ref_fp8.to(torch.float), atol=0, rtol=0
+            )
 
     def test_quantize_fp8_group(self) -> None:
         def _test_quantize_fp8_group(
