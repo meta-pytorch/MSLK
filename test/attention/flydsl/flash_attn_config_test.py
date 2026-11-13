@@ -104,10 +104,10 @@ def test_forced_splitk_preserves_dense_options(monkeypatch, D, dtype, variant):
     [
         ("cross", 64, 2047, False),
         ("cross", 64, 2048, True),
-        ("dropout", 64, 2047, False),
-        ("dropout", 64, 2048, True),
-        ("dropout", 128, 999, False),
-        ("dropout", 128, 1000, True),
+        ("dropout", 64, 767, False),
+        ("dropout", 64, 768, True),
+        ("dropout", 128, 767, False),
+        ("dropout", 128, 768, True),
     ],
 )
 def test_auto_splitk_cross_and_dropout(
