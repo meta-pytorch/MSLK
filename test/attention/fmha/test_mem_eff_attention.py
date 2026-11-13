@@ -8,6 +8,7 @@
 
 import logging
 import math
+import sys
 import unittest.mock
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Type
@@ -1196,6 +1197,63 @@ def test_splitk_decoder_declines_int32_kv(op, num_groups: int) -> None:
 
     reasons = op.not_supported_reasons(fmha.Inputs(q, k, v))
     assert "quantized (int32) key/value not supported" in reasons
+
+
+@pytest.mark.parametrize("op", [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp])
+def test_flydsl_decode_not_supported_without_flydsl(op, monkeypatch) -> None:
+    # torch.device, not str: attn_bias compares against torch.device("cpu") and
+    # would otherwise take the pin_memory path, which needs a GPU.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    q = torch.randn(1, 4, 1, 8, 128, dtype=torch.bfloat16, device=device)
+    k = torch.randn(1, 4 * 256, 1, 1, 128, dtype=torch.bfloat16, device=device)
+    k = k.expand(1, 4 * 256, 1, 8, 128)
+    bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * 4, kv_padding=256, kv_seqlen=[256] * 4, device=device
+    )
+    inp = fmha.Inputs(q, k, k, attn_bias=bias)
+    reason = "FlyDSL unavailable on this device/arch"
+
+    module = sys.modules[op.__module__]
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: False)
+    assert reason in op.not_supported_reasons(inp)
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: True)
+    reasons = op.not_supported_reasons(inp)
+    assert reason not in reasons
+    # Availability must follow FlyDSL, not a (possibly unbuilt) CK operator.
+    assert op.is_available()
+    assert "operator wasn't built" not in reasons
+
+
+@rocm_only
+@pytest.mark.parametrize("op", [fmha.flydsl_decoder.FwOp, fmha.flydsl_splitk.FwOp])
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1201", "gfx90a"])
+def test_flydsl_decode_declines_unsupported_arch(op, arch: str, monkeypatch) -> None:
+    q = torch.randn(1, 4, 1, 8, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 4 * 256, 1, 1, 128, dtype=torch.bfloat16, device="cuda")
+    k = k.expand(1, 4 * 256, 1, 8, 128)
+    bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+        q_seqlen=[1] * 4,
+        kv_padding=256,
+        kv_seqlen=[256] * 4,
+        device=torch.device("cuda"),
+    )
+    inp = fmha.Inputs(q, k, k, attn_bias=bias)
+
+    def has_arch_reason() -> bool:
+        return any("requires gfx arch" in r for r in op.not_supported_reasons(inp))
+
+    import mslk.attention.fmha.common as fmha_common
+    import mslk.utils.device as device_utils
+
+    module = sys.modules[op.__module__]
+    monkeypatch.setattr(module, "is_flydsl_available", lambda: True)
+    for archname in ["gfx942:sramecc+:xnack-", "gfx950:sramecc+:xnack-"]:
+        monkeypatch.setattr(device_utils, "get_gfx_arch_name", lambda a=archname: a)
+        monkeypatch.setattr(fmha_common, "get_gfx_arch_name", lambda a=archname: a)
+        assert not has_arch_reason(), archname
+    monkeypatch.setattr(device_utils, "get_gfx_arch_name", lambda: arch)
+    monkeypatch.setattr(fmha_common, "get_gfx_arch_name", lambda: arch)
+    assert has_arch_reason()
 
 
 @rocm_only

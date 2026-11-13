@@ -8,12 +8,12 @@
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
-from mslk.flydsl.common import require_flydsl
+from mslk.flydsl.common import is_flydsl_available, require_flydsl
 
 from ..flydsl.decode.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, Context, Inputs
-from .utils.op_common import get_operator, register_operator
+from .utils.op_common import register_operator
 
 # FlyDSL is a mandatory ROCm-only backend but absent on CUDA/CPU builds; guard the
 # kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
@@ -43,10 +43,13 @@ def _flydsl_decode_forward(
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    """FlyDSL dense decode op (gfx942/gfx950). f16/bf16/f32 KV, dense padded layout, GQA/MQA."""
+    """FlyDSL dense decode op (gfx942/gfx950). f16/bf16 KV, dense padded layout, GQA/MQA."""
 
-    OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_ck")
+    # Python callable rather than a torch.ops handle (cf. flydsl.FwOp).
+    OPERATOR = staticmethod(is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
+    # Wave64 MFMA kernels: CDNA3/CDNA4 only (FlyDSL itself also loads on RDNA).
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     # pyrefly: ignore [bad-override-mutable-attribute]
     SUPPORTED_MAX_K: int = 256
@@ -62,6 +65,8 @@ class FwOp(AttentionFwOpBase):
     @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:  # noqa: C901
         reasons = super(FwOp, cls).not_supported_reasons(d)
+        if not is_flydsl_available():
+            reasons.append("FlyDSL unavailable on this device/arch")
 
         attn_bias = d.attn_bias
         if isinstance(attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):

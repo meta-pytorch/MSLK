@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 from mslk.flydsl.common import is_flydsl_available, require_flydsl
@@ -13,7 +13,7 @@ from mslk.flydsl.common import is_flydsl_available, require_flydsl
 from ..flydsl.decode.layout_utils import canonicalize_qkv_5d, normalize_seq_positions
 from .attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from .common import AttentionFwOpBase, check_lastdim_alignment_stride1, Context, Inputs
-from .utils.op_common import get_operator, register_operator
+from .utils.op_common import register_operator
 
 # FlyDSL is a mandatory ROCm-only backend but absent on CUDA/CPU builds; guard the
 # kernel import so `import mslk.attention.fmha` still works there. require_flydsl()
@@ -43,8 +43,11 @@ def _flydsl_splitk_forward(
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    OPERATOR = get_operator("xformers", "efficient_attention_forward_decoder_splitk_ck")
+    # Python callable rather than a torch.ops handle (cf. flydsl.FwOp).
+    OPERATOR = staticmethod(is_flydsl_available)
     SUPPORTED_DEVICES = {"cuda"}
+    # Wave64 MFMA kernels: CDNA3/CDNA4 only (FlyDSL itself also loads on RDNA).
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES = {
         torch.half,
         torch.bfloat16,
@@ -77,7 +80,7 @@ class FwOp(AttentionFwOpBase):
         check_lastdim_alignment_stride1(reasons, "key", d.key, 8)
         check_lastdim_alignment_stride1(reasons, "value", d.value, 8)
         if not is_flydsl_available():
-            reasons.append("FlyDSL is not available for this GPU architecture")
+            reasons.append("FlyDSL unavailable on this device/arch")
 
         q_len = d.query.shape[1]
         if isinstance(d.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask):
