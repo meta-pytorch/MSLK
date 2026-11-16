@@ -21,6 +21,11 @@ from torch._utils_internal import justknobs_check
 from . import attn_bias, ck, cutlass, flash, flash3, flash_mtia, flydsl, triton_splitk
 from .common import AttentionBwOpBase, AttentionFwOpBase, Inputs
 
+try:
+    from . import rocm_aiter as aiter
+except ImportError:
+    aiter = None  # type: ignore[assignment]
+
 T = TypeVar("T", Type[AttentionFwOpBase], Type[AttentionBwOpBase])
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -218,6 +223,20 @@ def _dispatch_fw_priority_list(
                 flydsl.FwOp,
             ]
         )
+        if aiter is not None:
+            try:
+                from .routing.fmha import should_use_aiter
+
+                if should_use_aiter(
+                    head_dim=inp.query.shape[-1],
+                    dtype=inp.query.dtype,
+                    num_heads=inp.query.shape[-2] if inp.query.ndim == 4 else 1,
+                    seqlen=inp.query.shape[1],
+                    device=inp.device,
+                ):
+                    priority_list_ops.appendleft(aiter.FwOp)
+            except Exception:
+                pass
     # pyrefly: ignore [bad-argument-type]
     priority_list_ops.append(triton_splitk.FwOp)
     if not needs_gradient:
@@ -293,8 +312,6 @@ def _dispatch_bw(
         if _get_use_fa3():
             priority_list_ops = [flash3.BwOp] + priority_list_ops
     else:
-        # Order is a preference: ck.BwOp declines archs it has no device image
-        # for (SUPPORTED_GFX_ARCHS), which is when flydsl.BwOp is reached.
         priority_list_ops: List[Type[AttentionBwOpBase]] = [
             ck.BwOp,
             flydsl.BwOp,
