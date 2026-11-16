@@ -149,16 +149,17 @@ class TestAiterFmhaNotSupported:
         reasons = aiter_fmha.FwOp.not_supported_reasons(inp)
         assert any("bias type" in r.lower() for r in reasons), reasons
 
-    def test_fw_not_in_auto_dispatch(self):
-        """AITER should not be auto-selected; only via explicit op=."""
+    def test_fw_dispatch_via_tuning_table(self):
+        """AITER appears in auto-dispatch only when the tuning table selects it."""
         from mslk.attention.fmha.dispatch import _dispatch_fw_priority_list
         q = torch.randn(1, 32, 4, 64, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(1, 32, 4, 64, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(1, 32, 4, 64, device="cuda", dtype=torch.bfloat16)
         inp = fmha.Inputs(query=q, key=k, value=v)
         priority = _dispatch_fw_priority_list(inp, needs_gradient=False)
+        # With an empty tuning table, AITER should not be in the list.
         assert aiter_fmha.FwOp not in priority, (
-            "AITER should not be in auto-dispatch priority list"
+            "AITER should not be in auto-dispatch with an empty tuning table"
         )
 
     def test_bw_rejects_dropout(self):

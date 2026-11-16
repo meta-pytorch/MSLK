@@ -6,9 +6,10 @@
 """AITER flash-attention FwOp/BwOp for MSLK's fmha dispatch.
 
 AITER's ``flash_attn_func`` provides high-performance flash attention on
-gfx950 (MI350X).  These ops are NOT in the auto-dispatch priority lists;
-they are available for explicit use via ``op=aiter.FwOp`` or via future
-OpRouting integration (``mslk/aiter/routing.py``).
+gfx950 (MI350X).  Integrated via ``OpRouting`` (``mslk/aiter/routing.py``):
+the tuning table at ``mslk/attention/fmha/dispatch/tables/fmha.csv``
+selects AITER for shapes where it is faster than CK/FlyDSL.  Also
+available for explicit use via ``op=aiter.FwOp``.
 
 First-use latency: the pinned AITER build (``noprebuild``) JIT-compiles
 CK/ASM modules with ``hipcc`` on first call (~60-70s per kernel config).
