@@ -25,9 +25,9 @@ AITER: str = "aiter"
 
 
 def _key(
-    head_dim: int, dtype: torch.dtype, num_heads: int, *args: object, **kwargs: object
+    head_dim: int, dtype: torch.dtype, num_heads: int, seqlen: int,
 ) -> Tuple[Sequence[object], int]:
-    return (head_dim, str(dtype), num_heads), 0
+    return (head_dim, str(dtype), num_heads), seqlen
 
 
 _ROUTING: OpRouting = OpRouting(
@@ -58,7 +58,12 @@ def should_use_aiter(
         return False
 
     try:
-        name = _ROUTING.table.lookup(device, (head_dim, str(dtype), num_heads), seqlen)
+        from mslk.aiter.routing import choose_backend
+
+        name = choose_backend(
+            OP, lambda: _ROUTING.table, device.index or 0,
+            (head_dim, str(dtype), num_heads), seqlen,
+        )
         return name == AITER
     except Exception:
         return False
