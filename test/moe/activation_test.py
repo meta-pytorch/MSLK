@@ -25,6 +25,13 @@ from parameterized import parameterized
 
 running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
+# Native ROCm startup records the binary profiler registration path.
+# Inductor workers start a different executable and must register their own.
+# Drop the inherited path from their Python subprocess environment.
+if torch.version.hip is not None:
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
+
+
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
