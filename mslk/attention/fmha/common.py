@@ -3,7 +3,6 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-# pyre-unsafe
 
 import math
 from dataclasses import dataclass
@@ -22,7 +21,6 @@ from typing import (
 )
 
 import torch
-from mslk.utils.device import get_gfx_arch_name, gfx_arch_in
 
 from .attn_bias import (
     AttentionBias,
@@ -512,6 +510,12 @@ class AttentionOpBase(BaseOperator):
         return not cls.not_supported_reasons(d)
 
     @classmethod
+    def get_supported_gfx_archs(cls) -> tuple[str, ...] | None:
+        if cls.SUPPORTED_GFX_ARCHS is None:
+            return None
+        return tuple(sorted(cls.SUPPORTED_GFX_ARCHS))
+
+    @classmethod
     def shape_not_supported_reasons(
         cls, Mq: int, Mkv: int, K: int, Kv: int
     ) -> List[str]:
@@ -560,16 +564,15 @@ class AttentionOpBase(BaseOperator):
                     f"requires device with capability <= {cls.CUDA_MAXIMUM_COMPUTE_CAPABILITY} "
                     f"but your GPU has capability {device_capability} (too new)"
                 )
-        if (
-            device_type == "cuda"
-            and torch.version.hip is not None
-            and cls.SUPPORTED_GFX_ARCHS is not None
-            and not gfx_arch_in(cls.SUPPORTED_GFX_ARCHS)
-        ):
-            reasons.append(
-                f"requires gfx arch in {sorted(cls.SUPPORTED_GFX_ARCHS)} "
-                f"but your GPU is {get_gfx_arch_name()!r}"
-            )
+        if device_type == "cuda" and torch.version.hip is not None:
+            supported_gfx_archs = cls.get_supported_gfx_archs()
+            if supported_gfx_archs is not None:
+                gpu_arch = torch.cuda.get_device_properties(d.query.device).gcnArchName
+                if gpu_arch.split(":", 1)[0] not in supported_gfx_archs:
+                    reasons.append(
+                        f"requires gfx arch in {sorted(supported_gfx_archs)} "
+                        f"but your GPU is {gpu_arch!r}"
+                    )
         if dtype not in cls.SUPPORTED_DTYPES:
             reasons.append(f"dtype={dtype} (supported: {cls.SUPPORTED_DTYPES})")
         if d.key.dtype == torch.int32 and not cls.SUPPORTS_QUANTIZED_KV:

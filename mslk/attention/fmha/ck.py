@@ -3,9 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-# pyre-unsafe
 
 
+import functools
 from enum import Enum
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
@@ -39,6 +39,16 @@ from .common import (
     Inputs,
 )
 from .utils.op_common import get_operator, register_operator
+
+
+@functools.cache
+def _get_ck_forward_archs() -> tuple[str, ...] | None:
+    try:
+        get_archs = torch.ops.xformers._ck_fmha_forward_archs
+    except AttributeError:
+        return None
+    compiled_archs = (arch.split(":", 1)[0] for arch in get_archs().split(","))
+    return tuple(arch for arch in compiled_archs if arch in {"gfx942", "gfx950"})
 
 
 def _minimum_gemm_alignment(inp: Inputs) -> int:
@@ -170,8 +180,7 @@ class FwOp(AttentionFwOpBase):
 
     OPERATOR = get_operator("xformers", "efficient_attention_forward_ck")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
-    # Must match the --offload-arch the CK FMHA library is built for
-    # (MslkDefault.cmake); on any other arch there is no device image.
+    # Conservative fallback for native libraries predating the architecture query.
     SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     SUPPORTED_MAX_K = 256
@@ -365,6 +374,14 @@ class FwOp(AttentionFwOpBase):
         return out, ctx
 
     @classmethod
+    @torch.compiler.assume_constant_result
+    def get_supported_gfx_archs(cls) -> tuple[str, ...] | None:
+        archs = _get_ck_forward_archs()
+        if archs is None:
+            return super().get_supported_gfx_archs()
+        return archs
+
+    @classmethod
     def not_supported_reasons(cls, d: Inputs) -> List[str]:
         reasons = super(FwOp, cls).not_supported_reasons(d)
         matmul_alignment_mn = _minimum_gemm_alignment(d)
@@ -380,7 +397,7 @@ class BwOp(AttentionBwOpBase):
 
     OPERATOR = get_operator("xformers", "efficient_attention_backward_ck")
     SUPPORTED_DEVICES = FwOp.SUPPORTED_DEVICES
-    SUPPORTED_GFX_ARCHS = FwOp.SUPPORTED_GFX_ARCHS
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942"}
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = 256
     SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
