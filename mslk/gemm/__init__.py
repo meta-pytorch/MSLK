@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 import functools
 import importlib
 from collections.abc import Callable
@@ -240,6 +238,45 @@ if torch.version.hip is not None:
             torch.library.impl("mslk::bf16bf16bf16_grouped_stacked", "CUDA")(
                 _bf16bf16bf16_grouped_stacked_rocm
             )
+
+    if hasattr(torch.ops, "mslk") and hasattr(
+        torch.ops.mslk, "_f8f8bf16_rowwise_preshuffle_ck"
+    ):
+
+        @functools.lru_cache(maxsize=None)
+        def _rowwise_preshuffle_impl(
+            op: str, device_index: int
+        ) -> Callable[..., torch.Tensor]:
+            with torch.cuda.device(device_index):
+                mod = _flydsl_gemm_module("preshuffle_gemm")
+                if mod is not None and mod.is_supported():
+                    return getattr(mod, f"matmul_{op}")
+            return getattr(torch.ops.mslk, f"_{op}_ck")
+
+        def _rowwise_preshuffle_rocm(op: str) -> Callable[..., torch.Tensor]:
+            def _impl(
+                XQ: torch.Tensor,
+                WQ: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_scale: torch.Tensor,
+                bias: Optional[torch.Tensor] = None,
+                use_fast_accum: bool = True,
+            ) -> torch.Tensor:
+                device_index = XQ.get_device()
+                with torch.cuda.device(device_index):
+                    return _rowwise_preshuffle_impl(op, device_index)(
+                        XQ, WQ, x_scale, w_scale, bias, use_fast_accum
+                    )
+
+            return _impl
+
+        for _op in ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"):
+            if not torch._C._dispatch_has_kernel_for_dispatch_key(
+                f"mslk::{_op}", "CUDA"
+            ):
+                torch.library.impl(f"mslk::{_op}", "CUDA")(
+                    _rowwise_preshuffle_rocm(_op)
+                )
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 

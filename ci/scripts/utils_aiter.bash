@@ -55,7 +55,8 @@ install_aiter_pip () {
     echo "::warning::$1; continuing without aiter, so tests of MSLK's aiter paths will skip."
     # Leave no half-installed aiter behind; a no-op when none was installed.
     # shellcheck disable=SC2086
-    conda run ${env_prefix} python -m pip uninstall -y amd-aiter
+    conda run ${env_prefix} python -m pip uninstall -y amd-aiter || true
+    return 0
   }
 
   # The pin must stay exact: these builds are versioned 0.1.1.dev1+g<sha>, which

@@ -59,9 +59,10 @@ setup_miniconda () {
   # defaults to using conda-forge channel for all package installations.
   __download_install_miniforge
 
-  echo "[SETUP] Reloading the bash configuration ..."
   print_exec "${conda_install_prefix}/bin/conda" init bash
-  print_exec . ~/.bashrc
+
+  echo "[SETUP] Loading the Conda shell hook ..."
+  eval "$("${conda_install_prefix}/bin/conda" shell.bash hook)" || return 1
 
   # https://medium.com/data-tyro/resolving-the-conda-libmamba-issue-and-environment-activation-trouble-9f911a6106a4
   # https://www.reddit.com/r/learnpython/comments/160kjz9/how_do_i_get_anaconda_to_work_the_way_i_want_it_to/
@@ -90,7 +91,11 @@ setup_miniconda () {
   if [ -f "${GITHUB_PATH}" ]; then
     echo "[SETUP] Saving Miniconda variables to ${GITHUB_PATH} ..."
     echo "${conda_install_prefix}/bin" >> "${GITHUB_PATH}"
-    echo "CONDA=${conda_install_prefix}" >> "${GITHUB_PATH}"
+  fi
+
+  if [ -f "${GITHUB_ENV}" ]; then
+    echo "[SETUP] Saving Miniconda variables to ${GITHUB_ENV} ..."
+    echo "CONDA=${conda_install_prefix}" >> "${GITHUB_ENV}"
   fi
 
   echo "[SETUP] Successfully set up Miniconda at ${conda_install_prefix}"

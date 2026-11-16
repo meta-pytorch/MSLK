@@ -540,16 +540,8 @@ if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_preshuffle"):
         bias: Optional[torch.Tensor] = None,
         use_fast_accum: bool = True,
     ) -> torch.Tensor:
-        x_dims = XQ.dim()
-        if x_dims == 2:
-            M = XQ.shape[0]
-            N = WQ.shape[0]
-            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
-        else:
-            B = XQ.shape[0]
-            M = XQ.shape[1]
-            N = WQ.shape[0]
-            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+        # Any leading dims, like the kernels: output is XQ.shape[:-1] + (N,).
+        return XQ.new_empty((*XQ.shape[:-1], WQ.shape[0]), dtype=torch.bfloat16)
 
 
 if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
@@ -563,15 +555,14 @@ if hasattr(torch.ops.mslk, "f8f8f16_rowwise_preshuffle"):
         bias: Optional[torch.Tensor] = None,
         use_fast_accum: bool = True,
     ) -> torch.Tensor:
-        M = XQ.shape[0]
-        N = WQ.shape[0]
-        return torch.empty((M, N), dtype=torch.float16, device=XQ.device)
+        return XQ.new_empty((*XQ.shape[:-1], WQ.shape[0]), dtype=torch.float16)
 
 
 # ---------------------------------------------------------------------------
 # ROCm-only fallback: define mslk::f4f4bf16 in Python when the CUDA C++ op
-# isn't present. Dispatches to native MXFP4 Triton on gfx950 only — see
-# mslk/gemm/triton/f4f4bf16.py.
+# isn't present. mslk/gemm/dispatch/f4f4bf16.py picks the backend per call:
+# native MXFP4 Triton on gfx950 (mslk/gemm/triton/f4f4bf16.py), or aiter for
+# the shapes its tuning table assigns to aiter.
 # ---------------------------------------------------------------------------
 
 if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
@@ -591,10 +582,10 @@ if not hasattr(torch.ops.mslk, "f4f4bf16") and torch.version.hip is not None:
         global_scale: Optional[torch.Tensor] = None,
         mxfp4_block_size: int = 32,
     ) -> torch.Tensor:
-        # Import lazily so importing mslk.gemm doesn't pull in triton on CPU-only nodes.
-        from mslk.gemm.triton.f4f4bf16 import f4f4bf16 as _triton_f4f4bf16
+        # Imported on first call, like the backends it chooses between.
+        from mslk.gemm.dispatch.f4f4bf16 import ROUTING as _f4f4bf16_routing
 
-        return _triton_f4f4bf16(
+        return _f4f4bf16_routing(
             XQ,
             WQ,
             x_scale,

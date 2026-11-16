@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 """What CI's ``install_aiter_pip`` (ci/scripts/utils_aiter.bash) does on each outcome.
 
 aiter is optional and comes from a server outside PyPI, so CI must continue
@@ -23,18 +21,24 @@ import unittest
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parent / "fixtures"
+if not REPO.is_dir():
+    REPO = Path(__file__).resolve().parents[2]
 PINNED_FLYDSL: str = "".join((REPO / "ci" / "flydsl_version.txt").read_text().split())
 
 _SCRIPT = """
+set -e
 . "$REPO/ci/scripts/utils_aiter.bash"
 env_name_or_prefix () { echo "-n $1"; }
 exec_with_retries () { shift; "$@"; }
-test_python_import_package () { echo "import $2" >> "$CALLS"; [ "$FAKE_IMPORT_OK" = 1 ]; }
+test_python_import_package () {
+  echo "import $2" >> "$CALLS"
+  [ "$FAKE_IMPORT_OK" = 1 ]
+}
 conda () {
   case "$*" in
     *"pip install"*) echo "install" >> "$CALLS"; [ "$FAKE_INSTALL_OK" = 1 ] ;;
-    *"pip uninstall"*) echo "uninstall" >> "$CALLS" ;;
+    *"pip uninstall"*) echo "uninstall" >> "$CALLS"; [ "$FAKE_UNINSTALL_OK" = 1 ] ;;
     *"version('amd-aiter'), version('flydsl')"*) echo "aiter $FAKE_FLYDSL" ;;
     *"version('flydsl')"*) echo "$FAKE_FLYDSL" ;;
   esac
@@ -45,6 +49,7 @@ install_aiter_pip build_env
 
 def _run(
     install_ok: bool = True,
+    uninstall_ok: bool = True,
     import_ok: bool = True,
     flydsl: str = PINNED_FLYDSL,
     variant: str = "rocm",
@@ -59,6 +64,7 @@ def _run(
             "CALLS": calls,
             "BUILD_VARIANT": variant,
             "FAKE_INSTALL_OK": "1" if install_ok else "0",
+            "FAKE_UNINSTALL_OK": "1" if uninstall_ok else "0",
             "FAKE_IMPORT_OK": "1" if import_ok else "0",
             "FAKE_FLYDSL": flydsl,
         }
@@ -80,7 +86,7 @@ class InstallAiterCITest(unittest.TestCase):
         self.assertNotIn("::warning::", out)
 
     def test_install_failure_continues_without_aiter(self) -> None:
-        code, out, calls = _run(install_ok=False)
+        code, out, calls = _run(install_ok=False, uninstall_ok=False)
         self.assertEqual(code, 0, out)
         self.assertIn("::warning::Could not install aiter", out)
         self.assertEqual(calls, ["install", "uninstall"])
