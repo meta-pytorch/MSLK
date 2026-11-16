@@ -32,7 +32,7 @@ def _key(
 
 _ROUTING: OpRouting = OpRouting(
     OP,
-    "mslk.attention.fmha.dispatch",
+    "mslk.attention.fmha.routing",
     "tables/fmha.csv",
     key_columns=("head_dim", "dtype", "num_heads"),
     bucket_column="seqlen_max",

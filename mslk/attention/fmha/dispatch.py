@@ -225,7 +225,7 @@ def _dispatch_fw_priority_list(
         )
         if aiter is not None:
             try:
-                from .dispatch.fmha import should_use_aiter
+                from .routing.fmha import should_use_aiter
 
                 if should_use_aiter(
                     head_dim=inp.query.shape[-1],
