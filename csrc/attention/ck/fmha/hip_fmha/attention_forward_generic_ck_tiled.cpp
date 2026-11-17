@@ -6,6 +6,7 @@
  */
 #include <cmath>
 #include <mutex>
+#include <string>
 #include <tuple>
 
 #include <ATen/Context.h>
@@ -24,6 +25,10 @@
 
 #ifdef HIPIFY_V2
 #define getCurrentHIPStream getCurrentCUDAStream
+#endif
+
+#ifndef MSLK_CK_FMHA_ARCHS
+#define MSLK_CK_FMHA_ARCHS "gfx942"
 #endif
 
 extern void batched_forward_fp16(
@@ -45,6 +50,10 @@ extern void grouped_infer_fp16(GroupedForwardParams& param, hipStream_t stream);
 extern void grouped_infer_bf16(GroupedForwardParams& param, hipStream_t stream);
 
 namespace {
+
+std::string ck_fmha_forward_archs() {
+  return MSLK_CK_FMHA_ARCHS;
+}
 
 /*
   There are 2 modes for using this function.
@@ -525,6 +534,9 @@ efficient_attention_forward_ck_meta(
 } // namespace
 
 TORCH_LIBRARY_FRAGMENT(xformers, m) {
+  m.def(
+      TORCH_SELECTIVE_SCHEMA("xformers::_ck_fmha_forward_archs() -> str"),
+      TORCH_FN(ck_fmha_forward_archs));
   m.def(TORCH_SELECTIVE_SCHEMA(
       "xformers::efficient_attention_forward_ck(Tensor query, "
       "Tensor key, Tensor value, Tensor? attn_bias, Tensor? seqstart_q, "
