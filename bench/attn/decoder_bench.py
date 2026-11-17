@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Paged-attention decode benchmark: FlyDSL vs CK vs Triton.
+"""Paged-attention decode benchmark: FlyDSL vs Triton.
 
 Benchmarks the fmha decode forward ops (see ``decoder_ops.py``) across decode shapes
 and reports latency, achieved HBM bandwidth, and memory-bandwidth utilization. One
@@ -16,7 +16,7 @@ runs the fp8 ops (FlyDSLFp8, TritonFp8) instead.
 Usage:
     python bench/attn/decoder_bench.py --shapes decode_llm
     python bench/attn/decoder_bench.py --shapes sweep_kv --dtype fp8 --export-csv
-    python bench/attn/decoder_bench.py --kernels FlyDSLDecode,CKDecode,TritonSplitK
+    python bench/attn/decoder_bench.py --kernels FlyDSLDecode,FlyDSLSplitK,TritonSplitK
 """
 
 import os
