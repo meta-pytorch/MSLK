@@ -529,9 +529,14 @@ class FP8Tests(unittest.TestCase):
         Bias: bool,
         mode: str,
     ) -> None:
-        # AMD CK FP8 batched gemm does not support N < 512 or K < 512. FlyDSL,
-        # which serves the op on gfx942 and gfx950, has no such limit.
-        flydsl_serves = is_flydsl_available() and gfx_arch_in(("gfx942", "gfx950"))
+        # AMD CK FP8 batched gemm does not support N < 512 or K < 512. FlyDSL
+        # has no such limit, and serves the op wherever it is available and
+        # supports the GPU -- the same test mslk/gemm/__init__.py makes.
+        flydsl_serves = False
+        if torch.version.hip and is_flydsl_available():
+            from mslk.gemm.flydsl.fp8_rowwise_gemm import is_supported
+
+            flydsl_serves = is_supported()
         if (
             mode == "default"
             and torch.version.hip

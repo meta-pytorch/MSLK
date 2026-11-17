@@ -66,7 +66,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, memref as memref_dialect
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
@@ -76,39 +76,25 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from mslk.flydsl import buffer_ops
 from mslk.flydsl.common import lds_capacity_bytes
 from mslk.flydsl.kernels.common.kernels_common import default_f8_type
-from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import swizzle_xor16
+from mslk.flydsl.kernels.gemm.fp8_wide_mfma_common import (
+    ACC_REGS,
+    LdsAccess,
+    LOAD_BYTES,
+    MFMA_K,
+    MFMA_M,
+    MFMA_OPERAND_BYTES,
+    swap_quad,
+    WAVE,
+    wide_mfma,
+)
 
-# MFMA geometry: one issue is a 32x32 output tile contracting 64 of K.
-MFMA_M = 32
-MFMA_K = 64
-# Bytes each lane supplies per operand per issue (32 FP8 = 8 i32).
-MFMA_OPERAND_BYTES = 32
-# Accumulator registers per MFMA tile.
-ACC_REGS = MFMA_M * MFMA_M // 64
 # Accumulator tiles one wave may own; see the check in the compiler.
 MAX_ACC_TILES = 8
-
-WAVE = 64
-
-# E8M0 exponent bias: a scale of 2^0, so the instruction's block scaling is the
-# identity.
-NEUTRAL_E8M0 = 0x7F7F7F7F
-
-# Widest global load, and hence the staging and LDS swizzle granularity.
-LOAD_BYTES = 16
 
 # A buffer offset past every descriptor's extent: a load there reads zero and a
 # store is dropped. Each descriptor covers one tile, and the host keeps tiles
 # below this.
 OUT_OF_RANGE = 0x7FFFFFFF
-
-# Alias scopes for the direct-to-LDS path; see `fp8_groupwise_wide_gemm`, whose
-# pipeline this one extends. They let the backend overlap the transfers with the
-# fragment reads, which leaves the s_waitcnt at the top of each K tile as what
-# orders them, so its count has to be exact.
-_LDS_DOMAIN = '#llvm.alias_scope_domain<id = "rw_plain.lds">'
-_SCOPE_NAMES = ("dma", "reads")
-_SCOPE_DMA, _SCOPE_READS = range(len(_SCOPE_NAMES))
 
 # The widest count s_waitcnt can wait for on vmcnt.
 VMCNT_MAX = 63
@@ -131,7 +117,9 @@ def _load_width(k: int) -> int:
     return width
 
 
-@functools.lru_cache(maxsize=256)
+# Holds a whole tuning sweep's launchers for one shape, so a sweep compiles each
+# config once.
+@functools.lru_cache(maxsize=1024)
 def compile_fp8_rowwise_gemm(
     *,
     n: int,
@@ -240,9 +228,6 @@ def compile_fp8_rowwise_gemm(
             f"than s_waitcnt can count ({VMCNT_MAX})"
         )
 
-    k_chunks = tile_k // LOAD_BYTES
-    frag_loads = MFMA_OPERAND_BYTES // LOAD_BYTES
-
     lds_a_elems = tile_m * tile_k
     lds_b_elems = tile_n * tile_k
     lds_bytes = stages * (lds_a_elems + lds_b_elems)
@@ -331,8 +316,6 @@ def compile_fp8_rowwise_gemm(
         def b_buf(slot):
             return fx.Index(stages * lds_a_elems) + slot * fx.Index(lds_b_elems)
 
-        c_chunks = fx.Index(k_chunks)
-
         # Load i of thread tx covers tile bytes [(i * threads + tx) * 16, +16),
         # so consecutive lanes walk a row and the reads coalesce.
         def stage_coords(num_loads):
@@ -345,80 +328,29 @@ def compile_fp8_rowwise_gemm(
         a_coords = stage_coords(num_a_loads)
         b_coords = stage_coords(num_b_loads)
 
-        def lds_index(row, col, lds_base):
-            """Byte offset of tile element ``(row, col)`` under the XOR16 swizzle."""
-            return row * fx.Index(tile_k) + swizzle_xor16(row, col, c_chunks) + lds_base
-
-        _scopes = [
-            ir.Attribute.parse(
-                f'#llvm.alias_scope<id = "rw_plain.{nm}", domain = {_LDS_DOMAIN}>'
-            )
-            for nm in _SCOPE_NAMES
-        ]
-
-        def tag_alias(op, mine):
-            op = getattr(op, "owner", op)
-            op.attributes["alias_scopes"] = ir.ArrayAttr.get([_scopes[mine]])
-            op.attributes["noalias_scopes"] = ir.ArrayAttr.get(
-                [sc for i, sc in enumerate(_scopes) if i != mine]
-            )
-
-        lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-        lds_addr_i32 = fx.Int32(
-            arith.index_cast(
-                T.i32, memref_dialect.extract_aligned_pointer_as_index(lds)
-            )
-        )
-        lds_addr_base = fx.Int64(
-            arith.index_cast(
-                T.i64, memref_dialect.extract_aligned_pointer_as_index(lds)
-            )
-        )
-        v4i32 = ir.VectorType.get([4], fx.Int32.ir_type)
-
-        def lds_ptr(byte_idx):
-            return llvm.inttoptr(
-                lds_ptr_ty, (lds_addr_i32 + fx.Int32(byte_idx)).ir_value()
-            )
+        # The direct-to-LDS transfers and the fragment reads carry alias scopes,
+        # which let the backend overlap them; the s_waitcnt at the top of each
+        # K tile is then what orders them, so its count has to be exact.
+        lds_io = LdsAccess(lds, "rw_plain", tile_k)
 
         # ---- staging: global -> LDS ----------------------------------------
         def dma_tile(rsrc, coords, kt, lds_base):
-            """Move a tile straight into LDS; see `fp8_groupwise_wide_gemm`.
+            """Move a tile straight into LDS; a chunk past K is sent out of
+            range and so lands as zeros."""
 
-            Lane L of a wave lands at a fixed ``lds_ptr + L * 16``, so the XOR
-            swizzle is applied to the source address instead. A chunk past K
-            is sent out of range and so lands as zeros.
-            """
-            ptr = None
-            for i in range_constexpr(len(coords)):
+            def src_offset(i):
                 row, col = coords[i]
-                src_col = kt * fx.Index(tile_k) + swizzle_xor16(row, col, c_chunks)
+                src_col = kt * fx.Index(tile_k) + lds_io.swizzle(row, col)
                 byte_off = row * k_c + src_col
                 if const_expr(k_tail):
                     byte_off = fx.Index(
                         arith.select(src_col < k_c, byte_off, fx.Index(OUT_OF_RANGE))
                     )
-                if const_expr(i == 0):
-                    ptr = rocdl.readfirstlane(
-                        T.i64,
-                        lds_addr_base
-                        + fx.Int64(lds_base)
-                        + fx.Int64(wave_id * fx.Index(WAVE * LOAD_BYTES)),
-                    )
-                else:
-                    ptr = ptr + fx.Int64(total_threads * LOAD_BYTES)
-                tag_alias(
-                    rocdl.raw_ptr_buffer_load_lds(
-                        rsrc,
-                        llvm.inttoptr(lds_ptr_ty, ptr),
-                        fx.Int32(LOAD_BYTES),
-                        fx.Int32(byte_off),
-                        fx.Int32(0),
-                        fx.Int32(0),
-                        1,
-                    ),
-                    _SCOPE_DMA,
-                )
+                return byte_off
+
+            lds_io.dma_tile(
+                rsrc, len(coords), src_offset, lds_base, wave_id, total_threads
+            )
 
         # Loads of `load_width` bytes, as the element type of that width.
         piece_ty = {1: T.i8, 2: T.i16}.get(load_width, T.i32)
@@ -467,7 +399,7 @@ def compile_fp8_rowwise_gemm(
                 row, col = coords[i]
                 llvm.StoreOp(
                     _raw(chunks[i]),
-                    lds_ptr(lds_index(row, col, lds_base)),
+                    lds_io.ptr(lds_io.index(row, col, lds_base)),
                     alignment=16,
                 )
 
@@ -491,41 +423,12 @@ def compile_fp8_rowwise_gemm(
 
         # ---- fragment reads and MFMA ----------------------------------------
         def read_frag(row, lds_base, ks):
-            halves = []
-            for j in range_constexpr(frag_loads):
-                col = (
-                    fx.Index(ks * MFMA_K)
-                    + lane_hi * fx.Index(32)
-                    + fx.Index(j * LOAD_BYTES)
-                )
-                ld = llvm.LoadOp(
-                    v4i32, lds_ptr(lds_index(row, col, lds_base)), alignment=16
-                )
-                tag_alias(ld, _SCOPE_READS)
-                halves.append(Vector(ld.result))
-            return (
-                Vector(halves[0]).shuffle(Vector(halves[1]), list(range(8))).ir_value()
-            )
+            return lds_io.read_frag(row, lds_base, ks, lane_hi)
 
         def mfma(a_op, b_op, c_in):
             """Contract 64 of K: one wide issue, or four 32x32x16 ones."""
             if const_expr(cdna4):
-                # Operands: a, b, c, cbsz, blgp, opsel_a, scale_a, opsel_b,
-                # scale_b.
-                acc = rocdl.mfma_scale_f32_32x32x64_f8f6f4(
-                    v_acc_ty,
-                    [
-                        _raw(a_op),
-                        _raw(b_op),
-                        _raw(c_in),
-                        0,
-                        0,
-                        0,
-                        _raw(fx.Int32(NEUTRAL_E8M0)),
-                        0,
-                        _raw(fx.Int32(NEUTRAL_E8M0)),
-                    ],
-                )
+                acc = wide_mfma(v_acc_ty, a_op, b_op, c_in)
             else:
                 # See the module docstring for why the slices pair up.
                 acc = _raw(c_in)
@@ -658,34 +561,15 @@ def compile_fp8_rowwise_gemm(
         def col_valid(col):
             return (by_n + col) < n_c
 
-        pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-
         def store_wide(runs, row, col0):
-            for pair in range_constexpr(ACC_REGS // 8):
-                # permlane32_swap gathers both half-waves' runs of a column
-                # group into one half-wave, so two swaps turn four 8-byte
-                # stores into two 16-byte ones; see `fp8_groupwise_wide_gemm`.
-                def dwords(g):
-                    packed = Vector.from_elements(runs[g], out_ty).bitcast(fx.Int32)
-                    return fx.Int32(packed[0]), fx.Int32(packed[1])
+            def dwords(g):
+                packed = Vector.from_elements(runs[g], out_ty).bitcast(fx.Int32)
+                return fx.Int32(packed[0]), fx.Int32(packed[1])
 
-                even_lo, even_hi = dwords(2 * pair)
-                odd_lo, odd_hi = dwords(2 * pair + 1)
-                sw_lo = rocdl.permlane32_swap(
-                    pair_ty, _raw(even_lo), _raw(odd_lo), False, False
-                )
-                sw_hi = rocdl.permlane32_swap(
-                    pair_ty, _raw(even_hi), _raw(odd_hi), False, False
-                )
-                quad = Vector.from_elements(
-                    [
-                        fx.Int32(llvm.extractvalue(T.i32, sw_lo, [0])),
-                        fx.Int32(llvm.extractvalue(T.i32, sw_hi, [0])),
-                        fx.Int32(llvm.extractvalue(T.i32, sw_lo, [1])),
-                        fx.Int32(llvm.extractvalue(T.i32, sw_hi, [1])),
-                    ],
-                    fx.Int32,
-                )
+            for pair in range_constexpr(ACC_REGS // 8):
+                # Two column groups gathered across the half-waves into one
+                # 16-byte store per lane; see `fp8_wide_mfma_common.swap_quad`.
+                quad = swap_quad(dwords(2 * pair), dwords(2 * pair + 1))
                 # Low lanes take the even group, high lanes the odd one.
                 col = col0 + (fx.Index(2 * pair) + lane_hi) * fx.Index(8)
                 buffer_ops.buffer_store(

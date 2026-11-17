@@ -14,7 +14,8 @@ The kernel, ``mslk.flydsl.kernels.gemm.fp8_rowwise_gemm``, reads the caller's
 row-major weights and takes every shape the CK ops do. The batched op runs one
 batch per slice of the grid's z axis; the others are a batch of one. Callers
 that keep their weights in the MFMA preshuffle layout use the ``_preshuffle``
-ops instead (``preshuffle_gemm.py``).
+ops instead (``preshuffle_gemm.py``), which share this module's operand
+checks.
 
 Tensor contract (matches the CK ops):
   XQ      : [..., M, K]  FP8    ([B, M, K] for the batched op)
@@ -27,133 +28,102 @@ Tensor contract (matches the CK ops):
 """
 
 import functools
-import itertools
 from math import prod
 from typing import Optional
 
 import torch
-from mslk.flydsl.autotune import next_pow2, tunable
-from mslk.flydsl.common import lds_capacity_bytes
-from mslk.utils.device import get_gfx_arch_name, gfx_arch_in, supports_float8_fnuz
+from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
+from mslk.utils.device import is_gfx942, is_gfx950
 
-# Candidate configs for autotune. Small M is bound by how many weight loads
-# are in flight, so the space runs down to one-wave blocks of 32x32 with a
-# deep pipeline; large M wants big tiles and eight waves. Only configs the
-# kernel accepts on this GPU are listed: whole 32x32 MFMA tiles per wave and at
-# most eight of them, whole
-# 16-byte loads per thread, the LDS budget, and an in-flight count s_waitcnt
-# can express. gfx942 stages through registers, which pipelines two deep.
-# Configs that need K to be a multiple of 16 (more than two stages) fail to
-# compile otherwise, which the autotuner skips.
-# Without the target features (e.g. "gfx950:sramecc+:xnack-"), as the LDS
-# table is keyed.
-_ARCH = get_gfx_arch_name().split(":")[0]
-_CDNA4 = _ARCH.startswith("gfx95")
-_LDS_BYTES = lds_capacity_bytes(_ARCH)
-_STAGES = (2, 3, 4) if _CDNA4 else (2,)
-_WAVE_GRIDS = (
-    (1, 1),
-    (1, 2),
-    (2, 1),
-    (2, 2),
-    (1, 4),
-    (4, 1),
-    (2, 4),
-    (4, 2),
-    (8, 1),
-    (1, 8),
-)
+# Config used when autotuning is disabled. Picked for the smallest worst case
+# against the per-shape best, not the most wins, so an untuned caller has a
+# bounded loss. Legal for every supported shape on both architectures: two
+# stages is all gfx942, and K not a multiple of 16, can take, and it fits
+# gfx942's 64 KiB of LDS.
+DEFAULT_TILE = {
+    "tile_m": 64,
+    "tile_n": 64,
+    "tile_k": 256,
+    "waves_m": 2,
+    "waves_n": 2,
+    "stages": 2,
+    "waves_per_eu": 0,
+}
 
+# Candidates swept by autotune. With few rows the time is the latency of the
+# weight loads, which small tiles in one-wave blocks with a deep pipeline hide
+# best; with many rows big tiles and eight waves win, so the space spans both.
+_TILE_M = (32, 64, 128, 256)
+_TILE_N = (32, 64, 128, 256)
+_TILE_K = (128, 256)
+# The wave grid is explicit rather than a wave count, because its shape is what
+# drives LDS read traffic: reads per unit work are waves_m / tile_m + waves_n /
+# tile_n, so the grid wants to be proportioned like the tile.
+_WAVE_GRIDS = ((1, 1), (1, 2), (2, 1), (2, 2), (4, 1), (2, 4), (4, 2), (8, 1), (1, 8))
+# LDS buffers per operand; more than two needs gfx950 and K a multiple of 16.
+_STAGES = (2, 3, 4)
+# Occupancy target, as a minimum waves-per-EU hint to the register allocator; 0
+# leaves the choice to the compiler.
+_WAVES_PER_EU = (0, 2)
 
-def _legal(tm: int, tn: int, tk: int, wm: int, wn: int, stages: int) -> bool:
-    threads = wm * wn * 64
-    loads = (tm + tn) * tk // (threads * 16)
-    return (
-        tm % (wm * 32) == 0
-        and tn % (wn * 32) == 0
-        and (tm // wm // 32) * (tn // wn // 32) <= 8
-        and (tm * tk) % (threads * 16) == 0
-        and (tn * tk) % (threads * 16) == 0
-        and stages * (tm + tn) * tk <= _LDS_BYTES
-        and (stages - 2) * loads <= 63
-    )
-
-
+# Many of these do not divide into whole MFMA tiles per wave and whole 16-byte
+# loads per thread, or do not fit LDS or the pipeline the architecture and K
+# allow; those raise, which the autotuner reports and skips. Enumerating the
+# legal subset here instead would duplicate the kernel's guards and drift from
+# them.
 _TILES = tuple(
-    dict(tile_m=tm, tile_n=tn, tile_k=tk, waves_m=wm, waves_n=wn, stages=st)
-    for tm, tn, tk, (wm, wn), st in itertools.product(
-        (32, 64, 128, 256), (32, 64, 128, 256), (64, 128, 256), _WAVE_GRIDS, _STAGES
-    )
-    if _legal(tm, tn, tk, wm, wn, st)
+    {
+        "tile_m": tm,
+        "tile_n": tn,
+        "tile_k": tk,
+        "waves_m": wm,
+        "waves_n": wn,
+        "stages": st,
+        "waves_per_eu": wpe,
+    }
+    for tm in _TILE_M
+    for tn in _TILE_N
+    for tk in _TILE_K
+    for (wm, wn) in _WAVE_GRIDS
+    for st in _STAGES
+    for wpe in _WAVES_PER_EU
 )
 
-# Untuned config per M bucket, (m_upper, tile_m, tile_n, tile_k, waves_m,
-# waves_n, stages). On gfx950 each is the config that loses least, in geometric
-# mean, to the per-shape best over 10 (N, K) pairs; the worst loss is 1.26x up
-# to M = 128 and 1.56x above. gfx942 is not tuned: its buckets are the gfx950
-# ones cut to its 64 KiB of LDS and two stages.
-_M_BUCKETS_GFX950 = (
-    (64, 32, 32, 256, 1, 1, 4),
-    (128, 32, 64, 256, 1, 2, 3),
-    (512, 64, 64, 128, 2, 1, 4),
-    (1024, 128, 64, 128, 4, 1, 3),
-    (2048, 128, 128, 128, 4, 2, 4),
-    (4096, 128, 128, 128, 4, 1, 2),
-    (1 << 62, 256, 256, 128, 8, 1, 2),
-)
-_M_BUCKETS_GFX942 = (
-    (64, 32, 32, 256, 1, 1, 2),
-    (128, 32, 64, 256, 1, 2, 2),
-    (512, 64, 64, 128, 2, 1, 2),
-    (1024, 128, 64, 128, 4, 1, 2),
-    (1 << 62, 128, 128, 128, 4, 2, 2),
-)
+# A tile that overruns N or K still compiles, masking its tail, but wastes part
+# of its work, so prune on both axes; where nothing divides, the full list is
+# kept.
+_PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
+# The output dtype is part of the kernel, so the f16 and bf16 ops tune apart.
+_KEY = ["m_bucket", "n", "k", "batch", "out_dtype"]
 
 
-def _default_tile(*_: object, m_bucket: int, k: int, **__: object) -> dict:
-    for m_upper, tm, tn, tk, wm, wn, stages in (
-        _M_BUCKETS_GFX950 if _CDNA4 else _M_BUCKETS_GFX942
-    ):
-        if m_bucket <= m_upper:
-            break
-    # A deeper pipeline moves whole 16-byte chunks straight into LDS, which
-    # needs every row to start on one.
-    if k % 16:
-        stages = 2
-    return dict(tile_m=tm, tile_n=tn, tile_k=tk, waves_m=wm, waves_n=wn, stages=stages)
-
-
-@tunable(
-    configs=_TILES,
-    default=_default_tile,
-    key=["m_bucket", "n", "k", "batch", "out_dtype"],
-)
 def _launch_fp8_rowwise(
-    XQ: torch.Tensor,
-    WQ: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
-    out: torch.Tensor,
+    XQ,
+    WQ,
+    x_scale,
+    w_scale,
+    out,
+    m_bucket,
+    n,
+    k,
+    batch,
+    out_dtype,
     *,
-    m: int,
-    m_bucket: int,
-    n: int,
-    k: int,
-    batch: int,
-    out_dtype: str,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    waves_m: int,
-    waves_n: int,
-    stages: int,
-    waves_per_eu: int = 0,
-) -> torch.Tensor:
+    tile_m,
+    tile_n,
+    tile_k,
+    waves_m,
+    waves_n,
+    stages,
+    waves_per_eu=0,
+):
     """Compile (cached) and launch the kernel for one config.
 
-    ``m_bucket`` only feeds the tuning key, so nearby row counts share a tuned
-    config; ``m`` is the actual count. FlyDSL names the tuning cache file after
-    this function.
+    ``XQ``/``out`` are the batch's rows stacked, ``[batch * M, K]`` and
+    ``[batch * M, N]``. ``m_bucket`` only feeds the autotune key: bucketing M
+    keeps nearby token counts on one tuned config. ``n``/``k`` are passed for
+    the key and for tile pruning. FlyDSL names the tuning cache file after this
+    function.
     """
     from mslk.flydsl.jit import run_compiled
     from mslk.flydsl.kernels.gemm.fp8_rowwise_gemm import compile_fp8_rowwise_gemm
@@ -171,8 +141,8 @@ def _launch_fp8_rowwise(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         out_dtype=out_dtype,
     )
-    # The kernel addresses the operands as flat byte buffers, so FP8 is viewed
-    # as int8 for the handoff.
+    # The kernel addresses the operands as flat byte buffers; FP8 is viewed as
+    # int8 for the handoff, as the grouped path does.
     run_compiled(
         launcher,
         out,
@@ -180,11 +150,16 @@ def _launch_fp8_rowwise(
         WQ.view(torch.int8),
         x_scale,
         w_scale,
-        m,
+        XQ.shape[0] // batch,
         batch,
         torch.cuda.current_stream(XQ.device),
     )
     return out
+
+
+_tuned_fp8_rowwise = tunable(
+    configs=_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+)(_launch_fp8_rowwise)
 
 
 def _run(
@@ -199,25 +174,22 @@ def _run(
     k: int,
 ) -> None:
     # One canonical shape per operand: the compiled launcher fixes each
-    # argument's rank, and is shared by every caller with the same N and K. The
-    # tuning key and the default are read from keyword arguments, so they are
-    # passed by name.
-    _launch_fp8_rowwise(
+    # argument's rank, and is shared by every caller with the same N and K.
+    _tuned_fp8_rowwise(
         XQ.view(batch * m, k),
         WQ.view(batch * n, k),
         x_scale.contiguous().view(batch * m),
         w_scale.contiguous().view(batch * n),
         out.view(batch * m, n),
-        m=m,
-        m_bucket=next_pow2(m),
-        n=n,
-        k=k,
-        batch=batch,
-        out_dtype="f16" if out.dtype == torch.float16 else "bf16",
+        next_pow2(m),
+        n,
+        k,
+        batch,
+        "f16" if out.dtype == torch.float16 else "bf16",
     )
 
 
-def _check_operands(
+def check_rowwise_operands(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -225,12 +197,18 @@ def _check_operands(
     bias: Optional[torch.Tensor],
     use_fast_accum: bool,
 ) -> None:
+    """The CK rowwise ops' operand contract, shared by the plain and preshuffle
+    ops.
+
+    The FP8 flavour follows the MFMA the kernels issue, OCP E4M3 on gfx950 and
+    the fnuz encoding on gfx942, whatever torch's FP8 default is set to.
+    """
     torch._check(
         XQ.dtype == WQ.dtype,
         lambda: f"XQ and WQ dtypes must match, got {XQ.dtype} vs {WQ.dtype}",
     )
-    fp8 = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    torch._check(XQ.dtype == fp8, lambda: f"XQ and WQ must be {fp8}")
+    fp8_dtype = torch.float8_e4m3fn if is_gfx950() else torch.float8_e4m3fnuz
+    torch._check(XQ.dtype == fp8_dtype, lambda: f"XQ and WQ must be {fp8_dtype}")
     torch._check(
         x_scale.dtype == torch.float32 and w_scale.dtype == torch.float32,
         lambda: "Scales must be float32.",
@@ -277,7 +255,7 @@ def _rowwise(
     dtype: torch.dtype,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    _check_operands(XQ, WQ, x_scale, w_scale, bias, use_fast_accum)
+    check_rowwise_operands(XQ, WQ, x_scale, w_scale, bias, use_fast_accum)
     torch._check(WQ.dim() == 2, lambda: f"WQ must be [N, K], got {tuple(WQ.shape)}")
     torch._check(
         XQ.dim() >= 1 and XQ.shape[-1] == WQ.shape[1],
@@ -300,9 +278,14 @@ def _rowwise(
 
 @functools.lru_cache(maxsize=1)
 def is_supported() -> bool:
-    """Whether this module can serve the plain rowwise ops on the current GPU;
-    ``mslk/gemm/__init__.py`` falls back to CK when it is False."""
-    return gfx_arch_in(("gfx942", "gfx950"))
+    """Whether this module can serve the plain rowwise ops on the current GPU.
+
+    The kernel is built on MFMA, which the RDNA parts do not have -- and FlyDSL
+    reports itself available on those, so having the backend says nothing about
+    whether these ops can run. ``mslk/gemm/__init__.py`` falls back to CK when
+    it is False.
+    """
+    return is_gfx950() or is_gfx942()
 
 
 def matmul_f8f8bf16_rowwise(
@@ -352,7 +335,7 @@ def matmul_f8f8bf16_rowwise_batched(
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FlyDSL impl of ``mslk::f8f8bf16_rowwise_batched``."""
-    _check_operands(XQ, WQ, x_scale, w_scale, bias, use_fast_accum)
+    check_rowwise_operands(XQ, WQ, x_scale, w_scale, bias, use_fast_accum)
     torch._check(
         XQ.dim() == 3 and WQ.dim() == 3,
         lambda: "Inputs must have 3 dimensions, with the first being batch.",

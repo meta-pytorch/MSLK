@@ -18,7 +18,8 @@ from math import prod
 from typing import Optional
 
 import torch
-from mslk.utils.device import gfx_arch_in, is_gfx950
+from mslk.gemm.flydsl.fp8_rowwise_gemm import check_rowwise_operands
+from mslk.utils.device import gfx_arch_in
 from torch import Tensor
 
 
@@ -748,22 +749,7 @@ def _rowwise_preshuffle(
     dtype: torch.dtype,
 ) -> Tensor:
     torch._check(XQ.dim() >= 1, lambda: "XQ must have at least one dimension")
-    torch._check(
-        XQ.dtype == WQ.dtype,
-        lambda: f"XQ and WQ dtypes must match, got {XQ.dtype} vs {WQ.dtype}",
-    )
-    fp8_dtype = torch.float8_e4m3fn if is_gfx950() else torch.float8_e4m3fnuz
-    torch._check(XQ.dtype == fp8_dtype, lambda: f"XQ and WQ must be {fp8_dtype}")
-    torch._check(
-        x_scale.dtype == torch.float32 and w_scale.dtype == torch.float32,
-        lambda: "Scales must be float32.",
-    )
-    torch._check(
-        use_fast_accum, lambda: "AMD does not support disabling use_fast_accum."
-    )
-    torch._check(bias is None, lambda: "AMD does not support fused bias.")
-    torch._check(XQ.is_cuda and XQ.is_contiguous(), lambda: "XQ must be contiguous")
-    torch._check(WQ.is_cuda and WQ.is_contiguous(), lambda: "WQ must be contiguous")
+    check_rowwise_operands(XQ, WQ, x_scale, w_scale, bias, use_fast_accum)
     torch._check(WQ.dim() == 2, lambda: f"WQ must be [N, K], got {WQ.shape}")
     torch._check(
         XQ.shape[-1] == WQ.shape[1],
@@ -771,12 +757,6 @@ def _rowwise_preshuffle(
     )
     n, k = WQ.shape
     m = prod(XQ.shape[:-1])
-    torch._check(
-        WQ.device == XQ.device
-        and x_scale.device == XQ.device
-        and w_scale.device == XQ.device,
-        lambda: "XQ, WQ and scales must be on the same device",
-    )
     torch._check(x_scale.numel() == m, lambda: "x_scale must have one value per row")
     torch._check(w_scale.numel() == n, lambda: "w_scale must have one value per column")
     if m == 0 or n == 0 or k == 0:

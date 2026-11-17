@@ -91,7 +91,7 @@ def prune_by_divisibility(
 def tunable(
     *,
     configs: Sequence[Mapping[str, Any]],
-    default: Mapping[str, Any] | Callable[..., Mapping[str, Any]],
+    default: Mapping[str, Any],
     key: Sequence[str],
     prune: Callable[..., list] | None = None,
     returns: str = "out",
@@ -100,11 +100,6 @@ def tunable(
 
     The wrapped function takes the tuning parameters as keyword-only arguments
     and everything the cache key needs as ordinary arguments.
-
-    ``default`` is either a fixed config or a function returning one, for when
-    no single config suits every shape. A function is called with the call's
-    own arguments, so whatever it reads has to be passed by keyword. It runs on
-    the host alone, so it is as safe under graph capture as a fixed config.
 
     ``returns`` names the output argument. FlyDSL's autotuner discards the tuned
     function's return value, so on the tuned path the wrapper hands back that
@@ -132,8 +127,7 @@ def tunable(
         @functools.wraps(launch_fn)
         def call(*args, **kwargs):
             if not autotune_enabled():
-                config = default(*args, **kwargs) if callable(default) else default
-                return launch_fn(*args, **kwargs, **dict(config))
+                return launch_fn(*args, **kwargs, **dict(default))
             _tuner()(*args, **kwargs)
             bound = signature.bind_partial(*args, **kwargs)
             bound.apply_defaults()
