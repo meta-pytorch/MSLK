@@ -289,7 +289,9 @@ def test_dropout_training_varlen_flydsl(mask):
         ("dk", k.grad, kr.grad),
         ("dv", v.grad, vr.grad),
     ):
-        err = float((got.detach().float() - want.detach()).norm() / want.detach().norm())
+        err = float(
+            (got.detach().float() - want.detach()).norm() / want.detach().norm()
+        )
         assert err < tol, f"{name}: relative L2 {err:.3e} exceeds {tol}"
 
 
