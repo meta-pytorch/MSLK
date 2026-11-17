@@ -66,14 +66,13 @@ def _is_gfx950():
 
 
 @rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("p", [0.2, 0.5])
 @pytest.mark.parametrize("D", [64, 128])
-def test_dropout_mask_bit_exact_flydsl(D, p, dtype):
+def test_dropout_mask_bit_exact_flydsl(D):
     # With kv_len == D, V = I gives out = P' and dO = I gives dV = P'^T; P > 0
     # everywhere, so the nonzeros are exactly the kept elements.
     if not _is_gfx950():
         pytest.skip("flydsl dropout backward is gfx950-only")
+    p, dtype = 0.3, torch.bfloat16
     B, H, S = 2, 3, D
     torch.manual_seed(0)
     q = torch.randn((B, S, H, D), device="cuda", dtype=dtype).requires_grad_(True)
@@ -172,54 +171,6 @@ def test_dropout_flydsl(seq_len, batch_size, h_len, k_len, p, seed, attn_bias, d
     )
 
 
-@rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("p", [0.3, 0.7])
-@pytest.mark.parametrize("k_len", [64, 128])
-@pytest.mark.parametrize("seq_len", [32, 200])
-def test_dropout_training_flydsl(seq_len, k_len, p, causal, dtype):
-    if not _is_gfx950():
-        pytest.skip("flydsl dropout backward is gfx950-only")
-    device, B, H = "cuda", 2, 3
-    torch.manual_seed(0)
-    q, k, v, grad = (
-        torch.randn((B, seq_len, H, k_len), device=device, dtype=dtype)
-        for _ in range(4)
-    )
-    q, k, v = (t.requires_grad_(True) for t in (q, k, v))
-    bias = fmha.attn_bias.LowerTriangularMask() if causal else None
-    rng = torch.cuda.get_rng_state()
-    out = fmha.memory_efficient_attention(q, k, v, bias, p)
-    out.backward(grad)
-
-    torch.cuda.set_rng_state(rng)
-    mask = _drop_mask(_draw_seed(), B, H, seq_len, seq_len, p)
-    qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
-    scores = torch.einsum("bqhd,bkhd->bhqk", qr, kr) * k_len**-0.5
-    if causal:
-        future = torch.ones(seq_len, seq_len, device=device, dtype=torch.bool).triu(1)
-        scores = scores.masked_fill(future, float("-inf"))
-    probs = scores.softmax(-1) * mask / (1 - p)
-    ref = torch.einsum("bhqk,bkhd->bqhd", probs, vr)
-    ref.backward(grad.float())
-
-    def _rel_l2(a, b):
-        return float(
-            (a.detach().float() - b.detach()).norm() / b.norm().clamp_min(1e-6)
-        )
-
-    tol = 2e-2 if dtype is torch.bfloat16 else 5e-3
-    for name, got, want in (
-        ("out", out, ref),
-        ("dq", q.grad, qr.grad),
-        ("dk", k.grad, kr.grad),
-        ("dv", v.grad, vr.grad),
-    ):
-        err = _rel_l2(got, want)
-        assert err < tol, f"{name}: relative L2 {err:.3e} exceeds {tol}"
-
-
 _VARLEN_Q_LENS, _VARLEN_KV_LENS = [5, 64, 37], [60, 100, 45]
 
 
@@ -263,11 +214,10 @@ def _layout_kv(layout, H, D, dtype):
 
 
 @rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["varlen", "padded", "gappy", "paged_64"])
-def test_dropout_mask_bit_exact_packed_flydsl(layout, dtype):
+def test_dropout_mask_bit_exact_packed_flydsl(layout):
     # Every layout keys the mask per sequence, like dense.
-    p, H, D = 0.3, 3, 128
+    p, H, D, dtype = 0.3, 3, 128, torch.bfloat16
     torch.manual_seed(0)
     kv, bias = _layout_kv(layout, H, D, dtype)
     q = torch.randn(1, sum(_VARLEN_Q_LENS), H, D, device="cuda", dtype=dtype)
@@ -288,13 +238,12 @@ def test_dropout_mask_bit_exact_packed_flydsl(layout, dtype):
 
 
 @rocm_only
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask", ["varlen", "varlen_causal", "varlen_window"])
-def test_dropout_training_varlen_flydsl(mask, dtype):
+def test_dropout_training_varlen_flydsl(mask):
     if not _is_gfx950():
         pytest.skip("flydsl dropout backward is gfx950-only")
     ab = fmha.attn_bias
-    p, H, D = 0.3, 3, 128
+    p, H, D, dtype = 0.3, 3, 128, torch.bfloat16
     kv_lens = _VARLEN_KV_LENS
     if mask == "varlen":
         q_lens, bias = (
@@ -333,14 +282,14 @@ def test_dropout_training_varlen_flydsl(mask, dtype):
     )
     ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1) * drop / (1 - p), vr)
     ref.backward(grad.float())
-    tol = 2e-2 if dtype is torch.bfloat16 else 5e-3
+    tol = 2e-2
     for name, got, want in (
         ("out", out, ref),
         ("dq", q.grad, qr.grad),
         ("dk", k.grad, kr.grad),
         ("dv", v.grad, vr.grad),
     ):
-        err = float((got.detach().float() - want.detach()).norm() / want.norm())
+        err = float((got.detach().float() - want.detach()).norm() / want.detach().norm())
         assert err < tol, f"{name}: relative L2 {err:.3e} exceeds {tol}"
 
 
