@@ -6,10 +6,10 @@
 
 """FlyDSL preshuffle GEMM for FP8 rowwise scaling (gfx942 and gfx950).
 
-Provides single and batched FP8 preshuffle GEMM via FlyDSL. Also registers
-as the ROCm implementation of the ``mslk`` rowwise FP8 ops on gfx950, and
-provides the one ``mslk/gemm/__init__.py`` dispatches the preshuffle ops
-(``f8f8{bf16,f16}_rowwise_preshuffle``, CK-preshuffled weights) to.
+Provides single and batched FP8 preshuffle GEMM via FlyDSL, and the
+implementation ``mslk/gemm/__init__.py`` dispatches the preshuffle ops
+(``f8f8{bf16,f16}_rowwise_preshuffle``, CK-preshuffled weights) to. The ops
+taking plain weights are served by ``fp8_rowwise_gemm.py``.
 """
 
 import weakref
@@ -719,7 +719,7 @@ def _evict_padded(ref: weakref.ref, key: int) -> None:
 
 def _pad_preshuffled(WQ: Tensor, n_pad: int, k_pad: int) -> Tensor:
     """WQ zero-padded to (n_pad, k_pad) in the preshuffle layout, cached per
-    weight like the rowwise ops' preshuffle (identity + version, not address)."""
+    weight (identity + version, not address)."""
     key = id(WQ)
     version = None if WQ.is_inference() else WQ._version
     entry = _padded_cache.get(key) if version is not None else None
@@ -832,150 +832,3 @@ def matmul_f8f8f16_rowwise_preshuffle(
     return _rowwise_preshuffle(
         XQ, WQ, x_scale, w_scale, bias, use_fast_accum, torch.float16
     )
-
-
-# ---------------------------------------------------------------------------
-# Register FlyDSL as the ROCm implementation of mslk rowwise FP8 ops on gfx950
-# ---------------------------------------------------------------------------
-if torch.version.hip is not None and is_gfx950() and hasattr(torch.ops, "mslk"):
-    from mslk.flydsl.common import is_flydsl_available
-
-    if is_flydsl_available():
-        # Keyed by the weight tensor itself, not its address: a freed weight's
-        # address is handed to the next allocation of the same size, which
-        # would otherwise be served the old weight's preshuffle. The version
-        # counter catches in-place updates, and an entry is dropped once its
-        # weight is collected so the cache does not pin the copies.
-        _preshuffle_cache: dict[int, tuple[weakref.ref, int, Tensor]] = {}
-
-        def _evict(ref: weakref.ref, key: int) -> None:
-            entry = _preshuffle_cache.get(key)
-            if entry is not None and entry[0] is ref:
-                del _preshuffle_cache[key]
-
-        def _get_preshuffled(WQ: Tensor) -> Tensor:
-            key = id(WQ)
-            version = None if WQ.is_inference() else WQ._version
-            entry = _preshuffle_cache.get(key) if version is not None else None
-            if entry is not None:
-                ref, cached_version, shuf = entry
-                if ref() is WQ and cached_version == version and shuf.shape == WQ.shape:
-                    return shuf
-            shuf = flydsl_preshuffle(WQ)
-            if version is not None:
-                ref = weakref.ref(WQ, lambda r, k=key: _evict(r, k))
-                _preshuffle_cache[key] = (ref, version, shuf)
-            return shuf
-
-        def _flydsl_rowwise_impl(
-            XQ: Tensor,
-            WQ: Tensor,
-            x_scale: Tensor,
-            w_scale: Tensor,
-            bias: Optional[Tensor] = None,
-            use_fast_accum: bool = True,
-            dtype: torch.dtype = torch.bfloat16,
-            output: Optional[Tensor] = None,
-        ) -> Tensor:
-            WQ_shuf = _get_preshuffled(WQ)
-            return flydsl_preshuffle_gemm(
-                XQ,
-                WQ_shuf,
-                x_scale,
-                w_scale,
-                out=output,
-                dtype=dtype,
-            )
-
-        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise"):
-
-            @torch.library.impl("mslk::f8f8bf16_rowwise", "CUDA")
-            def _f8f8bf16_rowwise_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> Tensor:
-                return _flydsl_rowwise_impl(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    bias,
-                    use_fast_accum,
-                    dtype=torch.bfloat16,
-                )
-
-        if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_out"):
-
-            @torch.library.impl("mslk::f8f8bf16_rowwise_out", "CUDA")
-            def _f8f8bf16_rowwise_out_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                output: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> None:
-                _flydsl_rowwise_impl(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    bias,
-                    use_fast_accum,
-                    dtype=output.dtype,
-                    output=output,
-                )
-
-        if hasattr(torch.ops.mslk, "f8f8f16_rowwise"):
-
-            @torch.library.impl("mslk::f8f8f16_rowwise", "CUDA")
-            def _f8f8f16_rowwise_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> Tensor:
-                return _flydsl_rowwise_impl(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    bias,
-                    use_fast_accum,
-                    dtype=torch.float16,
-                )
-
-    # --- batched op ---
-    if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_batched"):
-        from mslk.flydsl.common import is_flydsl_available as _is_flydsl_batched
-
-        if _is_flydsl_batched():
-
-            @torch.library.impl("mslk::f8f8bf16_rowwise_batched", "CUDA")
-            def _f8f8bf16_rowwise_batched_flydsl(
-                XQ: Tensor,
-                WQ: Tensor,
-                x_scale: Tensor,
-                w_scale: Tensor,
-                bias: Optional[Tensor] = None,
-                use_fast_accum: bool = True,
-                output: Optional[Tensor] = None,
-            ) -> Tensor:
-                if bias is not None:
-                    raise NotImplementedError(
-                        "FlyDSL batched preshuffle GEMM does not support bias"
-                    )
-                return flydsl_preshuffle_batched_gemm(
-                    XQ,
-                    WQ,
-                    x_scale,
-                    w_scale,
-                    out=output,
-                )

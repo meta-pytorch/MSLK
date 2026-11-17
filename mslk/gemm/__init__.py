@@ -8,7 +8,7 @@ import functools
 import importlib
 from collections.abc import Callable
 from types import ModuleType
-from typing import Optional
+from typing import Any, Optional
 
 from mslk.utils.torch.library import load_library_buck
 
@@ -277,6 +277,35 @@ if torch.version.hip is not None:
                 torch.library.impl(f"mslk::{_op}", "CUDA")(
                     _rowwise_preshuffle_rocm(_op)
                 )
+
+    if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "_f8f8bf16_rowwise_ck"):
+        # The plain-weight rowwise ops, arbitrated like the preshuffle ones above.
+        @functools.lru_cache(maxsize=None)
+        def _rowwise_impl(op: str, device_index: int) -> Callable[..., Any]:
+            with torch.cuda.device(device_index):
+                mod = _flydsl_gemm_module("fp8_rowwise_gemm")
+                if mod is not None and mod.is_supported():
+                    return getattr(mod, f"matmul_{op}")
+            return getattr(torch.ops.mslk, f"_{op}_ck")
+
+        def _rowwise_rocm(op: str) -> Callable[..., Any]:
+            def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+                device_index = XQ.get_device()
+                with torch.cuda.device(device_index):
+                    return _rowwise_impl(op, device_index)(XQ, *args, **kwargs)
+
+            return _impl
+
+        for _op in (
+            "f8f8bf16_rowwise",
+            "f8f8bf16_rowwise_out",
+            "f8f8f16_rowwise",
+            "f8f8bf16_rowwise_batched",
+        ):
+            if not torch._C._dispatch_has_kernel_for_dispatch_key(
+                f"mslk::{_op}", "CUDA"
+            ):
+                torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_rocm(_op))
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 

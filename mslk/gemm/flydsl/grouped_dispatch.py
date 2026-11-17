@@ -342,7 +342,7 @@ def launch(
         waves_n=waves_n,
         scale_block_k=SCALE_BLOCK,
         scale_block_n=SCALE_BLOCK,
-        out_dtype="bf16",
+        out_dtype="f16" if out.dtype == torch.float16 else "bf16",
         in_dtype=in_dtype,
         b_preshuffled=b_preshuffled,
         scaling=scaling,

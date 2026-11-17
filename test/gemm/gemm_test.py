@@ -20,6 +20,7 @@ from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import force_backend
 from mslk.flydsl.common import (
     flydsl_version,
+    is_flydsl_available,
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
 )
@@ -528,9 +529,15 @@ class FP8Tests(unittest.TestCase):
         Bias: bool,
         mode: str,
     ) -> None:
-        # AMD CK FP8 batched gemm does not support N < 512 or K < 512.
-        # Funny enough, grouped gemm does not have this restriction.
-        if mode == "default" and torch.version.hip and (N < 512 or K < 512):
+        # AMD CK FP8 batched gemm does not support N < 512 or K < 512. FlyDSL,
+        # which serves the op on gfx942 and gfx950, has no such limit.
+        flydsl_serves = is_flydsl_available() and gfx_arch_in(("gfx942", "gfx950"))
+        if (
+            mode == "default"
+            and torch.version.hip
+            and not flydsl_serves
+            and (N < 512 or K < 512)
+        ):
             return
 
         x = (
@@ -4467,6 +4474,131 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
             (xq.view(2, 64, 1024), preshuffle_b_mfma(wq), x_scale.view(2, 64), w_scale),
             test_utils=("test_faketensor",),
         )
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLRowwiseTest(unittest.TestCase):
+    """Companion of the rowwise mode in ``test_gemm``: the f16, out and batched
+    ops, shapes whose N or K stop mid-tile, and the CK contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _quantized(self, *shape_x: int, n: int) -> tuple[torch.Tensor, ...]:
+        k = shape_x[-1]
+        x = torch.randn(*shape_x, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(*shape_x[:-2], n, k, dtype=torch.bfloat16, device=self.device)
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w * 0.01)
+        return xq, wq, x_scale, w_scale
+
+    @staticmethod
+    def _reference(
+        xq: torch.Tensor, wq: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor
+    ) -> torch.Tensor:
+        out = xq.float() @ wq.float().transpose(-1, -2)
+        return out * x_scale[..., None] * w_scale[..., None, :]
+
+    @parameterized.expand(
+        [
+            (M, N, K, op, dtype)
+            # The last two stop mid-tile in N and/or K.
+            for M, N, K in [(1, 4096, 4096), (300, 2048, 7168), (33, 1040, 1104)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(M, K, n=N)
+        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_out(self) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(33, 1104, n=1040)
+        out = torch.full(
+            (33, 1040), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    @parameterized.expand([(4, 64, 256, 512), (3, 1, 1024, 4096), (2, 300, 1040, 1104)])
+    def test_batched(self, B: int, M: int, N: int, K: int) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(B, M, K, n=N)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        buf = torch.full(
+            (B, M, N), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale, output=buf)
+        torch.testing.assert_close(buf.float(), ref, atol=1e-3, rtol=1e-2)
+
+    @parameterized.expand(
+        [
+            (shape, n, op, dtype)
+            for shape, n in [((0, 256), 64), ((2, 0, 3, 256), 64), ((3, 256), 0)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_empty_dimensions(
+        self, shape: tuple[int, ...], n: int, op: str, dtype: torch.dtype
+    ) -> None:
+        xq = torch.empty(shape, dtype=fp8_e4m3, device=self.device)
+        wq = torch.empty((n, shape[-1]), dtype=fp8_e4m3, device=self.device)
+        x_scale = torch.ones(shape[:-1], dtype=torch.float32, device=self.device)
+        w_scale = torch.ones(n, dtype=torch.float32, device=self.device)
+
+        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+
+        self.assertEqual(out.shape, (*shape[:-1], n))
+        self.assertEqual(out.dtype, dtype)
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+    def test_leading_dimensions(self) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(30, 192, n=80)
+        inputs = (xq.view(2, 3, 5, 192), wq, x_scale.view(2, 3, 5), w_scale)
+        out = torch.ops.mslk.f8f8bf16_rowwise(*inputs)
+        self.assertEqual(out.shape, (2, 3, 5, 80))
+        ref = self._reference(xq, wq, x_scale, w_scale).view(2, 3, 5, 80)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        torch.library.opcheck(
+            torch.ops.mslk.f8f8bf16_rowwise, inputs, test_utils=("test_faketensor",)
+        )
+
+    def test_rejects_what_ck_rejects(self) -> None:
+        op = torch.ops.mslk.f8f8bf16_rowwise
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        bias = torch.zeros(256, dtype=torch.bfloat16, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            op(xq, wq, x_scale, w_scale, bias)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            torch.ops.mslk.f8f8bf16_rowwise_batched(
+                xq[None], wq[None], x_scale[None], w_scale[None], bias[None]
+            )
+        with self.assertRaisesRegex(RuntimeError, "use_fast_accum"):
+            op(xq, wq, x_scale, w_scale, None, False)
+        with self.assertRaisesRegex(RuntimeError, "float32"):
+            op(xq, wq, x_scale.bfloat16(), w_scale)
+        with self.assertRaisesRegex(RuntimeError, "scale"):
+            op(xq, wq, x_scale[:-1], w_scale)
+        with self.assertRaisesRegex(RuntimeError, "float8|dtype"):
+            op(xq.float(), wq.float(), x_scale, w_scale)
+        with self.assertRaisesRegex(RuntimeError, "multiple of"):
+            op(xq, wq[:100], x_scale, w_scale[:100])
 
 
 @skipUnlessRocm()
