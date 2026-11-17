@@ -624,25 +624,32 @@ def test_gradcheck_all_ops():
 
 def _ragged_args(**overrides):
     q = torch.zeros(13, 2, 4)
-    args = dict(N=8, alpha=1.0, q=q, k=q, v=q, seq_offsets=_offsets((8, 5)))
+    args = {
+        "N": 8,
+        "alpha": 1.0,
+        "q": q,
+        "k": q,
+        "v": q,
+        "seq_offsets": _offsets((8, 5)),
+    }
     args.update(overrides)
     return args
 
 
 def _cross_args(**overrides):
     q, kv = torch.zeros(7, 2, 4), torch.zeros(9, 2, 4)
-    args = dict(
-        max_seq_len=8,
-        alpha=1.0,
-        q=q,
-        k=kv,
-        v=kv,
-        seq_offsets=_offsets((6, 3)),
-        seq_offsets_q=_offsets((3, 4)),
-        max_q_len=4,
-        attn_scale=None,
-        G=1,
-    )
+    args = {
+        "max_seq_len": 8,
+        "alpha": 1.0,
+        "q": q,
+        "k": kv,
+        "v": kv,
+        "seq_offsets": _offsets((6, 3)),
+        "seq_offsets_q": _offsets((3, 4)),
+        "max_q_len": 4,
+        "attn_scale": None,
+        "G": 1,
+    }
     args.update(overrides)
     return args
 
@@ -650,21 +657,21 @@ def _cross_args(**overrides):
 def _grouped_args(**overrides):
     q = torch.zeros(13, 2, 4)
     zeros = torch.zeros(2, dtype=torch.int64)
-    args = dict(
-        Z=1,
-        q=q,
-        k=q,
-        v=q,
-        seq_offsets=_offsets((8, 5)),
-        group_offsets=_offsets((8, 5)),
-        num_targets=None,
-        max_seq_len_tensor=torch.tensor([8, 5]),
-        max_attn_len_tensor=zeros,
-        full_attn_size_tensor=zeros,
-        contextual_seq_len_tensor=zeros,
-        alpha=1.0,
-        invalid_attn_mask_type="lower_triangular",
-    )
+    args = {
+        "Z": 1,
+        "q": q,
+        "k": q,
+        "v": q,
+        "seq_offsets": _offsets((8, 5)),
+        "group_offsets": _offsets((8, 5)),
+        "num_targets": None,
+        "max_seq_len_tensor": torch.tensor([8, 5]),
+        "max_attn_len_tensor": zeros,
+        "full_attn_size_tensor": zeros,
+        "contextual_seq_len_tensor": zeros,
+        "alpha": 1.0,
+        "invalid_attn_mask_type": "lower_triangular",
+    }
     args.update(overrides)
     return args
 
@@ -821,9 +828,12 @@ def test_cpu_and_gpu_references_agree(head_dim):
     gpu = {
         name: x.cuda() if isinstance(x, torch.Tensor) else x for name, x in cpu.items()
     }
-    options = dict(
-        contextual_seq_len=3, max_attn_len=16, full_attn_size=4, num_softmax_heads=1
-    )
+    options = {
+        "contextual_seq_len": 3,
+        "max_attn_len": 16,
+        "full_attn_size": 4,
+        "num_softmax_heads": 1,
+    }
     out_cpu, M_cpu = ragged_hstu_attention_ref(**cpu, **options)
     out_gpu, M_gpu = ragged_hstu_attention_ref(**gpu, **options)
     assert_hstu_close(out_gpu[:, :1].cpu(), out_cpu[:, :1], "softmax")

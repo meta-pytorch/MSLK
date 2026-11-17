@@ -19,6 +19,8 @@ import torch
 
 HEAD_DIMS = (64, 128, 256)
 
+_CPU = torch.device("cpu")
+
 
 def generate_sparse_seq_len(
     size: int, max_seq_len: int, sparsity: float, generator: torch.Generator
@@ -112,7 +114,7 @@ def make_ragged_inputs(
     sparsity: float,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = _CPU,
     seed: int = 0,
     max_targets: int = 0,
     shared_kv: bool = False,
@@ -161,7 +163,7 @@ def make_cross_inputs(
     sparsity: float,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = _CPU,
     seed: int = 0,
     max_targets: int = 0,
     shared_kv: bool = False,
@@ -218,7 +220,7 @@ def make_grouped_inputs(
     sparsity: float,
     *,
     dtype: torch.dtype = torch.bfloat16,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = _CPU,
     seed: int = 0,
     max_targets: int = 0,
     requires_grad: bool = False,
