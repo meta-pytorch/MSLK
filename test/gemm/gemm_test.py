@@ -4484,7 +4484,8 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
 )
 class FlyDSLRowwiseTest(unittest.TestCase):
     """Companion of the rowwise mode in ``test_gemm``: the f16, out and batched
-    ops, shapes whose N or K stop mid-tile, and the CK contract."""
+    ops, every shape the CK ops take (any N and K, not only tile multiples),
+    and the CK contract."""
 
     @classmethod
     def setUpClass(cls):
@@ -4508,8 +4509,17 @@ class FlyDSLRowwiseTest(unittest.TestCase):
     @parameterized.expand(
         [
             (M, N, K, op, dtype)
-            # The last two stop mid-tile in N and/or K.
-            for M, N, K in [(1, 4096, 4096), (300, 2048, 7168), (33, 1040, 1104)]
+            # All but the first two stop mid-tile in N and/or K; the last four
+            # stop mid-load or mid-store too.
+            for M, N, K in [
+                (1, 4096, 4096),
+                (300, 2048, 7168),
+                (33, 1040, 1104),
+                (37, 1000, 1000),
+                (16, 1028, 514),
+                (3, 100, 8),
+                (16, 7, 33),
+            ]
             for op, dtype in [
                 ("f8f8bf16_rowwise", torch.bfloat16),
                 ("f8f8f16_rowwise", torch.float16),
@@ -4532,7 +4542,23 @@ class FlyDSLRowwiseTest(unittest.TestCase):
         ref = self._reference(xq, wq, x_scale, w_scale)
         torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
 
-    @parameterized.expand([(4, 64, 256, 512), (3, 1, 1024, 4096), (2, 300, 1040, 1104)])
+    def test_out_flattened(self) -> None:
+        # As CK, the output's leading dims only have to flatten to XQ's rows.
+        xq, wq, x_scale, w_scale = self._quantized(6, 512, n=256)
+        out = torch.full(
+            (6, 256), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_out(
+            xq.view(2, 3, 512), wq, x_scale.view(2, 3), w_scale, out
+        )
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        with self.assertRaisesRegex(RuntimeError, "rows"):
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out[:5])
+
+    @parameterized.expand(
+        [(4, 64, 256, 512), (3, 1, 1024, 4096), (2, 300, 1040, 1104), (2, 37, 100, 520)]
+    )
     def test_batched(self, B: int, M: int, N: int, K: int) -> None:
         xq, wq, x_scale, w_scale = self._quantized(B, M, K, n=N)
         ref = self._reference(xq, wq, x_scale, w_scale)
@@ -4597,8 +4623,14 @@ class FlyDSLRowwiseTest(unittest.TestCase):
             op(xq, wq, x_scale[:-1], w_scale)
         with self.assertRaisesRegex(RuntimeError, "float8|dtype"):
             op(xq.float(), wq.float(), x_scale, w_scale)
-        with self.assertRaisesRegex(RuntimeError, "multiple of"):
-            op(xq, wq[:100], x_scale, w_scale[:100])
+
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
+    def test_rejects_output_on_another_device(self) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        other = (xq.device.index + 1) % torch.cuda.device_count()
+        out = torch.empty(16, 256, dtype=torch.bfloat16, device=f"cuda:{other}")
+        with self.assertRaisesRegex(RuntimeError, "device"):
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
 
 
 @skipUnlessRocm()

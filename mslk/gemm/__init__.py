@@ -239,73 +239,50 @@ if torch.version.hip is not None:
                 _bf16bf16bf16_grouped_stacked_rocm
             )
 
-    if hasattr(torch.ops, "mslk") and hasattr(
-        torch.ops.mslk, "_f8f8bf16_rowwise_preshuffle_ck"
+    # The FP8 rowwise ops, preshuffled and plain, are bound to CK in C++ only
+    # under private ``_<op>_ck`` names. Each public op is served by the named
+    # FlyDSL module where it is opted into and supports the GPU the inputs are
+    # on, and by that CK op otherwise.
+    @functools.lru_cache(maxsize=None)
+    def _rowwise_impl(module: str, op: str, device_index: int) -> Callable[..., Any]:
+        with torch.cuda.device(device_index):
+            mod = _flydsl_gemm_module(module)
+            if mod is not None and mod.is_supported():
+                return getattr(mod, f"matmul_{op}")
+        return getattr(torch.ops.mslk, f"_{op}_ck")
+
+    def _rowwise_rocm(module: str, op: str) -> Callable[..., Any]:
+        def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            device_index = XQ.get_device()
+            with torch.cuda.device(device_index):
+                return _rowwise_impl(module, op, device_index)(XQ, *args, **kwargs)
+
+        return _impl
+
+    for _module, _ops in (
+        (
+            "preshuffle_gemm",
+            ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"),
+        ),
+        (
+            "fp8_rowwise_gemm",
+            (
+                "f8f8bf16_rowwise",
+                "f8f8bf16_rowwise_out",
+                "f8f8f16_rowwise",
+                "f8f8bf16_rowwise_batched",
+            ),
+        ),
     ):
-
-        @functools.lru_cache(maxsize=None)
-        def _rowwise_preshuffle_impl(
-            op: str, device_index: int
-        ) -> Callable[..., torch.Tensor]:
-            with torch.cuda.device(device_index):
-                mod = _flydsl_gemm_module("preshuffle_gemm")
-                if mod is not None and mod.is_supported():
-                    return getattr(mod, f"matmul_{op}")
-            return getattr(torch.ops.mslk, f"_{op}_ck")
-
-        def _rowwise_preshuffle_rocm(op: str) -> Callable[..., torch.Tensor]:
-            def _impl(
-                XQ: torch.Tensor,
-                WQ: torch.Tensor,
-                x_scale: torch.Tensor,
-                w_scale: torch.Tensor,
-                bias: Optional[torch.Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> torch.Tensor:
-                device_index = XQ.get_device()
-                with torch.cuda.device(device_index):
-                    return _rowwise_preshuffle_impl(op, device_index)(
-                        XQ, WQ, x_scale, w_scale, bias, use_fast_accum
-                    )
-
-            return _impl
-
-        for _op in ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"):
-            if not torch._C._dispatch_has_kernel_for_dispatch_key(
-                f"mslk::{_op}", "CUDA"
-            ):
-                torch.library.impl(f"mslk::{_op}", "CUDA")(
-                    _rowwise_preshuffle_rocm(_op)
+        for _op in _ops:
+            if (
+                hasattr(torch.ops, "mslk")
+                and hasattr(torch.ops.mslk, f"_{_op}_ck")
+                and not torch._C._dispatch_has_kernel_for_dispatch_key(
+                    f"mslk::{_op}", "CUDA"
                 )
-
-    if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "_f8f8bf16_rowwise_ck"):
-        # The plain-weight rowwise ops, arbitrated like the preshuffle ones above.
-        @functools.lru_cache(maxsize=None)
-        def _rowwise_impl(op: str, device_index: int) -> Callable[..., Any]:
-            with torch.cuda.device(device_index):
-                mod = _flydsl_gemm_module("fp8_rowwise_gemm")
-                if mod is not None and mod.is_supported():
-                    return getattr(mod, f"matmul_{op}")
-            return getattr(torch.ops.mslk, f"_{op}_ck")
-
-        def _rowwise_rocm(op: str) -> Callable[..., Any]:
-            def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-                device_index = XQ.get_device()
-                with torch.cuda.device(device_index):
-                    return _rowwise_impl(op, device_index)(XQ, *args, **kwargs)
-
-            return _impl
-
-        for _op in (
-            "f8f8bf16_rowwise",
-            "f8f8bf16_rowwise_out",
-            "f8f8f16_rowwise",
-            "f8f8bf16_rowwise_batched",
-        ):
-            if not torch._C._dispatch_has_kernel_for_dispatch_key(
-                f"mslk::{_op}", "CUDA"
             ):
-                torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_rocm(_op))
+                torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_rocm(_module, _op))
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 

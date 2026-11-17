@@ -10,12 +10,11 @@
 ``mslk::f8f8bf16_rowwise``, ``f8f8bf16_rowwise_out``, ``f8f8f16_rowwise`` and
 ``f8f8bf16_rowwise_batched``).
 
-These run the shared grouped GEMM kernel in its ``batched`` layout, in which
-each group owns a fixed slab of rows and a slice of the grid's z axis, so
-nothing is resolved per group. The batched op is one group per batch; the
-others are a batch of one. B is the caller's row-major ``[N, K]`` weight,
-staged HBM->LDS->registers. Callers that keep their weights in the MFMA
-preshuffle layout use the ``_preshuffle`` ops instead (``preshuffle_gemm.py``).
+The kernel, ``mslk.flydsl.kernels.gemm.fp8_rowwise_gemm``, reads the caller's
+row-major weights and takes every shape the CK ops do. The batched op runs one
+batch per slice of the grid's z axis; the others are a batch of one. Callers
+that keep their weights in the MFMA preshuffle layout use the ``_preshuffle``
+ops instead (``preshuffle_gemm.py``).
 
 Tensor contract (matches the CK ops):
   XQ      : [..., M, K]  FP8    ([B, M, K] for the batched op)
@@ -28,67 +27,106 @@ Tensor contract (matches the CK ops):
 """
 
 import functools
+import itertools
 from math import prod
 from typing import Optional
 
 import torch
-from mslk.flydsl.autotune import next_pow2, prune_by_divisibility, tunable
-from mslk.gemm.flydsl import grouped_dispatch
-from mslk.utils.device import gfx_arch_in, supports_float8_fnuz
+from mslk.flydsl.autotune import next_pow2, tunable
+from mslk.flydsl.common import lds_capacity_bytes
+from mslk.utils.device import get_gfx_arch_name, gfx_arch_in, supports_float8_fnuz
 
-# The kernel masks a K tail one 16-byte load at a time and an N tail one
-# 8-column store at a time, so shapes only have to land on those boundaries.
-_K_ALIGN, _N_ALIGN = 16, 8
+# Candidate configs for autotune. Small M is bound by how many weight loads
+# are in flight, so the space runs down to one-wave blocks of 32x32 with a
+# deep pipeline; large M wants big tiles and eight waves. Only configs the
+# kernel accepts on this GPU are listed: whole 32x32 MFMA tiles per wave and at
+# most eight of them, whole
+# 16-byte loads per thread, the LDS budget, and an in-flight count s_waitcnt
+# can express. gfx942 stages through registers, which pipelines two deep.
+# Configs that need K to be a multiple of 16 (more than two stages) fail to
+# compile otherwise, which the autotuner skips.
+# Without the target features (e.g. "gfx950:sramecc+:xnack-"), as the LDS
+# table is keyed.
+_ARCH = get_gfx_arch_name().split(":")[0]
+_CDNA4 = _ARCH.startswith("gfx95")
+_LDS_BYTES = lds_capacity_bytes(_ARCH)
+_STAGES = (2, 3, 4) if _CDNA4 else (2,)
+_WAVE_GRIDS = (
+    (1, 1),
+    (1, 2),
+    (2, 1),
+    (2, 2),
+    (1, 4),
+    (4, 1),
+    (2, 4),
+    (4, 2),
+    (8, 1),
+    (1, 8),
+)
 
-# Candidate tiles for autotune. Unlike the grouped ops' rowwise space, tile_m
-# goes down to 16: with a few rows the work is reading the weight, and a taller
-# tile only multiplies padding. A tile has to give each of the block's 256
-# threads whole 16-byte loads of A, which tile_m=16 does only at tile_k=256.
-_TILES = tuple(
-    dict(
-        tile_m=tm,
-        tile_n=tn,
-        tile_k=tk,
-        waves_m=wm,
-        waves_n=wn,
-        waves_per_eu=wpe,
+
+def _legal(tm: int, tn: int, tk: int, wm: int, wn: int, stages: int) -> bool:
+    threads = wm * wn * 64
+    loads = (tm + tn) * tk // (threads * 16)
+    return (
+        tm % (wm * 32) == 0
+        and tn % (wn * 32) == 0
+        and (tm // wm // 32) * (tn // wn // 32) <= 8
+        and (tm * tk) % (threads * 16) == 0
+        and (tn * tk) % (threads * 16) == 0
+        and stages * (tm + tn) * tk <= _LDS_BYTES
+        and (stages - 2) * loads <= 63
     )
-    for tm in (16, 32, 64, 128, 256)
-    for tn in (64, 128, 256)
-    for tk in (128, 256)
-    for wm, wn in ((1, 4), (2, 2), (4, 1))
-    for wpe in (0, 2)
-    if tm % (wm * 16) == 0 and tn % (wn * 16) == 0 and (tm * tk) % (256 * 16) == 0
+
+
+_TILES = tuple(
+    dict(tile_m=tm, tile_n=tn, tile_k=tk, waves_m=wm, waves_n=wn, stages=st)
+    for tm, tn, tk, (wm, wn), st in itertools.product(
+        (32, 64, 128, 256), (32, 64, 128, 256), (64, 128, 256), _WAVE_GRIDS, _STAGES
+    )
+    if _legal(tm, tn, tk, wm, wn, st)
 )
 
-# Untuned tile per M bucket: the one closest to the best over 10 (N, K) pairs
-# with M = 1 .. 8192 on gfx950, (m_upper, tile_m, tile_n, tile_k, waves_m,
-# waves_n, waves_per_eu). All of them fit gfx942's 64 KiB of LDS. No fixed tile
-# serves both ends: 128x128x128 takes about 3.7x as long as the small tile at
-# M <= 32, where the few rows leave most of a tall tile idle.
-_M_BUCKETS = (
-    (64, 16, 64, 256, 1, 4, 2),
-    (128, 32, 64, 256, 2, 2, 2),
-    (512, 64, 64, 256, 2, 2, 0),
-    (1024, 128, 128, 128, 4, 1, 0),
-    (1 << 62, 128, 128, 128, 2, 2, 2),
+# Untuned config per M bucket, (m_upper, tile_m, tile_n, tile_k, waves_m,
+# waves_n, stages). On gfx950 each is the config that loses least, in geometric
+# mean, to the per-shape best over 10 (N, K) pairs; the worst loss is 1.26x up
+# to M = 128 and 1.56x above. gfx942 is not tuned: its buckets are the gfx950
+# ones cut to its 64 KiB of LDS and two stages.
+_M_BUCKETS_GFX950 = (
+    (64, 32, 32, 256, 1, 1, 4),
+    (128, 32, 64, 256, 1, 2, 3),
+    (512, 64, 64, 128, 2, 1, 4),
+    (1024, 128, 64, 128, 4, 1, 3),
+    (2048, 128, 128, 128, 4, 2, 4),
+    (4096, 128, 128, 128, 4, 1, 2),
+    (1 << 62, 256, 256, 128, 8, 1, 2),
+)
+_M_BUCKETS_GFX942 = (
+    (64, 32, 32, 256, 1, 1, 2),
+    (128, 32, 64, 256, 1, 2, 2),
+    (512, 64, 64, 128, 2, 1, 2),
+    (1024, 128, 64, 128, 4, 1, 2),
+    (1 << 62, 128, 128, 128, 4, 2, 2),
 )
 
 
-def _default_tile(*, m_bucket: int, **_: object) -> dict:
-    for m_upper, tm, tn, tk, wm, wn, wpe in _M_BUCKETS:
+def _default_tile(*_: object, m_bucket: int, k: int, **__: object) -> dict:
+    for m_upper, tm, tn, tk, wm, wn, stages in (
+        _M_BUCKETS_GFX950 if _CDNA4 else _M_BUCKETS_GFX942
+    ):
         if m_bucket <= m_upper:
             break
-    return dict(
-        tile_m=tm, tile_n=tn, tile_k=tk, waves_m=wm, waves_n=wn, waves_per_eu=wpe
-    )
+    # A deeper pipeline moves whole 16-byte chunks straight into LDS, which
+    # needs every row to start on one.
+    if k % 16:
+        stages = 2
+    return dict(tile_m=tm, tile_n=tn, tile_k=tk, waves_m=wm, waves_n=wn, stages=stages)
 
 
 @tunable(
     configs=_TILES,
     default=_default_tile,
-    key=["m_bucket", "n", "k", "g"],
-    prune=prune_by_divisibility({"tile_n": "n", "tile_k": "k"}),
+    key=["m_bucket", "n", "k", "batch", "out_dtype"],
 )
 def _launch_fp8_rowwise(
     XQ: torch.Tensor,
@@ -96,48 +134,60 @@ def _launch_fp8_rowwise(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     out: torch.Tensor,
+    *,
+    m: int,
     m_bucket: int,
     n: int,
     k: int,
-    g: int,
-    *,
+    batch: int,
+    out_dtype: str,
     tile_m: int,
     tile_n: int,
     tile_k: int,
     waves_m: int,
     waves_n: int,
+    stages: int,
     waves_per_eu: int = 0,
 ) -> torch.Tensor:
-    """The grouped kernel in its batched layout, one slab per batch.
+    """Compile (cached) and launch the kernel for one config.
 
-    A function of its own rather than another tunable over
-    ``grouped_dispatch.launch``: FlyDSL names the tuning cache file after the
-    wrapped function, and this keeps these entries out of the grouped ops' file.
+    ``m_bucket`` only feeds the tuning key, so nearby row counts share a tuned
+    config; ``m`` is the actual count. FlyDSL names the tuning cache file after
+    this function.
     """
-    return grouped_dispatch.launch(
-        XQ,
-        WQ,
-        x_scale,
-        w_scale,
-        grouped_dispatch.unused_group_meta(XQ.device),
-        out,
-        m_bucket,
-        n,
-        k,
-        g,
-        False,
-        "row",
-        "batched",
+    from mslk.flydsl.jit import run_compiled
+    from mslk.flydsl.kernels.gemm.fp8_rowwise_gemm import compile_fp8_rowwise_gemm
+
+    launcher = compile_fp8_rowwise_gemm(
+        n=n,
+        k=k,
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
         waves_m=waves_m,
         waves_n=waves_n,
-        waves_per_eu=waves_per_eu,
+        stages=stages,
+        # 0 means the compiler picks.
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        out_dtype=out_dtype,
     )
+    # The kernel addresses the operands as flat byte buffers, so FP8 is viewed
+    # as int8 for the handoff.
+    run_compiled(
+        launcher,
+        out,
+        XQ.view(torch.int8),
+        WQ.view(torch.int8),
+        x_scale,
+        w_scale,
+        m,
+        batch,
+        torch.cuda.current_stream(XQ.device),
+    )
+    return out
 
 
-def _launch(
+def _run(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
@@ -148,22 +198,22 @@ def _launch(
     n: int,
     k: int,
 ) -> None:
-    torch._check(
-        n % _N_ALIGN == 0 and k % _K_ALIGN == 0,
-        lambda: f"N must be a multiple of {_N_ALIGN} and K of {_K_ALIGN}, "
-        f"got N={n} K={k}",
-    )
-    # Bucketing M keeps nearby row counts on one tuned entry.
+    # One canonical shape per operand: the compiled launcher fixes each
+    # argument's rank, and is shared by every caller with the same N and K. The
+    # tuning key and the default are read from keyword arguments, so they are
+    # passed by name.
     _launch_fp8_rowwise(
         XQ.view(batch * m, k),
-        WQ.view(batch, n, k),
-        x_scale.reshape(batch * m),
-        w_scale.reshape(batch, n),
+        WQ.view(batch * n, k),
+        x_scale.contiguous().view(batch * m),
+        w_scale.contiguous().view(batch * n),
         out.view(batch * m, n),
-        next_pow2(m),
-        n,
-        k,
-        batch,
+        m=m,
+        m_bucket=next_pow2(m),
+        n=n,
+        k=k,
+        batch=batch,
+        out_dtype="f16" if out.dtype == torch.float16 else "bf16",
     )
 
 
@@ -200,13 +250,19 @@ def _check_operands(
 
 
 def _check_output(
-    output: torch.Tensor, shape: tuple[int, ...], dtype: torch.dtype
+    output: torch.Tensor,
+    rows: int,
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> None:
+    # As CK: the leading dims only have to flatten to the rows of XQ.
     torch._check(
-        tuple(output.shape) == shape,
-        lambda: f"output must be {shape}, got {tuple(output.shape)}",
+        output.dim() >= 1 and output.shape[-1] == n and prod(output.shape[:-1]) == rows,
+        lambda: f"output must hold {rows} rows of {n}, got {tuple(output.shape)}",
     )
     torch._check(output.dtype == dtype, lambda: f"output must be {dtype}")
+    torch._check(output.device == device, lambda: "output must be on XQ's device")
     # The kernel writes it in place, so a contiguous copy would be written instead.
     torch._check(output.is_contiguous(), lambda: "output must be contiguous")
 
@@ -231,15 +287,14 @@ def _rowwise(
     m = prod(XQ.shape[:-1])
     torch._check(x_scale.numel() == m, lambda: "x_scale must have one value per row")
     torch._check(w_scale.numel() == n, lambda: "w_scale must have one value per column")
-    shape = (*XQ.shape[:-1], n)
     if output is None:
-        output = XQ.new_empty(shape, dtype=dtype)
+        output = XQ.new_empty((*XQ.shape[:-1], n), dtype=dtype)
     else:
-        _check_output(output, shape, dtype)
+        _check_output(output, m, n, dtype, XQ.device)
     if m == 0 or n == 0 or k == 0:
         # A contraction over nothing sums to zero.
         return output.zero_()
-    _launch(XQ, WQ, x_scale, w_scale, output, 1, m, n, k)
+    _run(XQ, WQ, x_scale, w_scale, output, 1, m, n, k)
     return output
 
 
@@ -314,14 +369,17 @@ def matmul_f8f8bf16_rowwise_batched(
     torch._check(
         w_scale.numel() == batch * n, lambda: "w_scale must have one value per column"
     )
-    shape = (batch, m, n)
     if output is None:
-        output = XQ.new_empty(shape, dtype=torch.bfloat16)
+        output = XQ.new_empty((batch, m, n), dtype=torch.bfloat16)
     else:
-        _check_output(output, shape, torch.bfloat16)
+        torch._check(
+            tuple(output.shape) == (batch, m, n),
+            lambda: f"output must be {(batch, m, n)}, got {tuple(output.shape)}",
+        )
+        _check_output(output, batch * m, n, torch.bfloat16, XQ.device)
     if batch == 0 or m == 0 or n == 0 or k == 0:
         return output.zero_()
-    _launch(XQ, WQ, x_scale, w_scale, output, batch, m, n, k)
+    _run(XQ, WQ, x_scale, w_scale, output, batch, m, n, k)
     return output
 
 
