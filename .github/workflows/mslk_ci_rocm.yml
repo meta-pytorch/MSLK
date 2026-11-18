@@ -56,6 +56,10 @@ on:
       - 'mslk/gemm/dispatch/**'
       - 'test/aiter/**'
       - 'bench/aiter/**'
+      # aiter backends of attention ops and their tuning tables
+      - 'mslk/attention/aiter/**'
+      - 'mslk/attention/dispatch/**'
+      - 'test/attention/dispatch_test.py'
       # GEMM tests
       - 'test/gemm/gemm_test.py'
       - 'test/gemm/dispatch_test.py'

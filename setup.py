@@ -810,6 +810,7 @@ def main(argv: List[str]) -> None:
             "mslk.flydsl": ["aot_artifacts/*"],
             "mslk.aiter": ["aiter_version.txt"],
             "mslk.gemm.dispatch": ["tables/*.csv"],
+            "mslk.attention.dispatch": ["tables/*.csv"],
         },
         install_requires=[
             # Only specify numpy, as specifying torch will auto-install the

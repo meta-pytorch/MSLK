@@ -25,6 +25,9 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.aiter.routing",
             "mslk.gemm.aiter.f4f4bf16",
             "mslk.gemm.dispatch.f4f4bf16",
+            "mslk.attention.aiter.paged_attention_decode_fp8",
+            "mslk.attention.dispatch.paged_attention_decode_fp8",
+            "mslk.attention.flydsl.decode.pa_decode_fp8_dispatch",
         ):
             importlib.import_module(module)
 
