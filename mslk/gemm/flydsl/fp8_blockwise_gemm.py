@@ -105,7 +105,7 @@ def _launch_kernel(
         m,
         n,
         k,
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(output.device),
     )
     return output
 

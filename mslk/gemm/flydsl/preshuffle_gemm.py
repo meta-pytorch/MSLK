@@ -563,7 +563,8 @@ def flydsl_preshuffle_gemm(
         ptr_arg(_dummy_bias),
         m,
         n,
-        fx.Stream(torch.cuda.current_stream()),
+        fx.Stream(torch.cuda.current_stream(XQ.device)),
+        device=XQ.device,
     )
     if out_contig is not out:
         out.copy_(out_contig)
@@ -669,7 +670,7 @@ def flydsl_preshuffle_batched_gemm(
     ws_contig = w_scale.contiguous()
 
     dummy_bias = torch.empty(1, dtype=dtype, device=XQ.device)
-    stream = fx.Stream(torch.cuda.current_stream())
+    stream = fx.Stream(torch.cuda.current_stream(XQ.device))
 
     run_compiled(
         exe,
@@ -683,6 +684,7 @@ def flydsl_preshuffle_batched_gemm(
         N,
         B,
         stream,
+        device=XQ.device,
     )
     if out_contig is not out:
         out.copy_(out_contig)

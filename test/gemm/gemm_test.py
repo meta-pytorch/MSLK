@@ -4659,6 +4659,34 @@ class FlyDSLRowwiseTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "device"):
             torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
 
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
+    def test_same_shape_on_every_device(self) -> None:
+        # A compiled kernel is loaded into one GPU, so one cached per shape
+        # alone would fail on every GPU but the first to run that shape. The
+        # current device stays the default throughout.
+        torch.manual_seed(0)
+        x = torch.randn(2, 48, 512, dtype=torch.bfloat16) * 0.1
+        w = torch.randn(2, 256, 512, dtype=torch.bfloat16) * 0.01
+        for index in range(torch.cuda.device_count()):
+            device = torch.device("cuda", index)
+            xq, x_scale = quantize_fp8_row(x.to(device))
+            wq, w_scale = quantize_fp8_row(w.to(device))
+            ref = self._reference(xq, wq, x_scale, w_scale)
+            out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+            self.assertEqual(out.device, device)
+            torch.testing.assert_close(out.float(), ref, atol=8e-2, rtol=8e-2)
+            xq, x_scale, wq, w_scale = xq[0], x_scale[0], wq[0], w_scale[0]
+            ref = self._reference(xq, wq, x_scale, w_scale)
+            out = torch.empty(48, 256, dtype=torch.bfloat16, device=device)
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+            for y in (
+                torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale),
+                torch.ops.mslk.f8f8f16_rowwise(xq, wq, x_scale, w_scale),
+                out,
+            ):
+                self.assertEqual(y.device, device)
+                torch.testing.assert_close(y.float(), ref, atol=8e-2, rtol=8e-2)
+
 
 @skipUnlessRocm()
 @skipUnlessGfxArch("gfx942", "gfx950")

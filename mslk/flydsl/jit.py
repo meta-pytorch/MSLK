@@ -38,19 +38,78 @@ def configure_runtime_cache() -> None:
         os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
 
 
-def run_compiled(launcher: Callable[..., Any], *args: Any) -> None:
+def _launch_device(args: tuple[Any, ...]) -> Any:
+    """The device of the first CUDA tensor or stream in ``args``, else the
+    current device."""
+    import torch
+
+    for arg in args:
+        if isinstance(arg, torch.Tensor) and arg.is_cuda:
+            return arg.device
+        if isinstance(arg, torch.cuda.Stream):
+            return arg.device
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _launcher_on(launcher: Any, index: int) -> Any:
+    """``launcher`` itself on the first device it runs on, and a copy of it
+    with caches of its own on any other.
+
+    FlyDSL caches a compiled kernel on the ``@flyc.jit`` function, keyed by its
+    arguments' signature but not by device, and the cached kernel's GPU
+    modules are loaded into the device that was current when it was first
+    run; HIP refuses to launch them on any other. One launcher therefore
+    cannot serve two GPUs, so each further device gets its own, built from the
+    same source. The kernel is compiled once per device, or read back from
+    FlyDSL's disk cache.
+    """
+    owner = getattr(launcher, "_mslk_device", None)
+    if owner is None:
+        launcher._mslk_device = owner = index
+    if owner == index:
+        return launcher
+    copies = getattr(launcher, "_mslk_device_copies", None)
+    if copies is None:
+        copies = launcher._mslk_device_copies = {}
+    copy = copies.get(index)
+    if copy is None:
+        from flydsl.compiler.jit_function import JitFunction  # pyre-ignore[21]
+
+        # The source as written, before FlyDSL rewrote it for tracing.
+        copy = copies[index] = JitFunction(
+            launcher._original_func, compile_hints=launcher.compile_hints
+        )
+    return copy
+
+
+def run_compiled(launcher: Callable[..., Any], *args: Any, device: Any = None) -> None:
     """Dispatch a FlyDSL ``@flyc.jit`` host launcher with ``args``.
 
-    The first call compiles and runs the kernel, caching the
-    ``CompiledFunction`` on the launcher; later calls reuse it.
+    The first call on a device compiles and runs the kernel, caching the
+    ``CompiledFunction`` for that device; later calls on it reuse it. The
+    kernel is compiled and launched with its device made current, which is
+    where FlyDSL loads it; see :func:`_launcher_on` for why each device needs
+    a launcher of its own.
+
+    The device is ``device`` if given, else that of the first CUDA tensor or
+    stream in ``args``, else the current one. Callers whose operands all go
+    through :func:`ptr_arg` carry no tensor, so they pass ``device``.
     """
     import flydsl.compiler as flyc  # pyre-ignore[21]
+    import torch
 
-    cf = getattr(launcher, "_mslk_cf", None)
-    if cf is None:
-        launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]
-    else:
-        cf(*args)
+    if device is None:
+        device = _launch_device(args)
+    device = torch.device(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+
+    launcher = _launcher_on(launcher, index)
+    with torch.cuda.device(index):
+        cf = getattr(launcher, "_mslk_cf", None)
+        if cf is None:
+            launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]
+        else:
+            cf(*args)
 
 
 def ptr_arg(tensor: Any) -> Any:

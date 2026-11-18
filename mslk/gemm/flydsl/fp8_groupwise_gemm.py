@@ -165,7 +165,7 @@ def _launch_gfx950(
         XQ.shape[0],
         n,
         k,
-        torch.cuda.current_stream(),
+        torch.cuda.current_stream(out.device),
     )
     return out
 
