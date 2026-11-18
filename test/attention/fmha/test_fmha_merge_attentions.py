@@ -57,16 +57,23 @@ def get_supported_attn_bias_types(op):
     return supported_attn_bias_types
 
 
-@disable_on_rocm
+def _ops_for_platform(cuda_ops: list, rocm_ops: list) -> list:
+    # The CUDA ops listed in these tests are not built on ROCm, and vice versa.
+    return rocm_ops if torch.version.hip else cuda_ops
+
+
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "op",
-    [
-        fmha.triton_splitk.FwOp,
-        fmha.flash.FwOp,
-        None,
-    ]
-    + ([fmha.flash3.FwOp] if fmha.flash3.FwOp.is_available() else []),
+    _ops_for_platform(
+        [
+            fmha.triton_splitk.FwOp,
+            fmha.flash.FwOp,
+            None,
+        ]
+        + ([fmha.flash3.FwOp] if fmha.flash3.FwOp.is_available() else []),
+        [fmha.flydsl.FwOp],
+    ),
     ids=lambda op: "None" if op is None else op.NAME,
 )
 @pytest.mark.parametrize("G,H", [(1, 11), (7, 1), (1, 1), (7, 11), (None, 11)])
@@ -208,17 +215,19 @@ def test_partial_paged(
         ), f"{lse_chunk.shape=}, {(1, N_H_L, B_T)=}"
 
 
-@disable_on_rocm
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "dtype,op",
-    [
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
-        # Cutlass's LSE is not consistent
-        # (torch.float32, fmha.cutlass.FwOp),
-        (torch.bfloat16, fmha.flash.FwOp),
-    ],
+    _ops_for_platform(
+        [
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
+            # Cutlass's LSE is not consistent
+            # (torch.float32, fmha.cutlass.FwOp),
+            (torch.bfloat16, fmha.flash.FwOp),
+        ],
+        [(torch.bfloat16, fmha.flydsl.FwOp)],
+    ),
     ids=lambda o: f"{o.NAME}" if hasattr(o, "NAME") else str(o),
 )
 @pytest.mark.parametrize("num_queries", [1, 2])
@@ -358,14 +367,16 @@ def test_merge_attentions_decoding(
     assert_allclose(attn_full2, attn_full, rtol=1e-3, atol=1e-3, msg="out2")
 
 
-@disable_on_rocm
 @sm80_or_better_only
 @pytest.mark.parametrize(
     "dtype,op",
-    [
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
-        (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
-    ],
+    _ops_for_platform(
+        [
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S1),
+            (torch.bfloat16, fmha.triton_splitk.FwOp_S32),
+        ],
+        [(torch.bfloat16, fmha.flydsl.FwOp)],
+    ),
     ids=lambda o: f"{o.NAME}" if hasattr(o, "NAME") else str(o),
 )
 @pytest.mark.parametrize("gqa", [False, True], ids=lambda x: "gqa" if x else "")
@@ -472,8 +483,10 @@ def test_merge_attentions_sharedinput(
         op=op,
         output_dtype=output_dtype,
     )
+    # Without output_dtype the chunks are rounded to bf16 before merging.
+    atol = 2e-3 if output_dtype is not None else 4e-3
     assert_allclose(
-        attn_out.to(attn_full.dtype), attn_full, rtol=1e-2, atol=2e-3, msg="out"
+        attn_out.to(attn_full.dtype), attn_full, rtol=1e-2, atol=atol, msg="out"
     )
     assert_allclose(
         lse_out.to(lse_full.dtype), lse_full, rtol=1e-3, atol=1e-3, msg="lse"
