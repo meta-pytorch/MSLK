@@ -4599,15 +4599,37 @@ class FlyDSLRowwiseTest(unittest.TestCase):
         self.assertEqual(out.dtype, dtype)
         torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
 
-    def test_leading_dimensions(self) -> None:
-        xq, wq, x_scale, w_scale = self._quantized(30, 192, n=80)
-        inputs = (xq.view(2, 3, 5, 192), wq, x_scale.view(2, 3, 5), w_scale)
-        out = torch.ops.mslk.f8f8bf16_rowwise(*inputs)
-        self.assertEqual(out.shape, (2, 3, 5, 80))
-        ref = self._reference(xq, wq, x_scale, w_scale).view(2, 3, 5, 80)
+    @parameterized.expand(
+        [
+            (leading_shape, op, dtype)
+            for leading_shape in [(), (3,), (2, 3, 5)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_leading_dimensions(
+        self, leading_shape: tuple[int, ...], op: str, dtype: torch.dtype
+    ) -> None:
+        # Any leading dims, as CK takes them; opcheck holds the fake kernel to
+        # the same output shape as the real one.
+        xq, wq, x_scale, w_scale = self._quantized(prod(leading_shape), 192, n=80)
+        inputs = (
+            xq.view(*leading_shape, 192),
+            wq,
+            x_scale.reshape(leading_shape),
+            w_scale,
+        )
+
+        out = getattr(torch.ops.mslk, op)(*inputs)
+
+        self.assertEqual(out.shape, (*leading_shape, 80))
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale).view(*leading_shape, 80)
         torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
         torch.library.opcheck(
-            torch.ops.mslk.f8f8bf16_rowwise, inputs, test_utils=("test_faketensor",)
+            getattr(torch.ops.mslk, op), inputs, test_utils=("test_faketensor",)
         )
 
     def test_rejects_what_ck_rejects(self) -> None:
