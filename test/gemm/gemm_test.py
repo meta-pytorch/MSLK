@@ -16,7 +16,7 @@ import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
-from mslk.aiter.common import is_aiter_available
+from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import force_backend
 from mslk.flydsl.common import (
     flydsl_version,
@@ -3345,7 +3345,7 @@ class MXFP4Tests(unittest.TestCase):
             backend == "default"
             and (M, N, K) in _F4F4BF16_AITER_SHAPES
             and torch.version.hip is not None
-            and is_aiter_available()
+            and is_aiter_enabled(F4F4BF16_OP)
         ):
             self.assertEqual(
                 F4F4BF16_ROUTING.backend_for(aq, bq, a_scale, b_scale),
