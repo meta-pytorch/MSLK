@@ -8,6 +8,7 @@
 # pyre-ignore-all-errors[16,21,53,56]
 
 import logging
+import os
 import random
 import unittest
 from typing import Optional
@@ -38,6 +39,11 @@ except Exception:
 
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Inductor compiler workers start their own native executable and profiler.
+# Do not propagate the outer test binary registration path to their startup.
+if torch.version.hip is not None:
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
 
 
 @unittest.skipIf(open_source, "Tests currently fail in open source")
