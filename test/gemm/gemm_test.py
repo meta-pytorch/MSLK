@@ -17,11 +17,19 @@ import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
 from mslk.aiter.common import is_aiter_enabled
-from mslk.aiter.routing import force_backend
+from mslk.aiter.routing import device_key, force_backend, OpRouting
 from mslk.flydsl.common import (
     flydsl_version,
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
+)
+from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import (
+    OP as BF16_GROUPED_GRAD_OP,
+    ROUTING as BF16_GROUPED_GRAD_ROUTING,
+)
+from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import (
+    OP as BF16_GROUPED_STACKED_OP,
+    ROUTING as BF16_GROUPED_STACKED_ROUTING,
 )
 from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
 from mslk.quantize.triton.fp4_quantize import (
@@ -354,6 +362,44 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
         torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
             self.XQ, self.WQ, self.row_scale, self.col_scale
         )
+
+
+# (G, N, K, M) shapes that the BF16 grouped ops' tuning tables route to aiter on
+# gfx950, so that the ops' tests cover aiter's kernel as well as MSLK's.
+_BF16_GROUPED_STACKED_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
+    (8, 28672, 4096, 3000),
+    (16, 16384, 5120, 3000),
+)
+_BF16_GROUPED_GRAD_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
+    (8, 14336, 4096, 6000),
+    (32, 7168, 4096, 20000),
+)
+
+
+def _uneven_m_sizes(G: int, M: int, device: torch.device) -> torch.Tensor:
+    """M rows over G groups, skewed as MoE routing makes them; some empty."""
+    weights = torch.rand(G).pow(3) + 1e-3
+    picks = torch.multinomial(weights, M, replacement=True)
+    return torch.bincount(picks, minlength=G).to(device=device, dtype=torch.int64)
+
+
+def _grouped_reference(
+    x: torch.Tensor, w_kn: torch.Tensor, m_sizes: torch.Tensor
+) -> torch.Tensor:
+    """FP32 ``x[g] @ w_kn[g]`` for each group ``g`` of the rows of ``x``."""
+    out = torch.empty(x.shape[0], w_kn.shape[2], dtype=torch.float32, device=x.device)
+    start = 0
+    for g, size in enumerate(m_sizes.tolist()):
+        out[start : start + size] = x[start : start + size].float() @ w_kn[g].float()
+        start += size
+    return out
+
+
+def _table_covers_device(routing: OpRouting) -> bool:
+    gfx, cu_num = device_key(torch.cuda.current_device())
+    return any(
+        (r["gfx"], r["cu_num"]) == (gfx, str(cu_num)) for r in routing.table.rows
+    )
 
 
 @skipUnlessGfxArch("gfx942", "gfx950")
@@ -1284,6 +1330,60 @@ class FP8Tests(unittest.TestCase):
         ).to(torch.bfloat16)
 
         torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+
+    @skipUnlessRocm()
+    @parameterized.expand(
+        [
+            (*shape, backend)
+            for shape in (
+                (4, 512, 256, 1),  # one row
+                (16, 2880, 2880, 300),  # K == N
+                (32, 4096, 7168, 100),  # in the tuning table, routed to MSLK
+                (128, 3072, 4096, 64),  # more groups than rows
+                *_BF16_GROUPED_STACKED_AITER_SHAPES,
+            )
+            for backend in ("default", "mslk", "aiter")
+        ]
+    )
+    def test_bf16_grouped_stacked_backends(
+        self, G: int, N: int, K: int, M: int, backend: str
+    ) -> None:
+        op, routing = BF16_GROUPED_STACKED_OP, BF16_GROUPED_STACKED_ROUTING
+        if backend == "aiter" and not is_aiter_enabled(op):
+            self.skipTest("requires the pinned aiter, enabled for the op")
+        torch.manual_seed(hash((G, N, K, M)))
+        M_sizes = _uneven_m_sizes(G, M, self.device)
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device)
+        out = torch.full(
+            (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        args = (x, w, M_sizes, out)
+
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            served_by = routing.backend_for(*args)
+            actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(*args)
+
+        self.assertEqual(actual.data_ptr(), out.data_ptr())
+        expected = _grouped_reference(x, w.transpose(1, 2), M_sizes)
+        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+        if backend != "default":
+            self.assertEqual(served_by, backend)
+        elif (
+            (G, N, K, M) in _BF16_GROUPED_STACKED_AITER_SHAPES
+            and is_aiter_enabled(op)
+            and _table_covers_device(routing)
+        ):
+            self.assertEqual(
+                served_by,
+                "aiter",
+                "the tuning table no longer routes this shape to aiter; replace "
+                "it in _BF16_GROUPED_STACKED_AITER_SHAPES with one it does",
+            )
 
     @skipUnlessRocm()
     def test_packed_large_operand_uses_tile_descriptors(self) -> None:
@@ -2854,6 +2954,61 @@ class BF16Tests(unittest.TestCase):
             )
             start += size
         torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+
+    @skipUnlessRocm()
+    @parameterized.expand(
+        [
+            (*shape, backend)
+            for shape in (
+                (4, 512, 256, 1),  # one row
+                (8, 1024, 2048, 37),  # groups smaller than a tile
+                (16, 2880, 2880, 300),  # K == N: aiter cannot take it
+                (32, 7168, 4096, 100),  # in the tuning table, routed to MSLK
+                *_BF16_GROUPED_GRAD_AITER_SHAPES,
+            )
+            for backend in ("default", "mslk", "aiter")
+        ]
+    )
+    def test_grouped_gemm_dgrad_backends(
+        self, G: int, N: int, K: int, M: int, backend: str
+    ) -> None:
+        op, routing = BF16_GROUPED_GRAD_OP, BF16_GROUPED_GRAD_ROUTING
+        if backend == "aiter" and not is_aiter_enabled(op):
+            self.skipTest("requires the pinned aiter, enabled for the op")
+        torch.manual_seed(hash((G, N, K, M)))
+        m_sizes = _uneven_m_sizes(G, M, self.device)
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        # The forward weight [G, K, N]; the op takes its [G, N, K] view.
+        w = torch.randn((G, K, N), dtype=torch.bfloat16, device=self.device)
+        out = torch.full(
+            (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        args = (x, w.permute(0, 2, 1), m_sizes, out)
+
+        with (
+            force_backend(op, backend)
+            if backend != "default"
+            else contextlib.nullcontext()
+        ):
+            served_by = routing.backend_for(*args)
+            actual = torch.ops.mslk.bf16bf16bf16_grouped_grad(*args)
+
+        expected = _grouped_reference(x, w, m_sizes)
+        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+        if backend != "default":
+            # aiter cannot take K == N; such calls go to MSLK's kernel.
+            self.assertEqual(served_by, "mslk" if K == N else backend)
+        elif (
+            (G, N, K, M) in _BF16_GROUPED_GRAD_AITER_SHAPES
+            and is_aiter_enabled(op)
+            and _table_covers_device(routing)
+        ):
+            self.assertEqual(
+                served_by,
+                "aiter",
+                "the tuning table no longer routes this shape to aiter; replace "
+                "it in _BF16_GROUPED_GRAD_AITER_SHAPES with one it does",
+            )
 
     @parameterized.expand(
         [

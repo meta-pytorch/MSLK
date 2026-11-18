@@ -25,6 +25,10 @@ class LazyAiterImportTest(unittest.TestCase):
             "mslk.aiter.routing",
             "mslk.gemm.aiter.f4f4bf16",
             "mslk.gemm.dispatch.f4f4bf16",
+            "mslk.gemm.aiter.bf16bf16bf16_grouped_stacked",
+            "mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked",
+            "mslk.gemm.aiter.bf16bf16bf16_grouped_grad",
+            "mslk.gemm.dispatch.bf16bf16bf16_grouped_grad",
         ):
             importlib.import_module(module)
 

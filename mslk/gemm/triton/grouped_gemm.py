@@ -1610,7 +1610,12 @@ def _register_rocm_grad_ops() -> None:
         out: Optional[torch.Tensor] = None,
         num_sms: Optional[int] = None,
     ) -> torch.Tensor:
-        return grouped_gemm_dgrad(X, W, M_sizes, out=out, num_sms=num_sms)
+        # Imported on first call, like the backends it chooses between.
+        from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import (
+            ROUTING as _grouped_grad_routing,
+        )
+
+        return _grouped_grad_routing(X, W, M_sizes, out, num_sms)
 
     @torch.library.impl("mslk::bf16bf16bf16_grouped_wgrad", "CUDA")
     def _bf16_grouped_wgrad_impl(
