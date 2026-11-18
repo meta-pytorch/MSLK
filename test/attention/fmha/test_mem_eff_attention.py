@@ -10,6 +10,7 @@ import logging
 import math
 import unittest.mock
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, Optional, Tuple, Type
 
 import pytest
@@ -2145,8 +2146,28 @@ def test_triton_splitk_rowwise_fp8(
     ) = fmha._memory_efficient_attention_forward_requires_grad(
         inp_fp8_paged, op=fmha.triton_splitk.FwOp
     )
+    # Compare layouts before BF16 rounding: small accumulation differences can
+    # straddle a rounding midpoint and become a full BF16 ULP.
+    attn_output_fp8_float32, _ = fmha._memory_efficient_attention_forward_requires_grad(
+        replace(inp, output_dtype=torch.float32), op=fmha.triton_splitk.FwOp
+    )
+    attn_output_fp8_paged_float32, _ = (
+        fmha._memory_efficient_attention_forward_requires_grad(
+            replace(inp_fp8_paged, output_dtype=torch.float32),
+            op=fmha.triton_splitk.FwOp,
+        )
+    )
     torch.testing.assert_close(
-        attn_output_fp8, attn_output_fp8_paged, atol=2e-3, rtol=2e-3
+        attn_output_fp8_float32,
+        attn_output_fp8_paged_float32,
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        attn_output_fp8_paged,
+        attn_output_fp8_paged_float32.to(attn_output_fp8_paged.dtype),
+        atol=2e-3,
+        rtol=2e-3,
     )
     assert context_fp8_paged is not None
     torch.testing.assert_close(
