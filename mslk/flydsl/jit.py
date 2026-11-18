@@ -17,6 +17,7 @@ to those launched from here. Availability detection lives in
 :mod:`mslk.flydsl.common`.
 """
 
+import contextlib
 import os
 from typing import Any, Callable
 
@@ -101,10 +102,13 @@ def run_compiled(launcher: Callable[..., Any], *args: Any, device: Any = None) -
     if device is None:
         device = _launch_device(args)
     device = torch.device(device)
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    current = torch.cuda.current_device()
+    index = device.index if device.index is not None else current
 
     launcher = _launcher_on(launcher, index)
-    with torch.cuda.device(index):
+    # Callers usually have the device current already, and switching costs a
+    # round trip to the runtime on every launch.
+    with contextlib.nullcontext() if index == current else torch.cuda.device(index):
         cf = getattr(launcher, "_mslk_cf", None)
         if cf is None:
             launcher._mslk_cf = flyc.compile(launcher, *args)  # pyre-ignore[16]

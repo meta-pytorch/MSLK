@@ -4674,7 +4674,7 @@ class FlyDSLRowwiseTest(unittest.TestCase):
             ref = self._reference(xq, wq, x_scale, w_scale)
             out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
             self.assertEqual(out.device, device)
-            torch.testing.assert_close(out.float(), ref, atol=8e-2, rtol=8e-2)
+            torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
             xq, x_scale, wq, w_scale = xq[0], x_scale[0], wq[0], w_scale[0]
             ref = self._reference(xq, wq, x_scale, w_scale)
             out = torch.empty(48, 256, dtype=torch.bfloat16, device=device)
@@ -4685,7 +4685,7 @@ class FlyDSLRowwiseTest(unittest.TestCase):
                 out,
             ):
                 self.assertEqual(y.device, device)
-                torch.testing.assert_close(y.float(), ref, atol=8e-2, rtol=8e-2)
+                torch.testing.assert_close(y.float(), ref, atol=1e-3, rtol=1e-2)
 
 
 @skipUnlessRocm()
