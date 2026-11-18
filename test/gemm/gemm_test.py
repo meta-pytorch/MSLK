@@ -2579,7 +2579,7 @@ class MXFP8Tests(unittest.TestCase):
         )
 
 
-@skipUnlessGfxArch("gfx942")
+@skipUnlessGfxArch("gfx942", "gfx950")
 @skipUnlessCudaCapability(9)
 class BF16Tests(unittest.TestCase):
     @classmethod
@@ -2765,7 +2765,6 @@ class BF16Tests(unittest.TestCase):
             dtype=dtype,
             device=torch.accelerator.current_accelerator(),
         )
-        # ROCm grad kernel requires every non-empty group to have >= 8 rows.
         m_sizes = BF16Tests.generate_random_splits(G, M, min_group_size=8)
 
         sm_margin = 0
@@ -2812,6 +2811,49 @@ class BF16Tests(unittest.TestCase):
         torch.testing.assert_close(
             y_half_preallocated, ref_y_half, atol=1e-3, rtol=1.6e-2
         )
+
+    @skipUnlessRocm()
+    @parameterized.expand(
+        [
+            ([1, 0, 3, 2, 7, 5, 6, 4], 256, 128),  # groups smaller than a tile
+            ([0, 1, 0, 9, 1, 33, 7], 512, 2048),
+            ([5], 2880, 5760),
+            ([300, 0, 129, 64], 1024, 2080),  # K not a multiple of the K tiles
+        ]
+    )
+    def test_grouped_gemm_dgrad_any_group_size_in_cuda_graph(
+        self, sizes: list[int], N: int, K: int
+    ) -> None:
+        torch.manual_seed(hash((tuple(sizes), N, K)))
+        G, M = len(sizes), sum(sizes)
+        m_sizes = torch.tensor(sizes, dtype=torch.int64, device=self.device)
+        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+        w = torch.randn((G, K, N), dtype=torch.bfloat16, device=self.device)
+        out = torch.full(
+            (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+
+        def run() -> torch.Tensor:
+            return torch.ops.mslk.bf16bf16bf16_grouped_grad(
+                x, w.permute(0, 2, 1), m_sizes, out
+            )
+
+        run()  # autotune and compile before capturing
+        out.fill_(float("nan"))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run()
+        graph.replay()
+
+        expected = torch.empty((M, N), dtype=torch.float32, device=self.device)
+        start = 0
+        for g, size in enumerate(sizes):
+            # The op's W[g] is w[g].T, so X[g] @ W[g].T is X[g] @ w[g].
+            expected[start : start + size] = (
+                x[start : start + size].float() @ w[g].float()
+            )
+            start += size
+        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
 
     @parameterized.expand(
         [
