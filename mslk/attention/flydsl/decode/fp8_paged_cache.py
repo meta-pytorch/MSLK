@@ -15,7 +15,7 @@ benchmarks); it is NOT called per decode step. head_dim % 16 == 0, gfx950.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -111,3 +111,69 @@ def dense_kv_to_fp8_paged(
         .contiguous()
     )
     return key_cache, value_cache, key_scale, value_scale, block_tables
+
+
+def random_fp8_paged_cache(
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    lengths: List[int],
+    width: Optional[int] = None,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """A random per-token FP8 paged cache in the decode kernel's layout, for
+    tests and benchmarks: one sequence per entry of ``lengths``, each with its
+    own pages in random order, a block table ``width`` blocks wide (default:
+    the longest sequence's) and slots past a sequence's pages set to -1.
+
+    Keys are normal; each sequence's values are uniform in +-sqrt(length), so
+    that its attention output is O(1) at any length.
+
+    Returns (key_cache, value_cache, key_scale, value_scale, block_tables,
+    context_lengths), laid out as dense_kv_to_fp8_paged's.
+    """
+    pages = [-(-n // block_size) for n in lengths]
+    width = max(1, *pages) if width is None else width
+    num_blocks = sum(pages) + 1
+    block_tables = torch.full(
+        (len(lengths), width), -1, dtype=torch.int32, device="cuda"
+    )
+    order = torch.randperm(num_blocks, dtype=torch.int32, device="cuda")
+    value_size = torch.ones(num_blocks, 1, 1, 1, device="cuda")
+    start = 0
+    for b, n in enumerate(pages):
+        block_tables[b, :n] = order[start : start + n]
+        value_size[order[start : start + n].long()] = max(lengths[b], 1) ** 0.5
+        start += n
+
+    shape = (num_blocks, num_kv_heads, block_size, head_size)
+    kq, key_scale = _pertoken_quant_symmetric(torch.randn(shape, device="cuda"))
+    vq, value_scale = _pertoken_quant_symmetric(
+        (torch.rand(shape, device="cuda") * 2 - 1) * value_size
+    )
+    key_cache = (
+        kq.view(*shape[:3], head_size // _ELEMS_PER_VEC, _ELEMS_PER_VEC)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        vq.view(*shape[:2], block_size // _ELEMS_PER_VEC, _ELEMS_PER_VEC, head_size)
+        .transpose(3, 4)
+        .contiguous()
+    )
+    context_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    return key_cache, value_cache, key_scale, value_scale, block_tables, context_lengths
+
+
+def dequantize_fp8_paged_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """FP32 keys and values of (blocks of) a cache in the decode kernel's
+    layout, each as [blocks, block_size, kv_heads, head_size]."""
+    k = key_cache.permute(0, 3, 1, 2, 4).flatten(3).float()
+    v = value_cache.permute(0, 2, 4, 1, 3).flatten(1, 2).float()
+    return k * key_scale.transpose(1, 2), v * value_scale.transpose(1, 2)

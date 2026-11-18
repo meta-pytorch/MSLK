@@ -1348,7 +1348,13 @@ def compile_pa_decode_ps(
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
         k_global_ptr = _extract_global_ptr(key_cache_ptr)
         v_global_ptr = _extract_global_ptr(value_cache_ptr)
-        bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=False)
+        # Bounded by the table's rows (grid x is the batch), so reads past its end,
+        # e.g. a tile's padding entries in the last row, return 0 instead of faulting.
+        bt_rsrc = buffer_ops.create_buffer_resource(
+            block_tables_ptr,
+            max_size=False,
+            num_records_bytes=fx.Int32(gpu.grid_dim.x) * stride_bt_seq * fx.Int32(4),
+        )
         es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
         ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
         to_rsrc = buffer_ops.create_buffer_resource(tmp_out_ptr, max_size=True)
@@ -1601,19 +1607,41 @@ def compile_pa_decode_ps(
                 [],
             )
 
+        # Table entries past the context are padding and may hold any value; the
+        # masked tail of a tile reads block 0 instead, as zero padding did, so
+        # block 0 must hold finite values (as aiter's pa_decode also requires).
+        num_context_blocks = (context_len + fx.Int32(_block_size - 1)) // fx.Int32(
+            _block_size
+        )
+        zero_block = arith.constant(0, type=T.i32)
+
         def _pa_small_block_stage_phys_blocks(partition_block_base):
             # bt offset is wave-uniform -> s_buffer_load into SGPRs, avoiding the
             # vmcnt(0) drain and the downstream readfirstlane of the VMEM path.
             if const_expr(block_size == 64):
-                bt_elem_off = batch_idx * stride_bt_seq + partition_block_base + warp_id
+                block = partition_block_base + warp_id
+                bt_elem_off = batch_idx * stride_bt_seq + block
                 phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=1)
-            else:
-                bt_elem_off = (
-                    batch_idx * stride_bt_seq
-                    + partition_block_base
-                    + warp_id * fx.Int32(TLOOP)
+                phys_blocks = arith.select(
+                    block < num_context_blocks, phys_blocks, zero_block
                 )
-                phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
+            else:
+                first = partition_block_base + warp_id * fx.Int32(TLOOP)
+                bt_elem_off = batch_idx * stride_bt_seq + first
+                loaded = fx.Vector(
+                    _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
+                )
+                phys_blocks = fx.Vector.from_elements(
+                    [
+                        arith.select(
+                            first + fx.Int32(i) < num_context_blocks,
+                            loaded[i],
+                            zero_block,
+                        )
+                        for i in range_constexpr(TLOOP)
+                    ],
+                    dtype=fx.Int32,
+                )
             return phys_blocks
 
         def _pa_small_block_store_phys_blocks_to_lds(phys_block_vec):
@@ -2255,6 +2283,12 @@ def pa_decode_ps_launch(
             f"pa_decode_ps_launch: block_size={block_size} requires `block_tables` "
             "(per-sequence physical block index table)."
         )
+    # The kernel reads both as int32; other dtypes would be misread silently.
+    if context_lengths.dtype != torch.int32 or block_tables.dtype != torch.int32:
+        raise TypeError(
+            "pa_decode_ps_launch: context_lengths and block_tables must be int32, "
+            f"got {context_lengths.dtype} and {block_tables.dtype}."
+        )
     batch_size = context_lengths.shape[0]
     head_size = query.shape[-1]
     eqgs = query_length * query_group_size
@@ -2337,7 +2371,8 @@ def pa_decode_ps_launch(
         temporary_output.stride(1),
         temporary_output.stride(2),
         temporary_output.stride(3),
-        block_tables.stride(0),
+        # A table with no columns has no memory; stride 0 makes its reads return 0.
+        block_tables.stride(0) if block_tables.shape[1] else 0,
         stride_ks_block,
         stride_ks_head,
         batch_size,
