@@ -26,7 +26,7 @@ from mslk.quantize.triton.fp4_primitives import (
     stacked_segment_map,
 )
 from mslk.quantize.triton.quantize_kernels import _resolve_seed
-from mslk.utils.device import is_gfx950, is_rocm
+from mslk.utils.device import gfx_arch_in, is_gfx950, is_rocm
 from triton import language as tl  # @manual=//triton:triton
 
 
@@ -55,6 +55,7 @@ def quantize_mx4_stacked_kernel(
     STOCHASTIC: tl.constexpr,  # True → enable software stochastic rounding
     IS_ROCM: tl.constexpr,  # True → plain [M, K//32] scale layout (AMD GEMM contract)
     IS_GFX950: tl.constexpr,  # True → gfx950 native FP4 packing instruction
+    IS_GFX1250: tl.constexpr,
     ZERO_SLACK: tl.constexpr,  # True → initialize trailing over-allocation in-kernel
 ):
     """Stacked MX4 quantization kernel processing [M_PER_BLOCK, 64] tiles.
@@ -204,6 +205,7 @@ def quantize_mx4_stacked_kernel(
         x_blocks.reshape(M_PER_BLOCK, 32, 2).split(),
         IS_GFX950=IS_GFX950,
         IS_ROCM=IS_ROCM,
+        USE_RNE=IS_GFX1250,
     )
 
     q_offs_m = logical_rows[:, None]
@@ -349,6 +351,8 @@ def quantize_mx4_stacked(
         IS_ROCM=rocm,
         # pyre-ignore[6]
         IS_GFX950=gfx950,
+        # pyrefly: ignore [bad-argument-type]
+        IS_GFX1250=rocm and gfx_arch_in(("gfx1250",)),
         # pyre-ignore[6]
         ZERO_SLACK=not rocm and scale_K % 4 == 0,
         # pyre-ignore[28]
