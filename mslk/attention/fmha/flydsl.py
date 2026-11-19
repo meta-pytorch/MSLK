@@ -45,6 +45,7 @@ negative-path test in `test_backward.py`):
   Revisit if a backward caller for paged/gappy attention appears.
 """
 
+import importlib.util
 import math
 from typing import Any, Iterable, List, Mapping, Optional, Set, Tuple
 
@@ -186,8 +187,7 @@ def _is_flydsl_available() -> bool:
 class FwOp(AttentionFwOpBase):
     """FlyDSL flash-attention forward (gfx942 generic / gfx950 dualwave)."""
 
-    # Python callable rather than a torch.ops handle (cf. triton_splitk.FwOp).
-    OPERATOR = staticmethod(_is_flydsl_available)
+    OPERATOR = True if importlib.util.find_spec("flydsl") else None
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
     # [1, 256] via generic/dualwave; (256, 512] via small-attention kernel on gfx950.

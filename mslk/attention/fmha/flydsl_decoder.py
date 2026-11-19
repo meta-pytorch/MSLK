@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
+import importlib.util
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -45,8 +46,7 @@ def _flydsl_decode_forward(
 class FwOp(AttentionFwOpBase):
     """FlyDSL dense decode op (gfx942/gfx950). f16/bf16/f32 KV, dense padded layout, GQA/MQA."""
 
-    # Python callable rather than a torch.ops handle (cf. triton_splitk.FwOp).
-    OPERATOR = staticmethod(is_flydsl_available)
+    OPERATOR = True if importlib.util.find_spec("flydsl") else None
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.half, torch.bfloat16}
