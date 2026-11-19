@@ -73,7 +73,6 @@ file(GLOB_RECURSE mslk_cpp_source_files_cuda
 
 # HIP-specific sources
 file(GLOB_RECURSE mslk_cpp_source_files_hip
-  ${MSLK_SRC_DIR}/csrc/attention/ck/fmha/hip_decoder/*.hip
   ${MSLK_SRC_DIR}/csrc/gemm/ck/*.hip
   ${MSLK_SRC_DIR}/csrc/gemm/ck/**/*.hip)
 
@@ -123,8 +122,10 @@ if(NOT DEFINED ENV{MSLK_BUILD_HIP_FMHA} OR NOT "$ENV{MSLK_BUILD_HIP_FMHA}" STREQ
     foreach(_arch IN LISTS mslk_hip_fmha_archs)
       list(APPEND HIP_HCC_FLAGS_FMHA --offload-arch=${_arch})
     endforeach()
+    list(JOIN mslk_hip_fmha_archs "," _fmha_archs_csv)
     list(APPEND HIP_HCC_FLAGS_FMHA
       -fPIC
+      -DMSLK_CK_FMHA_ARCHS=\"${_fmha_archs_csv}\"
       -DFMHA_LIMIT_MAX_HEADDIM_TO_256=1)
 
     message("Building FMHA for arch: ${mslk_hip_fmha_archs} (HIP_VERSION=${HIP_VERSION})")

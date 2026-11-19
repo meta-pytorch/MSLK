@@ -10,6 +10,7 @@ import logging
 import math
 import unittest.mock
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, Optional, Tuple, Type
 
 import pytest
@@ -1052,28 +1053,6 @@ def test_triton_splitk_decoder_dequant(
 @pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
 @pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
 @pytest.mark.parametrize("padding", [32, 4096])
-@pytest.mark.parametrize("dtype", ["f16", "bf16", "f32"])
-def test_decoder_ck(
-    n_heads: int,
-    kv_heads: Optional[int],
-    padding: int,
-    bsz: int,
-    dtype: str,
-) -> None:
-    _test_decoder(
-        fmha.ck_decoder.FwOp,
-        kv_heads=kv_heads,
-        n_heads=n_heads,  # qheads per kv head
-        padding=padding,
-        bsz=bsz,
-        dtype=dtype,
-    )
-
-
-@rocm_only
-@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
-@pytest.mark.parametrize("bsz,n_heads", [(1, 1), (1, 16), (1, 32), (8, 1), (4, 8)])
-@pytest.mark.parametrize("padding", [32, 4096])
 @pytest.mark.parametrize("dtype", ["f16", "bf16"])
 def test_decoder_flydsl(
     n_heads: int,
@@ -1119,36 +1098,6 @@ def test_cutlass_blackwell_decoder(
 
 @rocm_only
 @pytest.mark.parametrize(
-    "op", [fmha.ck_splitk.FwOp_S1, fmha.ck_splitk.FwOp_S2, fmha.ck_splitk.FwOp_S4]
-)
-@pytest.mark.parametrize("dtype", ["f32"])
-@pytest.mark.parametrize("kv_heads", [None, 1, 2], ids=_kv_heads_label)
-@pytest.mark.parametrize("n_heads", [16])
-@pytest.mark.parametrize("d", [128, 256])
-@pytest.mark.parametrize("padding, bsz", [(32, 8), (4096, 1), (32, 1), (4096, 8)])
-def test_ck_splitk_decoder(
-    op,
-    kv_heads: Optional[int],
-    n_heads: int,
-    padding: int,
-    bsz: int,
-    dtype: str,
-    d: int,
-) -> None:
-    # no quantized impl compared to cuda
-    _test_decoder(
-        op,
-        kv_heads=kv_heads,
-        n_heads=n_heads,
-        padding=padding,
-        bsz=bsz,
-        dtype=dtype,
-        d=d,
-    )
-
-
-@rocm_only
-@pytest.mark.parametrize(
     "op",
     [
         fmha.flydsl_splitk.FwOp_S1,
@@ -1181,20 +1130,15 @@ def test_flydsl_splitk_decoder(
     )
 
 
-@pytest.mark.parametrize(
-    "op",
-    [fmha.ck_splitk.FwOp, fmha.flydsl_splitk.FwOp],
-    ids=["ck_splitk", "flydsl_splitk"],
-)
 @pytest.mark.parametrize("num_groups", [1, 8])
-def test_splitk_decoder_declines_int32_kv(op, num_groups: int) -> None:
+def test_flydsl_splitk_decoder_declines_int32_kv(num_groups: int) -> None:
     d = 128
     q = torch.randn(1, 8, 16, d, dtype=torch.float16)
     kv_shape = (1, 8 * 32, 16, d // 8 + num_groups)
     k = torch.zeros(kv_shape, dtype=torch.int32)
     v = torch.zeros(kv_shape, dtype=torch.int32)
 
-    reasons = op.not_supported_reasons(fmha.Inputs(q, k, v))
+    reasons = fmha.flydsl_splitk.FwOp.not_supported_reasons(fmha.Inputs(q, k, v))
     assert "quantized (int32) key/value not supported" in reasons
 
 
@@ -2202,8 +2146,28 @@ def test_triton_splitk_rowwise_fp8(
     ) = fmha._memory_efficient_attention_forward_requires_grad(
         inp_fp8_paged, op=fmha.triton_splitk.FwOp
     )
+    # Compare layouts before BF16 rounding: small accumulation differences can
+    # straddle a rounding midpoint and become a full BF16 ULP.
+    attn_output_fp8_float32, _ = fmha._memory_efficient_attention_forward_requires_grad(
+        replace(inp, output_dtype=torch.float32), op=fmha.triton_splitk.FwOp
+    )
+    attn_output_fp8_paged_float32, _ = (
+        fmha._memory_efficient_attention_forward_requires_grad(
+            replace(inp_fp8_paged, output_dtype=torch.float32),
+            op=fmha.triton_splitk.FwOp,
+        )
+    )
     torch.testing.assert_close(
-        attn_output_fp8, attn_output_fp8_paged, atol=2e-3, rtol=2e-3
+        attn_output_fp8_float32,
+        attn_output_fp8_paged_float32,
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    torch.testing.assert_close(
+        attn_output_fp8_paged,
+        attn_output_fp8_paged_float32.to(attn_output_fp8_paged.dtype),
+        atol=2e-3,
+        rtol=2e-3,
     )
     assert context_fp8_paged is not None
     torch.testing.assert_close(

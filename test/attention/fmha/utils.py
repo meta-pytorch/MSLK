@@ -233,11 +233,18 @@ def construct_fp8_attention_inputs(
         torch.randint(0, Mkv, size=(B,)).tolist() if randomize_lengths else [Mkv] * B
     )
 
+    # HIP kernels unpack stored FP16 coefficients to FP32 before dequantizing.
+    # Match reference arithmetic to avoid rounding intermediate results to FP16.
+    reference_scale_dtype = torch.float32 if torch.version.hip else scale_dtype
     k_deq = dequantize_fp8_asymmetric(
-        k_fp8.view(pt_fp8_dtype), k_fp8_scales, k_fp8_shifts
+        k_fp8.view(pt_fp8_dtype),
+        k_fp8_scales.to(reference_scale_dtype),
+        k_fp8_shifts.to(reference_scale_dtype),
     ).to(dtype)
     v_deq = dequantize_fp8_asymmetric(
-        v_fp8.view(pt_fp8_dtype), v_fp8_scales, v_fp8_shifts
+        v_fp8.view(pt_fp8_dtype),
+        v_fp8_scales.to(reference_scale_dtype),
+        v_fp8_shifts.to(reference_scale_dtype),
     ).to(dtype)
 
     k_deq = k_deq[:, :, :, :1, :].contiguous()

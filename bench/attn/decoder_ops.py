@@ -6,19 +6,13 @@
 
 """Paged-attention decode ops for decoder_bench.
 
-Each op wraps an fmha forward operator (FlyDSL / CK / Triton) and is benchmarked
+Each op wraps an fmha forward operator (FlyDSL / Triton) and is benchmarked
 through the standard ``op.apply`` interface, so all backends share one code path
 and input layout. Mirrors the ops-registry pattern of ``bench/gemm/gemm_ops.py``.
 """
 
 import torch
-from mslk.attention.fmha import (
-    ck_decoder,
-    ck_splitk,
-    flydsl_decoder,
-    flydsl_splitk,
-    triton_splitk,
-)
+from mslk.attention.fmha import flydsl_decoder, flydsl_splitk, triton_splitk
 from mslk.attention.fmha.attn_bias import BlockDiagonalCausalWithOffsetPaddedKeysMask
 from mslk.attention.fmha.common import AttentionFwOpBase, Inputs, InputsFp8
 from mslk.bench.common.utils import BenchOptions, do_bench
@@ -149,16 +143,6 @@ class FlyDSLDecode(_FlyDSLDecodeOp):
 @register_decode_op
 class FlyDSLSplitK(_FlyDSLDecodeOp):
     OP = flydsl_splitk.FwOp
-
-
-@register_decode_op
-class CKDecode(DecodeOpBase):
-    OP = ck_decoder.FwOp
-
-
-@register_decode_op
-class CKSplitK(DecodeOpBase):
-    OP = ck_splitk.FwOp
 
 
 @register_decode_op

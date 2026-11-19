@@ -9,6 +9,7 @@
 
 import itertools
 import logging
+import os
 import random
 import unittest
 from typing import Optional
@@ -27,6 +28,12 @@ try:
     from mslk import __version__, open_source  # noqa: F401
 except Exception:
     open_source: bool = False
+
+# Inductor workers start a different executable with its own ROCm registration.
+# Do not inherit the outer test binary profiler library path.
+if torch.version.hip is not None:
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
+
 
 logger: logging.Logger = logging.getLogger()
 logger.setLevel(logging.INFO)
