@@ -31,35 +31,46 @@ _GFX950_CVT_PK_FP4_F32 = tl.constexpr("v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, 1.0
 
 
 @triton.jit
-def _fp32_to_e2m1_nibble(v):
+# pyrefly: ignore [bad-function-definition]
+def _fp32_to_e2m1_nibble(v, USE_RNE: tl.constexpr = False):
     """Encode one float32 element as a 4-bit E2M1 nibble (int32, 0-15).
 
     Pure-Triton fallback for non-gfx950 ROCm (gfx942, etc.). Representable
     magnitudes: {0, 0.5, 1, 1.5, 2, 3, 4, 6}; rounding is round-half-up
     (ties always round toward the larger magnitude). This diverges from gfx950
-    hardware (which uses RNE) at tie values 0.25, 1.25, 2.5, and 5.0. E2M1
+    hardware (which uses RNE) at tie values 0.25, 1.25, 2.5, and 5.0.
+    USE_RNE selects nearest-even ties and preserves the sign bit for gfx1250. E2M1
     levels are non-uniformly spaced, so the branchless ``tl.where`` chain
     (each lowers to v_cmp + v_cndmask on CDNA) is the correct GPU
     implementation.
     """
-    sign = tl.where(v < 0.0, 1, 0).to(tl.int32)
+    if USE_RNE:
+        sign = (v.to(tl.int32, bitcast=True) >> 31) & 1
+    else:
+        sign = tl.where(v < 0.0, 1, 0).to(tl.int32)
     ax = tl.abs(v)
     # Clamp to the representable range [0, 6].
     ax = tl.minimum(ax, 6.0)
     mag = tl.where(
-        ax < 0.25,
+        (ax <= 0.25 if USE_RNE else ax < 0.25),
         0,
         tl.where(
             ax < 0.75,
             1,
             tl.where(
-                ax < 1.25,
+                (ax <= 1.25 if USE_RNE else ax < 1.25),
                 2,
                 tl.where(
                     ax < 1.75,
                     3,
                     tl.where(
-                        ax < 2.5, 4, tl.where(ax < 3.5, 5, tl.where(ax < 5.0, 6, 7))
+                        (ax <= 2.5 if USE_RNE else ax < 2.5),
+                        4,
+                        tl.where(
+                            ax < 3.5,
+                            5,
+                            tl.where((ax <= 5.0 if USE_RNE else ax < 5.0), 6, 7),
+                        ),
                     ),
                 ),
             ),
@@ -73,6 +84,8 @@ def convert_fp32_to_fp4_packed(
     x_pairs,
     IS_GFX950: tl.constexpr,
     IS_ROCM: tl.constexpr,
+    # pyrefly: ignore [bad-function-definition]
+    USE_RNE: tl.constexpr = False,
 ):
     """Convert FP32 value pairs to packed FP4 E2M1 format.
 
@@ -81,6 +94,7 @@ def convert_fp32_to_fp4_packed(
             ``[..., 2]`` trailing dim). ``lo`` -> low nibble, ``hi`` -> high
             nibble of each output byte.
         IS_GFX950: compile-time; use the gfx950 native conversion instruction.
+        USE_RNE: use native-compatible nearest-even software packing on gfx1250.
         IS_ROCM: compile-time; use the pure-Triton fallback (non-gfx950 ROCm).
             Ignored when ``IS_GFX950`` is True.
 
@@ -107,7 +121,9 @@ def convert_fp32_to_fp4_packed(
         return (packed & 0xFF).to(tl.uint8)
     elif IS_ROCM:
         lo, hi = x_pairs
-        return (_fp32_to_e2m1_nibble(lo) | (_fp32_to_e2m1_nibble(hi) << 4)).to(tl.uint8)
+        return (
+            _fp32_to_e2m1_nibble(lo, USE_RNE) | (_fp32_to_e2m1_nibble(hi, USE_RNE) << 4)
+        ).to(tl.uint8)
     else:
         # NVIDIA Blackwell (SM100+): pairs -> packed FP4 via PTX. ``pack=4``
         # processes 4 pairs per invocation ($1-$4 = lo lanes, $5-$8 = hi lanes),

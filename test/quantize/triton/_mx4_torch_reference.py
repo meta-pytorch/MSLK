@@ -40,9 +40,12 @@ def _to_mxfp4(
     exp_bits = (bits & _F32_EXP_MASK) >> _F32_EXP_OFFSET
     group_exp = (exp_bits - _F32_EXP_BIAS - _FP4_EBITS).clamp(-127, 125)
 
-    scale = torch.exp2(group_exp.to(torch.float64)).to(torch.float32)
+    # Keep a subnormal scale such as 2**-127 out of FP32 GPU division.
+    scale = torch.exp2(group_exp.to(torch.float64))
     unpacked = _f32_to_floatx_unpacked(
-        (data_hp / scale).contiguous(), _FP4_EBITS, _FP4_MBITS
+        (data_hp.to(torch.float64) / scale).to(torch.float32).contiguous(),
+        _FP4_EBITS,
+        _FP4_MBITS,
     )
     data_lp = pack_uint4(unpacked).view(torch.float4_e2m1fn_x2)
     final_shape = (*orig_shape[:-1], orig_shape[-1] // 2)

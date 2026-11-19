@@ -23,7 +23,7 @@ from mslk.utils.device import is_rocm
 from parameterized import parameterized  # @manual
 
 
-@skipUnlessGfxArch("gfx950")
+@skipUnlessGfxArch("gfx950", "gfx1250")
 @skipUnlessCudaCapability(10)
 class QuantizeMX4Test(unittest.TestCase):
     """Bitwise-vs-torch-reference + first-principles tests for quantize_mx4."""
