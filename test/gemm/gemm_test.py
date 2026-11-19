@@ -20,7 +20,6 @@ from mslk.aiter.common import is_aiter_available
 from mslk.aiter.routing import force_backend
 from mslk.flydsl.common import (
     flydsl_version,
-    is_flydsl_available,
     is_flydsl_version_at_least,
     MIN_FLYDSL_VERSION,
 )
@@ -533,7 +532,7 @@ class FP8Tests(unittest.TestCase):
         # has no such limit, and serves the op wherever it is available and
         # supports the GPU -- the same test mslk/gemm/__init__.py makes.
         flydsl_serves = False
-        if torch.version.hip and is_flydsl_available():
+        if torch.version.hip and is_flydsl_version_at_least():
             from mslk.gemm.flydsl.fp8_rowwise_gemm import is_supported
 
             flydsl_serves = is_supported()
@@ -4650,6 +4649,16 @@ class FlyDSLRowwiseTest(unittest.TestCase):
             op(xq, wq, x_scale[:-1], w_scale)
         with self.assertRaisesRegex(RuntimeError, "float8|dtype"):
             op(xq.float(), wq.float(), x_scale, w_scale)
+
+    @skipUnlessGfxArch("gfx950")
+    def test_fnuz_on_gfx950_names_the_override(self) -> None:
+        # MSLK_ROCM_FORCE_FP8FNUZ_TYPE makes MSLK's quantizers emit fnuz on
+        # gfx950, whose kernels read OCP FP8; the error has to say so.
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        fnuz = torch.float8_e4m3fnuz
+        xq, wq = xq.view(torch.int8).view(fnuz), wq.view(torch.int8).view(fnuz)
+        with self.assertRaisesRegex(RuntimeError, "MSLK_ROCM_FORCE_FP8FNUZ_TYPE"):
+            torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale)
 
     @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
     def test_rejects_output_on_another_device(self) -> None:

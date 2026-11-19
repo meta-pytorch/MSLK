@@ -61,6 +61,12 @@ if torch.version.hip is not None:
     #
     # Targets that want the FlyDSL kernels depend on flydsl_ops themselves; the
     # lazy imports below then resolve, and Triton serves everyone else.
+    def _min_flydsl() -> str:
+        """The oldest FlyDSL the kernels run on, for error messages."""
+        from mslk.flydsl.common import MIN_FLYDSL_VERSION
+
+        return MIN_FLYDSL_VERSION
+
     @functools.lru_cache(maxsize=8)
     def _flydsl_gemm_module(name: str) -> ModuleType | None:
         """A FlyDSL gemm module by name, or None when it is not opted into.
@@ -69,11 +75,15 @@ if torch.version.hip is not None:
         import ...``: this package deliberately does not depend on
         ``//mslk/mslk/gemm:flydsl_ops``, so the module is genuinely absent
         unless the caller opted in, and a static import would not resolve.
+
+        An installed FlyDSL older than ``MIN_FLYDSL_VERSION`` counts as absent:
+        it imports cleanly and then fails inside kernel compilation, so the op
+        has to fall back before it gets that far.
         """
         try:
-            from mslk.flydsl.common import is_flydsl_available
+            from mslk.flydsl.common import is_flydsl_version_at_least
 
-            if not is_flydsl_available():
+            if not is_flydsl_version_at_least():
                 return None
             return importlib.import_module(f"mslk.gemm.flydsl.{name}")
         except ImportError:
@@ -161,8 +171,8 @@ if torch.version.hip is not None:
                 if mod is None:
                     raise RuntimeError(
                         "mslk::f8f8bf16_groupwise_grouped_preshuffle requires the "
-                        "FlyDSL backend. Add //mslk/mslk/gemm:flydsl_ops to your "
-                        "target's deps."
+                        f"FlyDSL backend, version {_min_flydsl()} or newer. Add "
+                        "//mslk/mslk/gemm:flydsl_ops to your target's deps."
                     )
                 return mod.matmul_f8f8bf16_groupwise_grouped_preshuffle(
                     XQ, WQ, x_scale, w_scale, M_sizes
@@ -331,9 +341,10 @@ if torch.version.hip is not None:
                     if mod is None or not mod.is_supported():
                         raise RuntimeError(
                             "mslk::f8f8bf16_blockwise_preshuffle requires the "
-                            "FlyDSL backend on a gfx942 or gfx950 device and has "
-                            "no Triton fallback. Add //mslk/mslk/gemm:flydsl_ops "
-                            "to your target's deps."
+                            f"FlyDSL backend, version {_min_flydsl()} or newer, on "
+                            "a gfx942 or gfx950 device and has no Triton "
+                            "fallback. Add //mslk/mslk/gemm:flydsl_ops to your "
+                            "target's deps."
                         )
                     return mod.matmul_f8f8bf16_blockwise_preshuffle(
                         XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
@@ -347,13 +358,13 @@ if torch.version.hip is not None:
         """The FlyDSL rowwise grouped module, or None when not opted into.
 
         Resolved the same way as the groupwise one above, and for the same
-        reason: this package must not depend on
-        ``//mslk/mslk/gemm:flydsl_ops``.
+        reasons: this package must not depend on
+        ``//mslk/mslk/gemm:flydsl_ops``, and an out-of-date FlyDSL is absent.
         """
         try:
-            from mslk.flydsl.common import is_flydsl_available
+            from mslk.flydsl.common import is_flydsl_version_at_least
 
-            if not is_flydsl_available():
+            if not is_flydsl_version_at_least():
                 return None
             return importlib.import_module("mslk.gemm.flydsl.fp8_rowwise_grouped_gemm")
         except ImportError:
@@ -373,8 +384,9 @@ if torch.version.hip is not None:
             mod = _flydsl_rowwise_grouped_module()
             if mod is None:
                 raise RuntimeError(
-                    f"mslk::{op} requires the FlyDSL backend. Add "
-                    "//mslk/mslk/gemm:flydsl_ops to your target's deps."
+                    f"mslk::{op} requires the FlyDSL backend, version "
+                    f"{_min_flydsl()} or newer. Add //mslk/mslk/gemm:flydsl_ops "
+                    "to your target's deps."
                 )
             return getattr(mod, fn)(*args)
 

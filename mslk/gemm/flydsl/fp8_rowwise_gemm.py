@@ -207,8 +207,20 @@ def check_rowwise_operands(
         XQ.dtype == WQ.dtype,
         lambda: f"XQ and WQ dtypes must match, got {XQ.dtype} vs {WQ.dtype}",
     )
-    fp8_dtype = torch.float8_e4m3fn if is_gfx950() else torch.float8_e4m3fnuz
-    torch._check(XQ.dtype == fp8_dtype, lambda: f"XQ and WQ must be {fp8_dtype}")
+    gfx950 = is_gfx950()
+    fp8_dtype = torch.float8_e4m3fn if gfx950 else torch.float8_e4m3fnuz
+
+    def fp8_message() -> str:
+        arch = "gfx950" if gfx950 else "gfx942"
+        msg = f"XQ and WQ must be {fp8_dtype} on {arch}, got {XQ.dtype}"
+        if gfx950 and XQ.dtype == torch.float8_e4m3fnuz:
+            msg += (
+                "; MSLK_ROCM_FORCE_FP8FNUZ_TYPE makes MSLK quantize to fnuz, "
+                "which these kernels do not read on gfx950"
+            )
+        return msg
+
+    torch._check(XQ.dtype == fp8_dtype, fp8_message)
     torch._check(
         x_scale.dtype == torch.float32 and w_scale.dtype == torch.float32,
         lambda: "Scales must be float32.",
