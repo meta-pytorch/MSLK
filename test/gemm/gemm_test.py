@@ -16,7 +16,7 @@ import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
-from mslk.aiter.common import is_aiter_enabled
+from mslk.aiter.common import import_aiter_module, is_aiter_enabled
 from mslk.aiter.routing import device_key, force_backend, OpRouting
 from mslk.flydsl.common import (
     flydsl_version,
@@ -368,7 +368,7 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
 # gfx950, so that the ops' tests cover aiter's kernel as well as MSLK's.
 _BF16_GROUPED_STACKED_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
     (8, 28672, 4096, 3000),
-    (16, 16384, 5120, 3000),
+    (16, 16384, 5120, 6000),
 )
 _BF16_GROUPED_GRAD_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
     (8, 14336, 4096, 6000),
@@ -1358,7 +1358,9 @@ class FP8Tests(unittest.TestCase):
         out = torch.full(
             (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
         )
-        args = (x, w, M_sizes, out)
+        # A reduced num_sms on aiter becomes gmm's grid_dim.
+        num_sms = 64 if backend == "aiter" else None
+        args = (x, w, M_sizes, out, num_sms)
 
         with (
             force_backend(op, backend)
@@ -1366,7 +1368,13 @@ class FP8Tests(unittest.TestCase):
             else contextlib.nullcontext()
         ):
             served_by = routing.backend_for(*args)
-            actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(*args)
+            # aiter warns when num_sms overrides its own grid.
+            with (
+                self.assertWarnsRegex(UserWarning, "grid dim with 64")
+                if served_by == "aiter" and num_sms is not None
+                else contextlib.nullcontext()
+            ):
+                actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(*args)
 
         self.assertEqual(actual.data_ptr(), out.data_ptr())
         expected = _grouped_reference(x, w.transpose(1, 2), M_sizes)
@@ -1384,6 +1392,39 @@ class FP8Tests(unittest.TestCase):
                 "the tuning table no longer routes this shape to aiter; replace "
                 "it in _BF16_GROUPED_STACKED_AITER_SHAPES with one it does",
             )
+
+    @skipUnlessRocm()
+    @parameterized.expand(
+        [
+            ("stacked", BF16_GROUPED_STACKED_ROUTING),
+            ("grad", BF16_GROUPED_GRAD_ROUTING),
+        ]
+    )
+    def test_bf16_grouped_buckets_do_not_span_aiter_configs(
+        self, _name: str, routing: OpRouting
+    ) -> None:
+        # A bucket is timed at its bound only, so aiter must run one config for
+        # all of it; this fails if an aiter update moves its config switches.
+        if not is_aiter_enabled(routing.op) or not _table_covers_device(routing):
+            self.skipTest("requires the pinned aiter and a tuned device")
+        get_config = import_aiter_module(
+            "aiter.ops.triton._triton_kernels.gemm.grouped.gmm"
+        ).get_config
+        gfx, cu_num = device_key(torch.cuda.current_device())
+        bounds: dict[tuple[int, int, int], list[int]] = {}
+        for r in routing.table.rows:
+            if (r["gfx"], r["cu_num"]) == (gfx, str(cu_num)):
+                key = (int(r["G"]), int(r["N"]), int(r["K"]))
+                bounds.setdefault(key, []).append(int(r["M_max"]))
+        for (G, N, K), m_maxes in bounds.items():
+            lower = 1
+            for m_max in sorted(m_maxes):
+                self.assertEqual(
+                    get_config("gmm", lower, K, N, G),
+                    get_config("gmm", m_max, K, N, G),
+                    f"bucket {lower}..{m_max} of (G, N, K) = {(G, N, K)}",
+                )
+                lower = m_max + 1
 
     @skipUnlessRocm()
     def test_packed_large_operand_uses_tile_descriptors(self) -> None:
@@ -2983,7 +3024,9 @@ class BF16Tests(unittest.TestCase):
         out = torch.full(
             (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
         )
-        args = (x, w.permute(0, 2, 1), m_sizes, out)
+        # A reduced num_sms on aiter becomes gmm's grid_dim.
+        num_sms = 64 if backend == "aiter" else None
+        args = (x, w.permute(0, 2, 1), m_sizes, out, num_sms)
 
         with (
             force_backend(op, backend)
@@ -2991,7 +3034,13 @@ class BF16Tests(unittest.TestCase):
             else contextlib.nullcontext()
         ):
             served_by = routing.backend_for(*args)
-            actual = torch.ops.mslk.bf16bf16bf16_grouped_grad(*args)
+            # aiter warns when num_sms overrides its own grid.
+            with (
+                self.assertWarnsRegex(UserWarning, "grid dim with 64")
+                if served_by == "aiter" and num_sms is not None
+                else contextlib.nullcontext()
+            ):
+                actual = torch.ops.mslk.bf16bf16bf16_grouped_grad(*args)
 
         expected = _grouped_reference(x, w, m_sizes)
         torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
