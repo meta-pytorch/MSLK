@@ -43,7 +43,7 @@ def supports_nvfp4():
 
 def supports_mxfp4():
     if is_rocm():
-        return gfx_arch_in(["gfx950"])
+        return gfx_arch_in(["gfx950", "gfx1250"])
     return compute_capability_in(10)
 
 
