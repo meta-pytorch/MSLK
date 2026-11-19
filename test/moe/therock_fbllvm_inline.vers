@@ -1,3 +1,0 @@
-FBLLVM_21 {
-    global: *llvm*; LLVM*;
-};
