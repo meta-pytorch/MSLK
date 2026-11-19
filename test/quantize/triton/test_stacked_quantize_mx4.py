@@ -50,7 +50,7 @@ def _slice_padded_scales(scales_flat, padded_start, padded_rows, padded_cols):
     return scales_flat[start:end]
 
 
-@skipUnlessGfxArch("gfx950")
+@skipUnlessGfxArch("gfx950", "gfx1250")
 @skipUnlessCudaCapability(10)
 class StackedQuantizeMX4Test(unittest.TestCase):
     """Bitwise-vs-torch-reference tests for stacked (MoE) MX4 quantization."""
