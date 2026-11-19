@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 # pyre-unsafe
 
+import importlib.util
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -43,8 +44,7 @@ def _flydsl_splitk_forward(
 
 @register_operator
 class FwOp(AttentionFwOpBase):
-    # Python callable rather than a torch.ops handle (cf. triton_splitk.FwOp).
-    OPERATOR = staticmethod(is_flydsl_available)
+    OPERATOR = True if importlib.util.find_spec("flydsl") else None
     SUPPORTED_DEVICES = {"cuda"}
     SUPPORTED_GFX_ARCHS = {"gfx942", "gfx950"}
     SUPPORTED_DTYPES = {
