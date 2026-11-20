@@ -528,9 +528,20 @@ class FP8Tests(unittest.TestCase):
         Bias: bool,
         mode: str,
     ) -> None:
-        # AMD CK FP8 batched gemm does not support N < 512 or K < 512.
-        # Funny enough, grouped gemm does not have this restriction.
-        if mode == "default" and torch.version.hip and (N < 512 or K < 512):
+        # AMD CK FP8 batched gemm does not support N < 512 or K < 512. FlyDSL
+        # has no such limit, and serves the op wherever it is available and
+        # supports the GPU -- the same test mslk/gemm/__init__.py makes.
+        flydsl_serves = False
+        if torch.version.hip and is_flydsl_version_at_least():
+            from mslk.gemm.flydsl.fp8_rowwise_gemm import is_supported
+
+            flydsl_serves = is_supported()
+        if (
+            mode == "default"
+            and torch.version.hip
+            and not flydsl_serves
+            and (N < 512 or K < 512)
+        ):
             return
 
         x = (
@@ -4467,6 +4478,223 @@ class FlyDSLRowwisePreshuffleTest(unittest.TestCase):
             (xq.view(2, 64, 1024), preshuffle_b_mfma(wq), x_scale.view(2, 64), w_scale),
             test_utils=("test_faketensor",),
         )
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942", "gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLRowwiseTest(unittest.TestCase):
+    """Companion of the rowwise mode in ``test_gemm``: the f16, out and batched
+    ops, every shape the CK ops take (any N and K, not only tile multiples),
+    and the CK contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _quantized(self, *shape_x: int, n: int) -> tuple[torch.Tensor, ...]:
+        k = shape_x[-1]
+        x = torch.randn(*shape_x, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(*shape_x[:-2], n, k, dtype=torch.bfloat16, device=self.device)
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w * 0.01)
+        return xq, wq, x_scale, w_scale
+
+    @staticmethod
+    def _reference(
+        xq: torch.Tensor, wq: torch.Tensor, x_scale: torch.Tensor, w_scale: torch.Tensor
+    ) -> torch.Tensor:
+        out = xq.float() @ wq.float().transpose(-1, -2)
+        return out * x_scale[..., None] * w_scale[..., None, :]
+
+    @parameterized.expand(
+        [
+            (M, N, K, op, dtype)
+            # All but the first two stop mid-tile in N and/or K; the last four
+            # stop mid-load or mid-store too.
+            for M, N, K in [
+                (1, 4096, 4096),
+                (300, 2048, 7168),
+                (33, 1040, 1104),
+                (37, 1000, 1000),
+                (16, 1028, 514),
+                (3, 100, 8),
+                (16, 7, 33),
+            ]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int, op: str, dtype: torch.dtype) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(M, K, n=N)
+        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_out(self) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(33, 1104, n=1040)
+        out = torch.full(
+            (33, 1040), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+
+    def test_out_flattened(self) -> None:
+        # As CK, the output's leading dims only have to flatten to XQ's rows.
+        xq, wq, x_scale, w_scale = self._quantized(6, 512, n=256)
+        out = torch.full(
+            (6, 256), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_out(
+            xq.view(2, 3, 512), wq, x_scale.view(2, 3), w_scale, out
+        )
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        with self.assertRaisesRegex(RuntimeError, "rows"):
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out[:5])
+
+    @parameterized.expand(
+        [(4, 64, 256, 512), (3, 1, 1024, 4096), (2, 300, 1040, 1104), (2, 37, 100, 520)]
+    )
+    def test_batched(self, B: int, M: int, N: int, K: int) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(B, M, K, n=N)
+        ref = self._reference(xq, wq, x_scale, w_scale)
+        out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        buf = torch.full(
+            (B, M, N), float("nan"), dtype=torch.bfloat16, device=self.device
+        )
+        torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale, output=buf)
+        torch.testing.assert_close(buf.float(), ref, atol=1e-3, rtol=1e-2)
+
+    @parameterized.expand(
+        [
+            (shape, n, op, dtype)
+            for shape, n in [((0, 256), 64), ((2, 0, 3, 256), 64), ((3, 256), 0)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_empty_dimensions(
+        self, shape: tuple[int, ...], n: int, op: str, dtype: torch.dtype
+    ) -> None:
+        xq = torch.empty(shape, dtype=fp8_e4m3, device=self.device)
+        wq = torch.empty((n, shape[-1]), dtype=fp8_e4m3, device=self.device)
+        x_scale = torch.ones(shape[:-1], dtype=torch.float32, device=self.device)
+        w_scale = torch.ones(n, dtype=torch.float32, device=self.device)
+
+        out = getattr(torch.ops.mslk, op)(xq, wq, x_scale, w_scale)
+
+        self.assertEqual(out.shape, (*shape[:-1], n))
+        self.assertEqual(out.dtype, dtype)
+        torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+
+    @parameterized.expand(
+        [
+            (leading_shape, op, dtype)
+            for leading_shape in [(), (3,), (2, 3, 5)]
+            for op, dtype in [
+                ("f8f8bf16_rowwise", torch.bfloat16),
+                ("f8f8f16_rowwise", torch.float16),
+            ]
+        ]
+    )
+    def test_leading_dimensions(
+        self, leading_shape: tuple[int, ...], op: str, dtype: torch.dtype
+    ) -> None:
+        # Any leading dims, as CK takes them; opcheck holds the fake kernel to
+        # the same output shape as the real one.
+        xq, wq, x_scale, w_scale = self._quantized(prod(leading_shape), 192, n=80)
+        inputs = (
+            xq.view(*leading_shape, 192),
+            wq,
+            x_scale.reshape(leading_shape),
+            w_scale,
+        )
+
+        out = getattr(torch.ops.mslk, op)(*inputs)
+
+        self.assertEqual(out.shape, (*leading_shape, 80))
+        self.assertEqual(out.dtype, dtype)
+        ref = self._reference(xq, wq, x_scale, w_scale).view(*leading_shape, 80)
+        torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+        torch.library.opcheck(
+            getattr(torch.ops.mslk, op), inputs, test_utils=("test_faketensor",)
+        )
+
+    def test_rejects_what_ck_rejects(self) -> None:
+        op = torch.ops.mslk.f8f8bf16_rowwise
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        bias = torch.zeros(256, dtype=torch.bfloat16, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            op(xq, wq, x_scale, w_scale, bias)
+        with self.assertRaisesRegex(RuntimeError, "fused bias"):
+            torch.ops.mslk.f8f8bf16_rowwise_batched(
+                xq[None], wq[None], x_scale[None], w_scale[None], bias[None]
+            )
+        with self.assertRaisesRegex(RuntimeError, "use_fast_accum"):
+            op(xq, wq, x_scale, w_scale, None, False)
+        with self.assertRaisesRegex(RuntimeError, "float32"):
+            op(xq, wq, x_scale.bfloat16(), w_scale)
+        with self.assertRaisesRegex(RuntimeError, "scale"):
+            op(xq, wq, x_scale[:-1], w_scale)
+        with self.assertRaisesRegex(RuntimeError, "float8|dtype"):
+            op(xq.float(), wq.float(), x_scale, w_scale)
+
+    @skipUnlessGfxArch("gfx950")
+    def test_fnuz_on_gfx950_names_the_override(self) -> None:
+        # MSLK_ROCM_FORCE_FP8FNUZ_TYPE makes MSLK's quantizers emit fnuz on
+        # gfx950, whose kernels read OCP FP8; the error has to say so.
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        fnuz = torch.float8_e4m3fnuz
+        xq, wq = xq.view(torch.int8).view(fnuz), wq.view(torch.int8).view(fnuz)
+        with self.assertRaisesRegex(RuntimeError, "MSLK_ROCM_FORCE_FP8FNUZ_TYPE"):
+            torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale)
+
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
+    def test_rejects_output_on_another_device(self) -> None:
+        xq, wq, x_scale, w_scale = self._quantized(16, 512, n=256)
+        other = (xq.device.index + 1) % torch.cuda.device_count()
+        out = torch.empty(16, 256, dtype=torch.bfloat16, device=f"cuda:{other}")
+        with self.assertRaisesRegex(RuntimeError, "device"):
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+
+    @unittest.skipUnless(torch.cuda.device_count() > 1, "requires two AMD GPUs")
+    def test_same_shape_on_every_device(self) -> None:
+        # A compiled kernel is loaded into one GPU, so one cached per shape
+        # alone would fail on every GPU but the first to run that shape. The
+        # current device stays the default throughout.
+        torch.manual_seed(0)
+        x = torch.randn(2, 48, 512, dtype=torch.bfloat16) * 0.1
+        w = torch.randn(2, 256, 512, dtype=torch.bfloat16) * 0.01
+        for index in range(torch.cuda.device_count()):
+            device = torch.device("cuda", index)
+            xq, x_scale = quantize_fp8_row(x.to(device))
+            wq, w_scale = quantize_fp8_row(w.to(device))
+            ref = self._reference(xq, wq, x_scale, w_scale)
+            out = torch.ops.mslk.f8f8bf16_rowwise_batched(xq, wq, x_scale, w_scale)
+            self.assertEqual(out.device, device)
+            torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
+            xq, x_scale, wq, w_scale = xq[0], x_scale[0], wq[0], w_scale[0]
+            ref = self._reference(xq, wq, x_scale, w_scale)
+            out = torch.empty(48, 256, dtype=torch.bfloat16, device=device)
+            torch.ops.mslk.f8f8bf16_rowwise_out(xq, wq, x_scale, w_scale, out)
+            for y in (
+                torch.ops.mslk.f8f8bf16_rowwise(xq, wq, x_scale, w_scale),
+                torch.ops.mslk.f8f8f16_rowwise(xq, wq, x_scale, w_scale),
+                out,
+            ):
+                self.assertEqual(y.device, device)
+                torch.testing.assert_close(y.float(), ref, atol=1e-3, rtol=1e-2)
 
 
 @skipUnlessRocm()

@@ -8,7 +8,7 @@ import functools
 import importlib
 from collections.abc import Callable
 from types import ModuleType
-from typing import Optional
+from typing import Any, Optional
 
 from mslk.utils.torch.library import load_library_buck
 
@@ -61,6 +61,12 @@ if torch.version.hip is not None:
     #
     # Targets that want the FlyDSL kernels depend on flydsl_ops themselves; the
     # lazy imports below then resolve, and Triton serves everyone else.
+    def _min_flydsl() -> str:
+        """The oldest FlyDSL the kernels run on, for error messages."""
+        from mslk.flydsl.common import MIN_FLYDSL_VERSION
+
+        return MIN_FLYDSL_VERSION
+
     @functools.lru_cache(maxsize=8)
     def _flydsl_gemm_module(name: str) -> ModuleType | None:
         """A FlyDSL gemm module by name, or None when it is not opted into.
@@ -69,11 +75,15 @@ if torch.version.hip is not None:
         import ...``: this package deliberately does not depend on
         ``//mslk/mslk/gemm:flydsl_ops``, so the module is genuinely absent
         unless the caller opted in, and a static import would not resolve.
+
+        An installed FlyDSL older than ``MIN_FLYDSL_VERSION`` counts as absent:
+        it imports cleanly and then fails inside kernel compilation, so the op
+        has to fall back before it gets that far.
         """
         try:
-            from mslk.flydsl.common import is_flydsl_available
+            from mslk.flydsl.common import is_flydsl_version_at_least
 
-            if not is_flydsl_available():
+            if not is_flydsl_version_at_least():
                 return None
             return importlib.import_module(f"mslk.gemm.flydsl.{name}")
         except ImportError:
@@ -161,8 +171,8 @@ if torch.version.hip is not None:
                 if mod is None:
                     raise RuntimeError(
                         "mslk::f8f8bf16_groupwise_grouped_preshuffle requires the "
-                        "FlyDSL backend. Add //mslk/mslk/gemm:flydsl_ops to your "
-                        "target's deps."
+                        f"FlyDSL backend, version {_min_flydsl()} or newer. Add "
+                        "//mslk/mslk/gemm:flydsl_ops to your target's deps."
                     )
                 return mod.matmul_f8f8bf16_groupwise_grouped_preshuffle(
                     XQ, WQ, x_scale, w_scale, M_sizes
@@ -239,44 +249,50 @@ if torch.version.hip is not None:
                 _bf16bf16bf16_grouped_stacked_rocm
             )
 
-    if hasattr(torch.ops, "mslk") and hasattr(
-        torch.ops.mslk, "_f8f8bf16_rowwise_preshuffle_ck"
-    ):
+    # The FP8 rowwise ops, preshuffled and plain, are bound to CK in C++ only
+    # under private ``_<op>_ck`` names. Each public op is served by the named
+    # FlyDSL module where it is opted into and supports the GPU the inputs are
+    # on, and by that CK op otherwise.
+    @functools.lru_cache(maxsize=None)
+    def _rowwise_impl(module: str, op: str, device_index: int) -> Callable[..., Any]:
+        with torch.cuda.device(device_index):
+            mod = _flydsl_gemm_module(module)
+            if mod is not None and mod.is_supported():
+                return getattr(mod, f"matmul_{op}")
+        return getattr(torch.ops.mslk, f"_{op}_ck")
 
-        @functools.lru_cache(maxsize=None)
-        def _rowwise_preshuffle_impl(
-            op: str, device_index: int
-        ) -> Callable[..., torch.Tensor]:
+    def _rowwise_rocm(module: str, op: str) -> Callable[..., Any]:
+        def _impl(XQ: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            device_index = XQ.get_device()
             with torch.cuda.device(device_index):
-                mod = _flydsl_gemm_module("preshuffle_gemm")
-                if mod is not None and mod.is_supported():
-                    return getattr(mod, f"matmul_{op}")
-            return getattr(torch.ops.mslk, f"_{op}_ck")
+                return _rowwise_impl(module, op, device_index)(XQ, *args, **kwargs)
 
-        def _rowwise_preshuffle_rocm(op: str) -> Callable[..., torch.Tensor]:
-            def _impl(
-                XQ: torch.Tensor,
-                WQ: torch.Tensor,
-                x_scale: torch.Tensor,
-                w_scale: torch.Tensor,
-                bias: Optional[torch.Tensor] = None,
-                use_fast_accum: bool = True,
-            ) -> torch.Tensor:
-                device_index = XQ.get_device()
-                with torch.cuda.device(device_index):
-                    return _rowwise_preshuffle_impl(op, device_index)(
-                        XQ, WQ, x_scale, w_scale, bias, use_fast_accum
-                    )
+        return _impl
 
-            return _impl
-
-        for _op in ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"):
-            if not torch._C._dispatch_has_kernel_for_dispatch_key(
-                f"mslk::{_op}", "CUDA"
-            ):
-                torch.library.impl(f"mslk::{_op}", "CUDA")(
-                    _rowwise_preshuffle_rocm(_op)
+    for _module, _ops in (
+        (
+            "preshuffle_gemm",
+            ("f8f8bf16_rowwise_preshuffle", "f8f8f16_rowwise_preshuffle"),
+        ),
+        (
+            "fp8_rowwise_gemm",
+            (
+                "f8f8bf16_rowwise",
+                "f8f8bf16_rowwise_out",
+                "f8f8f16_rowwise",
+                "f8f8bf16_rowwise_batched",
+            ),
+        ),
+    ):
+        for _op in _ops:
+            if (
+                hasattr(torch.ops, "mslk")
+                and hasattr(torch.ops.mslk, f"_{_op}_ck")
+                and not torch._C._dispatch_has_kernel_for_dispatch_key(
+                    f"mslk::{_op}", "CUDA"
                 )
+            ):
+                torch.library.impl(f"mslk::{_op}", "CUDA")(_rowwise_rocm(_module, _op))
 
     if hasattr(torch.ops, "mslk") and hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
 
@@ -325,9 +341,10 @@ if torch.version.hip is not None:
                     if mod is None or not mod.is_supported():
                         raise RuntimeError(
                             "mslk::f8f8bf16_blockwise_preshuffle requires the "
-                            "FlyDSL backend on a gfx942 or gfx950 device and has "
-                            "no Triton fallback. Add //mslk/mslk/gemm:flydsl_ops "
-                            "to your target's deps."
+                            f"FlyDSL backend, version {_min_flydsl()} or newer, on "
+                            "a gfx942 or gfx950 device and has no Triton "
+                            "fallback. Add //mslk/mslk/gemm:flydsl_ops to your "
+                            "target's deps."
                         )
                     return mod.matmul_f8f8bf16_blockwise_preshuffle(
                         XQ, WQ, x_scale, w_scale, block_m, block_n, block_k
@@ -341,13 +358,13 @@ if torch.version.hip is not None:
         """The FlyDSL rowwise grouped module, or None when not opted into.
 
         Resolved the same way as the groupwise one above, and for the same
-        reason: this package must not depend on
-        ``//mslk/mslk/gemm:flydsl_ops``.
+        reasons: this package must not depend on
+        ``//mslk/mslk/gemm:flydsl_ops``, and an out-of-date FlyDSL is absent.
         """
         try:
-            from mslk.flydsl.common import is_flydsl_available
+            from mslk.flydsl.common import is_flydsl_version_at_least
 
-            if not is_flydsl_available():
+            if not is_flydsl_version_at_least():
                 return None
             return importlib.import_module("mslk.gemm.flydsl.fp8_rowwise_grouped_gemm")
         except ImportError:
@@ -367,8 +384,9 @@ if torch.version.hip is not None:
             mod = _flydsl_rowwise_grouped_module()
             if mod is None:
                 raise RuntimeError(
-                    f"mslk::{op} requires the FlyDSL backend. Add "
-                    "//mslk/mslk/gemm:flydsl_ops to your target's deps."
+                    f"mslk::{op} requires the FlyDSL backend, version "
+                    f"{_min_flydsl()} or newer. Add //mslk/mslk/gemm:flydsl_ops "
+                    "to your target's deps."
                 )
             return getattr(mod, fn)(*args)
 
