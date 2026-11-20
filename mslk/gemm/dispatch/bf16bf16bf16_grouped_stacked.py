@@ -14,13 +14,37 @@
   written by ``bench/aiter/tune_bf16bf16bf16_grouped_stacked.py``.
 """
 
+import functools
+import logging
 from typing import Optional, Sequence, Tuple
 
 import torch
+from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import MSLK, OpRouting
+from mslk.flydsl.autotune import autotune_enabled, AUTOTUNE_ENV
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 OP: str = "bf16bf16bf16_grouped_stacked"
 AITER: str = "aiter"
+
+
+def warn_if_not_autotuned() -> None:
+    """Warn once if the table routes calls while MSLK's FlyDSL kernel runs its
+    default tile: the table was tuned against the autotuned kernel."""
+    if not autotune_enabled() and is_aiter_enabled(OP):
+        _warn_not_autotuned()
+
+
+@functools.cache
+def _warn_not_autotuned() -> None:
+    logger.warning(
+        "%s is routed by a table tuned with %s set, but it is not set, so MSLK's "
+        "kernel runs its default tile; set %s=1 for the table's choices to hold.",
+        OP,
+        AUTOTUNE_ENV,
+        AUTOTUNE_ENV,
+    )
 
 
 # Backends are imported on first use: importing mslk.gemm must not pull in

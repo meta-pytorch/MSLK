@@ -368,7 +368,7 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
 # gfx950, so that the ops' tests cover aiter's kernel as well as MSLK's.
 _BF16_GROUPED_STACKED_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
     (8, 28672, 4096, 3000),
-    (16, 16384, 5120, 6000),
+    (16, 16384, 5120, 12000),
 )
 _BF16_GROUPED_GRAD_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
     (8, 14336, 4096, 6000),

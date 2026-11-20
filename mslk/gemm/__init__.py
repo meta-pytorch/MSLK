@@ -229,8 +229,10 @@ if torch.version.hip is not None:
             # Imported on first call, like the backends it chooses between.
             from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import (
                 ROUTING as _grouped_stacked_routing,
+                warn_if_not_autotuned,
             )
 
+            warn_if_not_autotuned()
             with torch.cuda.device(X.get_device()):
                 return _grouped_stacked_routing(X, W, M_sizes, out, num_sms)
 

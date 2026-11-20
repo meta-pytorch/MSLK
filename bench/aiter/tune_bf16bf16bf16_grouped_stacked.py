@@ -13,6 +13,11 @@ itself (incremental runs, multi-GPU, timing, choosing) is
 :mod:`mslk.aiter.tuning`; this file holds only what is specific to the op. Needs
 the pinned aiter and a gfx950 GPU.
 
+MSLK's FlyDSL kernel picks its tile by autotuning only with
+``MSLK_AUTOTUNE_ENABLE``, which this script sets unless it is already set, so
+aiter is compared with the tuned kernel. Group sizes are drawn from the seed the
+tuning driver sets per shape, so every run times the same split.
+
 Correctness: the reference is the FP32 product of the BF16 inputs, group by
 group, which the kernels match up to summation order and BF16 rounding, so the
 tolerance is tight (rtol = atol = 1e-2, aiter's default). Inputs are
@@ -23,6 +28,7 @@ Example, on four GPUs (run from the repository root):
     HIP_VISIBLE_DEVICES=0,1,2,3 python bench/aiter/tune_bf16bf16bf16_grouped_stacked.py --mp 4
 """
 
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -90,6 +96,7 @@ class BF16GroupedStackedTuner(OpTuner):
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("MSLK_AUTOTUNE_ENABLE", "1")
     tuning.main(
         BF16GroupedStackedTuner(),
         untune_file=str(REPO / "bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv"),

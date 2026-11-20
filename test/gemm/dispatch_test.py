@@ -12,6 +12,7 @@ it. Adding a routed op means adding one entry to ``CASES``.
 """
 
 import math
+import os
 import unittest
 from typing import Any, Callable, Dict, List, Tuple
 from unittest import mock
@@ -20,6 +21,7 @@ import mslk.gemm  # noqa: F401
 import torch
 from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import device_key, OpRouting
+from mslk.flydsl.autotune import AUTOTUNE_ENV
 from mslk.gemm.dispatch import (
     bf16bf16bf16_grouped_grad,
     bf16bf16bf16_grouped_stacked,
@@ -121,6 +123,28 @@ class DispatchTest(unittest.TestCase):
                 op(*args, **kwargs)
             for backend, spy in spies.items():
                 self.assertEqual(spy.call_count, int(backend == expected), row)
+
+
+class AutotuneWarningTest(unittest.TestCase):
+    def setUp(self) -> None:
+        bf16bf16bf16_grouped_stacked._warn_not_autotuned.cache_clear()
+        enabled = mock.patch.object(
+            bf16bf16bf16_grouped_stacked, "is_aiter_enabled", return_value=True
+        )
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
+    def test_warns_once_without_autotuning(self) -> None:
+        with mock.patch.dict(os.environ, {AUTOTUNE_ENV: ""}):
+            with self.assertLogs(bf16bf16bf16_grouped_stacked.logger) as logs:
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
+        self.assertEqual(len(logs.records), 1)
+
+    def test_silent_with_autotuning(self) -> None:
+        with mock.patch.dict(os.environ, {AUTOTUNE_ENV: "1"}):
+            with self.assertNoLogs(bf16bf16bf16_grouped_stacked.logger):
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
 
 
 if __name__ == "__main__":

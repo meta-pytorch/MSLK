@@ -14,8 +14,8 @@ this file holds only what is specific to the op. Needs the pinned aiter and a
 gfx950 GPU.
 
 The op is the input gradient of a grouped GEMM; ``W`` is passed as the
-``[G, N, K]`` view of a ``[G, K, N]`` weight. Group sizes, reference and
-tolerance are as in ``tune_bf16bf16bf16_grouped_stacked.py``.
+``[G, N, K]`` view of a ``[G, K, N]`` weight. Group sizes (seeded per shape),
+reference and tolerance are as in ``tune_bf16bf16bf16_grouped_stacked.py``.
 
 Example, on four GPUs (run from the repository root):
 
