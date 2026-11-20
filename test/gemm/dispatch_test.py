@@ -18,7 +18,7 @@ from unittest import mock
 
 import mslk.gemm  # noqa: F401
 import torch
-from mslk.aiter.common import is_aiter_available
+from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import device_key, OpRouting
 from mslk.gemm.dispatch import f4f4bf16
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
@@ -60,8 +60,10 @@ class DispatchTest(unittest.TestCase):
         op: Callable[..., Any],
         make_args: Callable[..., Args],
     ) -> None:
-        if not is_aiter_available():
-            self.skipTest("requires the pinned aiter")
+        # Off when aiter is not installed, or switched off for the op (e.g.
+        # MSLK_DISABLE_AITER=1); MSLK's kernel then serves every call.
+        if not is_aiter_enabled(routing.op):
+            self.skipTest("requires the pinned aiter, enabled for the op")
         gfx, cu_num = device_key(torch.cuda.current_device())
         table = routing.table
         columns = table.key_columns + (table.bucket_column,)
