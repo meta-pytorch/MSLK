@@ -226,11 +226,15 @@ if torch.version.hip is not None:
                     f"out must hold {total_m * n} elements, got {out.numel()}"
                 )
                 assert out.is_contiguous(), "out must be contiguous"
-            device_index = X.get_device()
-            with torch.cuda.device(device_index):
-                return _bf16bf16bf16_grouped_stacked_impl(device_index)(
-                    X, W, M_sizes, out, num_sms
-                )
+            # Imported on first call, like the backends it chooses between.
+            from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import (
+                ROUTING as _grouped_stacked_routing,
+                warn_if_not_autotuned,
+            )
+
+            warn_if_not_autotuned()
+            with torch.cuda.device(X.get_device()):
+                return _grouped_stacked_routing(X, W, M_sizes, out, num_sms)
 
         if not torch._C._dispatch_has_kernel_for_dispatch_key(
             "mslk::bf16bf16bf16_grouped_stacked", "CUDA"

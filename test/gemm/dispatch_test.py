@@ -12,15 +12,21 @@ it. Adding a routed op means adding one entry to ``CASES``.
 """
 
 import math
+import os
 import unittest
 from typing import Any, Callable, Dict, List, Tuple
 from unittest import mock
 
 import mslk.gemm  # noqa: F401
 import torch
-from mslk.aiter.common import is_aiter_available
+from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import device_key, OpRouting
-from mslk.gemm.dispatch import f4f4bf16
+from mslk.flydsl.autotune import AUTOTUNE_ENV
+from mslk.gemm.dispatch import (
+    bf16bf16bf16_grouped_grad,
+    bf16bf16bf16_grouped_stacked,
+    f4f4bf16,
+)
 from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
 from mslk.testing.device import skipUnlessRocm
 from parameterized import parameterized
@@ -39,6 +45,29 @@ def _f4f4bf16_args(row: Dict[str, str]) -> Args:
     return (aq, bq, a_scale, b_scale), {}
 
 
+def _group_sizes(M: int, G: int) -> torch.Tensor:
+    """M rows spread as evenly as possible over G groups."""
+    sizes = torch.full((G,), M // G, dtype=torch.int64)
+    sizes[: M % G] += 1
+    return sizes.cuda()
+
+
+def _bf16bf16bf16_grouped_stacked_args(row: Dict[str, str]) -> Args:
+    M, G = int(row["M_max"]), int(row["G"])
+    N, K = int(row["N"]), int(row["K"])
+    X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    W = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16)
+    return (X, W, _group_sizes(M, G)), {}
+
+
+def _bf16bf16bf16_grouped_grad_args(row: Dict[str, str]) -> Args:
+    M, G = int(row["M_max"]), int(row["G"])
+    N, K = int(row["N"]), int(row["K"])
+    X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    W = torch.randn(G, K, N, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1)
+    return (X, W, _group_sizes(M, G)), {}
+
+
 # (name, routing, the registered op, arguments for a table row)
 CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
     (
@@ -46,6 +75,18 @@ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
         f4f4bf16.ROUTING,
         lambda *a, **kw: torch.ops.mslk.f4f4bf16(*a, **kw),
         _f4f4bf16_args,
+    ),
+    (
+        "bf16bf16bf16_grouped_stacked",
+        bf16bf16bf16_grouped_stacked.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.bf16bf16bf16_grouped_stacked(*a, **kw),
+        _bf16bf16bf16_grouped_stacked_args,
+    ),
+    (
+        "bf16bf16bf16_grouped_grad",
+        bf16bf16bf16_grouped_grad.ROUTING,
+        lambda *a, **kw: torch.ops.mslk.bf16bf16bf16_grouped_grad(*a, **kw),
+        _bf16bf16bf16_grouped_grad_args,
     ),
 ]
 
@@ -60,8 +101,10 @@ class DispatchTest(unittest.TestCase):
         op: Callable[..., Any],
         make_args: Callable[..., Args],
     ) -> None:
-        if not is_aiter_available():
-            self.skipTest("requires the pinned aiter")
+        # Off when aiter is not installed, or switched off for the op (e.g.
+        # MSLK_DISABLE_AITER=1); MSLK's kernel then serves every call.
+        if not is_aiter_enabled(routing.op):
+            self.skipTest("requires the pinned aiter, enabled for the op")
         gfx, cu_num = device_key(torch.cuda.current_device())
         table = routing.table
         columns = table.key_columns + (table.bucket_column,)
@@ -80,6 +123,28 @@ class DispatchTest(unittest.TestCase):
                 op(*args, **kwargs)
             for backend, spy in spies.items():
                 self.assertEqual(spy.call_count, int(backend == expected), row)
+
+
+class AutotuneWarningTest(unittest.TestCase):
+    def setUp(self) -> None:
+        bf16bf16bf16_grouped_stacked._warn_not_autotuned.cache_clear()
+        enabled = mock.patch.object(
+            bf16bf16bf16_grouped_stacked, "is_aiter_enabled", return_value=True
+        )
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
+    def test_warns_once_without_autotuning(self) -> None:
+        with mock.patch.dict(os.environ, {AUTOTUNE_ENV: ""}):
+            with self.assertLogs(bf16bf16bf16_grouped_stacked.logger) as logs:
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
+        self.assertEqual(len(logs.records), 1)
+
+    def test_silent_with_autotuning(self) -> None:
+        with mock.patch.dict(os.environ, {AUTOTUNE_ENV: "1"}):
+            with self.assertNoLogs(bf16bf16bf16_grouped_stacked.logger):
+                bf16bf16bf16_grouped_stacked.warn_if_not_autotuned()
 
 
 if __name__ == "__main__":

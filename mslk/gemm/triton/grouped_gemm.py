@@ -1404,9 +1404,9 @@ _MIN_M_PER_GROUP = 8
 def _assert_m_sizes_min(m_sizes: torch.Tensor, op_name: str) -> None:
     """Ensure every non-empty group has m_size >= _MIN_M_PER_GROUP.
 
-    Matches the host-side guard requested for the Triton ports: groups of size
-    0 are allowed (and skipped inside the kernel), but any non-empty group
-    smaller than _MIN_M_PER_GROUP would land on an MFMA-tile edge case.
+    Host-side guard of the wgrad Triton port: groups of size 0 are allowed
+    (and skipped inside the kernel), but any non-empty group smaller than
+    _MIN_M_PER_GROUP would land on an MFMA-tile edge case.
     """
     sizes = m_sizes.tolist()
     for g, s in enumerate(sizes):
@@ -1474,8 +1474,6 @@ def grouped_gemm_dgrad(
 
     if total_M == 0:
         return y.view(total_M, N)
-
-    _assert_m_sizes_min(m_sizes, "grouped_gemm_dgrad")
 
     if num_sms is None:
         num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
@@ -1612,7 +1610,12 @@ def _register_rocm_grad_ops() -> None:
         out: Optional[torch.Tensor] = None,
         num_sms: Optional[int] = None,
     ) -> torch.Tensor:
-        return grouped_gemm_dgrad(X, W, M_sizes, out=out, num_sms=num_sms)
+        # Imported on first call, like the backends it chooses between.
+        from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import (
+            ROUTING as _grouped_grad_routing,
+        )
+
+        return _grouped_grad_routing(X, W, M_sizes, out, num_sms)
 
     @torch.library.impl("mslk::bf16bf16bf16_grouped_wgrad", "CUDA")
     def _bf16_grouped_wgrad_impl(
