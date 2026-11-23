@@ -88,6 +88,25 @@ def prune_by_divisibility(
     return prune
 
 
+def _with_hints(launch_fn):
+    """``launch_fn`` taking ``waves_per_eu`` from the active compile hints.
+
+    Keeps ``launch_fn``'s name and signature, which FlyDSL's autotuner reads
+    for the tuning cache file and the cache key.
+    """
+
+    @functools.wraps(launch_fn)
+    def launch(*args, **kwargs):
+        from flydsl.compiler.kernel_function import CompilationContext
+
+        hint = CompilationContext.get_compile_hints().get("waves_per_eu")
+        if hint is not None:
+            kwargs["waves_per_eu"] = hint
+        return launch_fn(*args, **kwargs)
+
+    return launch
+
+
 def tunable(
     *,
     configs: Sequence[Mapping[str, Any]],
@@ -105,6 +124,11 @@ def tunable(
     function's return value, so on the tuned path the wrapper hands back that
     argument instead, which requires the kernel to write into a caller-provided
     buffer.
+
+    A config's ``waves_per_eu`` reaches the wrapped function as a keyword
+    argument, like the other tuning parameters. FlyDSL's ``Config`` takes it as
+    a compiler hint instead and never passes it on, and MSLK's launchers apply
+    it themselves when they compile, so the hint is read back and forwarded.
     """
 
     def decorate(launch_fn):
@@ -120,7 +144,7 @@ def tunable(
                     configs=[Config(**dict(c)) for c in configs],
                     key=list(key),
                     prune_configs_by=prune,
-                )(launch_fn)
+                )(_with_hints(launch_fn))
                 state["tuner"] = tuner
             return tuner
 
