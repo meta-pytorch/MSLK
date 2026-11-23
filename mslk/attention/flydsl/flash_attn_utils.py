@@ -35,6 +35,7 @@ from flydsl.utils.smem_allocator import SmemPtr
 from mslk.flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
+from .dropout_philox import dropout_random_words, keep_flag, load_dropout_key
 from .split_arrival import (
     ARRIVAL_COUNTERS,
     arrive,
@@ -613,21 +614,6 @@ def _bf16_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
         ctx.elem_type, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
     )
     return llvm.FPExtOp(fx.Float32.ir_type, as_mlir_value(raw)).result
-
-
-def _u8_buffer_load_f32(ctx, rsrc, voff_bytes_i32):
-    """Bounded uint8 (0/1 dropout keep-mask) load from a buffer resource, to f32.
-
-    Same bounded-resource semantics as _bf16_buffer_load_f32 (an OOB tail row
-    reads 0 in hardware). The keep bit converts 0/1 -> 0.0/1.0; the 1/(1-p)
-    inverted-dropout scale is a constant factor applied to the attention output
-    by the caller (it factors out of the per-(q,k) sum), not here.
-    """
-    c0 = buffer_ops._create_i32_constant(0)
-    raw = rocdl.raw_ptr_buffer_load(
-        T.i8, as_mlir_value(rsrc), as_mlir_value(voff_bytes_i32), c0, 0
-    )
-    return llvm.UIToFPOp(fx.Float32.ir_type, as_mlir_value(raw)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
@@ -1777,7 +1763,9 @@ def _make_flash_attn_generic_traits(
         and not enable_gfx942_kv_gpfetch
         and not enable_dma
     )
-    # Bias and dropout gather both column halves; paged inputs reject them.
+    # Bias and dropout need both column halves. Wave split-K is only enabled
+    # with paged GQA packing, which paged inputs never combine with them: paged
+    # rejects bias, and paged dropout disables GQA packing.
     assert not (enable_wave_splitk and (has_bias or has_dropout))
     enable_gfx942_vec_k = (
         gpu_arch.startswith("gfx942")
@@ -2870,21 +2858,12 @@ class GenericFlashAttnContext:
             base_byte_offset=as_mlir_value(plane_off_bytes),
         )
 
-    def init_dropout(self, Dropout, drop_stride_b, drop_stride_h, drop_stride_q):
-        # Same bounded-plane-resource scheme as init_bias.
-        eb = 1  # bytes per element; the dropout keep-mask is uint8 (0/1)
-        self.drop_stride_q = fx.Int32(drop_stride_q)
-        plane_off_bytes = (
-            fx.Index(self.batch_idx) * fx.Index(drop_stride_b)
-            + fx.Index(self.q_head_idx) * fx.Index(drop_stride_h)
-        ) * fx.Index(eb)
-        self.drop_rsrc = buffer_ops.create_buffer_resource(
-            Dropout,
-            max_size=False,
-            num_records_bytes=as_mlir_value(
-                self.seqlen_q_b * fx.Index(drop_stride_q * eb)
-            ),
-            base_byte_offset=as_mlir_value(plane_off_bytes),
+    def init_dropout(self, DropoutSeed, drop_threshold):
+        # Philox key and b * H + h counter word (see dropout_philox).
+        self.drop_key = load_dropout_key(DropoutSeed)
+        self.drop_threshold = drop_threshold
+        self.drop_bh = self.batch_idx * fx.Index(self.traits.NUM_HEADS_Q) + fx.Index(
+            self.q_head_idx
         )
 
     def init_q_row(self):
@@ -4139,27 +4118,22 @@ class GenericSoftmaxHelper:
         return s_raw_lo, s_raw_hi
 
     def apply_dropout(self, p_vals_lo, p_vals_hi, kv_start):
-        # Multiply the 32 post-softmax probabilities by the uint8 keep bit
-        # M[q_row, kv_col] (0 or 1). Same fragment gather as add_bias, applied
-        # after online_softmax. The 1/(1-p) scale is applied to the output.
+        # Zero dropped post-softmax probabilities (after online_softmax, so l/LSE
+        # exclude dropout; the caller applies 1/(1-p)). Each 4-column fragment run
+        # is 4-aligned, so one Philox call covers it.
         ctx = self.ctx
         traits = ctx.traits
-        col_base_i32, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
-        # Bounded plane resource (init_dropout) zero-fills OOB rows in hardware; these
-        # lanes are already zero post-softmax, so no index clamp is needed.
-        row_base_i32 = ctx.q_row_i32 * ctx.drop_stride_q
-        k_sub_i32 = fx.Int32(traits.K_SUB_N)
-        eb = fx.Int32(1)  # bytes per element (uint8 keep-mask)
-        for r in range_constexpr(16):
-            kv_col = col_base_i32 + fx.Int32(moff[r])
-            off_lo = (row_base_i32 + kv_col) * eb
-            # keep bit is 0/1; the 1/(1-p) scale is applied to the output by the
-            # caller (constant factor, so it factors out of the per-(q,k) sum).
-            m_lo = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_lo)
-            p_vals_lo[r] = _fmul(p_vals_lo[r], m_lo, ctx.fm_fast)
-            off_hi = (row_base_i32 + kv_col + k_sub_i32) * eb
-            m_hi = _u8_buffer_load_f32(ctx, ctx.drop_rsrc, off_hi)
-            p_vals_hi[r] = _fmul(p_vals_hi[r], m_hi, ctx.fm_fast)
+        assert not traits.KV_VECTORIZED, "dropout needs the linear KV layout"
+        col_base, moff = self._kv_mask_lane_off(fx.Int32(kv_start))
+        for half, p_vals in ((0, p_vals_lo), (traits.K_SUB_N, p_vals_hi)):
+            for g in range_constexpr(4):
+                col0 = fx.Index(col_base + fx.Int32(moff[4 * g] + half))
+                words = dropout_random_words(
+                    ctx.drop_key, ctx.drop_bh, fx.Index(ctx.q_row), col0
+                )
+                for j in range_constexpr(4):
+                    keep = keep_flag(words[j], ctx.drop_threshold)
+                    p_vals[4 * g + j] = _fmul(p_vals[4 * g + j], keep, ctx.fm_fast)
         return p_vals_lo, p_vals_hi
 
     def apply_kv_mask(self, s_raw_lo, s_raw_hi, kv_start):

@@ -9,6 +9,7 @@ import math
 import pytest
 import torch
 from mslk.attention.flydsl import flash_attn_interface as fai
+from mslk.attention.flydsl.dropout_philox import draw_dropout_seed, reference_keep_mask
 from mslk.attention.flydsl.flash_attn_interface import flydsl_flash_attn_func
 from paged_reference import spy
 
@@ -33,9 +34,8 @@ def _inputs(D, dtype, Sq, Skv, variant):
     if variant in ("bias", "combined"):
         kw["bias"] = torch.randn(1, 4, Sq, Skv, device="cuda", dtype=dtype) * 0.3
     if variant in ("dropout", "combined"):
-        kw["dropout_mask"] = (torch.rand(1, 4, Sq, Skv, device="cuda") > 0.25).to(
-            torch.uint8
-        )
+        kw["dropout_p"] = 0.25
+        kw["dropout_seed"] = draw_dropout_seed(q.device)
     if variant == "cross_top_left":
         kw["causal_top_left"] = True
     return q, k, v, kw
@@ -59,8 +59,11 @@ def _reference(q, k, v, kw):
         keep &= keys >= pos - kw["window_left"]
     scores.masked_fill_(~keep, -math.inf)
     probs = scores.softmax(-1)
-    if "dropout_mask" in kw:
-        probs *= kw["dropout_mask"]
+    if "dropout_seed" in kw:
+        # The kernel applies the keep bits but not the 1/(1-p) scale.
+        B, H = q.shape[0], q.shape[2]
+        seed = int(kw["dropout_seed"].item())
+        probs *= reference_keep_mask(seed, kw["dropout_p"], B, H, Sq, Skv, q.device)
     return torch.einsum("bhqk,bkhd->bqhd", probs, v), scores.logsumexp(-1)
 
 
@@ -101,10 +104,10 @@ def test_forced_splitk_preserves_dense_options(monkeypatch, D, dtype, variant):
     [
         ("cross", 64, 2047, False),
         ("cross", 64, 2048, True),
-        ("dropout", 64, 2047, False),
-        ("dropout", 64, 2048, True),
-        ("dropout", 128, 999, False),
-        ("dropout", 128, 1000, True),
+        ("dropout", 64, 767, False),
+        ("dropout", 64, 768, True),
+        ("dropout", 128, 767, False),
+        ("dropout", 128, 768, True),
     ],
 )
 def test_auto_splitk_cross_and_dropout(
@@ -136,23 +139,34 @@ def test_negative_split_count_rejected(varlen, splits):
         flydsl_flash_attn_func(q, q, q, num_kv_splits=splits, **kw)
 
 
+_SEED = torch.zeros(1, dtype=torch.int64)
+
+
 @pytest.mark.parametrize(
-    "modifier,dtype,device",
+    "modifier,kwargs",
     [
-        ("bias", torch.float32, "cuda"),
-        ("bias", torch.float16, "cuda"),
-        ("bias", torch.bfloat16, "cpu"),
-        ("dropout_mask", torch.float32, "cuda"),
-        ("dropout_mask", torch.bool, "cuda"),
-        ("dropout_mask", torch.uint8, "cpu"),
+        ("bias", {"bias": (torch.float32, "cuda")}),
+        ("bias", {"bias": (torch.float16, "cuda")}),
+        ("bias", {"bias": (torch.bfloat16, "cpu")}),
+        # Dropout needs both a nonzero dropout_p and a seed tensor.
+        ("dropout_p and dropout_seed", {"dropout_p": 0.25}),
+        ("dropout_p and dropout_seed", {"dropout_seed": _SEED}),
+        ("dropout_p and dropout_seed", {"dropout_p": 0.0, "dropout_seed": _SEED}),
     ],
 )
-def test_dense_modifier_abi_rejected(monkeypatch, modifier, dtype, device):
+def test_dense_modifier_abi_rejected(monkeypatch, modifier, kwargs):
     def reject_build(*args, **kwargs):
         raise AssertionError("Invalid modifier reached kernel compilation")
 
     monkeypatch.setattr(fai, "_build_dense", reject_build)
     q = torch.randn(1, 64, 4, 64, device="cuda", dtype=torch.bfloat16)
-    value = torch.zeros(1, 4, 64, 64, device=device, dtype=dtype)
+    kw = {}
+    for name, value in kwargs.items():
+        if name == "bias":
+            dtype, device = value
+            value = torch.zeros(1, 4, 64, 64, device=device, dtype=dtype)
+        elif isinstance(value, torch.Tensor):
+            value = value.to("cuda")
+        kw[name] = value
     with pytest.raises(ValueError, match=modifier):
-        flydsl_flash_attn_func(q, q, q, **{modifier: value})
+        flydsl_flash_attn_func(q, q, q, **kw)
