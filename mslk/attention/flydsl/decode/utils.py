@@ -13,7 +13,7 @@ mslk.flydsl.kernels.common.kernel_intrinsics; kept as a stable import site for t
 pa_decode_* kernels.
 """
 
-from mslk.flydsl.kernels.common.kernel_intrinsics import (  # noqa: F401
+from mslk_flydsl.kernels.common.kernel_intrinsics import (  # noqa: F401
     dpp_xor_f32,
     exp2_f32,
     exp_f32,
@@ -34,4 +34,4 @@ from mslk.flydsl.kernels.common.kernel_intrinsics import (  # noqa: F401
     wave_reduce_max_f32,
     wave_reduce_sum_f32,
 )
-from mslk.flydsl.kernels.common.kernels_common import get_warp_size  # noqa: F401
+from mslk_flydsl.kernels.common.kernels_common import get_warp_size  # noqa: F401

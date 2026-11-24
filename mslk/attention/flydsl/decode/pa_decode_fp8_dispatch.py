@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from mslk.flydsl.common import is_flydsl_available, require_flydsl
+from mslk_flydsl.common import is_flydsl_available, require_flydsl
 
 
 def is_fp8_paged_decode_available() -> bool:

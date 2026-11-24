@@ -41,7 +41,7 @@ from flydsl.expr import (  # pyre-ignore[21]
 from flydsl.expr.typing import Int32, T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl import buffer_ops, vector_ops as vector
 
 from .utils import exp_f32, rcp_f32, WARP_SIZE, wave_reduce_max_f32, wave_reduce_sum_f32
 
@@ -365,7 +365,7 @@ def pa_decode_reduce(
     Pass the caller's stream so the reduce is captured on the same stream as the
     compute kernel under CUDA graphs; defaults to the current stream.
     """
-    from mslk.flydsl.jit import run_compiled  # pyre-ignore[21]
+    from mslk_flydsl.jit import run_compiled  # pyre-ignore[21]
 
     B, G, max_parts, H_q, D = partial_out.shape
     dtype_str = {torch.float32: "f32", torch.float16: "f16", torch.bfloat16: "bf16"}[

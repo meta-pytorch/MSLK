@@ -13,7 +13,7 @@ Target: gfx950 (CDNA4, wave64).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from mslk.attention.flydsl.fmha_bwd_mfma import dtype_to_elem_type
+from mslk_flydsl_attn.fmha_bwd_mfma import dtype_to_elem_type
 
 BLOCK_THREADS = 256
 VEC_WIDTH = 4
@@ -36,7 +36,7 @@ def compile_fmha_bwd_convert_dq(*, dtype_str: str = "bf16"):
         n_elems: fx.Int32,
     ):
         from flydsl.expr.typing import Vector as Vec
-        from mslk.flydsl import buffer_ops as _bops
+        from mslk_flydsl import buffer_ops as _bops
 
         # Derive elem type from dtype_str INSIDE the kernel so dtype_str is a
         # closure freevar and enters FlyDSL's JIT cache key. Otherwise bf16/f16

@@ -282,7 +282,15 @@ def _reference_splitk_reduce(
     )
     denominator = (weights * partial_sum).sum(dim=2)
     numerator = (weights.unsqueeze(-1) * partial_out).sum(dim=2)
-    return numerator / denominator.clamp_min(1.0).unsqueeze(-1)
+    # The kernel divides by the global sum and substitutes 1 only for an empty
+    # request (sum == 0, all partitions masked), which then reduces to zero.
+    # Clamping to >= 1 instead would agree only on real decode statistics, where
+    # the partition holding the global max contributes exp(0) = 1, not on the
+    # random sums below 1 that the tests feed in.
+    denominator = torch.where(
+        denominator > 0, denominator, torch.ones_like(denominator)
+    )
+    return numerator / denominator.unsqueeze(-1)
 
 
 @pytest.mark.parametrize(
@@ -474,12 +482,22 @@ def test_return_lse_rejects_fp8() -> None:
         )
 
 
-def test_return_lse_rejects_paged_kv() -> None:
+def test_return_lse_rejects_paged_kv_off_light_path() -> None:
+    # Native paged KV computes LSE only on the generic light kernel. Off gfx950
+    # every paged call takes that kernel, and on gfx950 so does any causal, f16,
+    # split-K or short (Sq <= 256) call, all covered by the paged LSE tests in
+    # flash_attn_paged_splitk_test.py and paged_matrix_test.py. What is left is
+    # a long non-causal bf16 call on gfx950, which takes the dualwave kernel.
+    from flydsl.runtime.device import get_rocm_arch
+
+    if not get_rocm_arch().startswith("gfx950"):
+        pytest.skip("every paged call takes the LSE-capable light kernel off gfx950")
     num_heads, head_dim, page_size, num_blocks = 8, 128, 64, 8
+    seq_len = page_size * num_blocks
     q = (
         torch.randn(
             1,
-            64,
+            seq_len,
             num_heads,
             head_dim,
             dtype=torch.bfloat16,
@@ -504,14 +522,14 @@ def test_return_lse_rejects_paged_kv() -> None:
         dtype=torch.int32,
         device=DEVICE,
     ).view(1, num_blocks)
-    seqlen_k = torch.tensor([64], dtype=torch.int32, device=DEVICE)
+    seqlen_k = torch.tensor([seq_len], dtype=torch.int32, device=DEVICE)
 
     with pytest.raises(NotImplementedError, match="return_lse"):
         flydsl_flash_attn_func(
             q,
             k,
             v,
-            causal=True,
+            causal=False,
             block_table=block_table,
             seqlen_k=seqlen_k,
             return_lse=True,

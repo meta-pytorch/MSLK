@@ -23,7 +23,8 @@ from flydsl.expr import arith, const_expr, gpu, math as fly_math, range_constexp
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.attention.flydsl.fmha_bwd_mfma import (
+from mslk_flydsl import buffer_ops
+from mslk_flydsl_attn.fmha_bwd_mfma import (
     _grad_ds_unscaled,
     _LOG2E,
     _softmax_p,
@@ -33,7 +34,6 @@ from mslk.attention.flydsl.fmha_bwd_mfma import (
     dtype_to_elem_type,
     WARP_SIZE,
 )
-from mslk.flydsl import buffer_ops
 
 _GFX950_LDS_BYTES = 160 * 1024
 

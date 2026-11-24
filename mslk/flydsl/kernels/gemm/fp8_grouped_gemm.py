@@ -67,9 +67,9 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.flydsl import buffer_ops, vector_ops as vector
-from mslk.flydsl.kernels.common.kernels_common import default_f8_type
-from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
+from mslk_flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl.kernels.common.kernels_common import default_f8_type
+from mslk_flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     compute_compile_constants,
     compute_mfma_tiling,
     init_accumulators,
@@ -101,7 +101,7 @@ from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
     validate_lds_budget_preshuffle,
     validate_params,
 )
-from mslk.flydsl.kernels.mma.mfma_epilogues import mfma_epilog
+from mslk_flydsl.kernels.mma.mfma_epilogues import mfma_epilog
 
 # Supported encodings of the group geometry; see the ``layout`` argument below.
 LAYOUTS = ("sizes", "offsets", "padded", "batched", "n_offsets", "k_offsets")

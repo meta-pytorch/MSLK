@@ -29,7 +29,7 @@ from flydsl._mlir.dialects import (
 from flydsl.expr import arith as _expr_arith, const_expr
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
-from mslk.flydsl import buffer_ops
+from mslk_flydsl import buffer_ops
 
 
 def default_f8_type():

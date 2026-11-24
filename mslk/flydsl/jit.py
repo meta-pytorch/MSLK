@@ -20,7 +20,7 @@ import importlib
 import os
 from typing import Any, Callable
 
-from mslk.flydsl.common import _BUNDLED_AOT_CACHE
+from .common import _BUNDLED_AOT_CACHE
 
 
 def configure_runtime_cache() -> None:

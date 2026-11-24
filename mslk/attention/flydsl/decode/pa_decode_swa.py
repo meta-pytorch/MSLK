@@ -35,7 +35,7 @@ from flydsl.expr import (  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl import buffer_ops, vector_ops as vector
 
 from ..split_arrival import (
     ARRIVAL_COUNTERS,
@@ -1039,7 +1039,7 @@ def pa_decode_swa_launch(
     max_seqlen_kv] (default: the block table's capacity). Splits are merged
     by the last CTA to finish, or by a reduce kernel past
     _MAX_INKERNEL_SPLITS."""
-    from mslk.flydsl.jit import run_compiled
+    from mslk_flydsl.jit import run_compiled
 
     B, Sq, H_q, D = q.shape
     _, page_size, H_kv, _ = k.shape

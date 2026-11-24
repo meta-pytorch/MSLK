@@ -45,7 +45,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
-from mslk.flydsl.kernels.common.kernels_common import _if_then
+from mslk_flydsl.kernels.common.kernels_common import _if_then
 
 
 def default_epilog(

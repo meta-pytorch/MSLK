@@ -31,10 +31,10 @@ from flydsl._mlir.dialects import math as math_dialect
 from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Vector
-from mslk.flydsl import buffer_ops, vector_ops as vector
-from mslk.flydsl.common import lds_capacity_bytes
-from mslk.flydsl.kernels.common.kernels_common import default_f8_type
-from mslk.flydsl.kernels.mma.mfma_preshuffle_pipeline import (
+from mslk_flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl.common import lds_capacity_bytes
+from mslk_flydsl.kernels.common.kernels_common import default_f8_type
+from mslk_flydsl.kernels.mma.mfma_preshuffle_pipeline import (
     crd2idx,
     lds_store_16b_xor16,
     load_b_pack_k32,

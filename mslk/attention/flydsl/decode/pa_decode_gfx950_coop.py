@@ -42,7 +42,7 @@ from flydsl.expr import (  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl import buffer_ops, vector_ops as vector
 
 from .pa_decode_reduce import pa_decode_reduce
 from .utils import (
@@ -628,7 +628,7 @@ def pa_decode_gfx950_coop_launch(
 ):
     """ds_read_tr16_b64 HW transpose for V reads — 8× fewer LDS instructions than scalar reads."""
     from flydsl.runtime.device import get_rocm_arch
-    from mslk.flydsl.jit import run_compiled
+    from mslk_flydsl.jit import run_compiled
 
     from .pa_decode_dense import auto_split_k_coop
 

@@ -21,7 +21,7 @@ from flydsl._mlir.dialects import llvm  # pyre-ignore[21]
 from flydsl.expr import gpu, rocdl  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops
+from mslk_flydsl import buffer_ops
 
 # Arrival counters (int32) at the head of the workspace; bounds the tile count.
 ARRIVAL_COUNTERS = 1 << 16

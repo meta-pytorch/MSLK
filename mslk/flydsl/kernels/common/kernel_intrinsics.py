@@ -19,7 +19,7 @@ from flydsl._mlir.dialects import llvm, math as mlir_math  # pyre-ignore[21]
 from flydsl.expr import arith, rocdl  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch, SMEM_CAPACITY_MAP  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops
+from mslk_flydsl import buffer_ops
 
 
 WARP_SIZE: int = 64  # CDNA wave64 (gfx942, gfx950)
