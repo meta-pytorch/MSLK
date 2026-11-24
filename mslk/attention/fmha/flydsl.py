@@ -186,6 +186,8 @@ def _is_flydsl_available() -> bool:
 class FwOp(AttentionFwOpBase):
     """FlyDSL flash-attention forward (gfx942 generic / gfx950 dualwave)."""
 
+    SUPPORTED_GFX_ARCHS: set[str] = {"gfx942", "gfx950"}
+
     # Python callable rather than a torch.ops handle (cf. triton_splitk.FwOp).
     OPERATOR = staticmethod(_is_flydsl_available)
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
