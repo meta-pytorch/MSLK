@@ -571,6 +571,10 @@ def test_merge_attention_with_compile() -> None:
 @sm80_or_better_only
 @disable_on_rocm
 def test_merge_training():
+    if not fmha.flash3.FwOp.is_available():
+        if UNSUPPORTED_OP_PASSES:
+            return
+        pytest.skip("FlashAttention3 is unavailable")
     torch.manual_seed(1)
     B, M, H, K = 1, 50, 1, 128
     dtype = torch.bfloat16
@@ -688,6 +692,7 @@ def test_merge_training_zilch():
 
 @sm80_or_better_only
 @cuda_only
+@disable_on_rocm
 def test_merge_training_undilate():
     torch.manual_seed(1)
 
