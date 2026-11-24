@@ -1680,6 +1680,11 @@ def compile_pa_decode_ps(
                 q_elems_per_lane=_Q_ELEMS_PER_LANE,
                 q_chunks_per_lane=_Q_CHUNKS_PER_LANE,
             )
+            # Each MTP group stages its Q and query scales in the same LDS slots,
+            # so all waves must finish reading the previous group's before any
+            # wave overwrites them (after the prefetch: the Q load overlaps this).
+            if const_expr(_mtp_g > 0):
+                gpu.barrier()
             qi_val, qhi_pos, q_frags, query_scale_lane = _finish_mtp_group_q_fragments(
                 logits_lds_i32,
                 logits_lds_i64,
