@@ -54,9 +54,9 @@ from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, Vector
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.flydsl import buffer_ops
-from mslk.flydsl.kernels.common.kernels_common import default_f8_type
-from mslk.flydsl.kernels.gemm.fp8_wide_mfma_common import (
+from mslk_flydsl import buffer_ops
+from mslk_flydsl.kernels.common.kernels_common import default_f8_type
+from mslk_flydsl.kernels.gemm.fp8_wide_mfma_common import (
     ACC_REGS,
     LdsAccess,
     LOAD_BYTES,

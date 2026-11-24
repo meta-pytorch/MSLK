@@ -35,7 +35,7 @@ from flydsl.expr import (  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
 from flydsl.runtime.device import get_rocm_arch  # pyre-ignore[21]
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl import buffer_ops, vector_ops as vector
 
 from .pa_decode_reduce import pa_decode_reduce
 from .utils import (
@@ -562,7 +562,7 @@ def pa_decode_generic_launch(
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Decode: mfma_f32_16x16x32 + per-warp Q-head ownership + TLOOP."""
-    from mslk.flydsl.jit import run_compiled  # pyre-ignore[21]
+    from mslk_flydsl.jit import run_compiled  # pyre-ignore[21]
 
     from .pa_decode_dense import auto_split_k
 

@@ -24,7 +24,7 @@ import math as _math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, ReductionOp
-from mslk.attention.flydsl.fmha_bwd_mfma import dtype_to_elem_type, WARP_SIZE
+from mslk_flydsl_attn.fmha_bwd_mfma import dtype_to_elem_type, WARP_SIZE
 
 BLOCK_THREADS = 256  # threads per block
 
@@ -65,7 +65,7 @@ def compile_fmha_bwd_preprocess(*, D: int, dtype_str: str = "bf16"):
         n_rows: fx.Int32,
     ):
         from flydsl.expr.typing import Vector as Vec
-        from mslk.flydsl import buffer_ops as _bops
+        from mslk_flydsl import buffer_ops as _bops
 
         # Derive elem type from dtype_str INSIDE the kernel so dtype_str is a
         # closure freevar and enters FlyDSL's JIT cache key. Otherwise bf16/f16

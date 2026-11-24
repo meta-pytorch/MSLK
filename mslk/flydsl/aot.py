@@ -30,7 +30,7 @@ from concurrent.futures import as_completed, ProcessPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Tuple
 
-from mslk.flydsl.common import _BUNDLED_AOT_CACHE
+from .common import _BUNDLED_AOT_CACHE
 
 # Module paths of AOT-eligible FlyDSL kernel modules. Each must expose
 # AOT_CONFIGS, AOT_ARCHS, and compile_aot_config(config, arch).

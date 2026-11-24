@@ -13,7 +13,7 @@ from typing import Any
 import flydsl.expr as fx  # pyre-ignore[21]
 from flydsl.expr import arith, range_constexpr, rocdl  # pyre-ignore[21]
 from flydsl.expr.typing import T  # pyre-ignore[21]
-from mslk.flydsl import buffer_ops, vector_ops as vector
+from mslk_flydsl import buffer_ops, vector_ops as vector
 
 MFMA_M = 16  # (query token, head) pairs packed on the QK MFMA M-axis
 MFMA_N = 16  # tokens per QK sub-tile

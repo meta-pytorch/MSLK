@@ -32,7 +32,7 @@ from flydsl.expr import arith, const_expr, gpu, math as fmath, range_constexpr, 
 from flydsl.expr.typing import T, Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.utils.smem_allocator import SmemPtr
-from mslk.flydsl import buffer_ops
+from mslk_flydsl import buffer_ops
 
 from ._common import dtype_to_elem_type
 from .split_arrival import (

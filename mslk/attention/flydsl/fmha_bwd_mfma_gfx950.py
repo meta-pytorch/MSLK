@@ -17,7 +17,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw, ArithValue
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from mslk.attention.flydsl.fmha_bwd_mfma import (
+from mslk_flydsl_attn.fmha_bwd_mfma import (
     _ds_read_tr_v4,
     _grad_ds_unscaled,
     _LOG2E,
@@ -459,7 +459,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         # seqstart lookup instead of a globally-uniform batch_idx*seq_len_idx --
         # see module docstring. Non-varlen: these reduce to the original formulas.
         if const_expr(varlen):
-            from mslk.flydsl import buffer_ops as _seq_bops
+            from mslk_flydsl import buffer_ops as _seq_bops
 
             seqstart_q_rsrc = _seq_bops.create_buffer_resource(seqstart_q)
             seqstart_k_rsrc = _seq_bops.create_buffer_resource(seqstart_k)
@@ -584,7 +584,7 @@ def compile_fmha_bwd_dqdkdv_mfma_gfx950(
         def _dvec_row(q_pos, head_idx):
             return _q_row_out(q_pos, head_idx)
 
-        from mslk.flydsl import buffer_ops as _bops
+        from mslk_flydsl import buffer_ops as _bops
 
         q_rsrc = _bops.create_buffer_resource(Q)
         k_rsrc = _bops.create_buffer_resource(K)
