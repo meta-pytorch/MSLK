@@ -458,12 +458,22 @@ def test_backward_flydsl_block_diagonal_causal_local_and_unwindowed(head_dim):
         query = query_base.clone().requires_grad_(True)
         key = key_base.clone().requires_grad_(True)
         value = value_base.clone().requires_grad_(True)
+        inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
+        op_fw = fmha.ck.FwOp
+        if op_fw.not_supported_reasons(inputs):
+            # CK forward is restricted to gfx942. Existing native FlyDSL
+            # forward supplies the same packed varlen LSE on gfx950.
+            op_fw = fmha.flydsl.FwOp
+        for op in (op_fw, fmha.flydsl.BwOp):
+            reasons = op.not_supported_reasons(inputs)
+            if reasons:
+                pytest.skip(f"{op.NAME} does not support these inputs: {reasons}")
         out = fmha.memory_efficient_attention(
             query,
             key,
             value,
             attn_bias,
-            op=(fmha.ck.FwOp, fmha.flydsl.BwOp),
+            op=(op_fw, fmha.flydsl.BwOp),
         )
         out.backward(grad_out)
         grads = [query.grad, key.grad, value.grad]
