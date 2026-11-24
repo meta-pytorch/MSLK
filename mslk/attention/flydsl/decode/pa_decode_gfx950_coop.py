@@ -499,6 +499,11 @@ def compile_pa_decode_gfx950_coop(
                         vector.extract(c_acc, static_position=[e], dynamic_position=[])
                     )
 
+            # Every wave reads all 64 V rows above, and the next tile's V copy
+            # overwrites them. Make all waves finish those reads before any
+            # wave starts the next tile's copies.
+            gpu.barrier()
+
             pv_scalars = new_pv_scalars
             state_out = [arith.unwrap(new_max), arith.unwrap(new_sum)] + list(
                 pv_scalars
