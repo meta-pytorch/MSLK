@@ -7,9 +7,9 @@
 
 AITER's ``flash_attn_func`` provides high-performance flash attention on
 gfx950 (MI350X).  Integrated via ``OpRouting`` (``mslk/aiter/routing.py``):
-the tuning table at ``mslk/attention/fmha/dispatch/tables/fmha.csv``
+the tuning table at ``mslk/attention/fmha/routing/tables/fmha.csv``
 selects AITER for shapes where it is faster than CK/FlyDSL.  Also
-available for explicit use via ``op=aiter.FwOp``.
+available for explicit use via ``op=rocm_aiter.FwOp``.
 
 First-use latency: the pinned AITER build (``noprebuild``) JIT-compiles
 CK/ASM modules with ``hipcc`` on first call (~60-70s per kernel config).
@@ -93,16 +93,13 @@ class FwOp(AttentionFwOpBase):
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     SUPPORTS_BMGHK = False
     SUPPORTS_PARTIAL = False
-    VARLEN_LSE_PACKED = True
     NAME = "aiterF"
 
     ERROR_ATOL: Mapping[torch.dtype, float] = {
-        torch.float: 3e-4,
         torch.half: 6e-3,
         torch.bfloat16: 2.8e-2,
     }
     ERROR_RTOL: Mapping[torch.dtype, float] = {
-        torch.float: 2e-5,
         torch.half: 3e-3,
         torch.bfloat16: 2e-2,
     }
@@ -165,7 +162,6 @@ class BwOp(AttentionBwOpBase):
     SUPPORTS_DIFFERENT_VALUE_EMBED = False
     SUPPORTS_BMGHK = False
     SUPPORTS_ATTN_BIAS_GRAD = False
-    VARLEN_LSE_PACKED = True
     NAME = "aiterB"
 
     _TEST_K: List[int] = [64, 128, 256]

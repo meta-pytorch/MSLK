@@ -1,1 +1,1 @@
-gfx,cu_num,head_dim,dtype,num_heads,seqlen_max,backend
+gfx,cu_num,head_dim,dtype,num_heads,seqlen_kv,seqlen_q_max,backend

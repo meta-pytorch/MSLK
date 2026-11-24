@@ -77,13 +77,22 @@ def aiter_fmha_backward(
     if scale is None:
         scale = 1.0 / math.sqrt(D)
 
+    # Pad to multiple of 8 (FlashAttnFunc does this;
+    # direct _flash_attn_backward does not)
+    pad = (8 - D % 8) % 8
+    if pad:
+        query = torch.nn.functional.pad(query, (0, pad))
+        key = torch.nn.functional.pad(key, (0, pad))
+        value = torch.nn.functional.pad(value, (0, pad))
+        out = torch.nn.functional.pad(out, (0, pad))
+        grad = torch.nn.functional.pad(grad, (0, pad))
+
     dq = torch.empty_like(query)
     dk = torch.empty_like(key)
     dv = torch.empty_like(value)
 
-    # AITER's v3 backward needs rng_state even when dropout_p=0.
-    # Create a dummy rng_state matching what FlashAttnFunc.forward saves.
-    rng_state = torch.cuda.get_rng_state()
+    # AITER's _flash_attn_forward returns empty int64 rng_state; match that.
+    rng_state = torch.empty((2,), dtype=torch.int64, device=query.device)
 
     mha._flash_attn_backward(
         dout=grad.contiguous(),
@@ -106,5 +115,10 @@ def aiter_fmha_backward(
         deterministic=False,
         rng_state=rng_state,
     )
+
+    if pad:
+        dq = dq[..., :D]
+        dk = dk[..., :D]
+        dv = dv[..., :D]
 
     return dq, dk, dv
