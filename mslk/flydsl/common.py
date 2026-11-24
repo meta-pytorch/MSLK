@@ -17,6 +17,9 @@ just-in-time or ahead-of-time.
 import functools
 import importlib.util
 import os
+import shutil
+import sys
+from pathlib import Path
 
 _INSTALL_HINT: str = (
     "FlyDSL is required for this kernel but is not available. "
@@ -48,6 +51,7 @@ def is_flydsl_available() -> bool:
     """
     if importlib.util.find_spec("flydsl") is None:
         return False
+    _prepare_flydsl_runtime_environment()
     try:
         from flydsl.runtime.device import (  # pyre-ignore[21]
             get_rocm_arch,
@@ -59,8 +63,62 @@ def is_flydsl_available() -> bool:
         return False
 
 
+def _add_rocm_sysdeps_to_loader_path() -> None:
+    """Expose the ROCm linker's private shared libraries to child processes."""
+    rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm_home:
+        root = Path(rocm_home).resolve()
+    else:
+        hipcc = shutil.which("hipcc")
+        if hipcc is None:
+            return
+        root = Path(hipcc).resolve().parent.parent
+        if root.name == "hip":
+            root = root.parent
+    sysdeps = root / "lib" / "rocm_sysdeps" / "lib"
+    if not sysdeps.is_dir():
+        return
+    directory = str(sysdeps)
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    if directory not in current.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = (
+            f"{current}:{directory}" if current else directory
+        )
+
+
+def _prepare_flydsl_runtime_environment() -> None:
+    """Use the selected physical GPU and expose ROCm linker dependencies."""
+    _add_rocm_sysdeps_to_loader_path()
+    if os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        return
+    # Torch is already imported by runtime callers. Do not import it while
+    # building a GPU-free AOT cache or probing an optional backend.
+    torch = sys.modules.get("torch")
+    if torch is None or getattr(getattr(torch, "version", None), "hip", None) is None:
+        return
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not cuda.is_available():
+        return
+    try:
+        arch = cuda.get_device_properties(cuda.current_device()).gcnArchName
+    except RuntimeError:
+        # A failing driver query must not escape the availability probe:
+        # leave FLYDSL_GPU_ARCH unset so is_flydsl_available() still
+        # returns False instead of raising to every caller.
+        return
+    # FlyDSL otherwise queries rocm_agent_enumerator and silently defaults to
+    # gfx942 when the tool is missing or fails in a hermetic test sandbox.
+    # An empty gcnArchName (unreported on some driver/ROCm combos) must not
+    # become an empty override: FlyDSL trusts an explicit FLYDSL_GPU_ARCH
+    # instead of enumerating, reintroducing the silent-wrong-arch failure.
+    base = (arch or "").split(":", 1)[0].lower()
+    if base:
+        os.environ["FLYDSL_GPU_ARCH"] = base
+
+
 def require_flydsl() -> None:
-    """Raise ``RuntimeError`` with an install hint when FlyDSL is unavailable."""
+    """Require FlyDSL and make its ROCm linker dependencies discoverable."""
+    _prepare_flydsl_runtime_environment()
     if not is_flydsl_available():
         raise RuntimeError(_INSTALL_HINT)
 
