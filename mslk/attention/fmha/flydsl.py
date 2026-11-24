@@ -1786,6 +1786,9 @@ def _flydsl_bwd_abstract(
 class BwOp(AttentionBwOpBase):
     """FlyDSL MFMA backward op selected after CK in ROCm dispatch."""
 
+    # Native MFMA kernels require the implemented CDNA architectures.
+    SUPPORTED_GFX_ARCHS: Set[str] = {"gfx942", "gfx950"}
+
     OPERATOR = get_operator("mslk_flydsl", "fmha_bwd")
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.bfloat16, torch.float16}
