@@ -12,6 +12,10 @@ import contextlib
 
 import pytest
 import torch
+
+# Loaded before any FlyDSL kernel: under TheRock, Triton (imported by aiter's
+# pa_decode) crashes if it loads after the ROCm SDK's LLVM.
+import triton  # noqa: F401
 from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import device_key, force_backend
 from mslk.attention.dispatch.paged_attention_decode_fp8 import OP, ROUTING
@@ -92,7 +96,7 @@ BACKENDS = ("default", "mslk", "aiter")
 # the tuning table routes to each backend on gfx950, so that the routed path is
 # covered on both.
 _ROUTED_SHAPES = {
-    "aiter": [(32, 8, 128, 16, 256, 256), (64, 8, 128, 64, 32768, 1)],
+    "aiter": [(32, 8, 128, 16, 256, 256), (128, 8, 128, 16, 32768, 2)],
     "mslk": [(8, 1, 128, 16, 1024, 8), (4, 1, 128, 64, 256, 4)],
 }
 
@@ -277,6 +281,16 @@ def test_aiter_leaves_calls_it_cannot_take_to_mslk(call):
     args = (out, query, k, v, lengths, tables, scale, k_scale, v_scale)
     with backend_forced("aiter"):
         assert run_and_check(args, kv, "default") == "mslk"
+
+
+def test_aiter_plan_follows_new_lengths():
+    """aiter's work plan is kept per batch size; later calls with other
+    lengths must refresh it."""
+    torch.manual_seed(0)
+    with backend_forced("aiter"):
+        for lengths in ([4096, 3, 250], [1, 2000, 4096], [17, 17, 17]):
+            args, kv = make_inputs(32, 8, 128, 16, lengths)
+            run_and_check(args, kv, "aiter")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

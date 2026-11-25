@@ -20,9 +20,11 @@ All come from tensor shapes, never from the context lengths on the GPU, so a
 CUDA graph replays the backend it was captured with.
 """
 
+import functools
 from typing import Any, Optional, Sequence, Tuple
 
 import torch
+from mslk.aiter.common import import_aiter_module, is_aiter_enabled
 from mslk.aiter.routing import MSLK, OpRouting
 
 OP: str = "paged_attention_decode_fp8"
@@ -138,6 +140,16 @@ def _key(
     context_max = max(256, 1 << (capacity - 1).bit_length())
     key = (query.shape[1], key_cache.shape[1], query.shape[-1], block_size, context_max)
     return key, context_lengths.shape[0]
+
+
+@functools.lru_cache(maxsize=None)
+def preload_aiter() -> None:
+    """Import aiter's ``pa_decode`` once if aiter may serve the op. Call it
+    before MSLK's first FlyDSL compile: under TheRock, Triton (which aiter's
+    ``pa_decode`` imports) crashes if it loads after the ROCm SDK's LLVM, which
+    FlyDSL loads."""
+    if is_aiter_enabled(OP):
+        import_aiter_module("aiter.ops.flydsl.pa_decode")
 
 
 #: ``paged_attention_decode_fp8`` on gfx950: call it with the op's arguments.

@@ -18,6 +18,10 @@ from typing import Any, Callable, Dict, List, Tuple
 from unittest import mock
 
 import torch
+
+# Loaded before any FlyDSL kernel: under TheRock, Triton (imported by aiter's
+# pa_decode) crashes if it loads after the ROCm SDK's LLVM.
+import triton  # noqa: F401
 from mslk.aiter.common import is_aiter_enabled
 from mslk.aiter.routing import device_key, OpRouting
 from mslk.attention.dispatch import paged_attention_decode_fp8

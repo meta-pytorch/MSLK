@@ -143,7 +143,12 @@ def paged_attention_decode_fp8(
             "FlyDSL native-fp8 paged decode requires gfx950 (CDNA4). "
             "For the int32-packed Triton fp8 format, use triton_splitk.FwOp instead."
         )
-    from mslk.attention.dispatch.paged_attention_decode_fp8 import ROUTING
+    from mslk.attention.dispatch.paged_attention_decode_fp8 import (
+        preload_aiter,
+        ROUTING,
+    )
+
+    preload_aiter()
 
     return ROUTING(
         output,
