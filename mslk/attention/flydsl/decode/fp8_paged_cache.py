@@ -56,28 +56,14 @@ def dense_kv_to_fp8_paged(
     )
     # GQA: fold (B, G) into the batch/seq axis (one sequence per KV head); query folds
     # the same way so group g's query heads pair with KV group g.
-    from .pa_decode_fp8 import KV_COMPUTE_BLOCK
-
     BG = B * G
     dev = key.device
-
-    # GOTCHA: kernel reads KV_COMPUTE_BLOCK // block_size block-table entries per
-    # partition; a shorter context would read out of bounds -> GPU fault. Pad each
-    # seq's block count up to one full partition (extras masked by context_lengths).
-    min_blocks_per_seq = KV_COMPUTE_BLOCK // block_size
-    blocks_per_seq = max(padding // block_size, min_blocks_per_seq)
-    padded = blocks_per_seq * block_size
+    blocks_per_seq = padding // block_size
     num_blocks = BG * blocks_per_seq
 
     # [B, padding, G, Hkv, D] -> [B*G, padding, Hkv, D].
     kbg = key.permute(0, 2, 1, 3, 4).reshape(BG, padding, Hkv, D)
     vbg = value.permute(0, 2, 1, 3, 4).reshape(BG, padding, Hkv, D)
-    if padded != padding:
-        # GOTCHA: pad with ONES not zeros. Zeros quantize to a ~0 scale and can
-        # dequant to inf/NaN before context_lengths masks them out.
-        pad_k = kbg.new_ones(BG, padded - padding, Hkv, D)
-        kbg = torch.cat([kbg, pad_k], dim=1)
-        vbg = torch.cat([vbg, pad_k], dim=1)
     k = kbg.reshape(num_blocks, block_size, Hkv, D).permute(0, 2, 1, 3).contiguous()
     v = vbg.reshape(num_blocks, block_size, Hkv, D).permute(0, 2, 1, 3).contiguous()
 
@@ -134,7 +120,7 @@ def random_fp8_paged_cache(
     context_lengths), laid out as dense_kv_to_fp8_paged's.
     """
     pages = [-(-n // block_size) for n in lengths]
-    width = max(1, *pages) if width is None else width
+    width = max([1, *pages]) if width is None else width
     num_blocks = sum(pages) + 1
     block_tables = torch.full(
         (len(lengths), width), -1, dtype=torch.int32, device="cuda"

@@ -16,6 +16,7 @@ from mslk.attention.flydsl.decode.fp8_paged_cache import (
 from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
     is_fp8_paged_decode_available,
     paged_attention_decode_fp8,
+    paged_attention_decode_fp8_csr,
 )
 from paged_reference import paged_reference
 
@@ -109,6 +110,60 @@ def test_empty_block_table():
     args = (*args[:5], args[5][:, :0], *args[6:])
     paged_attention_decode_fp8(*args)
     torch.testing.assert_close(args[0], torch.zeros_like(args[0]))
+
+
+def test_broadcast_block_table():
+    """A block table with row stride 0 (every sequence on the same pages)."""
+    torch.manual_seed(0)
+    args, kv = make_inputs(16, 4, 128, 16, [300, 120, 17, 300])
+    args = (*args[:5], args[5][:1].expand(4, -1), *args[6:])
+    paged_attention_decode_fp8(*args)
+    assert_matches(args[0], reference(args, kv))
+
+
+def test_padding_with_own_pages_ignores_unused_block_0():
+    """Rows padded with their own first page must not read block 0, which no
+    sequence uses here and which holds NaN."""
+    torch.manual_seed(0)
+    args, _ = make_inputs(16, 4, 128, 16, [300, 17, 64])
+    out, query, k, v, lengths, tables, scale, k_scale, v_scale = args
+    # Move block 0's data to the spare block, then poison block 0.
+    used = set(tables[tables >= 0].tolist())
+    spare = next(b for b in range(k.shape[0]) if b not in used)
+    for t in (k, v, k_scale, v_scale):
+        t[spare] = t[0]
+    tables[tables == 0] = spare
+    k_scale[0] = v_scale[0] = float("nan")
+    tables[:] = torch.where(tables < 0, tables[:, :1], tables)
+    paged_attention_decode_fp8(*args)
+    kv = dequantize_fp8_paged_cache(k, v, k_scale, v_scale)
+    assert_matches(out, reference(args, kv))
+
+
+def test_csr_entry_takes_int64_lengths():
+    torch.manual_seed(0)
+    args, kv = make_inputs(16, 4, 128, 16, [300, 17, 64])
+    out, query, k, v, lengths, tables, scale, k_scale, v_scale = args
+    pages = [row[row >= 0] for row in tables]
+    indptr = torch.tensor([0] + [len(p) for p in pages], device="cuda").cumsum(0)
+    paged_attention_decode_fp8_csr(
+        out,
+        query,
+        k,
+        v,
+        lengths.long(),
+        torch.cat(pages),
+        indptr,
+        scale,
+        k_scale,
+        v_scale,
+    )
+    assert_matches(out, reference(args, kv))
+
+
+def test_cache_builder_takes_no_sequences():
+    *_, block_tables, context_lengths = random_fp8_paged_cache(1, 128, 16, [])
+    assert block_tables.shape == (0, 1) and context_lengths.numel() == 0
 
 
 @pytest.mark.parametrize("index", [4, 5])  # context_lengths, block_tables

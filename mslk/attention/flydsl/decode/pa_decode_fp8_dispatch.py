@@ -16,9 +16,8 @@ Expected inputs (same CUDA device):
   * key_cache   : [num_blocks, num_kv_heads, head_size // 16, block_size, 16] fp8.
   * value_cache : [num_blocks, num_kv_heads, block_size // 16, head_size, 16] fp8 (transposed).
   * key_scale/value_scale : per-token f32 [num_blocks, num_kv_heads, block_size, 1].
-  * block_tables    : [num_seqs, max_blocks_per_seq] int32. Slots past a
-    sequence's pages may hold any value; the masked tail of a tile then reads
-    block 0, which must therefore hold finite K/V and scales.
+  * block_tables    : [num_seqs, max_blocks_per_seq] int32, any row stride.
+    Slots past a sequence's pages may hold any value.
   * context_lengths : [num_seqs] int32.
 
 Only block_size in {16, 64}; query_length must be 1 (decode); gfx950 only.
@@ -93,6 +92,8 @@ def paged_attention_decode_fp8_csr(
     """CSR-paging entry: converts ragged kv_page_indices/kv_indptr then dispatches to
     paged_attention_decode_fp8."""
     block_tables = csr_to_block_tables(kv_page_indices, kv_indptr)
+    if context_lengths.dtype != torch.int32:
+        context_lengths = context_lengths.to(torch.int32)
     return paged_attention_decode_fp8(
         output,
         query,
