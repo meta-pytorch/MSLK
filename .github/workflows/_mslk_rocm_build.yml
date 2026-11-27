@@ -19,10 +19,7 @@ on:
         default: >-
           {
             "image": "ubuntu:22.04",
-            "options": "--user root --privileged --pid=host",
-            "volumes": [
-              "/var/run/docker.sock:/var/run/docker.sock"
-            ]
+            "options": "--user root --privileged --pid=host"
           }
       repo-ref:
         description: Repository ref/sha
@@ -86,10 +83,6 @@ jobs:
       with:
         submodules: true
         ref: ${{ inputs.repo-ref }}
-
-    - name: Free Disk Space on Host
-      if: ${{ fromJson(inputs.container).image != null }}
-      run: . $PRELUDE; free_disk_space_on_host
 
     - name: Display System Info
       run: . $PRELUDE; print_system_info
