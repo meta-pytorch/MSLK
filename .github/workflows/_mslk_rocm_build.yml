@@ -88,7 +88,8 @@ jobs:
         ref: ${{ inputs.repo-ref }}
 
     - name: Free Disk Space on Host
-      if: ${{ fromJson(inputs.container).image != null }}
+      # OSDC job containers can't reach the host
+      if: ${{ fromJson(inputs.container).image != null && !startsWith(matrix.host-machine.instance, 'mt-') }}
       run: . $PRELUDE; free_disk_space_on_host
 
     - name: Display System Info

@@ -77,5 +77,10 @@ jobs:
     uses: ./.github/workflows/_mslk_cuda_test.yml
     with:
       matrix: ${{ needs.generate-test-matrix.outputs.matrix }}
+      # OSDC GPU runners need a container; forks test on ubuntu-latest without one
+      container: >-
+        ${{ github.repository_owner == 'meta-pytorch'
+            && '{"image": "pytorch/almalinux-builder:cuda13.0", "options": "--gpus all"}'
+            || '{"image": null}' }}
       repo-ref: ${{ github.sha }}
       pytorch-channel-version: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.pytorch-channel-version) || 'nightly' }}
