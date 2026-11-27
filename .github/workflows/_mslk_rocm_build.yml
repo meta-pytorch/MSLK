@@ -19,10 +19,7 @@ on:
         default: >-
           {
             "image": "ubuntu:22.04",
-            "options": "--user root --privileged --pid=host",
-            "volumes": [
-              "/var/run/docker.sock:/var/run/docker.sock"
-            ]
+            "options": "--user root --privileged --pid=host"
           }
       repo-ref:
         description: Repository ref/sha
