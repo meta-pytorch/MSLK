@@ -162,7 +162,7 @@ integration_mslk_pip_install_matrix_run () {
 
     local env_name="test_py${py_version}_pytorch_${pytorch_channel_version}_mslk_${mslk_channel_version}_${variant_type}/${variant_version}"
     local env_name="${env_name//\//_}"
-    integration_setup_conda_environment  "${env_name}" gcc "${py_version}" pip "${pytorch_channel_version}" "${variant_type}" "${variant_version}" || return 1
+    integration_setup_conda_environment  "${env_name}" gcc "${py_version}" "${pytorch_channel_version}" "${variant_type}/${variant_version}" || return 1
     install_mslk_pip        "${env_name}" "${mslk_channel_version}" "${variant_type}/${variant_version}"  || return 1
     pushd "${repo}"                                                                                          || return 1
 
@@ -191,11 +191,11 @@ integration_mslk_pip_install_matrix_run () {
   }
 
   local python_versions=(
-    3.9
-    3.10
     3.11
     3.12
     3.13
+    3.14
+    3.15
   )
 
   if [ "$variant_type" == "cuda" ]; then
@@ -213,6 +213,10 @@ integration_mslk_pip_install_matrix_run () {
   fi
 
   for py_ver in "${python_versions[@]}"; do
+    if [ "$variant_type" == "rocm" ] && [ "$py_ver" == "3.15" ]; then
+      echo "[TEST] Skipping ROCm Python 3.15: no matching FlyDSL wheels"
+      continue
+    fi
     for var_ver in "${variant_versions[@]}"; do
       __single_run "${py_ver}" "${var_ver}" "${repo}" || return 1
     done
