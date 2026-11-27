@@ -159,6 +159,8 @@ __configure_mslk_test_rocm () {
   )
   export explicitly_enabled_tests=(
     ./attention/fmha/flydsl_backward_gfx950_test.py
+    ./attention/flydsl/pa_decode_fp8_test.py
+    ./attention/dispatch_test.py
   )
 }
 

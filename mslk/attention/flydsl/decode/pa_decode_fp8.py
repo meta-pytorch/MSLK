@@ -1086,6 +1086,15 @@ def _get_output_dtype_str(output: torch.Tensor) -> str:
     )
 
 
+def _span_bytes(table: torch.Tensor) -> int:
+    """Bytes a 2-D int32 table spans from its first element, for any row
+    stride (0 for an empty table)."""
+    rows, width = table.shape
+    if rows == 0 or width == 0:
+        return 0
+    return ((rows - 1) * table.stride(0) + width) * table.element_size()
+
+
 def get_recommended_splits(
     num_sequences: int,
     num_kv_heads: int,
@@ -1328,6 +1337,8 @@ def compile_pa_decode_ps(
         stride_to_part: Int32,
         stride_to_group: Int32,
         stride_bt_seq: Int32,
+        # Bytes the block table spans; reads beyond it return 0.
+        bt_bytes: Int32,
         # Per-token K/V scale strides (per_token_kv only), scale layout
         # [num_blocks, num_kv_heads, block_size]; both 0 for per-tensor.
         stride_ks_block: Int32,
@@ -1348,7 +1359,11 @@ def compile_pa_decode_ps(
         q_rsrc = buffer_ops.create_buffer_resource(query_ptr, max_size=True)
         k_global_ptr = _extract_global_ptr(key_cache_ptr)
         v_global_ptr = _extract_global_ptr(value_cache_ptr)
-        bt_rsrc = buffer_ops.create_buffer_resource(block_tables_ptr, max_size=False)
+        # Bounded by the table's extent, so a tile's reads past its end (padding
+        # in the last row) return 0 instead of faulting.
+        bt_rsrc = buffer_ops.create_buffer_resource(
+            block_tables_ptr, max_size=False, num_records_bytes=bt_bytes
+        )
         es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
         ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
         to_rsrc = buffer_ops.create_buffer_resource(tmp_out_ptr, max_size=True)
@@ -1601,19 +1616,48 @@ def compile_pa_decode_ps(
                 [],
             )
 
+        # Table entries past the context are padding and may hold any value; the
+        # masked tail of a tile reads the sequence's first page instead. A
+        # sequence with no context reads block 0, but computes nothing from it.
+        num_context_blocks = (context_len + fx.Int32(_block_size - 1)) // fx.Int32(
+            _block_size
+        )
+        first_block = _s_buffer_load(
+            batch_idx * stride_bt_seq * fx.Int32(4), vec_width=1
+        )
+        fill_block = arith.select(
+            num_context_blocks > fx.Int32(0),
+            first_block,
+            arith.constant(0, type=T.i32),
+        )
+
         def _pa_small_block_stage_phys_blocks(partition_block_base):
             # bt offset is wave-uniform -> s_buffer_load into SGPRs, avoiding the
             # vmcnt(0) drain and the downstream readfirstlane of the VMEM path.
             if const_expr(block_size == 64):
-                bt_elem_off = batch_idx * stride_bt_seq + partition_block_base + warp_id
+                block = partition_block_base + warp_id
+                bt_elem_off = batch_idx * stride_bt_seq + block
                 phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=1)
-            else:
-                bt_elem_off = (
-                    batch_idx * stride_bt_seq
-                    + partition_block_base
-                    + warp_id * fx.Int32(TLOOP)
+                phys_blocks = arith.select(
+                    block < num_context_blocks, phys_blocks, fill_block
                 )
-                phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
+            else:
+                first = partition_block_base + warp_id * fx.Int32(TLOOP)
+                bt_elem_off = batch_idx * stride_bt_seq + first
+                loaded = fx.Vector(
+                    _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
+                )
+                phys_blocks = fx.Vector.from_elements(
+                    [
+                        arith.select(
+                            first + fx.Int32(i) < num_context_blocks,
+                            loaded[i],
+                            fill_block,
+                        )
+                        for i in range_constexpr(TLOOP)
+                    ],
+                    dtype=fx.Int32,
+                )
             return phys_blocks
 
         def _pa_small_block_store_phys_blocks_to_lds(phys_block_vec):
@@ -1935,6 +1979,7 @@ def compile_pa_decode_ps(
         s_to_part: Int32,
         s_to_group: Int32,
         s_bt_seq: Int32,
+        s_bt_bytes: Int32,
         s_ks_block: Int32,
         s_ks_head: Int32,
         gx: Int32,
@@ -1971,6 +2016,7 @@ def compile_pa_decode_ps(
             s_to_part,
             s_to_group,
             s_bt_seq,
+            s_bt_bytes,
             s_ks_block,
             s_ks_head,
         ).launch(grid=(gx, gy, gz), block=(BLOCK_THREADS, 1, 1), stream=stream)
@@ -2255,6 +2301,12 @@ def pa_decode_ps_launch(
             f"pa_decode_ps_launch: block_size={block_size} requires `block_tables` "
             "(per-sequence physical block index table)."
         )
+    # The kernel reads both as int32; other dtypes would be misread silently.
+    if context_lengths.dtype != torch.int32 or block_tables.dtype != torch.int32:
+        raise TypeError(
+            "pa_decode_ps_launch: context_lengths and block_tables must be int32, "
+            f"got {context_lengths.dtype} and {block_tables.dtype}."
+        )
     batch_size = context_lengths.shape[0]
     head_size = query.shape[-1]
     eqgs = query_length * query_group_size
@@ -2338,6 +2390,7 @@ def pa_decode_ps_launch(
         temporary_output.stride(2),
         temporary_output.stride(3),
         block_tables.stride(0),
+        _span_bytes(block_tables),
         stride_ks_block,
         stride_ks_head,
         batch_size,

@@ -16,7 +16,8 @@ Expected inputs (same CUDA device):
   * key_cache   : [num_blocks, num_kv_heads, head_size // 16, block_size, 16] fp8.
   * value_cache : [num_blocks, num_kv_heads, block_size // 16, head_size, 16] fp8 (transposed).
   * key_scale/value_scale : per-token f32 [num_blocks, num_kv_heads, block_size, 1].
-  * block_tables    : [num_seqs, max_blocks_per_seq] int32.
+  * block_tables    : [num_seqs, max_blocks_per_seq] int32, any row stride.
+    Slots past a sequence's pages may hold any value.
   * context_lengths : [num_seqs] int32.
 
 Only block_size in {16, 64}; query_length must be 1 (decode); gfx950 only.
@@ -91,6 +92,8 @@ def paged_attention_decode_fp8_csr(
     """CSR-paging entry: converts ragged kv_page_indices/kv_indptr then dispatches to
     paged_attention_decode_fp8."""
     block_tables = csr_to_block_tables(kv_page_indices, kv_indptr)
+    if context_lengths.dtype != torch.int32:
+        context_lengths = context_lengths.to(torch.int32)
     return paged_attention_decode_fp8(
         output,
         query,
@@ -126,14 +129,63 @@ def paged_attention_decode_fp8(
     temporary_output: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> str:
-    """Run the FlyDSL native-fp8 paged decode (writes into `output`). Guarded wrapper
-    around pa_decode_fp8.pa_decode_ps_launch; raises when FlyDSL/arch unavailable."""
+    """Run the native-fp8 paged decode (writes into `output`), by MSLK's FlyDSL
+    kernel or, for the shapes where it is faster, aiter's (see
+    mslk/attention/dispatch/paged_attention_decode_fp8.py). Raises when
+    FlyDSL/arch unavailable. The scratch arguments are used by MSLK's kernel
+    only, which needs them to be captured in a CUDA graph: pass them whenever
+    capturing. aiter's kernel is compiled per batch size, so the first call at
+    a new batch size on a shape routed to aiter takes ~0.1-2 s; warm up the
+    batch sizes you use, e.g. before capturing CUDA graphs."""
     require_flydsl()
     if not is_fp8_paged_decode_available():
         raise RuntimeError(
             "FlyDSL native-fp8 paged decode requires gfx950 (CDNA4). "
             "For the int32-packed Triton fp8 format, use triton_splitk.FwOp instead."
         )
+    from mslk.attention.dispatch.paged_attention_decode_fp8 import (
+        preload_aiter,
+        ROUTING,
+    )
+
+    preload_aiter()
+
+    return ROUTING(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        key_scale,
+        value_scale,
+        max_context_partition_num=max_context_partition_num,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        stream=stream,
+    )
+
+
+def paged_attention_decode_fp8_flydsl(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    key_scale: torch.Tensor,
+    value_scale: torch.Tensor,
+    *,
+    max_context_partition_num: int = 0,
+    exp_sums: Optional[torch.Tensor] = None,
+    max_logits: Optional[torch.Tensor] = None,
+    temporary_output: Optional[torch.Tensor] = None,
+    stream: Optional[object] = None,
+) -> str:
+    """MSLK's backend of paged_attention_decode_fp8: pa_decode_fp8.pa_decode_ps_launch."""
     from .pa_decode_fp8 import pa_decode_ps_launch
 
     return pa_decode_ps_launch(
