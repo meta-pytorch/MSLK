@@ -38,6 +38,7 @@ _AOT_KERNEL_MODULES: List[str] = [
     "mslk.attention.flydsl.decode.pa_decode_dense",
     "mslk.attention.flydsl.decode.pa_decode_reduce",
     "mslk.attention.flydsl.decode.pa_decode_fp8",
+    "mslk.attention.flydsl.hstu.ragged_fwd",
 ]
 
 _DEFAULT_MAX_WORKERS: int = 64
