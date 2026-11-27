@@ -19,7 +19,10 @@ on:
         default: >-
           {
             "image": "ubuntu:22.04",
-            "options": "--user root --privileged --pid=host"
+            "options": "--user root --privileged --pid=host",
+            "volumes": [
+              "/var/run/docker.sock:/var/run/docker.sock"
+            ]
           }
       repo-ref:
         description: Repository ref/sha
@@ -85,8 +88,7 @@ jobs:
         ref: ${{ inputs.repo-ref }}
 
     - name: Free Disk Space on Host
-      # OSDC job containers can't reach the host
-      if: ${{ fromJson(inputs.container).image != null && !startsWith(matrix.host-machine.instance, 'mt-') }}
+      if: ${{ fromJson(inputs.container).image != null }}
       run: . $PRELUDE; free_disk_space_on_host
 
     - name: Display System Info

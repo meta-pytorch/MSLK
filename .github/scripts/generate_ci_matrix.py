@@ -304,7 +304,7 @@ class BuildConfigScheme:
 
         elif self.variant == VARIANT_ROCM:
             if self.jobtype == JOBTYPE_BUILD:
-                return [{"arch": "x86", "instance": "mt-l-x86iavx512-94-768"}]
+                return [{"arch": "x86", "instance": "linux.24xlarge.memory"}]
             else:
                 return [{"arch": "x86", "instance": "amd-mi350-runner"}]
         else:

@@ -97,10 +97,10 @@ def main():
     new_matrix = {"include": new_matrix_entries}
 
     # Override the validation runner for ROCm builds to use a larger machine,
-    # since the default OSDC CPU runner is too small for a full MSLK ROCm build
+    # since the default linux.2xlarge is too small for a full MSLK ROCm build
     for entry in new_matrix_entries:
         if entry.get("gpu_arch_type") == "rocm":
-            entry["validation_runner"] = "mt-l-x86iavx512-94-768"
+            entry["validation_runner"] = "linux.24xlarge.memory"
 
     # Print the filtered matrix
     print(json.dumps(new_matrix))
