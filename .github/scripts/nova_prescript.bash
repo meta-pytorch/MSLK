@@ -107,6 +107,10 @@ if [[ $CU_VERSION = cu* ]]; then
   echo "[NOVA] Setting the MSLK build variant: cuda ..."
   export mslk_build_variant="cuda"
   export BUILD_CUDA_VERSION="$CU_VERSION"
+  # setup.py sizes parallelism from the node's CPUs and memory, not the OSDC
+  # pod's limit (41 GiB on the A10G runner), so NVCC gets OOM-killed. 5 jobs
+  # keeps the ~8 GiB per job the EC2 g5.4xlarge default had.
+  export BUILD_PARALLELISM="${BUILD_PARALLELISM:-5}"
 
 elif [[ $CU_VERSION = rocm* ]]; then
   echo "[NOVA] Setting the MSLK build variant: rocm ..."
