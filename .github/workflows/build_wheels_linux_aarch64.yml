@@ -116,4 +116,5 @@ jobs:
       trigger-event: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish) && 'schedule' || github.event_name }}
       architecture: aarch64
       setup-miniconda: false
-      timeout: 210
+      # CUDA wheels build with 5 parallel jobs on OSDC (see nova_prescript.bash).
+      timeout: 360

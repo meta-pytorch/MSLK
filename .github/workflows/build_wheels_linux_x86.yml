@@ -111,6 +111,6 @@ jobs:
       test-infra-ref: main
       build-matrix: ${{ needs.filter-matrix.outputs.matrix }}
       trigger-event: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish) && 'schedule' || github.event_name }}
-      # Based on current measurements for CUDA 12.9 workflows, builds take
-      # 2.5 hours while tests take 0.1 hours
-      timeout: 210
+      # CUDA wheels took ~3h10m on EC2 with 8 parallel jobs. OSDC pods fit 5
+      # (see nova_prescript.bash), so allow for a ~5h build.
+      timeout: 360
