@@ -47,6 +47,62 @@ class BF16GroupedFallbackTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "K must be divisible by 64"):
             torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes)
 
+    def _inputs_with_empty_group(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = torch.accelerator.current_accelerator()
+        x = torch.ones((32, 512), dtype=torch.bfloat16, device=device)
+        w = torch.stack(
+            [
+                torch.full((512, 512), value, dtype=torch.bfloat16, device=device)
+                for value in (1, 2, 3)
+            ]
+        )
+        m_sizes = torch.tensor([16, 0, 16], dtype=torch.int64, device=device)
+        out = torch.full((32 * 512,), -17, dtype=torch.bfloat16, device=device)
+        return x, w, m_sizes, out
+
+    def test_empty_group_and_preallocated_output(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("GPU unavailable")
+        x, w, m_sizes, out = self._inputs_with_empty_group()
+        actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes, out=out)
+        expected = torch.cat(
+            [
+                torch.full((16, 512), value, dtype=torch.bfloat16, device=x.device)
+                for value in (512, 1536)
+            ]
+        )
+        self.assertEqual(actual.data_ptr(), out.data_ptr())
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_graph_replay_reads_updated_group_sizes(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("GPU unavailable")
+        x, w, m_sizes, out = self._inputs_with_empty_group()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes, out=out)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(x, w, m_sizes, out=out)
+        m_sizes.copy_(
+            torch.tensor([0, 16, 16], dtype=torch.int64, device=m_sizes.device)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.cat(
+            [
+                torch.full((16, 512), value, dtype=torch.bfloat16, device=x.device)
+                for value in (1024, 1536)
+            ]
+        )
+        self.assertEqual(actual.data_ptr(), out.data_ptr())
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
 
 @skipUnlessRocm()
 @skipUnlessGfxArch("gfx942", "gfx950")

@@ -17,6 +17,9 @@
 #include <unordered_map>
 
 #include <ATen/ATen.h>
+#if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
+#include <ATen/cuda/CUDAContext.h>
+#endif
 #include <c10/hip/HIPStream.h>
 
 #include "ck/ck.hpp"
@@ -588,6 +591,28 @@ at::Tensor bf16bf16bf16_grouped_stacked(
   if (total_M == 0) {
     return Y;
   }
+
+#if defined(MSLK_ENABLE_MI45X_ATEN_GROUPED_GEMM_FALLBACK)
+  const std::string arch =
+      at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  if (arch.starts_with("gfx1250")) {
+    const auto rows =
+        at::arange(total_M, X.options().dtype(at::kLong)).unsqueeze(1);
+    const auto ends = at::cumsum(M_sizes, 0);
+    const auto starts = ends - M_sizes;
+    const auto x = X.to(at::kFloat);
+    auto result = at::zeros({total_M, N}, X.options().dtype(at::kFloat));
+    for (int64_t group = 0; group < group_count; ++group) {
+      const auto selected_rows =
+          rows.ge(starts.select(0, group)) & rows.lt(ends.select(0, group));
+      const auto product = at::matmul(
+          x, W.select(0, group).to(at::kFloat).transpose(0, 1));
+      result = at::where(selected_rows, product, result);
+    }
+    Y.copy_(result.to(at::kBFloat16));
+    return Y;
+  }
+#endif
 
   // Prepare kernel arguments by copying them to the proper device location.
   at::Tensor kernel_args = get_stacked_kernel_args(X, W, Y, M_sizes);
